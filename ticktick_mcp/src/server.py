@@ -609,15 +609,39 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
     Returns:
         Formatted string of filtered tasks
     """
+    # Prefer the v2 open-task pool: it includes the Inbox (which the official
+    # API leaves out of the project list) and is a single call instead of one
+    # request per project. Falls back to official iteration when v2 is off.
+    if ticktick_v2:
+        try:
+            state = ticktick_v2.get_state()
+            inbox = state.get("inboxId")
+            names = {p["id"]: p.get("name")
+                     for p in (state.get("projectProfiles") or [])}
+            names[inbox] = "Inbox"
+            tasks = state.get("syncTaskBean", {}).get("update", []) or []
+            matched = [t for t in tasks if filter_func(t)]
+            if not matched:
+                return f"No tasks found that are '{filter_name}'."
+            out = f"Tasks that are '{filter_name}' ({len(matched)}):\n\n"
+            for t in matched[:100]:
+                pname = names.get(t.get("projectId"), t.get("projectId"))
+                out += f"[{pname}] " + format_task(t) + "\n" + ("-" * 40) + "\n"
+            if len(matched) > 100:
+                out += f"... and {len(matched) - 100} more."
+            return out
+        except Exception as e:
+            logger.warning(f"v2 task pool failed, falling back to official API: {e}")
+
     if not projects:
         return "No projects found."
-    
+
     result = f"Found {len(projects)} projects:\n\n"
-    
+
     for i, project in enumerate(projects, 1):
         if project.get('closed'):
             continue
-            
+
         project_id = project.get('id', 'No ID')
         project_data = ticktick.get_project_with_data(project_id)
         tasks = project_data.get('tasks', [])
@@ -831,17 +855,32 @@ async def search_tasks(search_term: str) -> str:
     
     if not search_term.strip():
         return "Search term cannot be empty."
-    
+
     try:
+        # Prefer the v2 open-task pool: it includes the Inbox (which the
+        # official API omits from the project list) and is one fast call.
+        if ticktick_v2:
+            tasks = [t for t in ticktick_v2.get_open_tasks()
+                     if _task_matches_search(t, search_term)]
+            if not tasks:
+                return f"No tasks found matching '{search_term}'."
+            out = f"Tasks matching '{search_term}' ({len(tasks)}):\n\n"
+            for t in tasks[:50]:
+                out += format_task(t) + "\n" + ("-" * 40) + "\n"
+            if len(tasks) > 50:
+                out += f"... and {len(tasks) - 50} more."
+            return out
+
+        # Fallback (no v2): iterate official projects — note this misses the Inbox.
         projects = ticktick.get_projects()
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
-        
+
         def search_filter(task: Dict[str, Any]) -> bool:
             return _task_matches_search(task, search_term)
-        
+
         return _get_project_tasks_by_filter(projects, search_filter, f"matching '{search_term}'")
-        
+
     except Exception as e:
         logger.error(f"Error in search_tasks: {e}")
         return f"Error retrieving projects: {str(e)}"
