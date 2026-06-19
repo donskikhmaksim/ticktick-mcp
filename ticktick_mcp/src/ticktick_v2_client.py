@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 V2_BASE = "https://api.ticktick.com/api/v2"
 
+# Never let an unofficial-API call hang the MCP request forever.
+REQUEST_TIMEOUT = 20
+
 
 def _build_x_device() -> str:
     """Build the x-device header the web client sends; some endpoints 400 without it."""
@@ -68,6 +71,7 @@ class TickTickV2Client:
         resp = self.session.post(
             f"{V2_BASE}/user/signon?wc=true&remember=true",
             json={"username": self.username, "password": self.password},
+            timeout=REQUEST_TIMEOUT,
         )
         if resp.status_code != 200:
             raise RuntimeError(
@@ -89,13 +93,15 @@ class TickTickV2Client:
     def _request(self, method: str, path: str, **kwargs) -> Any:
         self._ensure_auth()
         url = f"{V2_BASE}{path}"
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         resp = self.session.request(method, url, **kwargs)
         # token may have expired -> re-login once
         if resp.status_code in (401, 403):
             logger.info("v2 session expired, re-authenticating...")
             self.token = None
             self._ensure_auth()
-            resp = self.session.request(method, url, **kwargs)
+            kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+        resp = self.session.request(method, url, **kwargs)
         resp.raise_for_status()
         if resp.status_code == 204 or not resp.text:
             return {}

@@ -10,6 +10,10 @@ from typing import Dict, List, Any, Optional, Tuple
 # Set up logging
 logger = logging.getLogger(__name__)
 
+# Hard cap on every TickTick HTTP call so a stalled connection can never hang
+# the whole MCP request indefinitely.
+REQUEST_TIMEOUT = 20
+
 class TickTickClient:
     """
     Client for the TickTick API using OAuth2 authentication.
@@ -68,7 +72,7 @@ class TickTickClient:
         
         try:
             # Send the token request
-            response = requests.post(self.token_url, data=token_data, headers=headers)
+            response = requests.post(self.token_url, data=token_data, headers=headers, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             
             # Parse the response
@@ -146,11 +150,11 @@ class TickTickClient:
         try:
             # Make the request
             if method == "GET":
-                response = requests.get(url, headers=self.headers)
+                response = requests.get(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
             elif method == "POST":
-                response = requests.post(url, headers=self.headers, json=data)
+                response = requests.post(url, headers=self.headers, json=data, timeout=REQUEST_TIMEOUT)
             elif method == "DELETE":
-                response = requests.delete(url, headers=self.headers)
+                response = requests.delete(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
             
@@ -162,11 +166,11 @@ class TickTickClient:
                 if self._refresh_access_token():
                     # Retry the request with the new token
                     if method == "GET":
-                        response = requests.get(url, headers=self.headers)
+                        response = requests.get(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
                     elif method == "POST":
-                        response = requests.post(url, headers=self.headers, json=data)
+                        response = requests.post(url, headers=self.headers, json=data, timeout=REQUEST_TIMEOUT)
                     elif method == "DELETE":
-                        response = requests.delete(url, headers=self.headers)
+                        response = requests.delete(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
             
             # Raise an exception for 4xx/5xx status codes
             response.raise_for_status()
