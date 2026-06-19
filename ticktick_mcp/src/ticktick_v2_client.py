@@ -20,6 +20,7 @@ A username/password fallback remains for local/residential use only.
 import os
 import json
 import logging
+import time
 import uuid
 import requests
 from datetime import datetime
@@ -72,6 +73,11 @@ class TickTickV2Client:
             "x-device": _build_x_device(),
         })
         self.inbox_id: Optional[str] = None
+        # Short-lived cache of the 3 MB /batch/check/0 sync so a single
+        # multi-tool turn doesn't refetch the full state on every call.
+        self._state_cache: Optional[Dict] = None
+        self._state_ts: float = 0.0
+        self._state_ttl: float = 20.0
 
     @property
     def enabled(self) -> bool:
@@ -122,6 +128,9 @@ class TickTickV2Client:
     def _request(self, method: str, path: str, **kwargs) -> Any:
         kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         url = f"{V2_BASE}{path}"
+        # Any write invalidates the cached sync state so reads stay fresh.
+        if method != "GET":
+            self._state_cache = None
         resp = self.session.request(method, url, **kwargs)
         if resp.status_code in (401, 403):
             raise TickTickAuthError(
@@ -143,11 +152,18 @@ class TickTickV2Client:
             )
         return data
 
-    def get_state(self) -> Dict:
-        """Full sync snapshot: projects, tags, open tasks, inboxId."""
+    def get_state(self, force: bool = False) -> Dict:
+        """Full sync snapshot: projects, tags, open tasks, inboxId.
+        Cached for a few seconds so back-to-back tool calls reuse one fetch."""
+        if (not force and self._state_cache is not None
+                and (time.monotonic() - self._state_ts) < self._state_ttl):
+            return self._state_cache
         state = self._request("GET", "/batch/check/0")
-        if isinstance(state, dict) and state.get("inboxId"):
-            self.inbox_id = state["inboxId"]
+        if isinstance(state, dict):
+            self._state_cache = state
+            self._state_ts = time.monotonic()
+            if state.get("inboxId"):
+                self.inbox_id = state["inboxId"]
         return state
 
     # ---- features the Open API lacks -------------------------------------

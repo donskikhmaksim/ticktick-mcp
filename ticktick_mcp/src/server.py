@@ -141,6 +141,54 @@ def format_project(project: Dict) -> str:
     
     return formatted
 
+_PRIO_SHORT = {0: "", 1: "P-Low", 3: "P-Med", 5: "P-High"}
+
+
+def format_task_line(task: Dict, project_name: str = None) -> str:
+    """One compact line per task — keeps tool outputs small so the model
+    isn't forced to read multi-KB dumps for every list call."""
+    bits = []
+    if project_name:
+        bits.append(f"[{project_name}]")
+    bits.append(task.get("title") or "(no title)")
+    meta = []
+    if task.get("dueDate"):
+        meta.append("due " + str(task["dueDate"])[:10])
+    pr = _PRIO_SHORT.get(task.get("priority", 0))
+    if pr:
+        meta.append(pr)
+    if task.get("tags"):
+        meta.append(" ".join("#" + t for t in task["tags"]))
+    line = "- " + " ".join(bits)
+    if meta:
+        line += " · " + ", ".join(meta)
+    return line + f"  (id:{task.get('id')} proj:{task.get('projectId')})"
+
+
+def _v2_project_names() -> Dict:
+    """Map projectId -> name (incl. Inbox) from the cached v2 state."""
+    if not ticktick_v2:
+        return {}
+    try:
+        st = ticktick_v2.get_state()
+        names = {p["id"]: p.get("name") for p in (st.get("projectProfiles") or [])}
+        if st.get("inboxId"):
+            names[st["inboxId"]] = "Inbox"
+        return names
+    except Exception:
+        return {}
+
+
+def format_task_list(tasks: List[Dict], limit: int = 100) -> str:
+    """Compact, one-line-per-task rendering with project names resolved once."""
+    names = _v2_project_names()
+    lines = [format_task_line(t, names.get(t.get("projectId"))) for t in tasks[:limit]]
+    out = "\n".join(lines)
+    if len(tasks) > limit:
+        out += f"\n... and {len(tasks) - limit} more."
+    return out
+
+
 # MCP Tools
 
 @mcp.tool()
@@ -623,10 +671,9 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
             matched = [t for t in tasks if filter_func(t)]
             if not matched:
                 return f"No tasks found that are '{filter_name}'."
-            out = f"Tasks that are '{filter_name}' ({len(matched)}):\n\n"
+            out = f"Tasks that are '{filter_name}' ({len(matched)}):\n"
             for t in matched[:100]:
-                pname = names.get(t.get("projectId"), t.get("projectId"))
-                out += f"[{pname}] " + format_task(t) + "\n" + ("-" * 40) + "\n"
+                out += format_task_line(t, names.get(t.get("projectId"))) + "\n"
             if len(matched) > 100:
                 out += f"... and {len(matched) - 100} more."
             return out
@@ -864,12 +911,8 @@ async def search_tasks(search_term: str) -> str:
                      if _task_matches_search(t, search_term)]
             if not tasks:
                 return f"No tasks found matching '{search_term}'."
-            out = f"Tasks matching '{search_term}' ({len(tasks)}):\n\n"
-            for t in tasks[:50]:
-                out += format_task(t) + "\n" + ("-" * 40) + "\n"
-            if len(tasks) > 50:
-                out += f"... and {len(tasks) - 50} more."
-            return out
+            return (f"Tasks matching '{search_term}' ({len(tasks)}):\n"
+                    + format_task_list(tasks, 50))
 
         # Fallback (no v2): iterate official projects — note this misses the Inbox.
         projects = ticktick.get_projects()
@@ -1113,9 +1156,7 @@ async def get_completed_tasks(limit: int = 50) -> str:
         if not tasks:
             return "No completed tasks found."
         out = f"Completed tasks ({len(tasks)}):\n\n"
-        for t in tasks:
-            out += format_task(t) + "\n" + ("-" * 40) + "\n"
-        return out
+        return out + format_task_list(tasks)
     except Exception as e:
         logger.error(f"Error in get_completed_tasks: {e}")
         return f"Error fetching completed tasks: {str(e)}"
@@ -1158,9 +1199,7 @@ async def get_tasks_by_tag(tag: str) -> str:
         if not tasks:
             return f"No open tasks found with tag '{tag}'."
         out = f"Tasks tagged '{tag}' ({len(tasks)}):\n\n"
-        for t in tasks:
-            out += format_task(t) + "\n" + ("-" * 40) + "\n"
-        return out
+        return out + format_task_list(tasks)
     except Exception as e:
         logger.error(f"Error in get_tasks_by_tag: {e}")
         return f"Error fetching tasks by tag: {str(e)}"
@@ -1179,9 +1218,7 @@ async def get_inbox_tasks() -> str:
         if not tasks:
             return "No open tasks in the Inbox."
         out = f"Inbox tasks ({len(tasks)}):\n\n"
-        for t in tasks:
-            out += format_task(t) + "\n" + ("-" * 40) + "\n"
-        return out
+        return out + format_task_list(tasks)
     except Exception as e:
         logger.error(f"Error in get_inbox_tasks: {e}")
         return f"Error fetching inbox tasks: {str(e)}"
@@ -1483,9 +1520,7 @@ async def run_filter(filter: str) -> str:
         if not tasks:
             return f"Filter '{filter}' matched no open tasks."
         out = f"Filter '{filter}' — {len(tasks)} task(s):\n\n"
-        for t in tasks:
-            out += format_task(t) + "\n" + ("-" * 40) + "\n"
-        return out
+        return out + format_task_list(tasks)
     except Exception as e:
         logger.error(f"Error in run_filter: {e}")
         return f"Error running filter: {str(e)}"
@@ -1642,9 +1677,7 @@ async def get_trash(limit: int = 50) -> str:
         if not tasks:
             return "Trash is empty."
         out = f"Trashed tasks ({len(tasks)}):\n\n"
-        for t in tasks:
-            out += format_task(t) + "\n" + ("-" * 40) + "\n"
-        return out
+        return out + format_task_list(tasks)
     except Exception as e:
         logger.error(f"Error in get_trash: {e}")
         return f"Error fetching trash: {str(e)}"
@@ -1877,12 +1910,8 @@ async def search_all_tasks(query: str, include_completed: bool = True) -> str:
                    or q in (t.get("content", "") or "").lower()]
         if not matches:
             return f"No tasks matched '{query}'."
-        out = f"Matches for '{query}' ({len(matches)}):\n\n"
-        for t in matches[:50]:
-            out += format_task(t) + "\n" + ("-" * 40) + "\n"
-        if len(matches) > 50:
-            out += f"... and {len(matches) - 50} more."
-        return out
+        return (f"Matches for '{query}' ({len(matches)}):\n"
+                + format_task_list(matches, 50))
     except Exception as e:
         logger.error(f"Error in search_all_tasks: {e}")
         return f"Error searching tasks: {str(e)}"
