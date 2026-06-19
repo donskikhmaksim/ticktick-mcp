@@ -343,6 +343,71 @@ class TickTickV2Client:
         tasks = state.get("syncTaskBean", {}).get("update", []) or []
         return [t for t in tasks if _rule_matches(t, rule, inbox, proj_group)]
 
+    # ---- tag write ops ---------------------------------------------------
+    def create_tag(self, name: str, color: str = None) -> Dict:
+        label = name
+        return self._request("POST", "/batch/tag", json={
+            "add": [{"name": name.lower(), "label": label, "color": color,
+                     "sortOrder": 0, "parent": None}],
+            "update": [], "delete": []})
+
+    def rename_tag(self, old_name: str, new_name: str) -> Dict:
+        return self._request("PUT", "/tag/rename",
+                             json={"name": old_name.lower(), "newName": new_name})
+
+    def delete_tag(self, name: str) -> Dict:
+        return self._request("DELETE", "/tag", params={"name": name.lower()})
+
+    def set_task_tags(self, task_id: str, tags: List[str]) -> Dict:
+        task = next((t for t in self.get_open_tasks() if t.get("id") == task_id), None)
+        if not task:
+            raise ValueError(f"Open task {task_id} not found.")
+        task = dict(task)
+        task["tags"] = [t.lstrip("#").lower() for t in tags]
+        return self._request("POST", "/batch/task",
+                             json={"add": [], "update": [task], "delete": []})
+
+    # ---- won't-do / duplicate -------------------------------------------
+    def abandon_task(self, task_id: str) -> Dict:
+        """Mark a task 'Won't do' (v2 status -1)."""
+        task = next((t for t in self.get_open_tasks() if t.get("id") == task_id), None)
+        if not task:
+            raise ValueError(f"Open task {task_id} not found.")
+        task = dict(task)
+        task["status"] = -1
+        return self._request("POST", "/batch/task",
+                             json={"add": [], "update": [task], "delete": []})
+
+    def duplicate_task(self, task_id: str) -> Dict:
+        src = next((t for t in self.get_open_tasks() if t.get("id") == task_id), None)
+        if not src:
+            raise ValueError(f"Open task {task_id} not found.")
+        copy = {k: src[k] for k in ("projectId", "content", "desc", "priority",
+                                    "tags", "isAllDay", "startDate", "dueDate",
+                                    "timeZone", "repeatFlag", "reminders")
+                if k in src}
+        copy["id"] = uuid.uuid4().hex[:24]
+        copy["title"] = (src.get("title", "") + " (copy)")
+        copy["status"] = 0
+        self.batch_create_tasks([copy])
+        return copy
+
+    # ---- comments delete -------------------------------------------------
+    def delete_task_comment(self, project_id: str, task_id: str,
+                            comment_id: str) -> Dict:
+        return self._request(
+            "DELETE", f"/project/{project_id}/task/{task_id}/comment/{comment_id}")
+
+    # ---- project archive -------------------------------------------------
+    def archive_project(self, project_id: str, closed: bool = True) -> Dict:
+        proj = next((p for p in self.list_projects() if p.get("id") == project_id), None)
+        if not proj:
+            raise ValueError(f"Project {project_id} not found.")
+        upd = dict(proj)
+        upd["closed"] = closed
+        return self._request("POST", "/batch/project",
+                             json={"add": [], "delete": [], "update": [upd]})
+
 
 # ---- filter rule evaluation (client-side, mirrors the TickTick web app) ----
 

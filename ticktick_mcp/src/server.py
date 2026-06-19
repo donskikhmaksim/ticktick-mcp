@@ -251,7 +251,9 @@ async def create_task(
     due_date: str = None,
     priority: int = 0,
     repeat_flag: str = None,
-    reminders: List[str] = None
+    reminders: List[str] = None,
+    is_all_day: bool = False,
+    tags: List[str] = None
 ) -> str:
     """
     Create a new task in TickTick.
@@ -265,6 +267,8 @@ async def create_task(
         priority: Priority level (0: None, 1: Low, 3: Medium, 5: High) (optional)
         repeat_flag: Recurrence RRULE, e.g. "RRULE:FREQ=DAILY;INTERVAL=1" (optional; use build_recurrence_rule)
         reminders: List of reminder triggers, e.g. ["TRIGGER:-PT30M"] (optional; use build_reminder)
+        is_all_day: Whether the task is an all-day task (optional)
+        tags: List of tag names to attach (optional; requires v2 API)
     """
     if not ticktick:
         if not initialize_client():
@@ -291,13 +295,20 @@ async def create_task(
             start_date=start_date,
             due_date=due_date,
             priority=priority,
+            is_all_day=is_all_day,
             repeat_flag=repeat_flag,
             reminders=reminders
         )
 
         if 'error' in task:
             return f"Error creating task: {task['error']}"
-        
+
+        if tags and ticktick_v2 and task.get("id"):
+            try:
+                ticktick_v2.set_task_tags(task["id"], tags)
+            except Exception as e:
+                logger.warning(f"Task created but tagging failed: {e}")
+
         return f"Task created successfully:\n\n" + format_task(task)
     except Exception as e:
         logger.error(f"Error in create_task: {e}")
@@ -313,7 +324,8 @@ async def update_task(
     due_date: str = None,
     priority: int = None,
     repeat_flag: str = None,
-    reminders: List[str] = None
+    reminders: List[str] = None,
+    tags: List[str] = None
 ) -> str:
     """
     Update an existing task in TickTick.
@@ -328,6 +340,7 @@ async def update_task(
         priority: New priority level (0: None, 1: Low, 3: Medium, 5: High) (optional)
         repeat_flag: Recurrence RRULE (optional; use build_recurrence_rule)
         reminders: List of reminder triggers (optional; use build_reminder)
+        tags: Replace the task's tags with this list (optional; requires v2 API)
     """
     if not ticktick:
         if not initialize_client():
@@ -361,7 +374,13 @@ async def update_task(
 
         if 'error' in task:
             return f"Error updating task: {task['error']}"
-        
+
+        if tags is not None and ticktick_v2:
+            try:
+                ticktick_v2.set_task_tags(task_id, tags)
+            except Exception as e:
+                logger.warning(f"Task updated but tagging failed: {e}")
+
         return f"Task updated successfully:\n\n" + format_task(task)
     except Exception as e:
         logger.error(f"Error in update_task: {e}")
@@ -1590,6 +1609,209 @@ async def get_trash(limit: int = 50) -> str:
     except Exception as e:
         logger.error(f"Error in get_trash: {e}")
         return f"Error fetching trash: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Tag write operations (v2)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def create_tag(name: str, color: str = None) -> str:
+    """Create a tag (requires v2 API). color is an optional hex like '#FF6161'."""
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ticktick_v2.create_tag(name, color)
+        return f"Tag '{name}' created."
+    except Exception as e:
+        logger.error(f"Error in create_tag: {e}")
+        return f"Error creating tag: {str(e)}"
+
+
+@mcp.tool()
+async def rename_tag(old_name: str, new_name: str) -> str:
+    """Rename a tag (requires v2 API)."""
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ticktick_v2.rename_tag(old_name, new_name)
+        return f"Tag '{old_name}' renamed to '{new_name}'."
+    except Exception as e:
+        logger.error(f"Error in rename_tag: {e}")
+        return f"Error renaming tag: {str(e)}"
+
+
+@mcp.tool()
+async def delete_tag(name: str) -> str:
+    """Delete a tag (requires v2 API). Tasks keep existing; they just lose the tag."""
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ticktick_v2.delete_tag(name)
+        return f"Tag '{name}' deleted."
+    except Exception as e:
+        logger.error(f"Error in delete_tag: {e}")
+        return f"Error deleting tag: {str(e)}"
+
+
+@mcp.tool()
+async def set_task_tags(task_id: str, tags: List[str]) -> str:
+    """
+    Replace a task's tags (requires v2 API).
+
+    Args:
+        task_id: ID of the task
+        tags: Full list of tag names the task should have (replaces existing)
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ticktick_v2.set_task_tags(task_id, tags)
+        return f"Task {task_id} tags set to: {', '.join(tags) or '(none)'}."
+    except Exception as e:
+        logger.error(f"Error in set_task_tags: {e}")
+        return f"Error setting tags: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Won't-do / duplicate (v2)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def abandon_task(task_id: str) -> str:
+    """Mark a task as 'Won't do' (requires v2 API)."""
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ticktick_v2.abandon_task(task_id)
+        return f"Task {task_id} marked as 'Won't do'."
+    except Exception as e:
+        logger.error(f"Error in abandon_task: {e}")
+        return f"Error abandoning task: {str(e)}"
+
+
+@mcp.tool()
+async def duplicate_task(task_id: str) -> str:
+    """Duplicate a task within the same project (requires v2 API)."""
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        copy = ticktick_v2.duplicate_task(task_id)
+        return f"Task duplicated as '{copy.get('title')}' (id: {copy.get('id')})."
+    except Exception as e:
+        logger.error(f"Error in duplicate_task: {e}")
+        return f"Error duplicating task: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Comment edit/delete (v2)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def delete_task_comment(project_id: str, task_id: str, comment_id: str) -> str:
+    """Delete a task comment (requires v2 API)."""
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ticktick_v2.delete_task_comment(project_id, task_id, comment_id)
+        return "Comment deleted."
+    except Exception as e:
+        logger.error(f"Error in delete_task_comment: {e}")
+        return f"Error deleting comment: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Project update / archive
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def update_project(project_id: str, name: str = None, color: str = None,
+                         view_mode: str = None) -> str:
+    """
+    Update a project's name, color, or view mode (uses the official API).
+
+    Args:
+        project_id: ID of the project
+        name: New name (optional)
+        color: New color hex like '#F18181' (optional)
+        view_mode: 'list', 'kanban', or 'timeline' (optional)
+    """
+    if not ticktick:
+        if not initialize_client():
+            return "Failed to initialize TickTick client. Please check your API credentials."
+    try:
+        proj = ticktick.update_project(project_id, name=name, color=color,
+                                       view_mode=view_mode)
+        if 'error' in proj:
+            return f"Error updating project: {proj['error']}"
+        return "Project updated:\n\n" + format_project(proj)
+    except Exception as e:
+        logger.error(f"Error in update_project: {e}")
+        return f"Error updating project: {str(e)}"
+
+
+@mcp.tool()
+async def archive_project(project_id: str, archived: bool = True) -> str:
+    """
+    Archive (close) or unarchive a project (requires v2 API).
+
+    Args:
+        project_id: ID of the project
+        archived: True to archive, False to restore it to active
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ticktick_v2.archive_project(project_id, closed=archived)
+        return f"Project {project_id} {'archived' if archived else 'unarchived'}."
+    except Exception as e:
+        logger.error(f"Error in archive_project: {e}")
+        return f"Error archiving project: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Search across open + completed (v2)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def search_all_tasks(query: str, include_completed: bool = True) -> str:
+    """
+    Search tasks by title/content across open and (optionally) completed tasks (requires v2 API).
+
+    Args:
+        query: Text to search for (case-insensitive substring)
+        include_completed: Also search recently completed tasks (default True)
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        q = query.lower()
+        pool = list(ticktick_v2.get_open_tasks())
+        if include_completed:
+            pool += ticktick_v2.get_completed_tasks(limit=100)
+        matches = [t for t in pool
+                   if q in (t.get("title", "") or "").lower()
+                   or q in (t.get("content", "") or "").lower()]
+        if not matches:
+            return f"No tasks matched '{query}'."
+        out = f"Matches for '{query}' ({len(matches)}):\n\n"
+        for t in matches[:50]:
+            out += format_task(t) + "\n" + ("-" * 40) + "\n"
+        if len(matches) > 50:
+            out += f"... and {len(matches) - 50} more."
+        return out
+    except Exception as e:
+        logger.error(f"Error in search_all_tasks: {e}")
+        return f"Error searching tasks: {str(e)}"
 
 
 def main():
