@@ -17,16 +17,20 @@ complete / delete / subtasks), and client-side views: by priority, due
 today / tomorrow / in N days / this week, overdue, search (open tasks),
 batch create, GTD "engaged"/"next".
 
-### Unofficial v2 API (optional — set `TICKTICK_USERNAME` / `TICKTICK_PASSWORD`)
+### Unofficial v2 API (optional — set `TICKTICK_V2_TOKEN`)
 Fills the gaps the official API lacks:
 - `get_completed_tasks` — recently completed tasks
 - `list_tags` / `get_tasks_by_tag` — tag support
 - `get_inbox_tasks` — read the Inbox
 - `move_task` — move a task between lists
 
-> ⚠️ The v2 API is undocumented and may break without notice. It logs in with
-> your email + password (session token). Leave the username/password unset to
-> disable it entirely.
+> ⚠️ The v2 API is undocumented and may break without notice. Auth is the **`t`
+> cookie** from a logged-in ticktick.com browser session — NOT username/password
+> (TickTick gates signon behind a captcha). Get it from DevTools → Application →
+> Cookies → `ticktick.com` → copy the value of `t`, and set it as
+> `TICKTICK_V2_TOKEN`. Leave unset to disable. The token is long-lived but
+> eventually expires; when it does the v2 tools return a "re-extract the cookie"
+> message and the official API keeps working.
 
 ## Environment variables
 
@@ -34,7 +38,7 @@ Fills the gaps the official API lacks:
 |---|---|---|
 | `TICKTICK_ACCESS_TOKEN` | ✅ | Open API OAuth token (from local `auth` flow) |
 | `TICKTICK_CLIENT_ID` / `TICKTICK_CLIENT_SECRET` | for auth flow | TickTick developer app creds |
-| `TICKTICK_USERNAME` / `TICKTICK_PASSWORD` | optional | enable the v2 API |
+| `TICKTICK_V2_TOKEN` | optional | the `t` cookie — enables the v2 API |
 | `MCP_TRANSPORT` | for remote | `streamable-http` (default `stdio`) |
 | `MCP_SECRET` | strongly recommended | secret appended to URL path: `/mcp/<secret>` |
 | `MCP_HOST` / `PORT` | auto on Railway | bind address / port |

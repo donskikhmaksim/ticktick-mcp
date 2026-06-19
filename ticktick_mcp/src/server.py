@@ -59,17 +59,20 @@ def initialize_client():
         logger.info(f"Connected to TickTick Open API with {len(projects)} projects")
 
         # Optionally initialize the unofficial v2 client (tags, completed,
-        # inbox, move). Failure here is non-fatal — Open API still works.
-        if os.getenv("TICKTICK_USERNAME") and os.getenv("TICKTICK_PASSWORD"):
+        # inbox, move). Preferred auth is the browser `t` cookie via
+        # TICKTICK_V2_TOKEN; username/password is a deprecated fallback.
+        # Failure here is non-fatal — the Open API still works.
+        candidate = TickTickV2Client()
+        if candidate.enabled:
             try:
-                ticktick_v2 = TickTickV2Client()
-                ticktick_v2.login()
+                candidate.authenticate()
+                ticktick_v2 = candidate
                 logger.info("TickTick v2 API enabled (tags/completed/inbox/move)")
             except Exception as e:
                 ticktick_v2 = None
                 logger.warning(f"v2 API unavailable, continuing with Open API only: {e}")
         else:
-            logger.info("v2 API disabled (set TICKTICK_USERNAME/TICKTICK_PASSWORD to enable)")
+            logger.info("v2 API disabled (set TICKTICK_V2_TOKEN to enable)")
 
         return True
     except Exception as e:
@@ -1015,9 +1018,10 @@ async def create_subtask(
 # ---------------------------------------------------------------------------
 
 _V2_DISABLED_MSG = (
-    "The unofficial v2 API is not enabled. Set TICKTICK_USERNAME and "
-    "TICKTICK_PASSWORD in the environment to use tags, completed tasks, "
-    "the Inbox, and moving tasks between lists."
+    "The unofficial v2 API is not enabled (or its session token expired). "
+    "Set TICKTICK_V2_TOKEN to the `t` cookie from a logged-in ticktick.com "
+    "browser session to use tags, completed tasks, the Inbox, and moving "
+    "tasks between lists."
 )
 
 
