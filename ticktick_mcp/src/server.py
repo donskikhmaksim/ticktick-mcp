@@ -1405,6 +1405,193 @@ async def build_reminder(minutes_before: int = 0) -> str:
     return f"TRIGGER:-PT{minutes_before}M"
 
 
+# ---------------------------------------------------------------------------
+# Smart-list execution (v2)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def run_filter(filter: str) -> str:
+    """
+    Run a saved smart-list filter and return the open tasks it matches (requires v2 API).
+
+    Args:
+        filter: Filter name or ID (from list_filters)
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        tasks = ticktick_v2.run_filter(filter)
+        if not tasks:
+            return f"Filter '{filter}' matched no open tasks."
+        out = f"Filter '{filter}' — {len(tasks)} task(s):\n\n"
+        for t in tasks:
+            out += format_task(t) + "\n" + ("-" * 40) + "\n"
+        return out
+    except Exception as e:
+        logger.error(f"Error in run_filter: {e}")
+        return f"Error running filter: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Project groups / folders (v2)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def list_project_groups() -> str:
+    """List project groups (folders) (requires v2 API)."""
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        groups = ticktick_v2.list_project_groups()
+        groups = [g for g in groups if not g.get("deleted")]
+        if not groups:
+            return "No project groups found."
+        return f"Project groups ({len(groups)}):\n" + "\n".join(
+            f"- {g.get('name','?')}  (id: {g.get('id')})" for g in groups)
+    except Exception as e:
+        logger.error(f"Error in list_project_groups: {e}")
+        return f"Error fetching project groups: {str(e)}"
+
+
+@mcp.tool()
+async def create_project_group(name: str) -> str:
+    """Create a project group (folder) (requires v2 API)."""
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        gid = ticktick_v2.create_project_group(name)
+        return f"Project group '{name}' created (id: {gid})."
+    except Exception as e:
+        logger.error(f"Error in create_project_group: {e}")
+        return f"Error creating project group: {str(e)}"
+
+
+@mcp.tool()
+async def delete_project_group(group_id: str) -> str:
+    """Delete a project group/folder (its projects are kept, just ungrouped) (requires v2 API)."""
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ticktick_v2.delete_project_group(group_id)
+        return f"Project group {group_id} deleted."
+    except Exception as e:
+        logger.error(f"Error in delete_project_group: {e}")
+        return f"Error deleting project group: {str(e)}"
+
+
+@mcp.tool()
+async def move_project_to_group(project_id: str, group_id: str) -> str:
+    """
+    Move a project into a group/folder (requires v2 API).
+
+    Args:
+        project_id: ID of the project to move
+        group_id: ID of the destination group, or "NONE" to ungroup
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ticktick_v2.move_project_to_group(project_id, group_id)
+        dest = "ungrouped" if group_id == "NONE" else f"group {group_id}"
+        return f"Project {project_id} moved to {dest}."
+    except Exception as e:
+        logger.error(f"Error in move_project_to_group: {e}")
+        return f"Error moving project: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Task comments (v2)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_task_comments(project_id: str, task_id: str) -> str:
+    """Get comments on a task (requires v2 API)."""
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        comments = ticktick_v2.get_task_comments(project_id, task_id)
+        if not comments:
+            return "No comments on this task."
+        out = f"Comments ({len(comments)}):\n"
+        for c in comments:
+            who = (c.get("userProfile") or {}).get("displayName") or c.get("userName", "?")
+            out += f"- [{who}] {c.get('title','')}\n"
+        return out
+    except Exception as e:
+        logger.error(f"Error in get_task_comments: {e}")
+        return f"Error fetching comments: {str(e)}"
+
+
+@mcp.tool()
+async def add_task_comment(project_id: str, task_id: str, text: str) -> str:
+    """Add a comment to a task (requires v2 API)."""
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ticktick_v2.add_task_comment(project_id, task_id, text)
+        return "Comment added."
+    except Exception as e:
+        logger.error(f"Error in add_task_comment: {e}")
+        return f"Error adding comment: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Statistics & trash (v2)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_statistics() -> str:
+    """Get productivity statistics: achievement score/level and completion counts (requires v2 API)."""
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        s = ticktick_v2.get_statistics()
+        if not s:
+            return "No statistics available."
+        return (
+            f"Achievement score: {s.get('score')}  |  Level: {s.get('level')}\n"
+            f"Completed today: {s.get('todayCompleted')}  |  "
+            f"yesterday: {s.get('yesterdayCompleted')}  |  "
+            f"total: {s.get('totalCompleted')}"
+        )
+    except Exception as e:
+        logger.error(f"Error in get_statistics: {e}")
+        return f"Error fetching statistics: {str(e)}"
+
+
+@mcp.tool()
+async def get_trash(limit: int = 50) -> str:
+    """
+    List recently deleted (trashed) tasks (requires v2 API). Restoring must be
+    done in the TickTick app — the restore endpoint is not exposed.
+
+    Args:
+        limit: Maximum number of trashed tasks to return (default 50, max 500)
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        tasks = ticktick_v2.get_trash(limit)
+        if not tasks:
+            return "Trash is empty."
+        out = f"Trashed tasks ({len(tasks)}):\n\n"
+        for t in tasks:
+            out += format_task(t) + "\n" + ("-" * 40) + "\n"
+        return out
+    except Exception as e:
+        logger.error(f"Error in get_trash: {e}")
+        return f"Error fetching trash: {str(e)}"
+
+
 def main():
     """Main entry point for the MCP server."""
     if not initialize_client():

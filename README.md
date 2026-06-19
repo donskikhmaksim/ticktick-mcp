@@ -23,6 +23,15 @@ Fills the gaps the official API lacks:
 - `list_tags` / `get_tasks_by_tag` — tag support
 - `get_inbox_tasks` — read the Inbox
 - `move_task` — move a task between lists
+- `get_habits` / `checkin_habit` (backdatable) / `get_habit_checkins` — habits
+- `list_filters` / `run_filter` — list and **execute** saved smart lists
+- `set_task_parent` / `unset_task_parent` — subtasks
+- `batch_complete_tasks` / `batch_delete_tasks` — bulk operations
+- `list_project_groups` / `create_project_group` / `delete_project_group` / `move_project_to_group` — folders
+- `get_task_comments` / `add_task_comment` — comments
+- `get_statistics` — achievement score & completion counts
+- `get_trash` — view deleted tasks (restore is app-only)
+- `build_recurrence_rule` / `build_reminder` — helpers for repeat & reminder strings
 
 > ⚠️ The v2 API is undocumented and may break without notice. Auth is the **`t`
 > cookie** from a logged-in ticktick.com browser session — NOT username/password

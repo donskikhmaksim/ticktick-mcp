@@ -270,3 +270,163 @@ class TickTickV2Client:
     def batch_create_tasks(self, tasks: List[Dict]) -> Dict:
         return self._request("POST", "/batch/task",
                              json={"add": tasks, "update": [], "delete": []})
+
+    # ---- project groups / folders ----------------------------------------
+    def list_project_groups(self) -> List[Dict]:
+        return self.get_state().get("projectGroups", []) or []
+
+    def list_projects(self) -> List[Dict]:
+        return self.get_state().get("projectProfiles", []) or []
+
+    def create_project_group(self, name: str) -> str:
+        gid = uuid.uuid4().hex[:24]
+        self._request("POST", "/batch/projectGroup",
+                      json={"add": [{"id": gid, "name": name, "listType": "group"}],
+                            "update": [], "delete": []})
+        return gid
+
+    def delete_project_group(self, group_id: str) -> Dict:
+        return self._request("POST", "/batch/projectGroup",
+                             json={"add": [], "update": [], "delete": [group_id]})
+
+    def move_project_to_group(self, project_id: str, group_id: str) -> Dict:
+        """group_id='NONE' ungroups the project."""
+        proj = next((p for p in self.list_projects() if p.get("id") == project_id), None)
+        if not proj:
+            raise ValueError(f"Project {project_id} not found.")
+        return self._request("POST", "/batch/project",
+                             json={"add": [], "delete": [], "update": [
+                                 {"id": project_id, "name": proj.get("name"),
+                                  "groupId": group_id}]})
+
+    # ---- task comments ---------------------------------------------------
+    def get_task_comments(self, project_id: str, task_id: str) -> List[Dict]:
+        data = self._request("GET", f"/project/{project_id}/task/{task_id}/comments")
+        return data if isinstance(data, list) else []
+
+    def add_task_comment(self, project_id: str, task_id: str, text: str) -> Dict:
+        body = {"id": uuid.uuid4().hex[:24], "title": text,
+                "taskId": task_id, "projectId": project_id}
+        return self._request("POST", f"/project/{project_id}/task/{task_id}/comment",
+                             json=body)
+
+    # ---- statistics ------------------------------------------------------
+    def get_statistics(self) -> Dict:
+        data = self._request("GET", "/statistics/general")
+        return data if isinstance(data, dict) else {}
+
+    # ---- trash -----------------------------------------------------------
+    def get_trash(self, limit: int = 50) -> List[Dict]:
+        data = self._request("GET", "/project/all/trash/pagination",
+                             params={"start": 0, "limit": max(1, min(limit, 500))})
+        return data.get("tasks", []) if isinstance(data, dict) else []
+
+    # ---- smart-list (filter) execution -----------------------------------
+    def run_filter(self, filter_id_or_name: str) -> List[Dict]:
+        """Fetch all open tasks and return those matching a saved filter's rule,
+        which TickTick evaluates client-side (no server endpoint exists)."""
+        filters = self.get_filters()
+        flt = next((f for f in filters
+                    if f.get("id") == filter_id_or_name
+                    or f.get("name") == filter_id_or_name), None)
+        if not flt:
+            raise ValueError(f"Filter '{filter_id_or_name}' not found.")
+        try:
+            rule = json.loads(flt.get("rule") or "{}")
+        except (ValueError, TypeError):
+            rule = {}
+        state = self.get_state()
+        inbox = state.get("inboxId")
+        # map projectId -> groupId for listOrGroup conditions
+        proj_group = {p["id"]: p.get("groupId") for p in
+                      (state.get("projectProfiles", []) or [])}
+        tasks = state.get("syncTaskBean", {}).get("update", []) or []
+        return [t for t in tasks if _rule_matches(t, rule, inbox, proj_group)]
+
+
+# ---- filter rule evaluation (client-side, mirrors the TickTick web app) ----
+
+def _rule_matches(task: Dict, rule: Dict, inbox: str, proj_group: Dict) -> bool:
+    groups = rule.get("and") or []
+    if not groups:
+        return True  # empty rule = everything
+    return all(_node_matches(task, g, inbox, proj_group) for g in groups)
+
+
+def _node_matches(task: Dict, node: Dict, inbox: str, proj_group: Dict) -> bool:
+    items = node.get("or")
+    combine = any
+    if items is None:
+        items = node.get("and") or []
+        combine = all
+    if not items:
+        return True
+    # Nested condition objects → recurse.
+    if items and isinstance(items[0], dict):
+        return combine(_node_matches(task, it, inbox, proj_group) for it in items)
+    return _leaf_matches(task, node.get("conditionName"), items, inbox, proj_group)
+
+
+def _leaf_matches(task, name, values, inbox, proj_group) -> bool:
+    if name in ("list", "listOrGroup"):
+        if "all" in values:
+            return True
+        resolved = {inbox if v == "inbox" else v for v in values}
+        pid = task.get("projectId")
+        return pid in resolved or proj_group.get(pid) in resolved
+    if name == "tag":
+        tset = {x.lower() for x in (task.get("tags") or [])}
+        pos = {v.lower() for v in values if not str(v).startswith("!")}
+        neg = {v[1:].lower() for v in values if str(v).startswith("!")}
+        if neg and (tset & neg):
+            return False
+        return (not pos) or bool(tset & pos)
+    if name == "priority":
+        return task.get("priority", 0) in set(values)
+    if name == "dueDate":
+        return any(_due_token_matches(task, v) for v in values)
+    return True  # unknown condition → don't exclude
+
+
+def _task_due_date(task):
+    raw = task.get("dueDate")
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+
+def _due_token_matches(task, token) -> bool:
+    from datetime import date, timedelta
+    d = _task_due_date(task)
+    today = date.today()
+    if token == "nodate":
+        return d is None
+    if token == "recurring":
+        return bool(task.get("repeatFlag") or task.get("repeatRule"))
+    if d is None:
+        return False
+    if token == "today":
+        return d == today
+    if token == "tomorrow":
+        return d == today + timedelta(days=1)
+    if token == "overdue":
+        return d < today and task.get("status", 0) == 0
+    if token == "thisweek":
+        start = today - timedelta(days=today.weekday())
+        return start <= d <= start + timedelta(days=6)
+    if token == "nextweek":
+        start = today - timedelta(days=today.weekday()) + timedelta(days=7)
+        return start <= d <= start + timedelta(days=6)
+    if token == "thismonth":
+        return d.year == today.year and d.month == today.month
+    if "~" in str(token):  # explicit range "YYYY-MM-DD~YYYY-MM-DD"
+        try:
+            a, b = token.split("~")
+            return (datetime.strptime(a[:10], "%Y-%m-%d").date() <= d
+                    <= datetime.strptime(b[:10], "%Y-%m-%d").date())
+        except (ValueError, TypeError):
+            return False
+    return False
