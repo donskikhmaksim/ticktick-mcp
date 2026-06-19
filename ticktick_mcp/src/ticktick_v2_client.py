@@ -403,7 +403,21 @@ class TickTickV2Client:
         self.batch_create_tasks([copy])
         return copy
 
-    # ---- comments delete -------------------------------------------------
+    # ---- comments edit/delete -------------------------------------------
+    def update_task_comment(self, project_id: str, task_id: str,
+                            comment_id: str, text: str) -> Dict:
+        """Edit a comment. The API needs the FULL comment object PUT to
+        /comment/{id} (id in the path) — a partial body is silently ignored."""
+        comments = self.get_task_comments(project_id, task_id)
+        cm = next((c for c in comments if c.get("id") == comment_id), None)
+        if not cm:
+            raise ValueError(f"Comment {comment_id} not found.")
+        cm = dict(cm)
+        cm["title"] = text
+        return self._request(
+            "PUT", f"/project/{project_id}/task/{task_id}/comment/{comment_id}",
+            json=cm)
+
     def delete_task_comment(self, project_id: str, task_id: str,
                             comment_id: str) -> Dict:
         return self._request(

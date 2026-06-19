@@ -1773,6 +1773,21 @@ async def duplicate_task(task_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
+async def update_task_comment(project_id: str, task_id: str,
+                              comment_id: str, text: str) -> str:
+    """Edit a task comment (requires v2 API)."""
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ticktick_v2.update_task_comment(project_id, task_id, comment_id, text)
+        return "Comment updated."
+    except Exception as e:
+        logger.error(f"Error in update_task_comment: {e}")
+        return f"Error updating comment: {str(e)}"
+
+
+@mcp.tool()
 async def delete_task_comment(project_id: str, task_id: str, comment_id: str) -> str:
     """Delete a task comment (requires v2 API)."""
     err = _ensure_ready()
