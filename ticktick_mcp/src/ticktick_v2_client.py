@@ -321,6 +321,17 @@ class TickTickV2Client:
                              params={"start": 0, "limit": max(1, min(limit, 500))})
         return data.get("tasks", []) if isinstance(data, dict) else []
 
+    def restore_task(self, task_id: str, to_project_id: str = None) -> Dict:
+        """Restore a task from trash to its original list (or to_project_id)."""
+        trashed = self.get_trash(limit=500)
+        t = next((x for x in trashed if x.get("id") == task_id), None)
+        if not t:
+            raise ValueError(f"Task {task_id} not found in trash.")
+        from_pid = t.get("projectId")
+        body = [{"fromProjectId": from_pid, "taskId": task_id,
+                 "toProjectId": to_project_id or from_pid}]
+        return self._request("POST", "/trash/restore", json=body)
+
     # ---- smart-list (filter) execution -----------------------------------
     def run_filter(self, filter_id_or_name: str) -> List[Dict]:
         """Fetch all open tasks and return those matching a saved filter's rule,

@@ -1628,8 +1628,8 @@ async def get_statistics() -> str:
 @mcp.tool()
 async def get_trash(limit: int = 50) -> str:
     """
-    List recently deleted (trashed) tasks (requires v2 API). Restoring must be
-    done in the TickTick app — the restore endpoint is not exposed.
+    List recently deleted (trashed) tasks (requires v2 API). Use restore_task
+    to bring one back.
 
     Args:
         limit: Maximum number of trashed tasks to return (default 50, max 500)
@@ -1648,6 +1648,26 @@ async def get_trash(limit: int = 50) -> str:
     except Exception as e:
         logger.error(f"Error in get_trash: {e}")
         return f"Error fetching trash: {str(e)}"
+
+
+@mcp.tool()
+async def restore_task(task_id: str, to_project_id: str = None) -> str:
+    """
+    Restore a task from the trash (requires v2 API).
+
+    Args:
+        task_id: ID of the trashed task (from get_trash)
+        to_project_id: Optional destination project; defaults to the task's original list
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ticktick_v2.restore_task(task_id, to_project_id)
+        return f"Task {task_id} restored from trash."
+    except Exception as e:
+        logger.error(f"Error in restore_task: {e}")
+        return f"Error restoring task: {str(e)}"
 
 
 # ---------------------------------------------------------------------------
