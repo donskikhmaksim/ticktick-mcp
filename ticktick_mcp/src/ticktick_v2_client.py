@@ -193,3 +193,80 @@ class TickTickV2Client:
             "taskId": task_id,
         }]
         return self._request("POST", "/batch/taskProject", json=body)
+
+    # ---- smart lists / filters -------------------------------------------
+    def get_filters(self) -> List[Dict]:
+        return self.get_state().get("filters", []) or []
+
+    # ---- habits ----------------------------------------------------------
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000+0000")
+
+    def get_habits(self) -> List[Dict]:
+        data = self._request("GET", "/habits")
+        return data if isinstance(data, list) else []
+
+    def get_habit_checkins(self, habit_ids: List[str], after_stamp: int) -> Dict:
+        """after_stamp is an int date like 20260101. Returns {habitId: [entries]}."""
+        data = self._request("POST", "/habitCheckins/query",
+                              json={"habitIds": habit_ids, "afterStamp": after_stamp})
+        return data.get("checkins", {}) if isinstance(data, dict) else {}
+
+    def checkin_habit(self, habit_id: str, date: str = None,
+                      status: int = 2, value: float = None, goal: float = 1.0) -> Dict:
+        """Record a habit check-in. date='YYYY-MM-DD' (default today) enables
+        backdating. status 2=done, 1=failed, 0=not-done."""
+        if date:
+            stamp = int(date.replace("-", ""))
+        else:
+            stamp = int(datetime.now().strftime("%Y%m%d"))
+        if value is None:
+            value = goal if status == 2 else 0.0
+        entry = {
+            "id": uuid.uuid4().hex[:24],
+            "habitId": habit_id,
+            "checkinStamp": stamp,
+            "checkinTime": self._now_iso(),
+            "opTime": self._now_iso(),
+            "value": float(value),
+            "goal": float(goal),
+            "status": int(status),
+        }
+        return self._request("POST", "/habitCheckins/batch",
+                             json={"add": [entry], "update": [], "delete": []})
+
+    # ---- subtasks (parent/child) -----------------------------------------
+    def set_task_parent(self, task_id: str, parent_id: str, project_id: str) -> Dict:
+        body = [{"parentId": parent_id, "taskId": task_id, "projectId": project_id}]
+        return self._request("POST", "/batch/taskParent", json=body)
+
+    def unset_task_parent(self, task_id: str, parent_id: str, project_id: str) -> Dict:
+        body = [{"oldParentId": parent_id, "taskId": task_id, "projectId": project_id}]
+        return self._request("POST", "/batch/taskParent", json=body)
+
+    # ---- batch -----------------------------------------------------------
+    def batch_complete_tasks(self, task_ids: List[str]) -> Dict:
+        """Mark several open tasks complete in one call."""
+        by_id = {t.get("id"): t for t in self.get_open_tasks()}
+        updates = []
+        for tid in task_ids:
+            t = by_id.get(tid)
+            if t:
+                t = dict(t)
+                t["status"] = 2
+                updates.append(t)
+        if not updates:
+            return {"message": "No matching open tasks found."}
+        return self._request("POST", "/batch/task",
+                             json={"add": [], "update": updates, "delete": []})
+
+    def batch_delete_tasks(self, items: List[Dict]) -> Dict:
+        """items: list of {"taskId": ..., "projectId": ...}."""
+        return self._request("POST", "/batch/task",
+                             json={"add": [], "update": [], "delete": items})
+
+    # raw create/update helpers for batch task creation via v2
+    def batch_create_tasks(self, tasks: List[Dict]) -> Dict:
+        return self._request("POST", "/batch/task",
+                             json={"add": tasks, "update": [], "delete": []})

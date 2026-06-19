@@ -244,16 +244,18 @@ async def get_task(project_id: str, task_id: str) -> str:
 
 @mcp.tool()
 async def create_task(
-    title: str, 
-    project_id: str, 
-    content: str = None, 
-    start_date: str = None, 
-    due_date: str = None, 
-    priority: int = 0
+    title: str,
+    project_id: str,
+    content: str = None,
+    start_date: str = None,
+    due_date: str = None,
+    priority: int = 0,
+    repeat_flag: str = None,
+    reminders: List[str] = None
 ) -> str:
     """
     Create a new task in TickTick.
-    
+
     Args:
         title: Task title
         project_id: ID of the project to add the task to
@@ -261,6 +263,8 @@ async def create_task(
         start_date: Start date in ISO format YYYY-MM-DDThh:mm:ss+0000 (optional)
         due_date: Due date in ISO format YYYY-MM-DDThh:mm:ss+0000 (optional)
         priority: Priority level (0: None, 1: Low, 3: Medium, 5: High) (optional)
+        repeat_flag: Recurrence RRULE, e.g. "RRULE:FREQ=DAILY;INTERVAL=1" (optional; use build_recurrence_rule)
+        reminders: List of reminder triggers, e.g. ["TRIGGER:-PT30M"] (optional; use build_reminder)
     """
     if not ticktick:
         if not initialize_client():
@@ -286,9 +290,11 @@ async def create_task(
             content=content,
             start_date=start_date,
             due_date=due_date,
-            priority=priority
+            priority=priority,
+            repeat_flag=repeat_flag,
+            reminders=reminders
         )
-        
+
         if 'error' in task:
             return f"Error creating task: {task['error']}"
         
@@ -305,11 +311,13 @@ async def update_task(
     content: str = None,
     start_date: str = None,
     due_date: str = None,
-    priority: int = None
+    priority: int = None,
+    repeat_flag: str = None,
+    reminders: List[str] = None
 ) -> str:
     """
     Update an existing task in TickTick.
-    
+
     Args:
         task_id: ID of the task to update
         project_id: ID of the project the task belongs to
@@ -318,6 +326,8 @@ async def update_task(
         start_date: New start date in ISO format YYYY-MM-DDThh:mm:ss+0000 (optional)
         due_date: New due date in ISO format YYYY-MM-DDThh:mm:ss+0000 (optional)
         priority: New priority level (0: None, 1: Low, 3: Medium, 5: High) (optional)
+        repeat_flag: Recurrence RRULE (optional; use build_recurrence_rule)
+        reminders: List of reminder triggers (optional; use build_reminder)
     """
     if not ticktick:
         if not initialize_client():
@@ -344,9 +354,11 @@ async def update_task(
             content=content,
             start_date=start_date,
             due_date=due_date,
-            priority=priority
+            priority=priority,
+            repeat_flag=repeat_flag,
+            reminders=reminders
         )
-        
+
         if 'error' in task:
             return f"Error updating task: {task['error']}"
         
@@ -1137,6 +1149,260 @@ async def move_task(task_id: str, to_project_id: str) -> str:
     except Exception as e:
         logger.error(f"Error in move_task: {e}")
         return f"Error moving task: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Habits (v2)
+# ---------------------------------------------------------------------------
+
+def _ensure_ready() -> Optional[str]:
+    """Return an error string if the client/v2 isn't ready, else None."""
+    if not ticktick:
+        if not initialize_client():
+            return "Failed to initialize TickTick client. Please check your API credentials."
+    if not ticktick_v2:
+        return _V2_DISABLED_MSG
+    return None
+
+
+@mcp.tool()
+async def get_habits() -> str:
+    """List all habits with their goal and current streak (requires v2 API)."""
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        habits = ticktick_v2.get_habits()
+        if not habits:
+            return "No habits found."
+        active = [h for h in habits if h.get("status") == 0 or h.get("status") == 1]
+        out = f"Habits ({len(habits)}):\n\n"
+        for h in habits:
+            out += (f"- {h.get('name','?')}  (id: {h.get('id')})\n"
+                    f"    goal: {h.get('goal')} {h.get('unit','')} | type: {h.get('type')} | "
+                    f"total check-ins: {h.get('totalCheckIns', 0)}\n"
+                    f"    repeat: {h.get('repeatRule','')}\n")
+        return out
+    except Exception as e:
+        logger.error(f"Error in get_habits: {e}")
+        return f"Error fetching habits: {str(e)}"
+
+
+@mcp.tool()
+async def checkin_habit(habit_id: str, date: str = None,
+                        status: int = 2, value: float = None) -> str:
+    """
+    Record a habit check-in (requires v2 API).
+
+    Args:
+        habit_id: ID of the habit (from get_habits)
+        date: Date to check in as YYYY-MM-DD (optional; defaults to today — pass a past date to backfill)
+        status: 2 = done (default), 1 = failed, 0 = not done
+        value: Numeric value for quantitative habits (optional; defaults to the goal when done)
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    if status not in (0, 1, 2):
+        return "Invalid status. Use 2 (done), 1 (failed), or 0 (not done)."
+    try:
+        ticktick_v2.checkin_habit(habit_id, date=date, status=status, value=value)
+        when = date or "today"
+        labels = {2: "done", 1: "failed", 0: "not done"}
+        return f"Habit {habit_id} checked in for {when} as '{labels[status]}'."
+    except Exception as e:
+        logger.error(f"Error in checkin_habit: {e}")
+        return f"Error checking in habit: {str(e)}"
+
+
+@mcp.tool()
+async def get_habit_checkins(habit_id: str, after_date: str) -> str:
+    """
+    Get a habit's check-in history (requires v2 API).
+
+    Args:
+        habit_id: ID of the habit
+        after_date: Only return check-ins on/after this date, as YYYY-MM-DD
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        # afterStamp is exclusive (>) on the API side; subtract 1 so the
+        # requested date itself is included (YYYYMMDD is monotonic).
+        stamp = int(after_date.replace("-", "")) - 1
+        result = ticktick_v2.get_habit_checkins([habit_id], stamp)
+        entries = result.get(habit_id, [])
+        if not entries:
+            return f"No check-ins for habit {habit_id} since {after_date}."
+        labels = {2: "✓ done", 1: "✗ failed", 0: "○ not done"}
+        lines = [f"- {e.get('checkinStamp')}: {labels.get(e.get('status'), e.get('status'))} "
+                 f"(value {e.get('value')}/{e.get('goal')})" for e in entries]
+        return f"Check-ins for {habit_id} ({len(entries)}):\n" + "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error in get_habit_checkins: {e}")
+        return f"Error fetching habit check-ins: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Filters / smart lists (v2)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def list_filters() -> str:
+    """List saved smart-list filters with their query rules (requires v2 API)."""
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        filters = ticktick_v2.get_filters()
+        if not filters:
+            return "No filters found."
+        out = f"Filters ({len(filters)}):\n\n"
+        for f in filters:
+            out += f"- {f.get('name','?')}  (id: {f.get('id')})\n    rule: {f.get('rule','')}\n"
+        return out
+    except Exception as e:
+        logger.error(f"Error in list_filters: {e}")
+        return f"Error fetching filters: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Subtasks (v2)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def set_task_parent(task_id: str, parent_task_id: str, project_id: str) -> str:
+    """
+    Make a task a subtask of another (requires v2 API). Both must be in the same project.
+
+    Args:
+        task_id: ID of the task to nest
+        parent_task_id: ID of the parent task
+        project_id: ID of the project both tasks live in
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ticktick_v2.set_task_parent(task_id, parent_task_id, project_id)
+        return f"Task {task_id} is now a subtask of {parent_task_id}."
+    except Exception as e:
+        logger.error(f"Error in set_task_parent: {e}")
+        return f"Error setting parent: {str(e)}"
+
+
+@mcp.tool()
+async def unset_task_parent(task_id: str, parent_task_id: str, project_id: str) -> str:
+    """
+    Detach a subtask from its parent, making it a top-level task (requires v2 API).
+
+    Args:
+        task_id: ID of the subtask to detach
+        parent_task_id: ID of its current parent
+        project_id: ID of the project both tasks live in
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ticktick_v2.unset_task_parent(task_id, parent_task_id, project_id)
+        return f"Task {task_id} detached from parent {parent_task_id}."
+    except Exception as e:
+        logger.error(f"Error in unset_task_parent: {e}")
+        return f"Error detaching subtask: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Batch operations (v2)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def batch_complete_tasks(task_ids: List[str]) -> str:
+    """
+    Mark several open tasks complete in one call (requires v2 API).
+
+    Args:
+        task_ids: List of task IDs to complete
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ticktick_v2.batch_complete_tasks(task_ids)
+        return f"Requested completion of {len(task_ids)} task(s)."
+    except Exception as e:
+        logger.error(f"Error in batch_complete_tasks: {e}")
+        return f"Error completing tasks: {str(e)}"
+
+
+@mcp.tool()
+async def batch_delete_tasks(tasks: List[Dict[str, str]]) -> str:
+    """
+    Delete several tasks in one call (requires v2 API).
+
+    Args:
+        tasks: List of {"taskId": "...", "projectId": "..."} objects
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        items = [{"taskId": t.get("taskId") or t.get("task_id"),
+                  "projectId": t.get("projectId") or t.get("project_id")} for t in tasks]
+        ticktick_v2.batch_delete_tasks(items)
+        return f"Requested deletion of {len(items)} task(s)."
+    except Exception as e:
+        logger.error(f"Error in batch_delete_tasks: {e}")
+        return f"Error deleting tasks: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Builder helpers (no API call — produce strings for create_task/update_task)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def build_recurrence_rule(frequency: str, interval: int = 1,
+                                by_day: List[str] = None, count: int = None,
+                                until: str = None) -> str:
+    """
+    Build an RRULE recurrence string to pass as repeat_flag in create_task/update_task.
+
+    Args:
+        frequency: DAILY, WEEKLY, MONTHLY, or YEARLY
+        interval: Repeat every N units (default 1)
+        by_day: For weekly rules, days like ["MO","WE","FR"] (optional)
+        count: Stop after this many occurrences (optional)
+        until: Stop on this date YYYY-MM-DD (optional)
+    """
+    freq = frequency.upper()
+    if freq not in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY"):
+        return "Invalid frequency. Use DAILY, WEEKLY, MONTHLY, or YEARLY."
+    parts = [f"FREQ={freq}", f"INTERVAL={max(1, interval)}"]
+    if by_day:
+        parts.append("BYDAY=" + ",".join(d.upper() for d in by_day))
+    if count:
+        parts.append(f"COUNT={count}")
+    if until:
+        parts.append("UNTIL=" + until.replace("-", "") + "T000000Z")
+    return "RRULE:" + ";".join(parts)
+
+
+@mcp.tool()
+async def build_reminder(minutes_before: int = 0) -> str:
+    """
+    Build a reminder TRIGGER string to pass in the reminders list of create_task/update_task.
+
+    Args:
+        minutes_before: Minutes before the due time to remind. 0 = at the time of the event.
+    """
+    if minutes_before <= 0:
+        return "TRIGGER:PT0S"
+    if minutes_before % (24 * 60) == 0:
+        return f"TRIGGER:-P{minutes_before // (24 * 60)}D"
+    if minutes_before % 60 == 0:
+        return f"TRIGGER:-PT{minutes_before // 60}H"
+    return f"TRIGGER:-PT{minutes_before}M"
 
 
 def main():
