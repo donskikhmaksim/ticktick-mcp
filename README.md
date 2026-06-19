@@ -74,7 +74,7 @@ MCP_TRANSPORT=streamable-http MCP_SECRET=dev123 MCP_PORT=8000 \
    - `MCP_TRANSPORT=streamable-http`
    - `TICKTICK_ACCESS_TOKEN=<token from the local auth flow>`
    - `MCP_SECRET=<openssl rand -hex 24>`
-   - *(optional)* `TICKTICK_USERNAME`, `TICKTICK_PASSWORD`
+   - *(optional)* `TICKTICK_V2_TOKEN` (the `t` cookie — enables v2 features)
    - `TICKTICK_CLIENT_ID`, `TICKTICK_CLIENT_SECRET`
    - `PORT` is injected by Railway — do not set it.
 4. Generate a public domain (Railway → Settings → Networking → Generate Domain).
