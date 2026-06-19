@@ -1,0 +1,7 @@
+[build]
+builder = "dockerfile"
+
+[deploy]
+startCommand = "python -m ticktick_mcp.cli run"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
