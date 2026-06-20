@@ -74,6 +74,11 @@ def initialize_client():
         else:
             logger.info("v2 API disabled (set TICKTICK_V2_TOKEN to enable)")
 
+        # Official-API writes must drop the v2 sync cache so v2 reads stay
+        # consistent (e.g. create a task via the official API, then move it).
+        TickTickClient.write_hook = lambda: (
+            ticktick_v2.invalidate_cache() if ticktick_v2 else None)
+
         return True
     except Exception as e:
         logger.error(f"Failed to initialize TickTick client: {e}")
@@ -177,6 +182,22 @@ def _v2_project_names() -> Dict:
         return names
     except Exception:
         return {}
+
+
+def _resolve_project_id(task_id: str, given: str) -> str:
+    """Return the task's CURRENT projectId. After a move_task the caller often
+    still holds the old projectId, and the official API silently no-ops an
+    update/complete/delete with a mismatched projectId. Look up the real one
+    from the (cache-fresh) v2 state when available; fall back to `given`."""
+    if ticktick_v2:
+        try:
+            t = next((x for x in ticktick_v2.get_open_tasks()
+                      if x.get("id") == task_id), None)
+            if t and t.get("projectId"):
+                return t["projectId"]
+        except Exception:
+            pass
+    return given
 
 
 def format_task_list(tasks: List[Dict], limit: int = 100) -> str:
@@ -408,6 +429,7 @@ async def update_task(
                 except ValueError:
                     return f"Invalid {date_name} format. Use ISO format: YYYY-MM-DDThh:mm:ss+0000"
         
+        project_id = _resolve_project_id(task_id, project_id)
         task = ticktick.update_task(
             task_id=task_id,
             project_id=project_id,
@@ -422,6 +444,10 @@ async def update_task(
 
         if 'error' in task:
             return f"Error updating task: {task['error']}"
+
+        if not task:
+            return ("Update did not apply — the task may have been moved or "
+                    "completed. Re-fetch it (e.g. search_tasks) and retry.")
 
         if tags is not None and ticktick_v2:
             try:
@@ -448,6 +474,7 @@ async def complete_task(project_id: str, task_id: str) -> str:
             return "Failed to initialize TickTick client. Please check your API credentials."
     
     try:
+        project_id = _resolve_project_id(task_id, project_id)
         result = ticktick.complete_task(project_id, task_id)
         if 'error' in result:
             return f"Error completing task: {result['error']}"
@@ -471,6 +498,7 @@ async def delete_task(project_id: str, task_id: str) -> str:
             return "Failed to initialize TickTick client. Please check your API credentials."
     
     try:
+        project_id = _resolve_project_id(task_id, project_id)
         result = ticktick.delete_task(project_id, task_id)
         if 'error' in result:
             return f"Error deleting task: {result['error']}"

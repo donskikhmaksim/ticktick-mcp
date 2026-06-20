@@ -152,6 +152,10 @@ class TickTickV2Client:
             )
         return data
 
+    def invalidate_cache(self) -> None:
+        """Drop the cached sync state (call after an external write)."""
+        self._state_cache = None
+
     def get_state(self, force: bool = False) -> Dict:
         """Full sync snapshot: projects, tags, open tasks, inboxId.
         Cached for a few seconds so back-to-back tool calls reuse one fetch."""

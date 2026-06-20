@@ -18,9 +18,16 @@ class TickTickClient:
     """
     Client for the TickTick API using OAuth2 authentication.
     """
-    
+
+    # Optional callback invoked after any successful write (POST/DELETE), so
+    # the v2 client can drop its cached sync state and stay consistent.
+    write_hook = None
+
     def __init__(self):
         load_dotenv()
+        # Reuse one TCP/TLS connection across calls (keep-alive) instead of a
+        # fresh handshake per request — noticeably faster for batches.
+        self.session = requests.Session()
         self.client_id = os.getenv("TICKTICK_CLIENT_ID")
         self.client_secret = os.getenv("TICKTICK_CLIENT_SECRET")
         self.access_token = os.getenv("TICKTICK_ACCESS_TOKEN")
@@ -150,11 +157,11 @@ class TickTickClient:
         try:
             # Make the request
             if method == "GET":
-                response = requests.get(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
+                response = self.session.get(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
             elif method == "POST":
-                response = requests.post(url, headers=self.headers, json=data, timeout=REQUEST_TIMEOUT)
+                response = self.session.post(url, headers=self.headers, json=data, timeout=REQUEST_TIMEOUT)
             elif method == "DELETE":
-                response = requests.delete(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
+                response = self.session.delete(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
             
@@ -166,15 +173,23 @@ class TickTickClient:
                 if self._refresh_access_token():
                     # Retry the request with the new token
                     if method == "GET":
-                        response = requests.get(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
+                        response = self.session.get(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
                     elif method == "POST":
-                        response = requests.post(url, headers=self.headers, json=data, timeout=REQUEST_TIMEOUT)
+                        response = self.session.post(url, headers=self.headers, json=data, timeout=REQUEST_TIMEOUT)
                     elif method == "DELETE":
-                        response = requests.delete(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
+                        response = self.session.delete(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
             
             # Raise an exception for 4xx/5xx status codes
             response.raise_for_status()
-            
+
+            # A write succeeded — let the v2 client drop its cached sync state
+            # so subsequent v2 reads reflect this change immediately.
+            if method != "GET" and TickTickClient.write_hook:
+                try:
+                    TickTickClient.write_hook()
+                except Exception:
+                    pass
+
             # Return empty dict for 204 No Content
             if response.status_code == 204 or response.text == "":
                 return {}
