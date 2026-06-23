@@ -19,7 +19,9 @@ A username/password fallback remains for local/residential use only.
 
 import os
 import json
+import base64
 import logging
+import mimetypes
 import time
 import uuid
 import requests
@@ -29,6 +31,9 @@ from typing import Dict, List, Any, Optional
 logger = logging.getLogger(__name__)
 
 V2_BASE = "https://api.ticktick.com/api/v2"
+# Attachment upload lives on the v1 path, not v2.
+ATTACHMENT_BASE = "https://api.ticktick.com/api/v1"
+ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024  # 20 MB (premium cap)
 
 # Never let an unofficial-API call hang the MCP request forever.
 REQUEST_TIMEOUT = 20
@@ -351,6 +356,47 @@ class TickTickV2Client:
         body = [{"fromProjectId": from_pid, "taskId": task_id,
                  "toProjectId": to_project_id or from_pid}]
         return self._request("POST", "/trash/restore", json=body)
+
+    # ---- attachments -----------------------------------------------------
+    def upload_attachment(self, project_id: str, task_id: str, *,
+                          url: str = None, content_base64: str = None,
+                          filename: str = None) -> Dict:
+        """Upload a file attachment to a task. Source is either a URL (the
+        server downloads it) or base64 content. Endpoint:
+        POST /api/v1/attachment/upload/{projectId}/{taskId}/{attachmentId},
+        multipart with a single `file` field."""
+        if url:
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+            data = r.content
+            if not filename:
+                filename = url.split("?")[0].rstrip("/").split("/")[-1] or "attachment"
+        elif content_base64:
+            data = base64.b64decode(content_base64)
+            filename = filename or "attachment"
+        else:
+            raise ValueError("Provide either url or content_base64.")
+
+        if len(data) > ATTACHMENT_MAX_BYTES:
+            raise ValueError(
+                f"File is {len(data) // (1024*1024)} MB; TickTick caps attachments at 20 MB.")
+
+        mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        attachment_id = uuid.uuid4().hex[:24]
+        upload_url = (f"{ATTACHMENT_BASE}/attachment/upload/"
+                      f"{project_id}/{task_id}/{attachment_id}")
+        self._state_cache = None  # task now has an attachment
+        # Drop the JSON content-type so requests sets the multipart boundary;
+        # cookie + x-device come from the session.
+        resp = self.session.post(upload_url,
+                                 files={"file": (filename, data, mime)},
+                                 headers={"Content-Type": None}, timeout=60)
+        if resp.status_code in (401, 403):
+            raise TickTickAuthError(
+                "TickTick v2 session token is invalid or expired. Re-extract "
+                "the `t` cookie and update TICKTICK_V2_TOKEN.")
+        resp.raise_for_status()
+        return resp.json() if resp.text else {}
 
     # ---- smart-list (filter) execution -----------------------------------
     def run_filter(self, filter_id_or_name: str) -> List[Dict]:
