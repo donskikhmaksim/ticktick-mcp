@@ -423,6 +423,7 @@ async def create_task(
 async def update_task(
     task_id: str,
     project_id: str,
+    current_title: str,
     title: str = None,
     content: str = None,
     start_date: str = None,
@@ -436,9 +437,14 @@ async def update_task(
     """
     Update an existing task in TickTick.
 
+    IMPORTANT: You MUST provide current_title — the task's current name before
+    any changes. This is shown to the user in the confirmation dialog so they
+    know which task is being modified. Always fetch it first if unknown.
+
     Args:
         task_id: ID of the task to update
         project_id: ID of the project the task belongs to
+        current_title: Current task title BEFORE changes — required for user confirmation
         title: New task title (optional)
         content: New task description/content (optional)
         start_date: New start date — date-only "YYYY-MM-DD" for all-day, or full ISO "YYYY-MM-DDThh:mm:ss+0000" only if a time was specified. Don't invent a time. (optional)
@@ -504,49 +510,57 @@ async def update_task(
         return f"Error updating task: {str(e)}"
 
 @mcp.tool()
-async def complete_task(project_id: str, task_id: str) -> str:
+async def complete_task(project_id: str, task_id: str, task_title: str) -> str:
     """
     Mark a task as complete.
-    
+
+    IMPORTANT: You MUST provide task_title — the task's name so the user can
+    confirm they're completing the right task. Always include it.
+
     Args:
         project_id: ID of the project
         task_id: ID of the task
+        task_title: Title of the task (required — shown in confirmation dialog)
     """
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
-    
+
     try:
         project_id = _resolve_project_id(task_id, project_id)
         result = ticktick.complete_task(project_id, task_id)
         if 'error' in result:
             return f"Error completing task: {result['error']}"
-        
-        return f"Task {task_id} marked as complete."
+
+        return f"Task '{task_title}' marked as complete."
     except Exception as e:
         logger.error(f"Error in complete_task: {e}")
         return f"Error completing task: {str(e)}"
 
 @mcp.tool()
-async def delete_task(project_id: str, task_id: str) -> str:
+async def delete_task(project_id: str, task_id: str, task_title: str) -> str:
     """
-    Delete a task.
-    
+    Delete a task permanently.
+
+    IMPORTANT: You MUST provide task_title — the task's name so the user can
+    confirm they're deleting the right task. Always include it.
+
     Args:
         project_id: ID of the project
         task_id: ID of the task
+        task_title: Title of the task (required — shown in confirmation dialog)
     """
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
-    
+
     try:
         project_id = _resolve_project_id(task_id, project_id)
         result = ticktick.delete_task(project_id, task_id)
         if 'error' in result:
             return f"Error deleting task: {result['error']}"
-        
-        return f"Task {task_id} deleted successfully."
+
+        return f"Task '{task_title}' deleted successfully."
     except Exception as e:
         logger.error(f"Error in delete_task: {e}")
         return f"Error deleting task: {str(e)}"
@@ -1292,13 +1306,17 @@ async def get_inbox_tasks() -> str:
 
 
 @mcp.tool()
-async def move_task(task_id: str, to_project_id: str) -> str:
+async def move_task(task_id: str, to_project_id: str, task_title: str) -> str:
     """
     Move an open task to another list/project (requires v2 API).
+
+    IMPORTANT: You MUST provide task_title so the user can confirm the right
+    task is being moved. Always include it.
 
     Args:
         task_id: ID of the task to move
         to_project_id: ID of the destination project/list
+        task_title: Title of the task (required — shown in confirmation dialog)
     """
     if not ticktick:
         if not initialize_client():
@@ -1307,7 +1325,7 @@ async def move_task(task_id: str, to_project_id: str) -> str:
         return _V2_DISABLED_MSG
     try:
         ticktick_v2.move_task(task_id, to_project_id)
-        return f"Task {task_id} moved to project {to_project_id}."
+        return f"Task '{task_title}' moved to project {to_project_id}."
     except Exception as e:
         logger.error(f"Error in move_task: {e}")
         return f"Error moving task: {str(e)}"
@@ -1480,31 +1498,40 @@ async def unset_task_parent(task_id: str, parent_task_id: str, project_id: str) 
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def batch_complete_tasks(task_ids: List[str]) -> str:
+async def batch_complete_tasks(task_ids: List[str], task_titles: List[str]) -> str:
     """
     Mark several open tasks complete in one call (requires v2 API).
 
+    IMPORTANT: You MUST provide task_titles — one title per task ID in the
+    same order — so the user can confirm what's being completed.
+
     Args:
         task_ids: List of task IDs to complete
+        task_titles: List of task titles in the same order as task_ids (required)
     """
     err = _ensure_ready()
     if err:
         return err
     try:
         ticktick_v2.batch_complete_tasks(task_ids)
-        return f"Requested completion of {len(task_ids)} task(s)."
+        titles_str = ", ".join(f"'{t}'" for t in (task_titles or task_ids))
+        return f"Completed {len(task_ids)} task(s): {titles_str}."
     except Exception as e:
         logger.error(f"Error in batch_complete_tasks: {e}")
         return f"Error completing tasks: {str(e)}"
 
 
 @mcp.tool()
-async def batch_delete_tasks(tasks: List[Dict[str, str]]) -> str:
+async def batch_delete_tasks(tasks: List[Dict[str, str]], task_titles: List[str]) -> str:
     """
     Delete several tasks in one call (requires v2 API).
 
+    IMPORTANT: You MUST provide task_titles — one title per task entry in the
+    same order — so the user can confirm what's being deleted.
+
     Args:
         tasks: List of {"taskId": "...", "projectId": "..."} objects
+        task_titles: List of task titles in the same order as tasks (required)
     """
     err = _ensure_ready()
     if err:
@@ -1513,7 +1540,8 @@ async def batch_delete_tasks(tasks: List[Dict[str, str]]) -> str:
         items = [{"taskId": t.get("taskId") or t.get("task_id"),
                   "projectId": t.get("projectId") or t.get("project_id")} for t in tasks]
         ticktick_v2.batch_delete_tasks(items)
-        return f"Requested deletion of {len(items)} task(s)."
+        titles_str = ", ".join(f"'{t}'" for t in (task_titles or [str(i) for i in range(len(items))]))
+        return f"Deleted {len(items)} task(s): {titles_str}."
     except Exception as e:
         logger.error(f"Error in batch_delete_tasks: {e}")
         return f"Error deleting tasks: {str(e)}"
@@ -1872,14 +1900,23 @@ async def set_task_tags(task_id: str, tags: List[str]) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def abandon_task(task_id: str) -> str:
-    """Mark a task as 'Won't do' (requires v2 API)."""
+async def abandon_task(task_id: str, task_title: str) -> str:
+    """
+    Mark a task as 'Won't do' (requires v2 API).
+
+    IMPORTANT: You MUST provide task_title so the user can confirm the right
+    task is being dismissed. Always include it.
+
+    Args:
+        task_id: ID of the task
+        task_title: Title of the task (required — shown in confirmation dialog)
+    """
     err = _ensure_ready()
     if err:
         return err
     try:
         ticktick_v2.abandon_task(task_id)
-        return f"Task {task_id} marked as 'Won't do'."
+        return f"Task '{task_title}' marked as 'Won't do'."
     except Exception as e:
         logger.error(f"Error in abandon_task: {e}")
         return f"Error abandoning task: {str(e)}"
@@ -2081,6 +2118,72 @@ async def get_task_info(task_id: str) -> str:
     except Exception as e:
         logger.error(f"Error in get_task_info: {e}")
         return f"Error fetching task info: {str(e)}"
+
+
+@mcp.tool()
+async def get_task_activity(task_id: str, project_id: str) -> str:
+    """
+    Get the edit-history / activity log for a task (requires v2 API).
+    Shows who changed what and when: title edits, due-date changes, moves,
+    content updates, parent changes, etc.
+
+    Args:
+        task_id: ID of the task
+        project_id: ID of the project the task belongs to
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        events = ticktick_v2.get_task_activity(project_id, task_id)
+        if not events:
+            return ("No activity found for this task. "
+                    "The endpoint may not be available — try providing the exact URL "
+                    "from the browser Network tab (F12) when viewing task activity.")
+
+        ACTION_LABELS = {
+            "T_TITLE":   "renamed",
+            "T_CONTENT": "edited description",
+            "T_DUE":     "changed due date",
+            "T_MOVE":    "moved to another list",
+            "T_PARENT":  "changed parent/subtask",
+            "T_CREATE":  "created",
+            "T_COMPLETE":"completed",
+            "T_DELETE":  "deleted",
+            "T_PRIORITY":"changed priority",
+            "T_TAG":     "changed tags",
+        }
+
+        out = f"Activity log ({len(events)} events):\n\n"
+        for e in events:
+            action = e.get("action", "?")
+            when = (e.get("when") or "?")[:19].replace("T", " ")
+            who = e.get("whoProfile", {})
+            actor = "you" if who.get("isMyself") else who.get("displayName") or "someone"
+            channel = e.get("deviceChannel", "")
+            label = ACTION_LABELS.get(action, action)
+
+            line = f"  {when}  {actor} {label}"
+            if action == "T_TITLE" and e.get("title"):
+                line += f' → "{e["title"]}"'
+            elif action == "T_DUE":
+                before = (e.get("dueDateBefore") or "")[:10] or "none"
+                after = (e.get("dueDate") or "")[:10] or "none"
+                line += f"  {before} → {after}"
+                if e.get("isAllDay"):
+                    line += " (all-day)"
+            elif action == "T_MOVE":
+                line += f"  {e.get('fromProjectId', '?')} → {e.get('toProjectId', '?')}"
+            elif action == "T_CONTENT" and e.get("content"):
+                snippet = str(e["content"])[:80].replace("\n", " ")
+                line += f'  "{snippet}…"' if len(str(e["content"])) > 80 else f'  "{snippet}"'
+            if channel:
+                line += f"  [{channel}]"
+            out += line + "\n"
+        return out
+    except Exception as e:
+        logger.error(f"Error in get_task_activity: {e}")
+        return f"Error fetching task activity: {str(e)}"
 
 
 @mcp.tool()

@@ -329,6 +329,18 @@ class TickTickV2Client:
         data = self._request("GET", f"/project/{project_id}/task/{task_id}/comments")
         return data if isinstance(data, list) else []
 
+    def get_task_activity(self, project_id: str, task_id: str) -> List[Dict]:
+        """Fetch the edit-history / activity log for a task."""
+        data = self._request("GET", f"/project/{project_id}/task/{task_id}/activities")
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            # some endpoints wrap in {"items": [...]} or {"activities": [...]}
+            for key in ("items", "activities", "data"):
+                if isinstance(data.get(key), list):
+                    return data[key]
+        return []
+
     def add_task_comment(self, project_id: str, task_id: str, text: str) -> Dict:
         body = {"id": uuid.uuid4().hex[:24], "title": text,
                 "taskId": task_id, "projectId": project_id}
