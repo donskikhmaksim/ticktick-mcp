@@ -184,6 +184,19 @@ def _v2_project_names() -> Dict:
         return {}
 
 
+def _lookup_task_title(task_id: str) -> str:
+    """Return the task's title from the v2 cache, or a fallback string."""
+    if ticktick_v2:
+        try:
+            t = next((x for x in ticktick_v2.get_open_tasks()
+                      if x.get("id") == task_id), None)
+            if t and t.get("title"):
+                return t["title"]
+        except Exception:
+            pass
+    return f"[task {task_id[:8]}…]"
+
+
 def _resolve_project_id(task_id: str, given: str) -> str:
     """Return the task's CURRENT projectId. After a move_task the caller often
     still holds the old projectId, and the official API silently no-ops an
@@ -453,7 +466,7 @@ async def create_task(
 async def update_task(
     task_id: str,
     project_id: str,
-    current_title: str,
+    current_title: str = None,
     title: str = None,
     content: str = None,
     start_date: str = None,
@@ -488,11 +501,13 @@ async def update_task(
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
-    
+
+    shown_title = current_title or _lookup_task_title(task_id)
+
     # Validate priority if provided
     if priority is not None and priority not in [0, 1, 3, 5]:
         return "Invalid priority. Must be 0 (None), 1 (Low), 3 (Medium), or 5 (High)."
-    
+
     try:
         # Validate dates if provided
         for date_str, date_name in [(start_date, "start_date"), (due_date, "due_date")]:
@@ -534,63 +549,65 @@ async def update_task(
             except Exception as e:
                 logger.warning(f"Task updated but column assignment failed: {e}")
 
-        return f"Task updated successfully:\n\n" + format_task(task)
+        return f"✏️ Updated: '{shown_title}'\n\n" + format_task(task)
     except Exception as e:
         logger.error(f"Error in update_task: {e}")
         return f"Error updating task: {str(e)}"
 
 @mcp.tool()
-async def complete_task(task_title: str, task_id: str, project_id: str) -> str:
+async def complete_task(task_id: str, project_id: str, task_title: str = None) -> str:
     """
     Mark a task as complete.
 
-    IMPORTANT: You MUST provide task_title — the task's name so the user can
-    confirm they're completing the right task. Always include it.
+    Provide task_title so it appears in the confirmation dialog — if omitted
+    the server looks it up automatically.
 
     Args:
-        task_title: Title of the task (required — shown first in confirmation dialog)
         task_id: ID of the task
         project_id: ID of the project
+        task_title: Title of the task (include so user sees it in the dialog)
     """
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
 
+    title = task_title or _lookup_task_title(task_id)
     try:
         project_id = _resolve_project_id(task_id, project_id)
         result = ticktick.complete_task(project_id, task_id)
         if 'error' in result:
             return f"Error completing task: {result['error']}"
 
-        return f"Task '{task_title}' marked as complete."
+        return f"✓ Completed: '{title}'"
     except Exception as e:
         logger.error(f"Error in complete_task: {e}")
         return f"Error completing task: {str(e)}"
 
 @mcp.tool()
-async def delete_task(task_title: str, task_id: str, project_id: str) -> str:
+async def delete_task(task_id: str, project_id: str, task_title: str = None) -> str:
     """
     Delete a task permanently.
 
-    IMPORTANT: You MUST provide task_title — the task's name so the user can
-    confirm they're deleting the right task. Always include it.
+    Provide task_title so it appears in the confirmation dialog — if omitted
+    the server looks it up automatically.
 
     Args:
-        task_title: Title of the task (required — shown first in confirmation dialog)
         task_id: ID of the task
         project_id: ID of the project
+        task_title: Title of the task (include so user sees it in the dialog)
     """
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
 
+    title = task_title or _lookup_task_title(task_id)
     try:
         project_id = _resolve_project_id(task_id, project_id)
         result = ticktick.delete_task(project_id, task_id)
         if 'error' in result:
             return f"Error deleting task: {result['error']}"
 
-        return f"Task '{task_title}' deleted successfully."
+        return f"🗑 Deleted: '{title}'"
     except Exception as e:
         logger.error(f"Error in delete_task: {e}")
         return f"Error deleting task: {str(e)}"
@@ -1339,26 +1356,27 @@ async def get_inbox_tasks() -> str:
 
 
 @mcp.tool()
-async def move_task(task_title: str, task_id: str, to_project_id: str) -> str:
+async def move_task(task_id: str, to_project_id: str, task_title: str = None) -> str:
     """
     Move an open task to another list/project (requires v2 API).
 
-    IMPORTANT: You MUST provide task_title so the user can confirm the right
-    task is being moved. Always include it.
+    Provide task_title so it appears in the confirmation dialog — if omitted
+    the server looks it up automatically.
 
     Args:
-        task_title: Title of the task (required — shown first in confirmation dialog)
         task_id: ID of the task to move
         to_project_id: ID of the destination project/list
+        task_title: Title of the task (include so user sees it in the dialog)
     """
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
     if not ticktick_v2:
         return _V2_DISABLED_MSG
+    title = task_title or _lookup_task_title(task_id)
     try:
         ticktick_v2.move_task(task_id, to_project_id)
-        return f"Task '{task_title}' moved to project {to_project_id}."
+        return f"↪ Moved: '{title}' → project {to_project_id}"
     except Exception as e:
         logger.error(f"Error in move_task: {e}")
         return f"Error moving task: {str(e)}"
@@ -1537,40 +1555,41 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def batch_complete_tasks(task_titles: List[str], task_ids: List[str]) -> str:
+async def batch_complete_tasks(task_ids: List[str], task_titles: List[str] = None) -> str:
     """
     Mark several open tasks complete in one call (requires v2 API).
 
-    IMPORTANT: You MUST provide task_titles — one title per task ID in the
-    same order — so the user can confirm what's being completed.
+    Provide task_titles (same order as task_ids) so they appear in the
+    confirmation dialog — if omitted the server looks them up automatically.
 
     Args:
-        task_titles: List of task titles (shown first in confirmation dialog)
-        task_ids: List of task IDs to complete in the same order as task_titles
+        task_ids: List of task IDs to complete
+        task_titles: List of task titles in the same order (optional but recommended)
     """
     err = _ensure_ready()
     if err:
         return err
+    titles = task_titles or [_lookup_task_title(tid) for tid in task_ids]
     try:
         ticktick_v2.batch_complete_tasks(task_ids)
-        titles_str = ", ".join(f"'{t}'" for t in (task_titles or task_ids))
-        return f"Completed {len(task_ids)} task(s): {titles_str}."
+        titles_str = ", ".join(f"'{t}'" for t in titles)
+        return f"✓ Completed {len(task_ids)}: {titles_str}"
     except Exception as e:
         logger.error(f"Error in batch_complete_tasks: {e}")
         return f"Error completing tasks: {str(e)}"
 
 
 @mcp.tool()
-async def batch_delete_tasks(task_titles: List[str], tasks: List[Dict[str, str]]) -> str:
+async def batch_delete_tasks(tasks: List[Dict[str, str]], task_titles: List[str] = None) -> str:
     """
     Delete several tasks in one call (requires v2 API).
 
-    IMPORTANT: You MUST provide task_titles — one title per task entry in the
-    same order — so the user can confirm what's being deleted.
+    Provide task_titles (same order as tasks) so they appear in the
+    confirmation dialog — if omitted the server looks them up automatically.
 
     Args:
-        task_titles: List of task titles (shown first in confirmation dialog)
-        tasks: List of {"taskId": "...", "projectId": "..."} objects in the same order
+        tasks: List of {"taskId": "...", "projectId": "..."} objects
+        task_titles: List of task titles in the same order (optional but recommended)
     """
     err = _ensure_ready()
     if err:
@@ -1578,9 +1597,10 @@ async def batch_delete_tasks(task_titles: List[str], tasks: List[Dict[str, str]]
     try:
         items = [{"taskId": t.get("taskId") or t.get("task_id"),
                   "projectId": t.get("projectId") or t.get("project_id")} for t in tasks]
+        titles = task_titles or [_lookup_task_title(t.get("taskId") or t.get("task_id") or "") for t in tasks]
         ticktick_v2.batch_delete_tasks(items)
-        titles_str = ", ".join(f"'{t}'" for t in (task_titles or [str(i) for i in range(len(items))]))
-        return f"Deleted {len(items)} task(s): {titles_str}."
+        titles_str = ", ".join(f"'{t}'" for t in titles)
+        return f"🗑 Deleted {len(items)}: {titles_str}"
     except Exception as e:
         logger.error(f"Error in batch_delete_tasks: {e}")
         return f"Error deleting tasks: {str(e)}"
@@ -1840,13 +1860,13 @@ async def get_trash(limit: int = 50) -> str:
 
 
 @mcp.tool()
-async def restore_task(task_title: str, task_id: str, to_project_id: str = None) -> str:
+async def restore_task(task_id: str, task_title: str = None, to_project_id: str = None) -> str:
     """
     Restore a task from the trash (requires v2 API).
 
     Args:
-        task_title: Title of the task to restore (shown first — get from get_trash)
-        task_id: ID of the trashed task
+        task_id: ID of the trashed task (from get_trash)
+        task_title: Title of the task (optional — get from get_trash output)
         to_project_id: Optional destination project; defaults to the task's original list
     """
     err = _ensure_ready()
@@ -1854,14 +1874,15 @@ async def restore_task(task_title: str, task_id: str, to_project_id: str = None)
         return err
     try:
         ticktick_v2.restore_task(task_id, to_project_id)
-        return f"Task '{task_title}' restored from trash."
+        title = task_title or f"[task {task_id[:8]}…]"
+        return f"↩ Restored from trash: '{title}'"
     except Exception as e:
         logger.error(f"Error in restore_task: {e}")
         return f"Error restoring task: {str(e)}"
 
 
 @mcp.tool()
-async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
+async def attach_file_to_task(task_id: str, project_id: str, task_title: str = None,
                               url: str = None,
                               content_base64: str = None, filename: str = None) -> str:
     """
@@ -1882,12 +1903,13 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
         return err
     if not url and not content_base64:
         return "Provide either a url or content_base64 for the file."
+    title = task_title or _lookup_task_title(task_id)
     try:
         pid = _resolve_project_id(task_id, project_id)
         att = ticktick_v2.upload_attachment(
             pid, task_id, url=url, content_base64=content_base64, filename=filename)
         return (f"Attached '{att.get('fileName', filename)}' "
-                f"({att.get('size', '?')} bytes) to task '{task_title}'.")
+                f"({att.get('size', '?')} bytes) to '{title}'")
     except Exception as e:
         logger.error(f"Error in attach_file_to_task: {e}")
         return f"Error attaching file: {str(e)}"
@@ -1940,21 +1962,22 @@ async def delete_tag(name: str) -> str:
 
 
 @mcp.tool()
-async def set_task_tags(task_title: str, task_id: str, tags: List[str]) -> str:
+async def set_task_tags(task_id: str, tags: List[str], task_title: str = None) -> str:
     """
     Replace a task's tags (requires v2 API).
 
     Args:
-        task_title: Title of the task (shown first in confirmation dialog)
         task_id: ID of the task
         tags: Full list of tag names the task should have (replaces existing)
+        task_title: Title of the task (optional but recommended for confirmation)
     """
     err = _ensure_ready()
     if err:
         return err
+    title = task_title or _lookup_task_title(task_id)
     try:
         ticktick_v2.set_task_tags(task_id, tags)
-        return f"Task '{task_title}' tags set to: {', '.join(tags) or '(none)'}."
+        return f"Tags updated on '{title}': {', '.join(tags) or '(none)'}"
     except Exception as e:
         logger.error(f"Error in set_task_tags: {e}")
         return f"Error setting tags: {str(e)}"
@@ -1965,43 +1988,45 @@ async def set_task_tags(task_title: str, task_id: str, tags: List[str]) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def abandon_task(task_title: str, task_id: str) -> str:
+async def abandon_task(task_id: str, task_title: str = None) -> str:
     """
     Mark a task as 'Won't do' (requires v2 API).
 
-    IMPORTANT: You MUST provide task_title so the user can confirm the right
-    task is being dismissed. Always include it.
+    Provide task_title so it appears in the confirmation dialog — if omitted
+    the server looks it up automatically.
 
     Args:
-        task_title: Title of the task (shown first in confirmation dialog)
         task_id: ID of the task
+        task_title: Title of the task (optional but recommended)
     """
     err = _ensure_ready()
     if err:
         return err
+    title = task_title or _lookup_task_title(task_id)
     try:
         ticktick_v2.abandon_task(task_id)
-        return f"Task '{task_title}' marked as 'Won't do'."
+        return f"✗ Won't do: '{title}'"
     except Exception as e:
         logger.error(f"Error in abandon_task: {e}")
         return f"Error abandoning task: {str(e)}"
 
 
 @mcp.tool()
-async def duplicate_task(task_title: str, task_id: str) -> str:
+async def duplicate_task(task_id: str, task_title: str = None) -> str:
     """
     Duplicate a task within the same project (requires v2 API).
 
     Args:
-        task_title: Title of the task to duplicate (shown first in confirmation dialog)
         task_id: ID of the task
+        task_title: Title of the task (optional but recommended for confirmation)
     """
     err = _ensure_ready()
     if err:
         return err
+    title = task_title or _lookup_task_title(task_id)
     try:
         copy = ticktick_v2.duplicate_task(task_id)
-        return f"Task '{task_title}' duplicated as '{copy.get('title')}' (id: {copy.get('id')})."
+        return f"Duplicated: '{title}' → new id: {copy.get('id')}"
     except Exception as e:
         logger.error(f"Error in duplicate_task: {e}")
         return f"Error duplicating task: {str(e)}"
