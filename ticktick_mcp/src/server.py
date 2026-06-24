@@ -210,6 +210,35 @@ def format_task_list(tasks: List[Dict], limit: int = 100) -> str:
     return out
 
 
+def format_task_tree(tasks: List[Dict], limit: int = 200) -> str:
+    """Render tasks as a hierarchy: subtasks indented under their parent.
+    If a subtask's parent is not in this list, it appears at the top level."""
+    names = _v2_project_names()
+    task_ids = {t.get("id") for t in tasks if t.get("id")}
+    top = [t for t in tasks if not t.get("parentId") or t.get("parentId") not in task_ids]
+    children: Dict[str, List] = {}
+    for t in tasks:
+        pid = t.get("parentId")
+        if pid and pid in task_ids:
+            children.setdefault(pid, []).append(t)
+    lines = []
+    count = 0
+    for t in top:
+        if count >= limit:
+            break
+        lines.append(format_task_line(t, names.get(t.get("projectId"))))
+        count += 1
+        for kid in children.get(t.get("id") or "", []):
+            if count >= limit:
+                break
+            lines.append("  ↳ " + format_task_line(kid))
+            count += 1
+    out = "\n".join(lines)
+    if len(tasks) > limit:
+        out += f"\n... and {len(tasks) - limit} more."
+    return out
+
+
 # MCP Tools
 
 @mcp.tool()
@@ -714,11 +743,7 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
             if not matched:
                 return f"No tasks found that are '{filter_name}'."
             out = f"Tasks that are '{filter_name}' ({len(matched)}):\n"
-            for t in matched[:100]:
-                out += format_task_line(t, names.get(t.get("projectId"))) + "\n"
-            if len(matched) > 100:
-                out += f"... and {len(matched) - 100} more."
-            return out
+            return out + format_task_tree(matched)
         except Exception as e:
             logger.warning(f"v2 task pool failed, falling back to official API: {e}")
 
@@ -954,7 +979,7 @@ async def search_tasks(search_term: str) -> str:
             if not tasks:
                 return f"No tasks found matching '{search_term}'."
             return (f"Tasks matching '{search_term}' ({len(tasks)}):\n"
-                    + format_task_list(tasks, 50))
+                    + format_task_tree(tasks, 100))
 
         # Fallback (no v2): iterate official projects — note this misses the Inbox.
         projects = ticktick.get_projects()
@@ -1241,7 +1266,7 @@ async def get_tasks_by_tag(tag: str) -> str:
         if not tasks:
             return f"No open tasks found with tag '{tag}'."
         out = f"Tasks tagged '{tag}' ({len(tasks)}):\n\n"
-        return out + format_task_list(tasks)
+        return out + format_task_tree(tasks)
     except Exception as e:
         logger.error(f"Error in get_tasks_by_tag: {e}")
         return f"Error fetching tasks by tag: {str(e)}"
@@ -1260,7 +1285,7 @@ async def get_inbox_tasks() -> str:
         if not tasks:
             return "No open tasks in the Inbox."
         out = f"Inbox tasks ({len(tasks)}):\n\n"
-        return out + format_task_list(tasks)
+        return out + format_task_tree(tasks)
     except Exception as e:
         logger.error(f"Error in get_inbox_tasks: {e}")
         return f"Error fetching inbox tasks: {str(e)}"
@@ -1562,7 +1587,7 @@ async def run_filter(filter: str) -> str:
         if not tasks:
             return f"Filter '{filter}' matched no open tasks."
         out = f"Filter '{filter}' — {len(tasks)} task(s):\n\n"
-        return out + format_task_list(tasks)
+        return out + format_task_tree(tasks)
     except Exception as e:
         logger.error(f"Error in run_filter: {e}")
         return f"Error running filter: {str(e)}"
@@ -1984,7 +2009,7 @@ async def search_all_tasks(query: str, include_completed: bool = True) -> str:
         if not matches:
             return f"No tasks matched '{query}'."
         return (f"Matches for '{query}' ({len(matches)}):\n"
-                + format_task_list(matches, 50))
+                + format_task_tree(matches, 100))
     except Exception as e:
         logger.error(f"Error in search_all_tasks: {e}")
         return f"Error searching tasks: {str(e)}"
