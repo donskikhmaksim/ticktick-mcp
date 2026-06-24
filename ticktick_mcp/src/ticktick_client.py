@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import base64
 import requests
@@ -13,6 +14,16 @@ logger = logging.getLogger(__name__)
 # Hard cap on every TickTick HTTP call so a stalled connection can never hang
 # the whole MCP request indefinitely.
 REQUEST_TIMEOUT = 20
+
+_DATE_ONLY = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+
+def _normalize_date(value):
+    """If a date is given without a time (YYYY-MM-DD), it's an all-day date:
+    return (midnight-padded value, True). Otherwise return (value, False)."""
+    if value and _DATE_ONLY.match(value.strip()):
+        return value.strip() + "T00:00:00+0000", True
+    return value, False
 
 class TickTickClient:
     """
@@ -258,12 +269,20 @@ class TickTickClient:
         
         if content:
             data["content"] = content
+        date_only = False
         if start_date:
+            start_date, d = _normalize_date(start_date)
+            date_only = date_only or d
             data["startDate"] = start_date
         if due_date:
+            due_date, d = _normalize_date(due_date)
+            date_only = date_only or d
             data["dueDate"] = due_date
         if priority is not None:
             data["priority"] = priority
+        # A date with no time = an all-day task; don't invent a clock time.
+        if date_only:
+            is_all_day = True
         if is_all_day is not None:
             data["isAllDay"] = is_all_day
         if repeat_flag:
@@ -289,10 +308,17 @@ class TickTickClient:
             data["content"] = content
         if priority is not None:
             data["priority"] = priority
+        date_only = False
         if start_date:
+            start_date, d = _normalize_date(start_date)
+            date_only = date_only or d
             data["startDate"] = start_date
         if due_date:
+            due_date, d = _normalize_date(due_date)
+            date_only = date_only or d
             data["dueDate"] = due_date
+        if date_only:
+            data["isAllDay"] = True
         if repeat_flag:
             data["repeatFlag"] = repeat_flag
         if reminders:

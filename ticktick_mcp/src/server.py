@@ -332,8 +332,8 @@ async def create_task(
         title: Task title
         project_id: ID of the project to add the task to
         content: Task description/content (optional)
-        start_date: Start date in ISO format YYYY-MM-DDThh:mm:ss+0000 (optional)
-        due_date: Due date in ISO format YYYY-MM-DDThh:mm:ss+0000 (optional)
+        start_date: Use a date-only "YYYY-MM-DD" for an all-day task; use full ISO "YYYY-MM-DDThh:mm:ss+0000" ONLY when the user gave a specific time. Do NOT invent a time. (optional)
+        due_date: Same rule — date-only "YYYY-MM-DD" = all-day; full datetime only if a time was specified. (optional)
         priority: Priority level (0: None, 1: Low, 3: Medium, 5: High) (optional)
         repeat_flag: Recurrence RRULE, e.g. "RRULE:FREQ=DAILY;INTERVAL=1" (optional; use build_recurrence_rule)
         reminders: List of reminder triggers, e.g. ["TRIGGER:-PT30M"] (optional; use build_reminder)
@@ -412,8 +412,8 @@ async def update_task(
         project_id: ID of the project the task belongs to
         title: New task title (optional)
         content: New task description/content (optional)
-        start_date: New start date in ISO format YYYY-MM-DDThh:mm:ss+0000 (optional)
-        due_date: New due date in ISO format YYYY-MM-DDThh:mm:ss+0000 (optional)
+        start_date: New start date — date-only "YYYY-MM-DD" for all-day, or full ISO "YYYY-MM-DDThh:mm:ss+0000" only if a time was specified. Don't invent a time. (optional)
+        due_date: New due date — same rule (date-only = all-day). (optional)
         priority: New priority level (0: None, 1: Low, 3: Medium, 5: High) (optional)
         repeat_flag: Recurrence RRULE (optional; use build_recurrence_rule)
         reminders: List of reminder triggers (optional; use build_reminder)
@@ -1988,6 +1988,74 @@ async def search_all_tasks(query: str, include_completed: bool = True) -> str:
     except Exception as e:
         logger.error(f"Error in search_all_tasks: {e}")
         return f"Error searching tasks: {str(e)}"
+
+
+@mcp.tool()
+async def get_task_info(task_id: str) -> str:
+    """
+    Detailed view of a task (requires v2 API): all fields, who created it and
+    when, last-modified time, its checklist items, AND its subtasks (child
+    tasks). Use this when you need the full picture of a task.
+
+    Args:
+        task_id: ID of the task
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        state = ticktick_v2.get_state()
+        owner = (state.get("inboxId") or "").replace("inbox", "")
+        names = _v2_project_names()
+        tasks = state.get("syncTaskBean", {}).get("update", []) or []
+        t = next((x for x in tasks if x.get("id") == task_id), None)
+        if not t:
+            return (f"Task {task_id} not found among open tasks "
+                    "(it may be completed or in the trash).")
+
+        pr = {0: "None", 1: "Low", 3: "Medium", 5: "High"}.get(t.get("priority", 0))
+        status = {0: "Active", 2: "Completed", -1: "Won't do"}.get(t.get("status", 0), t.get("status"))
+        creator = str(t.get("creator", ""))
+        who = "you" if creator == owner else f"user {creator}"
+
+        out = f"Task: {t.get('title')}\n"
+        out += f"  id: {t.get('id')}  |  project: {names.get(t.get('projectId'), t.get('projectId'))}\n"
+        out += f"  status: {status}  |  priority: {pr}\n"
+        if t.get("dueDate"):
+            d = t["dueDate"][:10] if t.get("isAllDay") else t["dueDate"]
+            out += f"  due: {d}{'  (all-day)' if t.get('isAllDay') else ''}\n"
+        if t.get("tags"):
+            out += f"  tags: {', '.join('#'+x for x in t['tags'])}\n"
+        if t.get("columnId"):
+            out += f"  columnId: {t['columnId']}\n"
+        if t.get("content"):
+            out += f"  content: {t['content'][:300]}\n"
+        # Activity (no full edit-log endpoint exists; these are the task's stamps)
+        out += "\nActivity:\n"
+        out += f"  created: {t.get('createdTime', '?')} by {who}\n"
+        out += f"  last modified: {t.get('modifiedTime', '?')}\n"
+        if t.get("completedTime"):
+            out += f"  completed: {t['completedTime']}\n"
+        # Checklist items
+        items = t.get("items") or []
+        if items:
+            out += f"\nChecklist ({len(items)}):\n"
+            for it in items:
+                mark = "x" if it.get("status") == 1 else " "
+                out += f"  [{mark}] {it.get('title')}\n"
+        # Subtasks = child tasks (parentId points here)
+        kids = [x for x in tasks if x.get("parentId") == task_id]
+        if kids:
+            out += f"\nSubtasks ({len(kids)}):\n"
+            for k in kids:
+                km = "x" if k.get("status") in (2, -1) else " "
+                out += f"  [{km}] {k.get('title')}  (id:{k.get('id')})\n"
+        if not items and not kids:
+            out += "\n(no checklist items or subtasks)\n"
+        return out
+    except Exception as e:
+        logger.error(f"Error in get_task_info: {e}")
+        return f"Error fetching task info: {str(e)}"
 
 
 @mcp.tool()
