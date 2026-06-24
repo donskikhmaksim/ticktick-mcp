@@ -510,7 +510,7 @@ async def update_task(
         return f"Error updating task: {str(e)}"
 
 @mcp.tool()
-async def complete_task(project_id: str, task_id: str, task_title: str) -> str:
+async def complete_task(task_title: str, task_id: str, project_id: str) -> str:
     """
     Mark a task as complete.
 
@@ -518,9 +518,9 @@ async def complete_task(project_id: str, task_id: str, task_title: str) -> str:
     confirm they're completing the right task. Always include it.
 
     Args:
-        project_id: ID of the project
+        task_title: Title of the task (required — shown first in confirmation dialog)
         task_id: ID of the task
-        task_title: Title of the task (required — shown in confirmation dialog)
+        project_id: ID of the project
     """
     if not ticktick:
         if not initialize_client():
@@ -538,7 +538,7 @@ async def complete_task(project_id: str, task_id: str, task_title: str) -> str:
         return f"Error completing task: {str(e)}"
 
 @mcp.tool()
-async def delete_task(project_id: str, task_id: str, task_title: str) -> str:
+async def delete_task(task_title: str, task_id: str, project_id: str) -> str:
     """
     Delete a task permanently.
 
@@ -546,9 +546,9 @@ async def delete_task(project_id: str, task_id: str, task_title: str) -> str:
     confirm they're deleting the right task. Always include it.
 
     Args:
-        project_id: ID of the project
+        task_title: Title of the task (required — shown first in confirmation dialog)
         task_id: ID of the task
-        task_title: Title of the task (required — shown in confirmation dialog)
+        project_id: ID of the project
     """
     if not ticktick:
         if not initialize_client():
@@ -603,11 +603,12 @@ async def create_project(
         return f"Error creating project: {str(e)}"
 
 @mcp.tool()
-async def delete_project(project_id: str) -> str:
+async def delete_project(project_name: str, project_id: str) -> str:
     """
-    Delete a project.
-    
+    Delete a project permanently.
+
     Args:
+        project_name: Name of the project (shown first in confirmation dialog)
         project_id: ID of the project
     """
     if not ticktick:
@@ -619,7 +620,7 @@ async def delete_project(project_id: str) -> str:
         if 'error' in result:
             return f"Error deleting project: {result['error']}"
         
-        return f"Project {project_id} deleted successfully."
+        return f"Project '{project_name}' deleted successfully."
     except Exception as e:
         logger.error(f"Error in delete_project: {e}")
         return f"Error deleting project: {str(e)}"
@@ -1165,6 +1166,7 @@ async def get_next_tasks() -> str:
 
 @mcp.tool()
 async def create_subtask(
+    parent_task_title: str,
     subtask_title: str,
     parent_task_id: str,
     project_id: str,
@@ -1173,9 +1175,10 @@ async def create_subtask(
 ) -> str:
     """
     Create a subtask for a parent task within the same project.
-    
+
     Args:
-        subtask_title: Title of the subtask
+        parent_task_title: Title of the parent task (shown first in confirmation dialog)
+        subtask_title: Title of the new subtask
         parent_task_id: ID of the parent task
         project_id: ID of the project (must be same for both parent and subtask)
         content: Optional content/description for the subtask
@@ -1306,7 +1309,7 @@ async def get_inbox_tasks() -> str:
 
 
 @mcp.tool()
-async def move_task(task_id: str, to_project_id: str, task_title: str) -> str:
+async def move_task(task_title: str, task_id: str, to_project_id: str) -> str:
     """
     Move an open task to another list/project (requires v2 API).
 
@@ -1314,9 +1317,9 @@ async def move_task(task_id: str, to_project_id: str, task_title: str) -> str:
     task is being moved. Always include it.
 
     Args:
+        task_title: Title of the task (required — shown first in confirmation dialog)
         task_id: ID of the task to move
         to_project_id: ID of the destination project/list
-        task_title: Title of the task (required — shown in confirmation dialog)
     """
     if not ticktick:
         if not initialize_client():
@@ -1369,13 +1372,14 @@ async def get_habits() -> str:
 
 
 @mcp.tool()
-async def checkin_habit(habit_id: str, date: str = None,
+async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
                         status: int = 2, value: float = None) -> str:
     """
     Record a habit check-in (requires v2 API).
 
     Args:
-        habit_id: ID of the habit (from get_habits)
+        habit_name: Name of the habit (shown first in confirmation dialog — get from get_habits)
+        habit_id: ID of the habit
         date: Date to check in as YYYY-MM-DD (optional; defaults to today — pass a past date to backfill)
         status: 2 = done (default), 1 = failed, 0 = not done
         value: Numeric value for quantitative habits (optional; defaults to the goal when done)
@@ -1389,18 +1393,19 @@ async def checkin_habit(habit_id: str, date: str = None,
         ticktick_v2.checkin_habit(habit_id, date=date, status=status, value=value)
         when = date or "today"
         labels = {2: "done", 1: "failed", 0: "not done"}
-        return f"Habit {habit_id} checked in for {when} as '{labels[status]}'."
+        return f"Habit '{habit_name}' checked in for {when} as '{labels[status]}'."
     except Exception as e:
         logger.error(f"Error in checkin_habit: {e}")
         return f"Error checking in habit: {str(e)}"
 
 
 @mcp.tool()
-async def get_habit_checkins(habit_id: str, after_date: str) -> str:
+async def get_habit_checkins(habit_name: str, habit_id: str, after_date: str) -> str:
     """
     Get a habit's check-in history (requires v2 API).
 
     Args:
+        habit_name: Name of the habit (shown first in confirmation dialog — get from get_habits)
         habit_id: ID of the habit
         after_date: Only return check-ins on/after this date, as YYYY-MM-DD
     """
@@ -1414,11 +1419,11 @@ async def get_habit_checkins(habit_id: str, after_date: str) -> str:
         result = ticktick_v2.get_habit_checkins([habit_id], stamp)
         entries = result.get(habit_id, [])
         if not entries:
-            return f"No check-ins for habit {habit_id} since {after_date}."
+            return f"No check-ins for '{habit_name}' since {after_date}."
         labels = {2: "✓ done", 1: "✗ failed", 0: "○ not done"}
         lines = [f"- {e.get('checkinStamp')}: {labels.get(e.get('status'), e.get('status'))} "
                  f"(value {e.get('value')}/{e.get('goal')})" for e in entries]
-        return f"Check-ins for {habit_id} ({len(entries)}):\n" + "\n".join(lines)
+        return f"Check-ins for '{habit_name}' ({len(entries)}):\n" + "\n".join(lines)
     except Exception as e:
         logger.error(f"Error in get_habit_checkins: {e}")
         return f"Error fetching habit check-ins: {str(e)}"
@@ -1452,11 +1457,13 @@ async def list_filters() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def set_task_parent(task_id: str, parent_task_id: str, project_id: str) -> str:
+async def set_task_parent(task_title: str, parent_task_title: str, task_id: str, parent_task_id: str, project_id: str) -> str:
     """
     Make a task a subtask of another (requires v2 API). Both must be in the same project.
 
     Args:
+        task_title: Title of the task being nested (shown first in confirmation dialog)
+        parent_task_title: Title of the parent task
         task_id: ID of the task to nest
         parent_task_id: ID of the parent task
         project_id: ID of the project both tasks live in
@@ -1466,18 +1473,20 @@ async def set_task_parent(task_id: str, parent_task_id: str, project_id: str) ->
         return err
     try:
         ticktick_v2.set_task_parent(task_id, parent_task_id, project_id)
-        return f"Task {task_id} is now a subtask of {parent_task_id}."
+        return f"Task '{task_title}' is now a subtask of '{parent_task_title}'."
     except Exception as e:
         logger.error(f"Error in set_task_parent: {e}")
         return f"Error setting parent: {str(e)}"
 
 
 @mcp.tool()
-async def unset_task_parent(task_id: str, parent_task_id: str, project_id: str) -> str:
+async def unset_task_parent(task_title: str, parent_task_title: str, task_id: str, parent_task_id: str, project_id: str) -> str:
     """
     Detach a subtask from its parent, making it a top-level task (requires v2 API).
 
     Args:
+        task_title: Title of the subtask being detached (shown first in confirmation dialog)
+        parent_task_title: Title of its current parent task
         task_id: ID of the subtask to detach
         parent_task_id: ID of its current parent
         project_id: ID of the project both tasks live in
@@ -1487,7 +1496,7 @@ async def unset_task_parent(task_id: str, parent_task_id: str, project_id: str) 
         return err
     try:
         ticktick_v2.unset_task_parent(task_id, parent_task_id, project_id)
-        return f"Task {task_id} detached from parent {parent_task_id}."
+        return f"Task '{task_title}' detached from parent '{parent_task_title}'."
     except Exception as e:
         logger.error(f"Error in unset_task_parent: {e}")
         return f"Error detaching subtask: {str(e)}"
@@ -1498,7 +1507,7 @@ async def unset_task_parent(task_id: str, parent_task_id: str, project_id: str) 
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def batch_complete_tasks(task_ids: List[str], task_titles: List[str]) -> str:
+async def batch_complete_tasks(task_titles: List[str], task_ids: List[str]) -> str:
     """
     Mark several open tasks complete in one call (requires v2 API).
 
@@ -1506,8 +1515,8 @@ async def batch_complete_tasks(task_ids: List[str], task_titles: List[str]) -> s
     same order — so the user can confirm what's being completed.
 
     Args:
-        task_ids: List of task IDs to complete
-        task_titles: List of task titles in the same order as task_ids (required)
+        task_titles: List of task titles (shown first in confirmation dialog)
+        task_ids: List of task IDs to complete in the same order as task_titles
     """
     err = _ensure_ready()
     if err:
@@ -1522,7 +1531,7 @@ async def batch_complete_tasks(task_ids: List[str], task_titles: List[str]) -> s
 
 
 @mcp.tool()
-async def batch_delete_tasks(tasks: List[Dict[str, str]], task_titles: List[str]) -> str:
+async def batch_delete_tasks(task_titles: List[str], tasks: List[Dict[str, str]]) -> str:
     """
     Delete several tasks in one call (requires v2 API).
 
@@ -1530,8 +1539,8 @@ async def batch_delete_tasks(tasks: List[Dict[str, str]], task_titles: List[str]
     same order — so the user can confirm what's being deleted.
 
     Args:
-        tasks: List of {"taskId": "...", "projectId": "..."} objects
-        task_titles: List of task titles in the same order as tasks (required)
+        task_titles: List of task titles (shown first in confirmation dialog)
+        tasks: List of {"taskId": "...", "projectId": "..."} objects in the same order
     """
     err = _ensure_ready()
     if err:
@@ -1658,25 +1667,32 @@ async def create_project_group(name: str) -> str:
 
 
 @mcp.tool()
-async def delete_project_group(group_id: str) -> str:
-    """Delete a project group/folder (its projects are kept, just ungrouped) (requires v2 API)."""
+async def delete_project_group(group_name: str, group_id: str) -> str:
+    """
+    Delete a project group/folder (projects inside are kept, just ungrouped) (requires v2 API).
+
+    Args:
+        group_name: Name of the group (shown first in confirmation dialog)
+        group_id: ID of the group
+    """
     err = _ensure_ready()
     if err:
         return err
     try:
         ticktick_v2.delete_project_group(group_id)
-        return f"Project group {group_id} deleted."
+        return f"Project group '{group_name}' deleted (projects ungrouped)."
     except Exception as e:
         logger.error(f"Error in delete_project_group: {e}")
         return f"Error deleting project group: {str(e)}"
 
 
 @mcp.tool()
-async def move_project_to_group(project_id: str, group_id: str) -> str:
+async def move_project_to_group(project_name: str, project_id: str, group_id: str) -> str:
     """
     Move a project into a group/folder (requires v2 API).
 
     Args:
+        project_name: Name of the project (shown first in confirmation dialog)
         project_id: ID of the project to move
         group_id: ID of the destination group, or "NONE" to ungroup
     """
@@ -1686,7 +1702,7 @@ async def move_project_to_group(project_id: str, group_id: str) -> str:
     try:
         ticktick_v2.move_project_to_group(project_id, group_id)
         dest = "ungrouped" if group_id == "NONE" else f"group {group_id}"
-        return f"Project {project_id} moved to {dest}."
+        return f"Project '{project_name}' moved to {dest}."
     except Exception as e:
         logger.error(f"Error in move_project_to_group: {e}")
         return f"Error moving project: {str(e)}"
@@ -1697,16 +1713,23 @@ async def move_project_to_group(project_id: str, group_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def get_task_comments(project_id: str, task_id: str) -> str:
-    """Get comments on a task (requires v2 API)."""
+async def get_task_comments(task_title: str, project_id: str, task_id: str) -> str:
+    """
+    Get comments on a task (requires v2 API).
+
+    Args:
+        task_title: Title of the task (shown first in confirmation dialog)
+        project_id: ID of the project
+        task_id: ID of the task
+    """
     err = _ensure_ready()
     if err:
         return err
     try:
         comments = ticktick_v2.get_task_comments(project_id, task_id)
         if not comments:
-            return "No comments on this task."
-        out = f"Comments ({len(comments)}):\n"
+            return f"No comments on task '{task_title}'."
+        out = f"Comments on '{task_title}' ({len(comments)}):\n"
         for c in comments:
             who = (c.get("userProfile") or {}).get("displayName") or c.get("userName", "?")
             out += f"- [{who}] {c.get('title','')}\n"
@@ -1717,14 +1740,22 @@ async def get_task_comments(project_id: str, task_id: str) -> str:
 
 
 @mcp.tool()
-async def add_task_comment(project_id: str, task_id: str, text: str) -> str:
-    """Add a comment to a task (requires v2 API)."""
+async def add_task_comment(task_title: str, text: str, project_id: str, task_id: str) -> str:
+    """
+    Add a comment to a task (requires v2 API).
+
+    Args:
+        task_title: Title of the task (shown first in confirmation dialog)
+        text: Comment text
+        project_id: ID of the project
+        task_id: ID of the task
+    """
     err = _ensure_ready()
     if err:
         return err
     try:
         ticktick_v2.add_task_comment(project_id, task_id, text)
-        return "Comment added."
+        return f"Comment added to '{task_title}'."
     except Exception as e:
         logger.error(f"Error in add_task_comment: {e}")
         return f"Error adding comment: {str(e)}"
@@ -1779,12 +1810,13 @@ async def get_trash(limit: int = 50) -> str:
 
 
 @mcp.tool()
-async def restore_task(task_id: str, to_project_id: str = None) -> str:
+async def restore_task(task_title: str, task_id: str, to_project_id: str = None) -> str:
     """
     Restore a task from the trash (requires v2 API).
 
     Args:
-        task_id: ID of the trashed task (from get_trash)
+        task_title: Title of the task to restore (shown first — get from get_trash)
+        task_id: ID of the trashed task
         to_project_id: Optional destination project; defaults to the task's original list
     """
     err = _ensure_ready()
@@ -1792,14 +1824,15 @@ async def restore_task(task_id: str, to_project_id: str = None) -> str:
         return err
     try:
         ticktick_v2.restore_task(task_id, to_project_id)
-        return f"Task {task_id} restored from trash."
+        return f"Task '{task_title}' restored from trash."
     except Exception as e:
         logger.error(f"Error in restore_task: {e}")
         return f"Error restoring task: {str(e)}"
 
 
 @mcp.tool()
-async def attach_file_to_task(task_id: str, project_id: str, url: str = None,
+async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
+                              url: str = None,
                               content_base64: str = None, filename: str = None) -> str:
     """
     Attach a file to a task (requires v2 API). Provide the file either by URL
@@ -1807,6 +1840,7 @@ async def attach_file_to_task(task_id: str, project_id: str, url: str = None,
     Google Drive or generated by Claude. Max 20 MB.
 
     Args:
+        task_title: Title of the task (shown first in confirmation dialog)
         task_id: ID of the task
         project_id: ID of the task's project (auto-corrected if stale)
         url: Public/direct URL to download the file from (optional)
@@ -1823,7 +1857,7 @@ async def attach_file_to_task(task_id: str, project_id: str, url: str = None,
         att = ticktick_v2.upload_attachment(
             pid, task_id, url=url, content_base64=content_base64, filename=filename)
         return (f"Attached '{att.get('fileName', filename)}' "
-                f"({att.get('size', '?')} bytes) to task {task_id}.")
+                f"({att.get('size', '?')} bytes) to task '{task_title}'.")
     except Exception as e:
         logger.error(f"Error in attach_file_to_task: {e}")
         return f"Error attaching file: {str(e)}"
@@ -1876,11 +1910,12 @@ async def delete_tag(name: str) -> str:
 
 
 @mcp.tool()
-async def set_task_tags(task_id: str, tags: List[str]) -> str:
+async def set_task_tags(task_title: str, task_id: str, tags: List[str]) -> str:
     """
     Replace a task's tags (requires v2 API).
 
     Args:
+        task_title: Title of the task (shown first in confirmation dialog)
         task_id: ID of the task
         tags: Full list of tag names the task should have (replaces existing)
     """
@@ -1889,7 +1924,7 @@ async def set_task_tags(task_id: str, tags: List[str]) -> str:
         return err
     try:
         ticktick_v2.set_task_tags(task_id, tags)
-        return f"Task {task_id} tags set to: {', '.join(tags) or '(none)'}."
+        return f"Task '{task_title}' tags set to: {', '.join(tags) or '(none)'}."
     except Exception as e:
         logger.error(f"Error in set_task_tags: {e}")
         return f"Error setting tags: {str(e)}"
@@ -1900,7 +1935,7 @@ async def set_task_tags(task_id: str, tags: List[str]) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def abandon_task(task_id: str, task_title: str) -> str:
+async def abandon_task(task_title: str, task_id: str) -> str:
     """
     Mark a task as 'Won't do' (requires v2 API).
 
@@ -1908,8 +1943,8 @@ async def abandon_task(task_id: str, task_title: str) -> str:
     task is being dismissed. Always include it.
 
     Args:
+        task_title: Title of the task (shown first in confirmation dialog)
         task_id: ID of the task
-        task_title: Title of the task (required — shown in confirmation dialog)
     """
     err = _ensure_ready()
     if err:
@@ -1923,14 +1958,20 @@ async def abandon_task(task_id: str, task_title: str) -> str:
 
 
 @mcp.tool()
-async def duplicate_task(task_id: str) -> str:
-    """Duplicate a task within the same project (requires v2 API)."""
+async def duplicate_task(task_title: str, task_id: str) -> str:
+    """
+    Duplicate a task within the same project (requires v2 API).
+
+    Args:
+        task_title: Title of the task to duplicate (shown first in confirmation dialog)
+        task_id: ID of the task
+    """
     err = _ensure_ready()
     if err:
         return err
     try:
         copy = ticktick_v2.duplicate_task(task_id)
-        return f"Task duplicated as '{copy.get('title')}' (id: {copy.get('id')})."
+        return f"Task '{task_title}' duplicated as '{copy.get('title')}' (id: {copy.get('id')})."
     except Exception as e:
         logger.error(f"Error in duplicate_task: {e}")
         return f"Error duplicating task: {str(e)}"
@@ -1941,29 +1982,46 @@ async def duplicate_task(task_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def update_task_comment(project_id: str, task_id: str,
-                              comment_id: str, text: str) -> str:
-    """Edit a task comment (requires v2 API)."""
+async def update_task_comment(task_title: str, text: str, project_id: str,
+                              task_id: str, comment_id: str) -> str:
+    """
+    Edit a task comment (requires v2 API).
+
+    Args:
+        task_title: Title of the task (shown first in confirmation dialog)
+        text: New comment text
+        project_id: ID of the project
+        task_id: ID of the task
+        comment_id: ID of the comment to edit
+    """
     err = _ensure_ready()
     if err:
         return err
     try:
         ticktick_v2.update_task_comment(project_id, task_id, comment_id, text)
-        return "Comment updated."
+        return f"Comment on '{task_title}' updated."
     except Exception as e:
         logger.error(f"Error in update_task_comment: {e}")
         return f"Error updating comment: {str(e)}"
 
 
 @mcp.tool()
-async def delete_task_comment(project_id: str, task_id: str, comment_id: str) -> str:
-    """Delete a task comment (requires v2 API)."""
+async def delete_task_comment(task_title: str, project_id: str, task_id: str, comment_id: str) -> str:
+    """
+    Delete a task comment (requires v2 API).
+
+    Args:
+        task_title: Title of the task (shown first in confirmation dialog)
+        project_id: ID of the project
+        task_id: ID of the task
+        comment_id: ID of the comment to delete
+    """
     err = _ensure_ready()
     if err:
         return err
     try:
         ticktick_v2.delete_task_comment(project_id, task_id, comment_id)
-        return "Comment deleted."
+        return f"Comment on '{task_title}' deleted."
     except Exception as e:
         logger.error(f"Error in delete_task_comment: {e}")
         return f"Error deleting comment: {str(e)}"
@@ -1974,12 +2032,13 @@ async def delete_task_comment(project_id: str, task_id: str, comment_id: str) ->
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def update_project(project_id: str, name: str = None, color: str = None,
-                         view_mode: str = None) -> str:
+async def update_project(project_name: str, project_id: str, name: str = None,
+                         color: str = None, view_mode: str = None) -> str:
     """
     Update a project's name, color, or view mode (uses the official API).
 
     Args:
+        project_name: Current name of the project (shown first in confirmation dialog)
         project_id: ID of the project
         name: New name (optional)
         color: New color hex like '#F18181' (optional)
@@ -2000,11 +2059,12 @@ async def update_project(project_id: str, name: str = None, color: str = None,
 
 
 @mcp.tool()
-async def archive_project(project_id: str, archived: bool = True) -> str:
+async def archive_project(project_name: str, project_id: str, archived: bool = True) -> str:
     """
     Archive (close) or unarchive a project (requires v2 API).
 
     Args:
+        project_name: Name of the project (shown first in confirmation dialog)
         project_id: ID of the project
         archived: True to archive, False to restore it to active
     """
@@ -2013,7 +2073,7 @@ async def archive_project(project_id: str, archived: bool = True) -> str:
         return err
     try:
         ticktick_v2.archive_project(project_id, closed=archived)
-        return f"Project {project_id} {'archived' if archived else 'unarchived'}."
+        return f"Project '{project_name}' {'archived' if archived else 'unarchived'}."
     except Exception as e:
         logger.error(f"Error in archive_project: {e}")
         return f"Error archiving project: {str(e)}"
