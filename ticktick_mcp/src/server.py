@@ -352,10 +352,11 @@ async def create_task(
     reminders: List[str] = None,
     is_all_day: bool = False,
     tags: List[str] = None,
-    column_id: str = None
+    column_id: str = None,
+    subtasks: List[str] = None
 ) -> str:
     """
-    Create a new task in TickTick.
+    Create a new task in TickTick, optionally with subtasks in one call.
 
     Args:
         title: Task title
@@ -369,25 +370,25 @@ async def create_task(
         is_all_day: Whether the task is an all-day task (optional)
         tags: List of tag names to attach (optional; requires v2 API)
         column_id: Kanban column/section ID to place the task in (optional; from list_project_columns; requires v2 API)
+        subtasks: List of subtask titles to create under this task (optional; requires v2 API)
     """
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
-    
+
     # Validate priority
     if priority not in [0, 1, 3, 5]:
         return "Invalid priority. Must be 0 (None), 1 (Low), 3 (Medium), or 5 (High)."
-    
+
     try:
         # Validate dates if provided
         for date_str, date_name in [(start_date, "start_date"), (due_date, "due_date")]:
             if date_str:
                 try:
-                    # Try to parse the date to validate it
                     datetime.fromisoformat(date_str.replace("Z", "+00:00"))
                 except ValueError:
                     return f"Invalid {date_name} format. Use ISO format: YYYY-MM-DDThh:mm:ss+0000"
-        
+
         task = ticktick.create_task(
             title=title,
             project_id=project_id,
@@ -403,18 +404,47 @@ async def create_task(
         if 'error' in task:
             return f"Error creating task: {task['error']}"
 
-        if tags and ticktick_v2 and task.get("id"):
+        task_id = task.get("id")
+
+        if tags and ticktick_v2 and task_id:
             try:
-                ticktick_v2.set_task_tags(task["id"], tags)
+                ticktick_v2.set_task_tags(task_id, tags)
             except Exception as e:
                 logger.warning(f"Task created but tagging failed: {e}")
-        if column_id and ticktick_v2 and task.get("id"):
+        if column_id and ticktick_v2 and task_id:
             try:
-                ticktick_v2.set_task_column(task["id"], column_id)
+                ticktick_v2.set_task_column(task_id, column_id)
             except Exception as e:
                 logger.warning(f"Task created but column assignment failed: {e}")
 
-        return f"Task created successfully:\n\n" + format_task(task)
+        created_subtasks = []
+        failed_subtasks = []
+        if subtasks and task_id:
+            for st_title in subtasks:
+                try:
+                    st = ticktick.create_subtask(
+                        subtask_title=st_title,
+                        parent_task_id=task_id,
+                        project_id=project_id
+                    )
+                    if 'error' not in st:
+                        created_subtasks.append(st_title)
+                    else:
+                        failed_subtasks.append(st_title)
+                except Exception as e:
+                    logger.warning(f"Subtask '{st_title}' failed: {e}")
+                    failed_subtasks.append(st_title)
+
+        out = f"Task '{title}' created"
+        if created_subtasks:
+            out += f" with {len(created_subtasks)} subtask(s):\n"
+            for st in created_subtasks:
+                out += f"  ↳ {st}\n"
+        else:
+            out += ".\n"
+        if failed_subtasks:
+            out += f"Failed subtasks: {', '.join(failed_subtasks)}\n"
+        return out
     except Exception as e:
         logger.error(f"Error in create_task: {e}")
         return f"Error creating task: {str(e)}"
