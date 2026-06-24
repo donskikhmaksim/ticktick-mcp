@@ -444,6 +444,16 @@ class TickTickV2Client:
         return self._request("POST", "/batch/task",
                              json={"add": [], "update": [task], "delete": []})
 
+    def set_task_column(self, task_id: str, column_id: str) -> Dict:
+        """Move a task to a kanban column/section (v2 `columnId`)."""
+        task = next((t for t in self.get_open_tasks() if t.get("id") == task_id), None)
+        if not task:
+            raise ValueError(f"Open task {task_id} not found.")
+        task = dict(task)
+        task["columnId"] = column_id
+        return self._request("POST", "/batch/task",
+                             json={"add": [], "update": [task], "delete": []})
+
     # ---- won't-do / duplicate -------------------------------------------
     def abandon_task(self, task_id: str) -> Dict:
         """Mark a task 'Won't do' (v2 status -1)."""

@@ -322,7 +322,8 @@ async def create_task(
     repeat_flag: str = None,
     reminders: List[str] = None,
     is_all_day: bool = False,
-    tags: List[str] = None
+    tags: List[str] = None,
+    column_id: str = None
 ) -> str:
     """
     Create a new task in TickTick.
@@ -338,6 +339,7 @@ async def create_task(
         reminders: List of reminder triggers, e.g. ["TRIGGER:-PT30M"] (optional; use build_reminder)
         is_all_day: Whether the task is an all-day task (optional)
         tags: List of tag names to attach (optional; requires v2 API)
+        column_id: Kanban column/section ID to place the task in (optional; from list_project_columns; requires v2 API)
     """
     if not ticktick:
         if not initialize_client():
@@ -377,6 +379,11 @@ async def create_task(
                 ticktick_v2.set_task_tags(task["id"], tags)
             except Exception as e:
                 logger.warning(f"Task created but tagging failed: {e}")
+        if column_id and ticktick_v2 and task.get("id"):
+            try:
+                ticktick_v2.set_task_column(task["id"], column_id)
+            except Exception as e:
+                logger.warning(f"Task created but column assignment failed: {e}")
 
         return f"Task created successfully:\n\n" + format_task(task)
     except Exception as e:
@@ -394,7 +401,8 @@ async def update_task(
     priority: int = None,
     repeat_flag: str = None,
     reminders: List[str] = None,
-    tags: List[str] = None
+    tags: List[str] = None,
+    column_id: str = None
 ) -> str:
     """
     Update an existing task in TickTick.
@@ -410,6 +418,7 @@ async def update_task(
         repeat_flag: Recurrence RRULE (optional; use build_recurrence_rule)
         reminders: List of reminder triggers (optional; use build_reminder)
         tags: Replace the task's tags with this list (optional; requires v2 API)
+        column_id: Move the task to this kanban column/section (optional; from list_project_columns; requires v2 API)
     """
     if not ticktick:
         if not initialize_client():
@@ -454,6 +463,11 @@ async def update_task(
                 ticktick_v2.set_task_tags(task_id, tags)
             except Exception as e:
                 logger.warning(f"Task updated but tagging failed: {e}")
+        if column_id and ticktick_v2:
+            try:
+                ticktick_v2.set_task_column(task_id, column_id)
+            except Exception as e:
+                logger.warning(f"Task updated but column assignment failed: {e}")
 
         return f"Task updated successfully:\n\n" + format_task(task)
     except Exception as e:
@@ -1974,6 +1988,34 @@ async def search_all_tasks(query: str, include_completed: bool = True) -> str:
     except Exception as e:
         logger.error(f"Error in search_all_tasks: {e}")
         return f"Error searching tasks: {str(e)}"
+
+
+@mcp.tool()
+async def list_project_columns(project_id: str) -> str:
+    """
+    List the kanban columns/sections of a project, with their IDs (uses the
+    official API). Use a column id as column_id in create_task/update_task.
+
+    Args:
+        project_id: ID of the project
+    """
+    if not ticktick:
+        if not initialize_client():
+            return "Failed to initialize TickTick client. Please check your API credentials."
+    try:
+        data = ticktick.get_project_with_data(project_id)
+        if 'error' in data:
+            return f"Error fetching project: {data['error']}"
+        cols = data.get("columns", []) or []
+        if not cols:
+            return ("This project has no kanban columns (it may be a list-view "
+                    "project). Switch its view to kanban to use sections.")
+        cols = sorted(cols, key=lambda x: x.get("sortOrder", 0))
+        return f"Columns of project {project_id} ({len(cols)}):\n" + "\n".join(
+            f"- {col.get('name', '?')}  (id: {col.get('id')})" for col in cols)
+    except Exception as e:
+        logger.error(f"Error in list_project_columns: {e}")
+        return f"Error fetching columns: {str(e)}"
 
 
 def main():
