@@ -360,13 +360,25 @@ class TickTickV2Client:
 
     def restore_task(self, task_id: str, to_project_id: str = None) -> Dict:
         """Restore a task from trash to its original list (or to_project_id)."""
+        return self.batch_restore_tasks([task_id], to_project_id)
+
+    def batch_restore_tasks(self, task_ids: List[str], to_project_id: str = None) -> Dict:
+        """Restore several tasks from trash in one call. Each task's original
+        list is looked up from the trash unless to_project_id overrides it."""
         trashed = self.get_trash(limit=500)
-        t = next((x for x in trashed if x.get("id") == task_id), None)
-        if not t:
-            raise ValueError(f"Task {task_id} not found in trash.")
-        from_pid = t.get("projectId")
-        body = [{"fromProjectId": from_pid, "taskId": task_id,
-                 "toProjectId": to_project_id or from_pid}]
+        by_id = {x.get("id"): x for x in trashed}
+        body = []
+        missing = []
+        for tid in task_ids:
+            t = by_id.get(tid)
+            if not t:
+                missing.append(tid)
+                continue
+            from_pid = t.get("projectId")
+            body.append({"fromProjectId": from_pid, "taskId": tid,
+                         "toProjectId": to_project_id or from_pid})
+        if missing:
+            raise ValueError(f"Task(s) not found in trash: {', '.join(missing)}")
         return self._request("POST", "/trash/restore", json=body)
 
     # ---- attachments -----------------------------------------------------

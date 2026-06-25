@@ -1950,6 +1950,35 @@ async def restore_task(task_id: str, task_title: str = None, to_project_id: str 
 
 
 @mcp.tool()
+async def batch_restore_tasks(tasks: List[Dict[str, str]], to_project_id: str = None) -> str:
+    """
+    Restore several tasks from the trash in one call (requires v2 API).
+
+    For restoring a single task use restore_task. For more than one, use
+    this tool — do NOT call restore_task in a loop.
+
+    Args:
+        tasks: List of {"taskId": "...", "title": "..."} objects (title shown
+            in the confirmation dialog; get both from get_trash output)
+        to_project_id: Optional destination for all tasks; defaults to each
+            task's original list
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ids = [t.get("taskId") or t.get("task_id") for t in tasks]
+        titles = [t.get("title") or _lookup_task_title(t.get("taskId") or t.get("task_id") or "")
+                  for t in tasks]
+        ticktick_v2.batch_restore_tasks(ids, to_project_id)
+        titles_str = ", ".join(f"'{t}'" for t in titles)
+        return f"↩ Restored {len(ids)} from trash: {titles_str}"
+    except Exception as e:
+        logger.error(f"Error in batch_restore_tasks: {e}")
+        return f"Error restoring tasks: {str(e)}"
+
+
+@mcp.tool()
 async def attach_file_to_task(task_id: str, project_id: str, task_title: str = None,
                               url: str = None,
                               content_base64: str = None, filename: str = None) -> str:
