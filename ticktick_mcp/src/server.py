@@ -613,6 +613,62 @@ async def delete_task(task_id: str, project_id: str, task_title: str = None) -> 
         return f"Error deleting task: {str(e)}"
 
 @mcp.tool()
+async def delete_task_with_subtasks(
+    task_id: str,
+    project_id: str,
+    task_title: str = None,
+) -> str:
+    """
+    Delete a parent task AND all its subtasks in one go.
+
+    Finds every subtask whose parentId matches task_id, deletes them via
+    batch delete, then deletes the parent itself.
+
+    Provide task_title so it appears in the confirmation dialog — if omitted
+    the server looks it up automatically.
+
+    Args:
+        task_id: ID of the parent task
+        project_id: ID of the project
+        task_title: Title of the parent task (optional, auto-looked-up)
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+
+    title = task_title or _lookup_task_title(task_id)
+    try:
+        project_id = _resolve_project_id(task_id, project_id)
+
+        # Find subtasks from v2 cache
+        subtasks = []
+        if ticktick_v2:
+            try:
+                all_open = ticktick_v2.get_open_tasks()
+                subtasks = [t for t in all_open if t.get("parentId") == task_id]
+            except Exception:
+                pass
+
+        # Delete subtasks first (batch)
+        if subtasks:
+            items = [{"taskId": t["id"], "projectId": t.get("projectId", project_id)} for t in subtasks]
+            ticktick_v2.batch_delete_tasks(items)
+
+        # Delete parent via official API
+        result = ticktick.delete_task(project_id, task_id)
+        if 'error' in result:
+            return f"Error deleting parent task: {result['error']}"
+
+        if subtasks:
+            sub_titles = ", ".join(f"'{t.get('title', t['id'][:8])}'" for t in subtasks)
+            return f"🗑 Deleted '{title}' + {len(subtasks)} subtask(s): {sub_titles}"
+        return f"🗑 Deleted '{title}' (no subtasks found)"
+    except Exception as e:
+        logger.error(f"Error in delete_task_with_subtasks: {e}")
+        return f"Error deleting task with subtasks: {str(e)}"
+
+
+@mcp.tool()
 async def create_project(
     name: str,
     color: str = "#F18181",
