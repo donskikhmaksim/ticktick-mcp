@@ -196,11 +196,14 @@ class TickTickV2Client:
         tasks = state.get("syncTaskBean", {}).get("update", []) or []
         return [t for t in tasks if t.get("projectId") == inbox]
 
-    def get_completed_tasks(self, limit: int = 50) -> List[Dict]:
-        """Recently completed tasks across all lists (v2 endpoint, max 100)."""
+    def get_completed_tasks(self, limit: int = 50, from_str: str = "",
+                            to_str: str = None) -> List[Dict]:
+        """Recently completed tasks across all lists (v2 endpoint, max 100).
+        from_str/to_str are 'YYYY-MM-DD HH:MM:SS' bounds (empty = unbounded)."""
         limit = max(1, min(limit, COMPLETED_MAX_LIMIT))
-        params = {"from": "", "to": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                  "limit": limit}
+        if to_str is None:
+            to_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        params = {"from": from_str, "to": to_str, "limit": limit}
         data = self._request("GET", "/project/all/completed", params=params)
         return data if isinstance(data, list) else data.get("tasks", [])
 

@@ -2669,6 +2669,94 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
 
 
 @mcp.tool()
+async def get_changes(since: str, until: str = None,
+                      project_id: str = None) -> str:
+    """
+    Audit feed: everything that changed across the account in a date range —
+    what was CREATED, COMPLETED, DELETED, and MODIFIED (requires v2 API).
+
+    Use this to answer "what happened to my tasks yesterday / last week" —
+    e.g. find tasks that disappeared (deleted) or got moved/edited. For the
+    exact per-task history (who renamed it, which list it moved from→to, and
+    WHO did it on shared lists) drill into a specific task with get_task_activity.
+
+    Dates are matched at day granularity in UTC; a task completed late at night
+    local time may land on the next UTC day.
+
+    Args:
+        since: Start date YYYY-MM-DD (inclusive)
+        until: End date YYYY-MM-DD (inclusive; defaults to today)
+        project_id: Optional — limit the feed to one list/project
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+
+    since = since.strip()
+    until = (until or datetime.now(timezone.utc).strftime("%Y-%m-%d")).strip()
+
+    def in_range(ts: str) -> bool:
+        if not ts:
+            return False
+        d = ts[:10]
+        return since <= d <= until
+
+    def when(ts: str) -> str:
+        return (ts or "")[:16].replace("T", " ") if ts else "?"
+
+    try:
+        names = _v2_project_names()
+        pname = lambda pid: names.get(pid, pid or "?")
+
+        open_tasks = ticktick_v2.get_open_tasks()
+        completed = ticktick_v2.get_completed_tasks(
+            limit=100, from_str=since + " 00:00:00", to_str=until + " 23:59:59")
+        trash = ticktick_v2.get_trash(limit=300)
+
+        if project_id:
+            open_tasks = [t for t in open_tasks if t.get("projectId") == project_id]
+            completed = [t for t in completed if t.get("projectId") == project_id]
+            trash = [t for t in trash if t.get("projectId") == project_id]
+
+        events = []  # (timestamp, icon, line)
+
+        for t in open_tasks:
+            ct = t.get("createdTime")
+            mt = t.get("modifiedTime")
+            if in_range(ct):
+                events.append((ct, "🆕",
+                    f'{when(ct)}  Создано: «{t.get("title","?")}» в «{pname(t.get("projectId"))}»'))
+            elif in_range(mt):
+                events.append((mt, "✏️",
+                    f'{when(mt)}  Изменено: «{t.get("title","?")}» в «{pname(t.get("projectId"))}»'))
+
+        for t in completed:
+            cm = t.get("completedTime") or t.get("modifiedTime")
+            if in_range(cm):
+                events.append((cm, "✅",
+                    f'{when(cm)}  Завершено: «{t.get("title","?")}» в «{pname(t.get("projectId"))}»'))
+
+        for t in trash:
+            dt = t.get("modifiedTime") or t.get("createdTime")
+            if in_range(dt):
+                events.append((dt, "🗑",
+                    f'{when(dt)}  Удалено (в корзине): «{t.get("title","?")}» из «{pname(t.get("projectId"))}»'))
+
+        if not events:
+            return f"С {since} по {until} изменений не найдено."
+
+        events.sort(key=lambda e: e[0] or "", reverse=True)
+        header = f"Изменения с {since} по {until} ({len(events)}):\n\n"
+        body = "\n".join(f"{icon} {line}" for _, icon, line in events)
+        note = ("\n\nℹ️ Для точной истории конкретной задачи (кто/куда перенёс, "
+                "что переименовал) используй get_task_activity.")
+        return header + body + note
+    except Exception as e:
+        logger.error(f"Error in get_changes: {e}")
+        return f"Error fetching changes: {str(e)}"
+
+
+@mcp.tool()
 async def list_project_columns(project_id: str) -> str:
     """
     List the kanban columns/sections of a project, with their IDs (uses the
