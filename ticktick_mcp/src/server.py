@@ -369,7 +369,10 @@ async def create_task(
     subtasks: List[str] = None
 ) -> str:
     """
-    Create a new task in TickTick, optionally with subtasks in one call.
+    Create a single task in TickTick, optionally with subtasks in one call.
+
+    For creating multiple tasks at once use batch_create_tasks — do NOT
+    call this tool in a loop.
 
     Args:
         title: Task title
@@ -1420,7 +1423,10 @@ async def get_inbox_tasks() -> str:
 @mcp.tool()
 async def move_task(task_id: str, to_project_id: str, task_title: str = None) -> str:
     """
-    Move an open task to another list/project (requires v2 API).
+    Move a single open task to another list/project (requires v2 API).
+
+    If you need to move several tasks, call batch_delete_tasks + batch_create_tasks
+    or call this tool once per task — but prefer batching where possible.
 
     Provide task_title so it appears in the confirmation dialog — if omitted
     the server looks it up automatically.
