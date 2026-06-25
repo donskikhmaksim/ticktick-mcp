@@ -4,9 +4,12 @@ import json
 import base64
 import requests
 import logging
+from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from typing import Dict, List, Any, Optional, Tuple
+
+from zoneinfo import ZoneInfo
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -17,12 +20,25 @@ REQUEST_TIMEOUT = 20
 
 _DATE_ONLY = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
+# User's local timezone for all-day date storage. Set USER_TIMEZONE env var
+# (e.g. "America/Los_Angeles") so midnight means local midnight, not UTC midnight.
+_USER_TZ = ZoneInfo(os.getenv("USER_TIMEZONE", "UTC"))
+
 
 def _normalize_date(value):
     """If a date is given without a time (YYYY-MM-DD), it's an all-day date:
-    return (midnight-padded value, True). Otherwise return (value, False)."""
+    return (local-midnight-padded value, True). Otherwise return (value, False).
+    Midnight is in the user's local timezone (USER_TIMEZONE env var) so TickTick
+    stores the correct calendar date rather than off-by-one due to UTC conversion."""
     if value and _DATE_ONLY.match(value.strip()):
-        return value.strip() + "T00:00:00+0000", True
+        naive = datetime.fromisoformat(value.strip() + "T00:00:00")
+        local_midnight = naive.replace(tzinfo=_USER_TZ)
+        offset = local_midnight.utcoffset()
+        total_minutes = int(offset.total_seconds() / 60)
+        sign = '+' if total_minutes >= 0 else '-'
+        h, m = divmod(abs(total_minutes), 60)
+        tz_str = f"{sign}{h:02d}{m:02d}"
+        return value.strip() + f"T00:00:00{tz_str}", True
     return value, False
 
 class TickTickClient:
