@@ -8,7 +8,7 @@ from typing import Dict, List, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
 
-from .ticktick_client import TickTickClient
+from .ticktick_client import TickTickClient, _normalize_date
 from .ticktick_v2_client import TickTickV2Client
 
 # Set up logging
@@ -481,7 +481,9 @@ async def update_task(
     column_id: str = None
 ) -> str:
     """
-    Update an existing task in TickTick.
+    Update a single existing task in TickTick.
+
+    For updating several tasks use batch_update_tasks — do NOT call this in a loop.
 
     IMPORTANT: You MUST provide current_title — the task's current name before
     any changes. This is shown to the user in the confirmation dialog so they
@@ -590,20 +592,22 @@ async def complete_task(task_id: str, project_id: str, task_title: str = None) -
         return f"Error completing task: {str(e)}"
 
 @mcp.tool()
-async def delete_task(task_id: str, project_id: str, task_title: str = None) -> str:
+async def delete_task(task_id: str, project_id: str, task_title: str = None,
+                      project_name: str = None) -> str:
     """
     Delete a single task permanently.
 
     For deleting multiple tasks use batch_delete_tasks — do NOT call this
     tool in a loop.
 
-    Provide task_title so it appears in the confirmation dialog — if omitted
-    the server looks it up automatically.
+    Provide task_title AND project_name so the confirmation dialog shows what
+    is being deleted and from which list — if omitted the server looks them up.
 
     Args:
         task_id: ID of the task
         project_id: ID of the project
         task_title: Title of the task (include so user sees it in the dialog)
+        project_name: Name of the list the task is in (for the dialog)
     """
     if not ticktick:
         if not initialize_client():
@@ -612,11 +616,13 @@ async def delete_task(task_id: str, project_id: str, task_title: str = None) -> 
     title = task_title or _lookup_task_title(task_id)
     try:
         project_id = _resolve_project_id(task_id, project_id)
+        pname = project_name or _v2_project_names().get(project_id, "")
         result = ticktick.delete_task(project_id, task_id)
         if 'error' in result:
             return f"Error deleting task: {result['error']}"
 
-        return f"🗑 Deleted: '{title}'"
+        where = f" from '{pname}'" if pname else ""
+        return f"🗑 Deleted: '{title}'{where}"
     except Exception as e:
         logger.error(f"Error in delete_task: {e}")
         return f"Error deleting task: {str(e)}"
@@ -626,6 +632,7 @@ async def delete_task_with_subtasks(
     task_id: str,
     project_id: str,
     task_title: str = None,
+    project_name: str = None,
 ) -> str:
     """
     Delete a parent task AND all its subtasks in one go.
@@ -633,13 +640,14 @@ async def delete_task_with_subtasks(
     Finds every subtask whose parentId matches task_id, deletes them via
     batch delete, then deletes the parent itself.
 
-    Provide task_title so it appears in the confirmation dialog — if omitted
-    the server looks it up automatically.
+    Provide task_title AND project_name so the confirmation dialog shows what
+    is being deleted and from which list — if omitted the server looks them up.
 
     Args:
         task_id: ID of the parent task
         project_id: ID of the project
         task_title: Title of the parent task (optional, auto-looked-up)
+        project_name: Name of the list the task is in (for the dialog)
     """
     err = _ensure_ready()
     if err:
@@ -668,10 +676,12 @@ async def delete_task_with_subtasks(
         if 'error' in result:
             return f"Error deleting parent task: {result['error']}"
 
+        pname = project_name or _v2_project_names().get(project_id, "")
+        where = f" from '{pname}'" if pname else ""
         if subtasks:
             sub_titles = ", ".join(f"'{t.get('title', t['id'][:8])}'" for t in subtasks)
-            return f"🗑 Deleted '{title}' + {len(subtasks)} subtask(s): {sub_titles}"
-        return f"🗑 Deleted '{title}' (no subtasks found)"
+            return f"🗑 Deleted '{title}'{where} + {len(subtasks)} subtask(s): {sub_titles}"
+        return f"🗑 Deleted '{title}'{where} (no subtasks found)"
     except Exception as e:
         logger.error(f"Error in delete_task_with_subtasks: {e}")
         return f"Error deleting task with subtasks: {str(e)}"
@@ -1421,20 +1431,23 @@ async def get_inbox_tasks() -> str:
 
 
 @mcp.tool()
-async def move_task(task_id: str, to_project_id: str, task_title: str = None) -> str:
+async def move_task(task_id: str, to_project_id: str, task_title: str = None,
+                    from_project_name: str = None, to_project_name: str = None) -> str:
     """
     Move a single open task to another list/project (requires v2 API).
 
-    If you need to move several tasks, call batch_delete_tasks + batch_create_tasks
-    or call this tool once per task — but prefer batching where possible.
+    For several tasks use batch_move_tasks — do NOT call this in a loop.
 
-    Provide task_title so it appears in the confirmation dialog — if omitted
-    the server looks it up automatically.
+    Provide task_title, from_project_name and to_project_name so the
+    confirmation dialog shows WHAT moves and FROM→TO which list — if omitted
+    the server looks them up.
 
     Args:
         task_id: ID of the task to move
         to_project_id: ID of the destination project/list
-        task_title: Title of the task (include so user sees it in the dialog)
+        task_title: Title of the task (for the dialog)
+        from_project_name: Name of the current list (for the dialog)
+        to_project_name: Name of the destination list (for the dialog)
     """
     if not ticktick:
         if not initialize_client():
@@ -1442,12 +1455,103 @@ async def move_task(task_id: str, to_project_id: str, task_title: str = None) ->
     if not ticktick_v2:
         return _V2_DISABLED_MSG
     title = task_title or _lookup_task_title(task_id)
+    names = _v2_project_names()
     try:
+        from_pid = _resolve_project_id(task_id, "")
+        from_name = from_project_name or names.get(from_pid, "")
+        to_name = to_project_name or names.get(to_project_id, to_project_id)
         ticktick_v2.move_task(task_id, to_project_id)
-        return f"↪ Moved: '{title}' → project {to_project_id}"
+        arrow = f"'{from_name}' → '{to_name}'" if from_name else f"→ '{to_name}'"
+        return f"↪ Moved '{title}': {arrow}"
     except Exception as e:
         logger.error(f"Error in move_task: {e}")
         return f"Error moving task: {str(e)}"
+
+
+@mcp.tool()
+async def batch_move_tasks(tasks: List[Dict[str, str]], to_project_id: str,
+                           to_project_name: str = None) -> str:
+    """
+    Move several open tasks into ONE destination list in a single call
+    (requires v2 API). The whole batch goes to the same to_project_id, so the
+    destination is stated once.
+
+    For a single task use move_task — do NOT call this in a loop.
+
+    IMPORTANT: put the human title inside each task object so the confirmation
+    dialog shows what moves: [{"title": "Buy milk", "taskId": "abc"}]. The
+    destination list name is shown once via to_project_name.
+
+    Args:
+        tasks: List of {"title": "...", "taskId": "..."} objects
+        to_project_id: Destination project/list ID for ALL tasks
+        to_project_name: Destination list name (shown once in the dialog)
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ids = [t.get("taskId") or t.get("task_id") for t in tasks]
+        titles = [t.get("title") or _lookup_task_title(i) for t, i in zip(tasks, ids)]
+        to_name = to_project_name or _v2_project_names().get(to_project_id, to_project_id)
+        ticktick_v2.batch_move_tasks(ids, to_project_id)
+        titles_str = ", ".join(f"'{t}'" for t in titles)
+        return f"↪ Moved {len(ids)} → '{to_name}': {titles_str}"
+    except Exception as e:
+        logger.error(f"Error in batch_move_tasks: {e}")
+        return f"Error moving tasks: {str(e)}"
+
+
+@mcp.tool()
+async def batch_update_tasks(tasks: List[Dict[str, Any]]) -> str:
+    """
+    Update fields on several open tasks in one call (requires v2 API).
+
+    For a single task use update_task — do NOT call this in a loop.
+
+    Each item identifies a task by taskId and carries the fields to change,
+    plus a human title for the confirmation dialog. Supported fields:
+    title, content, priority (0/1/3/5), due_date, start_date, tags
+    (replaces the task's tags). Dates: "YYYY-MM-DD" = all-day; full ISO only
+    if a time was given — don't invent a time.
+
+    Example: [{"title": "Pay rent", "taskId": "abc", "due_date": "2026-07-01",
+               "priority": 5}]
+
+    Args:
+        tasks: List of {"title","taskId", <fields to change>} objects
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        changes = []
+        labels = []
+        for t in tasks:
+            tid = t.get("taskId") or t.get("task_id")
+            labels.append(t.get("title") or _lookup_task_title(tid))
+            ch = {"taskId": tid}
+            if t.get("title") is not None:
+                ch["title"] = t["title"]
+            if t.get("content") is not None:
+                ch["content"] = t["content"]
+            if t.get("priority") is not None:
+                ch["priority"] = t["priority"]
+            if t.get("tags") is not None:
+                ch["tags"] = t["tags"]
+            for src, dst in (("due_date", "dueDate"), ("start_date", "startDate")):
+                if t.get(src):
+                    val, all_day = _normalize_date(t[src])
+                    ch[dst] = val
+                    if all_day:
+                        ch["isAllDay"] = True
+            changes.append(ch)
+        ticktick_v2.batch_update_tasks(changes)
+        labels_str = ", ".join(f"'{l}'" for l in labels)
+        return f"✏️ Updated {len(changes)}: {labels_str}"
+    except Exception as e:
+        logger.error(f"Error in batch_update_tasks: {e}")
+        return f"Error updating tasks: {str(e)}"
 
 
 # ---------------------------------------------------------------------------
@@ -1577,6 +1681,8 @@ async def set_task_parent(task_title: str, parent_task_title: str, task_id: str,
     """
     Make a task a subtask of another (requires v2 API). Both must be in the same project.
 
+    To nest several tasks under one parent use batch_set_task_parent — do NOT loop.
+
     Args:
         task_title: Title of the task being nested (shown first in confirmation dialog)
         parent_task_title: Title of the parent task
@@ -1618,30 +1724,107 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
         return f"Error detaching subtask: {str(e)}"
 
 
+@mcp.tool()
+async def batch_set_task_parent(tasks: List[Dict[str, str]], parent_task_id: str,
+                                project_id: str, parent_task_title: str = None) -> str:
+    """
+    Nest several tasks under ONE parent in a single call (requires v2 API).
+    All tasks and the parent must be in the same project.
+
+    For a single task use set_task_parent — do NOT call this in a loop.
+
+    IMPORTANT: put the human title inside each task object so the confirmation
+    dialog shows what's being nested: [{"title": "Step 1", "taskId": "abc"}].
+    The parent is stated once via parent_task_title.
+
+    Args:
+        tasks: List of {"title": "...", "taskId": "..."} objects to nest
+        parent_task_id: ID of the parent task
+        project_id: ID of the project all tasks live in
+        parent_task_title: Title of the parent (shown once in the dialog)
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        ids = [t.get("taskId") or t.get("task_id") for t in tasks]
+        titles = [t.get("title") or _lookup_task_title(i) for t, i in zip(tasks, ids)]
+        pname = parent_task_title or _lookup_task_title(parent_task_id)
+        ticktick_v2.batch_set_task_parent(ids, parent_task_id, project_id)
+        titles_str = ", ".join(f"'{t}'" for t in titles)
+        return f"🔗 Nested {len(ids)} under '{pname}': {titles_str}"
+    except Exception as e:
+        logger.error(f"Error in batch_set_task_parent: {e}")
+        return f"Error nesting tasks: {str(e)}"
+
+
+@mcp.tool()
+async def batch_set_task_tags(tasks: List[Dict[str, Any]]) -> str:
+    """
+    Replace tags on several tasks in one call (requires v2 API).
+
+    For a single task use set_task_tags — do NOT call this in a loop.
+
+    Each item carries the task's human title (for the dialog) and the full
+    list of tags it should have (replaces existing):
+    [{"title": "Buy milk", "taskId": "abc", "tags": ["errand", "today"]}]
+
+    Args:
+        tasks: List of {"title","taskId","tags"} objects
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        changes = [{"taskId": t.get("taskId") or t.get("task_id"),
+                    "tags": t.get("tags") or []} for t in tasks]
+        labels = [t.get("title") or _lookup_task_title(c["taskId"])
+                  for t, c in zip(tasks, changes)]
+        ticktick_v2.batch_update_tasks(changes)
+        labels_str = ", ".join(f"'{l}'" for l in labels)
+        return f"🏷 Tagged {len(changes)}: {labels_str}"
+    except Exception as e:
+        logger.error(f"Error in batch_set_task_tags: {e}")
+        return f"Error setting tags: {str(e)}"
+
+
 # ---------------------------------------------------------------------------
 # Batch operations (v2)
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def batch_complete_tasks(task_ids: List[str], task_titles: List[str] = None) -> str:
+async def batch_complete_tasks(tasks: List[Dict[str, str]] = None,
+                               task_ids: List[str] = None,
+                               task_titles: List[str] = None) -> str:
     """
     Mark several open tasks complete in one call (requires v2 API).
 
-    Provide task_titles (same order as task_ids) so they appear in the
-    confirmation dialog — if omitted the server looks them up automatically.
+    For ONE task use complete_task — do NOT call this in a loop.
+
+    IMPORTANT: pass `tasks` as a list of objects that each carry the human
+    title NEXT TO the id, so the confirmation dialog shows what you're
+    completing — e.g. [{"title": "Buy milk", "taskId": "abc"}]. The legacy
+    task_ids/task_titles arrays are still accepted but show titles in a
+    separate block that's hard to match up.
 
     Args:
-        task_ids: List of task IDs to complete
-        task_titles: List of task titles in the same order (optional but recommended)
+        tasks: List of {"title": "...", "taskId": "..."} objects (preferred)
+        task_ids: (legacy) list of task IDs
+        task_titles: (legacy) list of titles in the same order as task_ids
     """
     err = _ensure_ready()
     if err:
         return err
-    titles = task_titles or [_lookup_task_title(tid) for tid in task_ids]
+    if tasks:
+        ids = [t.get("taskId") or t.get("task_id") for t in tasks]
+        titles = [t.get("title") or _lookup_task_title(i) for t, i in zip(tasks, ids)]
+    else:
+        ids = task_ids or []
+        titles = task_titles or [_lookup_task_title(tid) for tid in ids]
     try:
-        ticktick_v2.batch_complete_tasks(task_ids)
+        ticktick_v2.batch_complete_tasks(ids)
         titles_str = ", ".join(f"'{t}'" for t in titles)
-        return f"✓ Completed {len(task_ids)}: {titles_str}"
+        return f"✓ Completed {len(ids)}: {titles_str}"
     except Exception as e:
         logger.error(f"Error in batch_complete_tasks: {e}")
         return f"Error completing tasks: {str(e)}"
@@ -1652,12 +1835,18 @@ async def batch_delete_tasks(tasks: List[Dict[str, str]], task_titles: List[str]
     """
     Delete several tasks in one call (requires v2 API).
 
-    Provide task_titles (same order as tasks) so they appear in the
-    confirmation dialog — if omitted the server looks them up automatically.
+    For ONE task use delete_task — do NOT call this in a loop.
+
+    IMPORTANT: put the human title AND project name INSIDE each task object so
+    the confirmation dialog shows, per row, what's being deleted and from where:
+    [{"title": "Buy milk", "projectName": "Groceries", "taskId": "abc",
+      "projectId": "xyz"}]. The separate task_titles array is legacy and hard
+    to match up by eye.
 
     Args:
-        tasks: List of {"taskId": "...", "projectId": "..."} objects
-        task_titles: List of task titles in the same order (optional but recommended)
+        tasks: List of {"title","projectName","taskId","projectId"} objects
+            (title/projectName optional but strongly recommended for the dialog)
+        task_titles: (legacy) titles in the same order as tasks
     """
     err = _ensure_ready()
     if err:
@@ -1665,7 +1854,8 @@ async def batch_delete_tasks(tasks: List[Dict[str, str]], task_titles: List[str]
     try:
         items = [{"taskId": t.get("taskId") or t.get("task_id"),
                   "projectId": t.get("projectId") or t.get("project_id")} for t in tasks]
-        titles = task_titles or [_lookup_task_title(t.get("taskId") or t.get("task_id") or "") for t in tasks]
+        titles = ([t.get("title") for t in tasks] if all(t.get("title") for t in tasks)
+                  else task_titles) or [_lookup_task_title(i["taskId"]) for i in items]
         ticktick_v2.batch_delete_tasks(items)
         titles_str = ", ".join(f"'{t}'" for t in titles)
         return f"🗑 Deleted {len(items)}: {titles_str}"
@@ -2061,7 +2251,9 @@ async def delete_tag(name: str) -> str:
 @mcp.tool()
 async def set_task_tags(task_id: str, tags: List[str], task_title: str = None) -> str:
     """
-    Replace a task's tags (requires v2 API).
+    Replace a single task's tags (requires v2 API).
+
+    For several tasks use batch_set_task_tags — do NOT call this in a loop.
 
     Args:
         task_id: ID of the task

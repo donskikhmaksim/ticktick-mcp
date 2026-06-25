@@ -219,6 +219,23 @@ class TickTickV2Client:
         }]
         return self._request("POST", "/batch/taskProject", json=body)
 
+    def batch_move_tasks(self, task_ids: List[str], to_project_id: str) -> Dict:
+        """Move several open tasks to to_project_id in one batch/taskProject call."""
+        by_id = {t.get("id"): t for t in self.get_open_tasks()}
+        body = []
+        for tid in task_ids:
+            t = by_id.get(tid)
+            if not t:
+                continue
+            from_project = t.get("projectId")
+            if from_project == to_project_id:
+                continue
+            body.append({"fromProjectId": from_project,
+                         "toProjectId": to_project_id, "taskId": tid})
+        if not body:
+            return {"message": "No tasks to move (already in target or not found)."}
+        return self._request("POST", "/batch/taskProject", json=body)
+
     # ---- smart lists / filters -------------------------------------------
     def get_filters(self) -> List[Dict]:
         return self.get_state().get("filters", []) or []
@@ -270,6 +287,13 @@ class TickTickV2Client:
         body = [{"oldParentId": parent_id, "taskId": task_id, "projectId": project_id}]
         return self._request("POST", "/batch/taskParent", json=body)
 
+    def batch_set_task_parent(self, task_ids: List[str], parent_id: str,
+                              project_id: str) -> Dict:
+        """Nest several tasks under one parent in a single batch/taskParent call."""
+        body = [{"parentId": parent_id, "taskId": tid, "projectId": project_id}
+                for tid in task_ids]
+        return self._request("POST", "/batch/taskParent", json=body)
+
     # ---- batch -----------------------------------------------------------
     def batch_complete_tasks(self, task_ids: List[str]) -> Dict:
         """Mark several open tasks complete in one call."""
@@ -295,6 +319,28 @@ class TickTickV2Client:
     def batch_create_tasks(self, tasks: List[Dict]) -> Dict:
         return self._request("POST", "/batch/task",
                              json={"add": tasks, "update": [], "delete": []})
+
+    def batch_update_tasks(self, changes: List[Dict]) -> Dict:
+        """Apply field changes to several open tasks in one call. Each change is
+        {"taskId": ..., <field>: <value>, ...}; the current task object is
+        fetched from the sync state and the given fields are merged onto it."""
+        by_id = {t.get("id"): t for t in self.get_open_tasks()}
+        updates = []
+        for ch in changes:
+            tid = ch.get("taskId") or ch.get("id")
+            base = by_id.get(tid)
+            if not base:
+                continue
+            merged = dict(base)
+            for k, v in ch.items():
+                if k in ("taskId",):
+                    continue
+                merged[k] = v
+            updates.append(merged)
+        if not updates:
+            return {"message": "No matching open tasks found."}
+        return self._request("POST", "/batch/task",
+                             json={"add": [], "update": updates, "delete": []})
 
     # ---- project groups / folders ----------------------------------------
     def list_project_groups(self) -> List[Dict]:
