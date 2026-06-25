@@ -557,7 +557,10 @@ async def update_task(
 @mcp.tool()
 async def complete_task(task_id: str, project_id: str, task_title: str = None) -> str:
     """
-    Mark a task as complete.
+    Mark a single task as complete.
+
+    For completing multiple tasks use batch_complete_tasks — do NOT call
+    this tool in a loop.
 
     Provide task_title so it appears in the confirmation dialog — if omitted
     the server looks it up automatically.
@@ -586,7 +589,10 @@ async def complete_task(task_id: str, project_id: str, task_title: str = None) -
 @mcp.tool()
 async def delete_task(task_id: str, project_id: str, task_title: str = None) -> str:
     """
-    Delete a task permanently.
+    Delete a single task permanently.
+
+    For deleting multiple tasks use batch_delete_tasks — do NOT call this
+    tool in a loop.
 
     Provide task_title so it appears in the confirmation dialog — if omitted
     the server looks it up automatically.
