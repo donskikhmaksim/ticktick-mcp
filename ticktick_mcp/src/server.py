@@ -354,300 +354,319 @@ async def get_task(project_id: str, task_id: str) -> str:
         return f"Error retrieving task: {str(e)}"
 
 @mcp.tool()
-async def create_task(
+async def create_tasks(
     summary: str,
-    title: str,
-    project_id: str,
-    content: str = None,
-    start_date: str = None,
-    due_date: str = None,
-    priority: int = 0,
-    repeat_flag: str = None,
-    reminders: List[str] = None,
-    is_all_day: bool = False,
-    tags: List[str] = None,
-    column_id: str = None,
-    subtasks: List[str] = None
+    tasks: List[Dict[str, Any]]
 ) -> str:
     """
-    Create a single task in TickTick, optionally with subtasks in one call.
+    Create one or more tasks in TickTick, optionally with subtasks.
 
-    For creating multiple tasks at once use batch_create_tasks — do NOT
-    call this tool in a loop.
+    summary (FIRST arg): one-line human sentence IN THE USER'S LANGUAGE shown
+    at the TOP of the confirmation dialog, e.g.
+    «Создаю задачу „Позвонить маме" в „Личное", срок 2026-07-01, приоритет высокий»
+    or «Создаю 3 задачи в „Работа"». Include date and priority when set.
 
-    summary (FIRST arg) is a one-line human sentence IN THE USER'S LANGUAGE
-    shown at the TOP of the confirmation dialog, e.g.
-    «Создаю задачу „Позвонить маме" в проекте „Личное", срок 2026-07-01,
-    приоритет высокий». For create/update include date, priority and notable
-    content when set. See the module-level confirmation-summary convention.
+    For a single task, pass a one-element list. For multiple tasks, pass all items
+    at once — do NOT call this tool in a loop.
 
-    Args:
-        title: Task title
-        project_id: ID of the project to add the task to
-        content: Task description/content (optional)
-        start_date: Use a date-only "YYYY-MM-DD" for an all-day task; use full ISO "YYYY-MM-DDThh:mm:ss+0000" ONLY when the user gave a specific time. Do NOT invent a time. (optional)
-        due_date: Same rule — date-only "YYYY-MM-DD" = all-day; full datetime only if a time was specified. (optional)
-        priority: Priority level (0: None, 1: Low, 3: Medium, 5: High) (optional)
-        repeat_flag: Recurrence RRULE, e.g. "RRULE:FREQ=DAILY;INTERVAL=1" (optional; use build_recurrence_rule)
-        reminders: List of reminder triggers, e.g. ["TRIGGER:-PT30M"] (optional; use build_reminder)
-        is_all_day: Whether the task is an all-day task (optional)
-        tags: List of tag names to attach (optional; requires v2 API)
-        column_id: Kanban column/section ID to place the task in (optional; from list_project_columns; requires v2 API)
-        subtasks: List of subtask titles to create under this task (optional; requires v2 API)
-    """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    Supported fields per item:
+      title (required), project_id (required),
+      content, start_date, due_date,
+      priority (0=None/1=Low/3=Medium/5=High, default 0),
+      repeat_flag (RRULE; use build_recurrence_rule),
+      reminders (list of triggers; use build_reminder),
+      is_all_day, tags (list of names; requires v2 API),
+      column_id (kanban section; use list_project_columns; requires v2 API),
+      subtasks (list of subtask titles; requires v2 API)
 
-    # Validate priority
-    if priority not in [0, 1, 3, 5]:
-        return "Invalid priority. Must be 0 (None), 1 (Low), 3 (Medium), or 5 (High)."
+    Dates: use "YYYY-MM-DD" for all-day; full ISO "YYYY-MM-DDThh:mm:ss+0000"
+    only when the user specified an exact time. Do NOT invent a time.
 
-    try:
-        # Validate dates if provided
-        for date_str, date_name in [(start_date, "start_date"), (due_date, "due_date")]:
-            if date_str:
-                try:
-                    datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                except ValueError:
-                    return f"Invalid {date_name} format. Use ISO format: YYYY-MM-DDThh:mm:ss+0000"
-
-        task = ticktick.create_task(
-            title=title,
-            project_id=project_id,
-            content=content,
-            start_date=start_date,
-            due_date=due_date,
-            priority=priority,
-            is_all_day=is_all_day,
-            repeat_flag=repeat_flag,
-            reminders=reminders
-        )
-
-        if 'error' in task:
-            return f"Error creating task: {task['error']}"
-
-        task_id = task.get("id")
-
-        if tags and ticktick_v2 and task_id:
-            try:
-                ticktick_v2.set_task_tags(task_id, tags)
-            except Exception as e:
-                logger.warning(f"Task created but tagging failed: {e}")
-        if column_id and ticktick_v2 and task_id:
-            try:
-                ticktick_v2.set_task_column(task_id, column_id)
-            except Exception as e:
-                logger.warning(f"Task created but column assignment failed: {e}")
-
-        created_subtasks = []
-        failed_subtasks = []
-        if subtasks and task_id:
-            for st_title in subtasks:
-                try:
-                    st = ticktick.create_subtask(
-                        subtask_title=st_title,
-                        parent_task_id=task_id,
-                        project_id=project_id
-                    )
-                    if 'error' not in st:
-                        created_subtasks.append(st_title)
-                    else:
-                        failed_subtasks.append(st_title)
-                except Exception as e:
-                    logger.warning(f"Subtask '{st_title}' failed: {e}")
-                    failed_subtasks.append(st_title)
-
-        out = f"Task '{title}' created"
-        if created_subtasks:
-            out += f" with {len(created_subtasks)} subtask(s):\n"
-            for st in created_subtasks:
-                out += f"  ↳ {st}\n"
-        else:
-            out += ".\n"
-        if failed_subtasks:
-            out += f"Failed subtasks: {', '.join(failed_subtasks)}\n"
-        return out
-    except Exception as e:
-        logger.error(f"Error in create_task: {e}")
-        return f"Error creating task: {str(e)}"
-
-@mcp.tool()
-async def update_task(
-    summary: str,
-    task_id: str,
-    project_id: str,
-    current_title: str = None,
-    title: str = None,
-    content: str = None,
-    start_date: str = None,
-    due_date: str = None,
-    priority: int = None,
-    repeat_flag: str = None,
-    reminders: List[str] = None,
-    tags: List[str] = None,
-    column_id: str = None
-) -> str:
-    """
-    Update a single existing task in TickTick.
-
-    For updating several tasks use batch_update_tasks — do NOT call this in a loop.
-
-    summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog, e.g. «Меняю задачу „Оплатить аренду":
-    срок 2026-07-01, приоритет высокий». Mention only what actually changes
-    (new date/priority/title/content). See the confirmation-summary convention.
-
-    IMPORTANT: You MUST provide current_title — the task's current name before
-    any changes. This is shown to the user in the confirmation dialog so they
-    know which task is being modified. Always fetch it first if unknown.
-
-    Args:
-        task_id: ID of the task to update
-        project_id: ID of the project the task belongs to
-        current_title: Current task title BEFORE changes — required for user confirmation
-        title: New task title (optional)
-        content: New task description/content (optional)
-        start_date: New start date — date-only "YYYY-MM-DD" for all-day, or full ISO "YYYY-MM-DDThh:mm:ss+0000" only if a time was specified. Don't invent a time. (optional)
-        due_date: New due date — same rule (date-only = all-day). (optional)
-        priority: New priority level (0: None, 1: Low, 3: Medium, 5: High) (optional)
-        repeat_flag: Recurrence RRULE (optional; use build_recurrence_rule)
-        reminders: List of reminder triggers (optional; use build_reminder)
-        tags: Replace the task's tags with this list (optional; requires v2 API)
-        column_id: Move the task to this kanban column/section (optional; from list_project_columns; requires v2 API)
-    """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
-
-    shown_title = current_title or _lookup_task_title(task_id)
-
-    # Validate priority if provided
-    if priority is not None and priority not in [0, 1, 3, 5]:
-        return "Invalid priority. Must be 0 (None), 1 (Low), 3 (Medium), or 5 (High)."
-
-    try:
-        # Validate dates if provided
-        for date_str, date_name in [(start_date, "start_date"), (due_date, "due_date")]:
-            if date_str:
-                try:
-                    # Try to parse the date to validate it
-                    datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                except ValueError:
-                    return f"Invalid {date_name} format. Use ISO format: YYYY-MM-DDThh:mm:ss+0000"
-        
-        project_id = _resolve_project_id(task_id, project_id)
-        task = ticktick.update_task(
-            task_id=task_id,
-            project_id=project_id,
-            title=title,
-            content=content,
-            start_date=start_date,
-            due_date=due_date,
-            priority=priority,
-            repeat_flag=repeat_flag,
-            reminders=reminders
-        )
-
-        if 'error' in task:
-            return f"Error updating task: {task['error']}"
-
-        if not task:
-            return ("Update did not apply — the task may have been moved or "
-                    "completed. Re-fetch it (e.g. search_tasks) and retry.")
-
-        if tags is not None and ticktick_v2:
-            try:
-                ticktick_v2.set_task_tags(task_id, tags)
-            except Exception as e:
-                logger.warning(f"Task updated but tagging failed: {e}")
-        if column_id and ticktick_v2:
-            try:
-                ticktick_v2.set_task_column(task_id, column_id)
-            except Exception as e:
-                logger.warning(f"Task updated but column assignment failed: {e}")
-
-        return f"✏️ Updated: '{shown_title}'\n\n" + format_task(task)
-    except Exception as e:
-        logger.error(f"Error in update_task: {e}")
-        return f"Error updating task: {str(e)}"
-
-@mcp.tool()
-async def complete_task(summary: str, task_id: str, project_id: str,
-                        task_title: str = None, project_name: str = None) -> str:
-    """
-    Mark a single task as complete.
-
-    For completing multiple tasks use batch_complete_tasks — do NOT call
-    this tool in a loop.
-
-    summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog, e.g. «Завершаю задачу „Купить молоко"
-    в проекте „Покупки"». No need to mention date/priority here.
+    Example (single): [{"title": "Buy milk", "project_id": "abc",
+                         "due_date": "2026-07-05", "priority": 1}]
+    Example (batch):  [{"title": "A", "project_id": "x"},
+                       {"title": "B", "project_id": "x", "priority": 5}]
 
     Args:
         summary: Human-readable confirmation line (see above)
-        task_id: ID of the task
-        project_id: ID of the project
-        task_title: Title of the task (include so user sees it in the dialog)
-        project_name: Name of the list the task is in (for the dialog)
+        tasks: List of task definition objects — one item for a single task
     """
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
 
-    title = task_title or _lookup_task_title(task_id)
-    try:
-        project_id = _resolve_project_id(task_id, project_id)
-        pname = project_name or _v2_project_names().get(project_id, "")
-        result = ticktick.complete_task(project_id, task_id)
-        if 'error' in result:
-            return f"Error completing task: {result['error']}"
+    if not tasks:
+        return "No tasks provided."
 
-        where = f" в «{pname}»" if pname else ""
-        return f"✓ Завершено: «{title}»{where}"
-    except Exception as e:
-        logger.error(f"Error in complete_task: {e}")
-        return f"Error completing task: {str(e)}"
+    created = []
+    failed = []
+
+    for i, t in enumerate(tasks):
+        title = t.get("title")
+        project_id = t.get("project_id") or t.get("projectId")
+        if not title or not project_id:
+            failed.append(f"#{i+1}: missing title or project_id")
+            continue
+        priority = t.get("priority", 0)
+        if priority not in [0, 1, 3, 5]:
+            failed.append(f"#{i+1} «{title}»: неверный приоритет")
+            continue
+        try:
+            task = ticktick.create_task(
+                title=title,
+                project_id=project_id,
+                content=t.get("content"),
+                start_date=t.get("start_date"),
+                due_date=t.get("due_date"),
+                priority=priority,
+                is_all_day=t.get("is_all_day", False),
+                repeat_flag=t.get("repeat_flag"),
+                reminders=t.get("reminders"),
+            )
+            if 'error' in task:
+                failed.append(f"#{i+1} «{title}»: {task['error']}")
+                continue
+            task_id = task.get("id")
+            if t.get("tags") and ticktick_v2 and task_id:
+                try:
+                    ticktick_v2.set_task_tags(task_id, t["tags"])
+                except Exception as e:
+                    logger.warning(f"Created but tagging failed: {e}")
+            if t.get("column_id") and ticktick_v2 and task_id:
+                try:
+                    ticktick_v2.set_task_column(task_id, t["column_id"])
+                except Exception as e:
+                    logger.warning(f"Created but column failed: {e}")
+            sub_ok = []
+            sub_fail = []
+            if t.get("subtasks") and task_id:
+                for st_title in t["subtasks"]:
+                    try:
+                        st = ticktick.create_subtask(st_title, task_id, project_id)
+                        (sub_ok if 'error' not in st else sub_fail).append(st_title)
+                    except Exception:
+                        sub_fail.append(st_title)
+            line = f"✓ «{title}»"
+            if sub_ok:
+                line += f" + {len(sub_ok)} подзадач"
+            if sub_fail:
+                line += f" (подзадачи не созданы: {', '.join(sub_fail)})"
+            created.append(line)
+        except Exception as e:
+            failed.append(f"#{i+1} «{title}»: {e}")
+
+    parts = []
+    if created:
+        parts.append(f"Создано {len(created)}:\n" + "\n".join(created))
+    if failed:
+        parts.append(f"Ошибки ({len(failed)}):\n" + "\n".join(failed))
+    return "\n\n".join(parts)
 
 @mcp.tool()
-async def delete_task(summary: str, task_id: str, project_id: str,
-                      task_title: str = None, project_name: str = None) -> str:
+async def update_tasks(
+    summary: str,
+    tasks: List[Dict[str, Any]]
+) -> str:
     """
-    ⚠️ Delete a single task permanently.
-
-    For deleting multiple tasks use batch_delete_tasks — do NOT call this
-    tool in a loop.
+    Update one or more tasks in TickTick.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog. Since this is destructive, START IT
-    WITH ⚠️, e.g. «⚠️ Удаляю задачу „Купить молоко" из проекта „Покупки"».
-    No need to mention date/priority for a deletion.
+    at the TOP of the confirmation dialog, e.g. «Меняю задачу „Оплатить аренду":
+    срок 2026-07-01, приоритет высокий» or «Меняю срок у 3 задач на 2026-07-05».
+    Mention only what actually changes.
+
+    Each item identifies a task and carries the fields to update. For a single
+    task, use a one-element list. For multiple tasks, all items are processed in
+    one call via v2 batch (limited fields). For a single task with advanced fields
+    (repeat_flag, reminders, column_id), the official API is used.
+
+    IMPORTANT: always include the task's current title in each item (as "title")
+    so the user knows which task is being changed.
+
+    Supported fields per item:
+      taskId (required), projectId (required for single/advanced),
+      title (current title, for the dialog), new_title, content,
+      start_date ("YYYY-MM-DD" = all-day; full ISO only if time given),
+      due_date (same rule), priority (0/1/3/5),
+      repeat_flag (single task only; use build_recurrence_rule),
+      reminders (single task only; use build_reminder),
+      tags (replaces existing), column_id (single task only)
+
+    Example (single): [{"title": "Pay rent", "taskId": "abc",
+                         "projectId": "xyz", "due_date": "2026-07-01",
+                         "priority": 5}]
+    Example (batch):  [{"title": "A", "taskId": "1", "priority": 3},
+                       {"title": "B", "taskId": "2", "due_date": "2026-07-05"}]
+
+    Args:
+        summary: Human-readable confirmation line (see above)
+        tasks: List of task change objects — one item for a single task
+    """
+    if not ticktick:
+        if not initialize_client():
+            return "Failed to initialize TickTick client. Please check your API credentials."
+
+    has_advanced = any(t.get("repeat_flag") or t.get("reminders") or t.get("column_id")
+                       for t in tasks)
+
+    if len(tasks) == 1 or has_advanced:
+        results = []
+        for t in tasks:
+            tid = t.get("taskId") or t.get("task_id")
+            pid = t.get("projectId") or t.get("project_id") or ""
+            shown_title = t.get("title") or _lookup_task_title(tid)
+            new_title = t.get("new_title")
+            priority = t.get("priority")
+            if priority is not None and priority not in [0, 1, 3, 5]:
+                results.append(f"✗ «{shown_title}»: неверный приоритет (допустимо 0/1/3/5)")
+                continue
+            try:
+                pid = _resolve_project_id(tid, pid)
+                task = ticktick.update_task(
+                    task_id=tid,
+                    project_id=pid,
+                    title=new_title,
+                    content=t.get("content"),
+                    start_date=t.get("start_date"),
+                    due_date=t.get("due_date"),
+                    priority=priority,
+                    repeat_flag=t.get("repeat_flag"),
+                    reminders=t.get("reminders"),
+                )
+                if 'error' in task:
+                    results.append(f"✗ «{shown_title}»: {task['error']}")
+                    continue
+                if t.get("tags") is not None and ticktick_v2:
+                    try:
+                        ticktick_v2.set_task_tags(tid, t["tags"])
+                    except Exception as e:
+                        logger.warning(f"Updated but tagging failed: {e}")
+                if t.get("column_id") and ticktick_v2:
+                    try:
+                        ticktick_v2.set_task_column(tid, t["column_id"])
+                    except Exception as e:
+                        logger.warning(f"Updated but column assignment failed: {e}")
+                results.append(f"✏️ «{shown_title}» обновлено")
+            except Exception as e:
+                results.append(f"✗ «{shown_title}»: {e}")
+        return "\n".join(results)
+
+    # Multiple tasks, no advanced fields — use v2 batch
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        changes = []
+        labels = []
+        for t in tasks:
+            tid = t.get("taskId") or t.get("task_id")
+            labels.append(t.get("title") or _lookup_task_title(tid))
+            ch = {"taskId": tid}
+            if t.get("new_title") is not None:
+                ch["title"] = t["new_title"]
+            if t.get("content") is not None:
+                ch["content"] = t["content"]
+            if t.get("priority") is not None:
+                ch["priority"] = t["priority"]
+            if t.get("tags") is not None:
+                ch["tags"] = t["tags"]
+            for src, dst in (("due_date", "dueDate"), ("start_date", "startDate")):
+                if t.get(src):
+                    val, all_day = _normalize_date(t[src])
+                    ch[dst] = val
+                    if all_day:
+                        ch["isAllDay"] = True
+            changes.append(ch)
+        ticktick_v2.batch_update_tasks(changes)
+        labels_str = ", ".join(f"«{l}»" for l in labels)
+        return f"✏️ Обновлено {len(changes)}: {labels_str}"
+    except Exception as e:
+        logger.error(f"Error in update_tasks: {e}")
+        return f"Error updating tasks: {str(e)}"
+
+@mcp.tool()
+async def complete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
+    """
+    Mark one or more tasks as complete in one call.
+
+    summary (FIRST arg): one-line human sentence in the user's language shown
+    at the TOP of the confirmation dialog, e.g. «Завершаю задачу „Купить молоко"
+    в проекте „Покупки"» or «Завершаю 4 задачи».
+
+    Put the human title inside each task object so the dialog shows what's
+    being completed: [{"title": "Buy milk", "taskId": "abc", "projectId": "xyz"}].
+    project_name is optional but nice to have for a single task.
+
+    For a single task: [{"title": "...", "taskId": "...", "projectId": "...",
+                         "projectName": "..."}]
+    For multiple: [{"title": "...", "taskId": "..."}, ...]
+
+    Args:
+        summary: Human-readable confirmation line (see above)
+        tasks: List of {"title","taskId","projectId"} objects — one item for single task
+    """
+    if not ticktick:
+        if not initialize_client():
+            return "Failed to initialize TickTick client. Please check your API credentials."
+    try:
+        if ticktick_v2 and len(tasks) > 1:
+            ids = [t.get("taskId") or t.get("task_id") for t in tasks]
+            titles = [t.get("title") or _lookup_task_title(i) for t, i in zip(tasks, ids)]
+            ticktick_v2.batch_complete_tasks(ids)
+            titles_str = ", ".join(f"«{t}»" for t in titles)
+            return f"✓ Завершено {len(ids)}: {titles_str}"
+        else:
+            results = []
+            for t in tasks:
+                tid = t.get("taskId") or t.get("task_id")
+                pid = t.get("projectId") or t.get("project_id") or ""
+                title = t.get("title") or _lookup_task_title(tid)
+                pid = _resolve_project_id(tid, pid)
+                pname = t.get("projectName") or _v2_project_names().get(pid, "")
+                res = ticktick.complete_task(pid, tid)
+                if 'error' in res:
+                    results.append(f"✗ «{title}»: {res['error']}")
+                else:
+                    where = f" в «{pname}»" if pname else ""
+                    results.append(f"✓ «{title}»{where}")
+            return "\n".join(results)
+    except Exception as e:
+        logger.error(f"Error in complete_tasks: {e}")
+        return f"Error completing tasks: {str(e)}"
+
+@mcp.tool()
+async def delete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
+    """
+    ⚠️ Delete one or more tasks permanently in one call.
+
+    summary (FIRST arg): one-line human sentence in the user's language shown
+    at the TOP of the confirmation dialog. Destructive — START WITH ⚠️, e.g.
+    «⚠️ Удаляю задачу „Купить молоко" из „Покупки"» or
+    «⚠️ Удаляю 5 задач из „Inbox"».
+
+    Put the human title and project name INSIDE each task object so the dialog
+    shows what's being deleted:
+    [{"title": "Buy milk", "projectName": "Groceries", "taskId": "abc",
+      "projectId": "xyz"}]
 
     Args:
         summary: Human-readable confirmation line starting with ⚠️ (see above)
-        task_id: ID of the task
-        project_id: ID of the project
-        task_title: Title of the task (include so user sees it in the dialog)
-        project_name: Name of the list the task is in (for the dialog)
+        tasks: List of {"title","projectName","taskId","projectId"} objects
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
-
-    title = task_title or _lookup_task_title(task_id)
+    err = _ensure_ready()
+    if err:
+        return err
     try:
-        project_id = _resolve_project_id(task_id, project_id)
-        pname = project_name or _v2_project_names().get(project_id, "")
-        result = ticktick.delete_task(project_id, task_id)
-        if 'error' in result:
-            return f"Error deleting task: {result['error']}"
-
-        where = f" из «{pname}»" if pname else ""
-        return f"🗑 Удалено: «{title}»{where}"
+        items = [{"taskId": t.get("taskId") or t.get("task_id"),
+                  "projectId": t.get("projectId") or t.get("project_id")} for t in tasks]
+        titles = ([t.get("title") for t in tasks] if all(t.get("title") for t in tasks)
+                  else [_lookup_task_title(i["taskId"]) for i in items])
+        ticktick_v2.batch_delete_tasks(items)
+        titles_str = ", ".join(f"«{t}»" for t in titles)
+        return f"🗑 Удалено {len(items)}: {titles_str}"
     except Exception as e:
-        logger.error(f"Error in delete_task: {e}")
-        return f"Error deleting task: {str(e)}"
+        logger.error(f"Error in delete_tasks: {e}")
+        return f"Error deleting tasks: {str(e)}"
 
 @mcp.tool()
 async def delete_task_with_subtasks(
@@ -1202,111 +1221,6 @@ async def get_recurring_tasks(search_term: str = "") -> str:
         logger.error(f"Error in get_recurring_tasks: {e}")
         return f"Ошибка при получении повторяющихся задач: {str(e)}"
 
-@mcp.tool()
-async def batch_create_tasks(summary: str, tasks: List[Dict[str, Any]]) -> str:
-    """
-    Create multiple tasks in TickTick at once.
-
-    summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog, e.g. «Создаю 3 задачи в проекте
-    „Работа"» (or name the projects if they differ). Mention dates/priorities
-    only if they matter.
-
-    Args:
-        summary: Human-readable confirmation line (see above)
-        tasks: List of task dictionaries. Each task must contain:
-            - title (required): Task Name
-            - project_id (required): ID of the project for the task
-            - content (optional): Task description
-            - start_date (optional): Start date in user timezone (YYYY-MM-DDTHH:mm:ss or with timezone)
-            - due_date (optional): Due date in user timezone (YYYY-MM-DDTHH:mm:ss or with timezone)  
-            - priority (optional): Priority level {0: "None", 1: "Low", 3: "Medium", 5: "High"}
-    
-    Example:
-        tasks = [
-            {"title": "Example A", "project_id": "1234ABC", "priority": 5},
-            {"title": "Example B", "project_id": "1234XYZ", "content": "Description", "start_date": "2025-07-18T10:00:00", "due_date": "2025-07-19T10:00:00"}
-        ]
-    """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
-    
-    if not tasks:
-        return "No tasks provided. Please provide a list of tasks to create."
-    
-    if not isinstance(tasks, list):
-        return "Tasks must be provided as a list of dictionaries."
-    
-    # Validate all tasks before creating any
-    validation_errors = []
-    for i, task_data in enumerate(tasks):
-        if not isinstance(task_data, dict):
-            validation_errors.append(f"Task {i + 1}: Must be a dictionary")
-            continue
-        
-        error = _validate_task_data(task_data, i)
-        if error:
-            validation_errors.append(error)
-    
-    if validation_errors:
-        return "Validation errors found:\n" + "\n".join(validation_errors)
-    
-    # Create tasks one by one and collect results
-    created_tasks = []
-    failed_tasks = []
-    
-    try:
-        for i, task_data in enumerate(tasks):
-            try:
-                # Extract task parameters with defaults
-                title = task_data['title']
-                project_id = task_data['project_id']
-                content = task_data.get('content')
-                start_date = task_data.get('start_date')
-                due_date = task_data.get('due_date')
-                priority = task_data.get('priority', 0)
-                
-                # Create the task
-                result = ticktick.create_task(
-                    title=title,
-                    project_id=project_id,
-                    content=content,
-                    start_date=start_date,
-                    due_date=due_date,
-                    priority=priority
-                )
-                
-                if 'error' in result:
-                    failed_tasks.append(f"Task {i + 1} ('{title}'): {result['error']}")
-                else:
-                    created_tasks.append((i + 1, title, result))
-                    
-            except Exception as e:
-                failed_tasks.append(f"Task {i + 1} ('{task_data.get('title', 'Unknown')}'): {str(e)}")
-        
-        # Format the results
-        result_message = f"Batch task creation completed.\n\n"
-        result_message += f"Successfully created: {len(created_tasks)} tasks\n"
-        result_message += f"Failed: {len(failed_tasks)} tasks\n\n"
-        
-        if created_tasks:
-            result_message += "✅ Successfully Created Tasks:\n"
-            for task_num, title, task_obj in created_tasks:
-                result_message += f"{task_num}. {title} (ID: {task_obj.get('id', 'Unknown')})\n"
-            result_message += "\n"
-        
-        if failed_tasks:
-            result_message += "❌ Failed Tasks:\n"
-            for error in failed_tasks:
-                result_message += f"{error}\n"
-        
-        return result_message
-        
-    except Exception as e:
-        logger.error(f"Error in batch_create_tasks: {e}")
-        return f"Error during batch task creation: {str(e)}"
-
 # New MCP Tools for Getting things done framework (Priority / Due Dates)
 
 @mcp.tool()
@@ -1507,67 +1421,24 @@ async def get_inbox_tasks() -> str:
 
 
 @mcp.tool()
-async def move_task(summary: str, task_id: str, to_project_id: str,
-                    task_title: str = None,
-                    from_project_name: str = None, to_project_name: str = None) -> str:
+async def move_tasks(summary: str, tasks: List[Dict[str, str]],
+                     to_project_id: str, to_project_name: str = None) -> str:
     """
-    Move a single open task to another list/project (requires v2 API).
-
-    For several tasks use batch_move_tasks — do NOT call this in a loop.
+    Move one or more open tasks to a destination list in one call (requires v2 API).
+    All tasks go to the same destination.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
     at the TOP of the confirmation dialog, e.g. «Перемещаю задачу „Купить молоко"
-    из проекта „Inbox" в „Покупки"». No need to mention date/priority for a move.
+    из „Inbox" в „Покупки"» or «Перемещаю 3 задачи в „Покупки"».
+
+    Put the human title inside each task object so the dialog shows what moves:
+    [{"title": "Buy milk", "taskId": "abc"}]
 
     Args:
         summary: Human-readable confirmation line (see above)
-        task_id: ID of the task to move
-        to_project_id: ID of the destination project/list
-        task_title: Title of the task (for the dialog)
-        from_project_name: Name of the current list (for the dialog)
-        to_project_name: Name of the destination list (for the dialog)
-    """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
-    if not ticktick_v2:
-        return _V2_DISABLED_MSG
-    title = task_title or _lookup_task_title(task_id)
-    names = _v2_project_names()
-    try:
-        from_pid = _resolve_project_id(task_id, "")
-        from_name = from_project_name or names.get(from_pid, "")
-        to_name = to_project_name or names.get(to_project_id, to_project_id)
-        ticktick_v2.move_task(task_id, to_project_id)
-        arrow = f"«{from_name}» → «{to_name}»" if from_name else f"→ «{to_name}»"
-        return f"↪ Перемещено «{title}»: {arrow}"
-    except Exception as e:
-        logger.error(f"Error in move_task: {e}")
-        return f"Error moving task: {str(e)}"
-
-
-@mcp.tool()
-async def batch_move_tasks(summary: str, tasks: List[Dict[str, str]],
-                           to_project_id: str, to_project_name: str = None) -> str:
-    """
-    Move several open tasks into ONE destination list in a single call
-    (requires v2 API). The whole batch goes to the same to_project_id, so the
-    destination is stated once.
-
-    For a single task use move_task — do NOT call this in a loop.
-
-    summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog, e.g. «Перемещаю 3 задачи в проект
-    „Покупки"».
-
-    IMPORTANT: put the human title inside each task object so the dialog also
-    shows what moves: [{"title": "Buy milk", "taskId": "abc"}].
-
-    Args:
-        summary: Human-readable confirmation line (see above)
-        tasks: List of {"title": "...", "taskId": "..."} objects
+        tasks: List of {"title": "...", "taskId": "..."} objects — one item for single task
         to_project_id: Destination project/list ID for ALL tasks
-        to_project_name: Destination list name (shown once in the dialog)
+        to_project_name: Destination list name (shown in the dialog)
     """
     err = _ensure_ready()
     if err:
@@ -1580,64 +1451,10 @@ async def batch_move_tasks(summary: str, tasks: List[Dict[str, str]],
         titles_str = ", ".join(f"«{t}»" for t in titles)
         return f"↪ Перемещено {len(ids)} → «{to_name}»: {titles_str}"
     except Exception as e:
-        logger.error(f"Error in batch_move_tasks: {e}")
+        logger.error(f"Error in move_tasks: {e}")
         return f"Error moving tasks: {str(e)}"
 
 
-@mcp.tool()
-async def batch_update_tasks(summary: str, tasks: List[Dict[str, Any]]) -> str:
-    """
-    Update fields on several open tasks in one call (requires v2 API).
-
-    For a single task use update_task — do NOT call this in a loop.
-
-    summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog, e.g. «Меняю срок на 2026-07-01 у
-    3 задач». Mention only what changes.
-
-    Each item identifies a task by taskId and carries the fields to change,
-    plus a human title for the dialog. Supported fields: title, content,
-    priority (0/1/3/5), due_date, start_date, tags (replaces the task's tags).
-    Dates: "YYYY-MM-DD" = all-day; full ISO only if a time was given.
-
-    Example: [{"title": "Pay rent", "taskId": "abc", "due_date": "2026-07-01",
-               "priority": 5}]
-
-    Args:
-        summary: Human-readable confirmation line (see above)
-        tasks: List of {"title","taskId", <fields to change>} objects
-    """
-    err = _ensure_ready()
-    if err:
-        return err
-    try:
-        changes = []
-        labels = []
-        for t in tasks:
-            tid = t.get("taskId") or t.get("task_id")
-            labels.append(t.get("title") or _lookup_task_title(tid))
-            ch = {"taskId": tid}
-            if t.get("title") is not None:
-                ch["title"] = t["title"]
-            if t.get("content") is not None:
-                ch["content"] = t["content"]
-            if t.get("priority") is not None:
-                ch["priority"] = t["priority"]
-            if t.get("tags") is not None:
-                ch["tags"] = t["tags"]
-            for src, dst in (("due_date", "dueDate"), ("start_date", "startDate")):
-                if t.get(src):
-                    val, all_day = _normalize_date(t[src])
-                    ch[dst] = val
-                    if all_day:
-                        ch["isAllDay"] = True
-            changes.append(ch)
-        ticktick_v2.batch_update_tasks(changes)
-        labels_str = ", ".join(f"«{l}»" for l in labels)
-        return f"✏️ Обновлено {len(changes)}: {labels_str}"
-    except Exception as e:
-        logger.error(f"Error in batch_update_tasks: {e}")
-        return f"Error updating tasks: {str(e)}"
 
 
 # ---------------------------------------------------------------------------
@@ -1763,28 +1580,40 @@ async def list_filters() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def set_task_parent(task_title: str, parent_task_title: str, task_id: str, parent_task_id: str, project_id: str) -> str:
+async def set_task_parent(summary: str, tasks: List[Dict[str, str]],
+                          parent_task_id: str, project_id: str,
+                          parent_task_title: str = None) -> str:
     """
-    Make a task a subtask of another (requires v2 API). Both must be in the same project.
+    Nest one or more tasks under a parent in one call (requires v2 API).
+    All tasks and the parent must be in the same project.
 
-    To nest several tasks under one parent use batch_set_task_parent — do NOT loop.
+    summary (FIRST arg): one-line human sentence in the user's language shown
+    at the TOP of the confirmation dialog, e.g. «Делаю задачу „Шаг 1"
+    подзадачей „Большой проект"» or «Делаю 3 задачи подзадачами „Большой проект"».
+
+    Put the human title inside each task object so the dialog shows what's being
+    nested: [{"title": "Step 1", "taskId": "abc"}].
 
     Args:
-        task_title: Title of the task being nested (shown first in confirmation dialog)
-        parent_task_title: Title of the parent task
-        task_id: ID of the task to nest
+        summary: Human-readable confirmation line (see above)
+        tasks: List of {"title": "...", "taskId": "..."} objects — one item for single task
         parent_task_id: ID of the parent task
-        project_id: ID of the project both tasks live in
+        project_id: ID of the project all tasks live in
+        parent_task_title: Title of the parent (shown in the dialog)
     """
     err = _ensure_ready()
     if err:
         return err
     try:
-        ticktick_v2.set_task_parent(task_id, parent_task_id, project_id)
-        return f"Task '{task_title}' is now a subtask of '{parent_task_title}'."
+        ids = [t.get("taskId") or t.get("task_id") for t in tasks]
+        titles = [t.get("title") or _lookup_task_title(i) for t, i in zip(tasks, ids)]
+        pname = parent_task_title or _lookup_task_title(parent_task_id)
+        ticktick_v2.batch_set_task_parent(ids, parent_task_id, project_id)
+        titles_str = ", ".join(f"«{t}»" for t in titles)
+        return f"🔗 Вложено {len(ids)} под «{pname}»: {titles_str}"
     except Exception as e:
         logger.error(f"Error in set_task_parent: {e}")
-        return f"Error setting parent: {str(e)}"
+        return f"Error nesting tasks: {str(e)}"
 
 
 @mcp.tool()
@@ -1811,53 +1640,13 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
 
 
 @mcp.tool()
-async def batch_set_task_parent(summary: str, tasks: List[Dict[str, str]],
-                                parent_task_id: str, project_id: str,
-                                parent_task_title: str = None) -> str:
+async def set_task_tags(summary: str, tasks: List[Dict[str, Any]]) -> str:
     """
-    Nest several tasks under ONE parent in a single call (requires v2 API).
-    All tasks and the parent must be in the same project.
-
-    For a single task use set_task_parent — do NOT call this in a loop.
+    Replace tags on one or more tasks in one call (requires v2 API).
 
     summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog, e.g. «Делаю 3 задачи подзадачами
-    „Большой проект"».
-
-    IMPORTANT: put the human title inside each task object so the dialog also
-    shows what's being nested: [{"title": "Step 1", "taskId": "abc"}].
-
-    Args:
-        summary: Human-readable confirmation line (see above)
-        tasks: List of {"title": "...", "taskId": "..."} objects to nest
-        parent_task_id: ID of the parent task
-        project_id: ID of the project all tasks live in
-        parent_task_title: Title of the parent (shown once in the dialog)
-    """
-    err = _ensure_ready()
-    if err:
-        return err
-    try:
-        ids = [t.get("taskId") or t.get("task_id") for t in tasks]
-        titles = [t.get("title") or _lookup_task_title(i) for t, i in zip(tasks, ids)]
-        pname = parent_task_title or _lookup_task_title(parent_task_id)
-        ticktick_v2.batch_set_task_parent(ids, parent_task_id, project_id)
-        titles_str = ", ".join(f"«{t}»" for t in titles)
-        return f"🔗 Вложено {len(ids)} под «{pname}»: {titles_str}"
-    except Exception as e:
-        logger.error(f"Error in batch_set_task_parent: {e}")
-        return f"Error nesting tasks: {str(e)}"
-
-
-@mcp.tool()
-async def batch_set_task_tags(summary: str, tasks: List[Dict[str, Any]]) -> str:
-    """
-    Replace tags on several tasks in one call (requires v2 API).
-
-    For a single task use set_task_tags — do NOT call this in a loop.
-
-    summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog, e.g. «Ставлю тег „работа" на 4 задачи».
+    at the TOP of the confirmation dialog, e.g. «Ставлю тег „работа" на задачу
+    „Купить молоко"» or «Ставлю тег „работа" на 4 задачи».
 
     Each item carries the task's human title (for the dialog) and the full
     list of tags it should have (replaces existing):
@@ -1865,7 +1654,7 @@ async def batch_set_task_tags(summary: str, tasks: List[Dict[str, Any]]) -> str:
 
     Args:
         summary: Human-readable confirmation line (see above)
-        tasks: List of {"title","taskId","tags"} objects
+        tasks: List of {"title","taskId","tags"} objects — one item for a single task
     """
     err = _ensure_ready()
     if err:
@@ -1879,7 +1668,7 @@ async def batch_set_task_tags(summary: str, tasks: List[Dict[str, Any]]) -> str:
         labels_str = ", ".join(f"«{l}»" for l in labels)
         return f"🏷 Теги обновлены у {len(changes)}: {labels_str}"
     except Exception as e:
-        logger.error(f"Error in batch_set_task_tags: {e}")
+        logger.error(f"Error in set_task_tags: {e}")
         return f"Error setting tags: {str(e)}"
 
 
@@ -1887,85 +1676,6 @@ async def batch_set_task_tags(summary: str, tasks: List[Dict[str, Any]]) -> str:
 # Batch operations (v2)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-async def batch_complete_tasks(summary: str,
-                               tasks: List[Dict[str, str]] = None,
-                               task_ids: List[str] = None,
-                               task_titles: List[str] = None) -> str:
-    """
-    Mark several open tasks complete in one call (requires v2 API).
-
-    For ONE task use complete_task — do NOT call this in a loop.
-
-    summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog, e.g. «Завершаю 4 задачи».
-
-    IMPORTANT: pass `tasks` as a list of objects that each carry the human
-    title NEXT TO the id, so the dialog also shows what you're completing —
-    e.g. [{"title": "Buy milk", "taskId": "abc"}]. The legacy
-    task_ids/task_titles arrays are still accepted but harder to match up.
-
-    Args:
-        summary: Human-readable confirmation line (see above)
-        tasks: List of {"title": "...", "taskId": "..."} objects (preferred)
-        task_ids: (legacy) list of task IDs
-        task_titles: (legacy) list of titles in the same order as task_ids
-    """
-    err = _ensure_ready()
-    if err:
-        return err
-    if tasks:
-        ids = [t.get("taskId") or t.get("task_id") for t in tasks]
-        titles = [t.get("title") or _lookup_task_title(i) for t, i in zip(tasks, ids)]
-    else:
-        ids = task_ids or []
-        titles = task_titles or [_lookup_task_title(tid) for tid in ids]
-    try:
-        ticktick_v2.batch_complete_tasks(ids)
-        titles_str = ", ".join(f"«{t}»" for t in titles)
-        return f"✓ Завершено {len(ids)}: {titles_str}"
-    except Exception as e:
-        logger.error(f"Error in batch_complete_tasks: {e}")
-        return f"Error completing tasks: {str(e)}"
-
-
-@mcp.tool()
-async def batch_delete_tasks(summary: str, tasks: List[Dict[str, str]],
-                             task_titles: List[str] = None) -> str:
-    """
-    ⚠️ Delete several tasks in one call (requires v2 API).
-
-    For ONE task use delete_task — do NOT call this in a loop.
-
-    summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog. Destructive — START WITH ⚠️ and name
-    the project(s), e.g. «⚠️ Удаляю 5 задач из проекта „Inbox"».
-
-    IMPORTANT: put the human title AND project name INSIDE each task object so
-    the dialog also shows, per row, what's being deleted and from where:
-    [{"title": "Buy milk", "projectName": "Groceries", "taskId": "abc",
-      "projectId": "xyz"}].
-
-    Args:
-        summary: Human-readable confirmation line starting with ⚠️ (see above)
-        tasks: List of {"title","projectName","taskId","projectId"} objects
-            (title/projectName optional but strongly recommended for the dialog)
-        task_titles: (legacy) titles in the same order as tasks
-    """
-    err = _ensure_ready()
-    if err:
-        return err
-    try:
-        items = [{"taskId": t.get("taskId") or t.get("task_id"),
-                  "projectId": t.get("projectId") or t.get("project_id")} for t in tasks]
-        titles = ([t.get("title") for t in tasks] if all(t.get("title") for t in tasks)
-                  else task_titles) or [_lookup_task_title(i["taskId"]) for i in items]
-        ticktick_v2.batch_delete_tasks(items)
-        titles_str = ", ".join(f"«{t}»" for t in titles)
-        return f"🗑 Удалено {len(items)}: {titles_str}"
-    except Exception as e:
-        logger.error(f"Error in batch_delete_tasks: {e}")
-        return f"Error deleting tasks: {str(e)}"
 
 
 # ---------------------------------------------------------------------------
@@ -2222,51 +1932,20 @@ async def get_trash(limit: int = 50) -> str:
 
 
 @mcp.tool()
-async def restore_task(summary: str, task_id: str, task_title: str = None,
-                       to_project_id: str = None) -> str:
+async def restore_tasks(summary: str, tasks: List[Dict[str, str]],
+                        to_project_id: str = None) -> str:
     """
-    Restore a task from the trash (requires v2 API).
+    Restore one or more tasks from the trash in one call (requires v2 API).
 
     summary (FIRST arg): one-line human sentence in the user's language shown
     at the TOP of the confirmation dialog, e.g. «Восстанавливаю из корзины
-    задачу „Купить молоко"».
+    задачу „Купить молоко"» or «Восстанавливаю из корзины 3 задачи».
 
     Args:
         summary: Human-readable confirmation line (see above)
-        task_id: ID of the trashed task (from get_trash)
-        task_title: Title of the task (optional — get from get_trash output)
-        to_project_id: Optional destination project; defaults to the task's original list
-    """
-    err = _ensure_ready()
-    if err:
-        return err
-    try:
-        ticktick_v2.restore_task(task_id, to_project_id)
-        title = task_title or f"[task {task_id[:8]}…]"
-        return f"↩ Восстановлено из корзины: «{title}»"
-    except Exception as e:
-        logger.error(f"Error in restore_task: {e}")
-        return f"Error restoring task: {str(e)}"
-
-
-@mcp.tool()
-async def batch_restore_tasks(summary: str, tasks: List[Dict[str, str]],
-                              to_project_id: str = None) -> str:
-    """
-    Restore several tasks from the trash in one call (requires v2 API).
-
-    For restoring a single task use restore_task. For more than one, use
-    this tool — do NOT call restore_task in a loop.
-
-    summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog, e.g. «Восстанавливаю из корзины
-    3 задачи».
-
-    Args:
-        summary: Human-readable confirmation line (see above)
-        tasks: List of {"taskId": "...", "title": "..."} objects (title shown
-            in the confirmation dialog; get both from get_trash output)
-        to_project_id: Optional destination for all tasks; defaults to each
+        tasks: List of {"taskId": "...", "title": "..."} objects — one item for
+            a single task, multiple for batch. Get IDs/titles from get_trash.
+        to_project_id: Optional destination list for all tasks; defaults to each
             task's original list
     """
     err = _ensure_ready()
@@ -2280,7 +1959,7 @@ async def batch_restore_tasks(summary: str, tasks: List[Dict[str, str]],
         titles_str = ", ".join(f"«{t}»" for t in titles)
         return f"↩ Восстановлено из корзины {len(ids)}: {titles_str}"
     except Exception as e:
-        logger.error(f"Error in batch_restore_tasks: {e}")
+        logger.error(f"Error in restore_tasks: {e}")
         return f"Error restoring tasks: {str(e)}"
 
 
@@ -2364,28 +2043,6 @@ async def delete_tag(name: str) -> str:
         return f"Error deleting tag: {str(e)}"
 
 
-@mcp.tool()
-async def set_task_tags(task_id: str, tags: List[str], task_title: str = None) -> str:
-    """
-    Replace a single task's tags (requires v2 API).
-
-    For several tasks use batch_set_task_tags — do NOT call this in a loop.
-
-    Args:
-        task_id: ID of the task
-        tags: Full list of tag names the task should have (replaces existing)
-        task_title: Title of the task (optional but recommended for confirmation)
-    """
-    err = _ensure_ready()
-    if err:
-        return err
-    title = task_title or _lookup_task_title(task_id)
-    try:
-        ticktick_v2.set_task_tags(task_id, tags)
-        return f"Tags updated on '{title}': {', '.join(tags) or '(none)'}"
-    except Exception as e:
-        logger.error(f"Error in set_task_tags: {e}")
-        return f"Error setting tags: {str(e)}"
 
 
 # ---------------------------------------------------------------------------
