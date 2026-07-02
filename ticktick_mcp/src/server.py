@@ -1159,6 +1159,50 @@ async def search_tasks(search_term: str) -> str:
         return f"Error retrieving projects: {str(e)}"
 
 @mcp.tool()
+async def get_recurring_tasks(search_term: str = "") -> str:
+    """
+    Get all tasks that have a recurrence rule (repeatFlag set), i.e. repeating tasks.
+    Optionally filter by title/content search term.
+
+    Do NOT call this in a loop — it already scans all open tasks at once.
+
+    Args:
+        search_term: Optional text to further filter by title/content (case-insensitive).
+                     Leave empty to return all recurring tasks.
+    """
+    if not ticktick:
+        if not initialize_client():
+            return "Failed to initialize TickTick client. Please check your API credentials."
+
+    try:
+        if ticktick_v2:
+            all_open = ticktick_v2.get_open_tasks()
+        else:
+            projects = ticktick.get_projects()
+            if 'error' in projects:
+                return f"Ошибка получения проектов: {projects['error']}"
+            all_open = []
+            for p in projects:
+                pid = p.get("id")
+                data = ticktick.get_project_with_data(pid)
+                all_open.extend(data.get("tasks", []))
+
+        tasks = [t for t in all_open if t.get("repeatFlag")]
+        if search_term.strip():
+            tasks = [t for t in tasks if _task_matches_search(t, search_term.strip())]
+
+        if not tasks:
+            msg = f"Повторяющихся задач, подходящих под «{search_term}», не найдено." if search_term else "Повторяющихся задач не найдено."
+            return msg
+
+        label = f"Повторяющиеся задачи{f' по запросу «{search_term}»' if search_term else ''} ({len(tasks)}):"
+        return label + "\n" + format_task_tree(tasks, 200)
+
+    except Exception as e:
+        logger.error(f"Error in get_recurring_tasks: {e}")
+        return f"Ошибка при получении повторяющихся задач: {str(e)}"
+
+@mcp.tool()
 async def batch_create_tasks(summary: str, tasks: List[Dict[str, Any]]) -> str:
     """
     Create multiple tasks in TickTick at once.
