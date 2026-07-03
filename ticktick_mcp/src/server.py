@@ -2266,15 +2266,32 @@ async def get_task_info(task_id: str) -> str:
         out = f"Task: {t.get('title')}\n"
         out += f"  id: {t.get('id')}  |  project: {names.get(t.get('projectId'), t.get('projectId'))}\n"
         out += f"  status: {status}  |  priority: {pr}\n"
+        if t.get("parentId"):
+            all_tasks = state.get("syncTaskBean", {}).get("update", []) or []
+            parent = next((x for x in all_tasks if x.get("id") == t["parentId"]), None)
+            pname = parent.get("title") if parent else t["parentId"]
+            out += f"  parent: «{pname}»  (id:{t['parentId']})\n"
+        if t.get("startDate"):
+            sd = t["startDate"][:10] if t.get("isAllDay") else t["startDate"]
+            out += f"  start: {sd}\n"
         if t.get("dueDate"):
             d = t["dueDate"][:10] if t.get("isAllDay") else t["dueDate"]
             out += f"  due: {d}{'  (all-day)' if t.get('isAllDay') else ''}\n"
+        repeat = t.get("repeatFlag") or t.get("repeatRule")
+        if repeat:
+            out += f"  repeat: {repeat}\n"
+        reminders = t.get("reminders") or []
+        if reminders:
+            out += f"  reminders: {', '.join(str(r) for r in reminders)}\n"
+        if t.get("assignee"):
+            out += f"  assignee: {t['assignee']}\n"
         if t.get("tags"):
             out += f"  tags: {', '.join('#'+x for x in t['tags'])}\n"
         if t.get("columnId"):
             out += f"  columnId: {t['columnId']}\n"
-        if t.get("content"):
-            out += f"  content: {t['content'][:300]}\n"
+        content = t.get("content") or t.get("desc") or ""
+        if content:
+            out += f"  content: {content[:300]}\n"
         # Activity (no full edit-log endpoint exists; these are the task's stamps)
         out += "\nActivity:\n"
         out += f"  created: {t.get('createdTime', '?')} by {who}\n"
