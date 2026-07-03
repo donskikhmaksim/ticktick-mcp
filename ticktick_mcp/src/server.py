@@ -6,6 +6,7 @@ from datetime import datetime, timezone, date, timedelta
 from typing import Dict, List, Any, Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from dotenv import load_dotenv
 
 from .ticktick_client import TickTickClient, _normalize_date
@@ -29,6 +30,10 @@ STREAMABLE_PATH = f"/mcp/{SECRET}" if SECRET else "/mcp"
 
 # Create FastMCP server
 mcp = FastMCP("ticktick", host=HOST, port=PORT, streamable_http_path=STREAMABLE_PATH)
+
+# Read-only tools carry this annotation so MCP clients (Claude) can skip the
+# confirmation dialog / offer "always allow" for them.
+READONLY = ToolAnnotations(readOnlyHint=True)
 
 # Create TickTick clients
 ticktick = None       # official Open API (OAuth)
@@ -254,7 +259,7 @@ def format_task_tree(tasks: List[Dict], limit: int = 200) -> str:
 
 # MCP Tools
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_projects() -> str:
     """Get all projects from TickTick."""
     if not ticktick:
@@ -278,7 +283,7 @@ async def get_projects() -> str:
         logger.error(f"Error in get_projects: {e}")
         return f"Error retrieving projects: {str(e)}"
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_project(project_id: str) -> str:
     """
     Get details about a specific project.
@@ -300,7 +305,7 @@ async def get_project(project_id: str) -> str:
         logger.error(f"Error in get_project: {e}")
         return f"Error retrieving project: {str(e)}"
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_project_tasks(project_id: str) -> str:
     """
     Get all tasks in a specific project.
@@ -330,7 +335,7 @@ async def get_project_tasks(project_id: str) -> str:
         logger.error(f"Error in get_project_tasks: {e}")
         return f"Error retrieving project tasks: {str(e)}"
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_task(project_id: str, task_id: str) -> str:
     """
     Get details about a specific task.
@@ -975,7 +980,7 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
 
 # New MCP Tools for Tasks
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_all_tasks() -> str:
     """Get all tasks from TickTick. Ignores closed projects."""
     if not ticktick:
@@ -996,7 +1001,7 @@ async def get_all_tasks() -> str:
         logger.error(f"Error in get_all_tasks: {e}")
         return f"Error retrieving projects: {str(e)}"
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_tasks_by_priority(priority_id: int) -> str:
     """
     Get all tasks from TickTick by priority. Ignores closed projects.
@@ -1026,7 +1031,7 @@ async def get_tasks_by_priority(priority_id: int) -> str:
         logger.error(f"Error in get_tasks_by_priority: {e}")
         return f"Error retrieving projects: {str(e)}"
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_tasks_due_today() -> str:
     """Get all tasks from TickTick that are due today. Ignores closed projects."""
     if not ticktick:
@@ -1047,7 +1052,7 @@ async def get_tasks_due_today() -> str:
         logger.error(f"Error in get_tasks_due_today: {e}")
         return f"Error retrieving projects: {str(e)}"
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_overdue_tasks() -> str:
     """Get all overdue tasks from TickTick. Ignores closed projects."""
     if not ticktick:
@@ -1068,7 +1073,7 @@ async def get_overdue_tasks() -> str:
         logger.error(f"Error in get_overdue_tasks: {e}")
         return f"Error retrieving projects: {str(e)}"
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_tasks_due_tomorrow() -> str:
     """Get all tasks from TickTick that are due today. Ignores closed projects."""
     if not ticktick:
@@ -1089,7 +1094,7 @@ async def get_tasks_due_tomorrow() -> str:
         logger.error(f"Error in get_tasks_due_today: {e}")
         return f"Error retrieving projects: {str(e)}"
     
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_tasks_due_in_days(days: int) -> str:
     """
     Get all tasks from TickTick that are due in exactly X days. Ignores closed projects.
@@ -1119,7 +1124,7 @@ async def get_tasks_due_in_days(days: int) -> str:
         logger.error(f"Error in get_tasks_due_in_days: {e}")
         return f"Error retrieving projects: {str(e)}"
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_tasks_due_this_week() -> str:
     """Get all tasks from TickTick that are due within the next 7 days. Ignores closed projects."""
     if not ticktick:
@@ -1150,7 +1155,7 @@ async def get_tasks_due_this_week() -> str:
         logger.error(f"Error in get_tasks_due_this_week: {e}")
         return f"Error retrieving projects: {str(e)}"
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def search_tasks(search_term: str) -> str:
     """
     Search for tasks in TickTick by title, content, or subtask titles. Ignores closed projects.
@@ -1190,7 +1195,7 @@ async def search_tasks(search_term: str) -> str:
         logger.error(f"Error in search_tasks: {e}")
         return f"Error retrieving projects: {str(e)}"
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_recurring_tasks(search_term: str = "") -> str:
     """
     Get all tasks that have a recurrence rule (repeatFlag set), i.e. repeating tasks.
@@ -1236,7 +1241,7 @@ async def get_recurring_tasks(search_term: str = "") -> str:
 
 # New MCP Tools for Getting things done framework (Priority / Due Dates)
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_engaged_tasks() -> str:
     """
     Get all tasks from TickTick that are "Engaged".
@@ -1263,7 +1268,7 @@ async def get_engaged_tasks() -> str:
         logger.error(f"Error in get_engaged_tasks: {e}")
         return f"Error retrieving projects: {str(e)}"
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_next_tasks() -> str:
     """
     Get all tasks from TickTick that are "Next".
@@ -1347,7 +1352,7 @@ _V2_DISABLED_MSG = (
 )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_completed_tasks(limit: int = 50) -> str:
     """
     Get recently completed tasks across all lists (requires v2 API).
@@ -1371,7 +1376,7 @@ async def get_completed_tasks(limit: int = 50) -> str:
         return f"Error fetching completed tasks: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def list_tags() -> str:
     """List all tags in the account (requires v2 API)."""
     if not ticktick:
@@ -1390,7 +1395,7 @@ async def list_tags() -> str:
         return f"Error fetching tags: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_tasks_by_tag(tag: str) -> str:
     """
     Get open tasks that carry a given tag (requires v2 API).
@@ -1414,7 +1419,7 @@ async def get_tasks_by_tag(tag: str) -> str:
         return f"Error fetching tasks by tag: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_inbox_tasks() -> str:
     """Get open tasks in the Inbox (requires v2 API)."""
     if not ticktick:
@@ -1484,7 +1489,7 @@ def _ensure_ready() -> Optional[str]:
     return None
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_habits() -> str:
     """List all habits with their goal and current streak (requires v2 API)."""
     err = _ensure_ready()
@@ -1535,7 +1540,7 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
         return f"Error checking in habit: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_habit_checkins(habit_name: str, habit_id: str, after_date: str) -> str:
     """
     Get a habit's check-in history (requires v2 API).
@@ -1569,7 +1574,7 @@ async def get_habit_checkins(habit_name: str, habit_id: str, after_date: str) ->
 # Filters / smart lists (v2)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def list_filters() -> str:
     """List saved smart-list filters with their query rules (requires v2 API)."""
     err = _ensure_ready()
@@ -1695,7 +1700,7 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]]) -> str:
 # Builder helpers (no API call — produce strings for create_task/update_task)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def build_recurrence_rule(frequency: str, interval: int = 1,
                                 by_day: List[str] = None, count: int = None,
                                 until: str = None) -> str:
@@ -1722,7 +1727,7 @@ async def build_recurrence_rule(frequency: str, interval: int = 1,
     return "RRULE:" + ";".join(parts)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def build_reminder(minutes_before: int = 0) -> str:
     """
     Build a reminder TRIGGER string to pass in the reminders list of create_task/update_task.
@@ -1743,7 +1748,7 @@ async def build_reminder(minutes_before: int = 0) -> str:
 # Smart-list execution (v2)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def run_filter(filter: str) -> str:
     """
     Run a saved smart-list filter and return the open tasks it matches (requires v2 API).
@@ -1769,7 +1774,7 @@ async def run_filter(filter: str) -> str:
 # Project groups / folders (v2)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def list_project_groups() -> str:
     """List project groups (folders) (requires v2 API)."""
     err = _ensure_ready()
@@ -1847,7 +1852,7 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
 # Task comments (v2)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_task_comments(task_title: str, project_id: str, task_id: str) -> str:
     """
     Get comments on a task (requires v2 API).
@@ -1900,7 +1905,7 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
 # Statistics & trash (v2)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_statistics() -> str:
     """Get productivity statistics: achievement score/level and completion counts (requires v2 API)."""
     err = _ensure_ready()
@@ -1921,7 +1926,7 @@ async def get_statistics() -> str:
         return f"Error fetching statistics: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_trash(limit: int = 50) -> str:
     """
     List recently deleted (trashed) tasks (requires v2 API). Use restore_task
@@ -2219,7 +2224,7 @@ async def archive_project(project_name: str, project_id: str, archived: bool = T
 # Search across open + completed (v2)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def search_all_tasks(query: str, include_completed: bool = True) -> str:
     """
     Search tasks by title/content across open and (optionally) completed tasks (requires v2 API).
@@ -2248,7 +2253,7 @@ async def search_all_tasks(query: str, include_completed: bool = True) -> str:
         return f"Error searching tasks: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_task_info(task_id: str) -> str:
     """
     Detailed view of a task (requires v2 API): all fields, who created it and
@@ -2346,7 +2351,7 @@ async def get_task_info(task_id: str) -> str:
         return f"Error fetching task info: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_task_activity(task_id: str, project_id: str) -> str:
     """
     Get the edit-history / activity log for a task (requires v2 API).
@@ -2412,7 +2417,7 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
         return f"Error fetching task activity: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def get_changes(since: str, until: str = None,
                       project_id: str = None) -> str:
     """
@@ -2500,7 +2505,7 @@ async def get_changes(since: str, until: str = None,
         return f"Error fetching changes: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def list_project_columns(project_id: str) -> str:
     """
     List the kanban columns/sections of a project, with their IDs (uses the
