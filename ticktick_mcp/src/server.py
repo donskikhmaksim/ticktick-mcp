@@ -432,6 +432,11 @@ async def create_tasks(
                     ticktick_v2.set_task_tags(task_id, t["tags"])
                 except Exception as e:
                     logger.warning(f"Created but tagging failed: {e}")
+            if t.get("assignee") is not None and ticktick_v2 and task_id:
+                try:
+                    ticktick_v2.batch_update_tasks([{"taskId": task_id, "assignee": t["assignee"]}])
+                except Exception as e:
+                    logger.warning(f"Created but assignee failed: {e}")
             if t.get("column_id") and ticktick_v2 and task_id:
                 try:
                     ticktick_v2.set_task_column(task_id, t["column_id"])
@@ -490,7 +495,8 @@ async def update_tasks(
       due_date (same rule), priority (0/1/3/5),
       repeat_flag (single task only; use build_recurrence_rule),
       reminders (single task only; use build_reminder),
-      tags (replaces existing), column_id (single task only)
+      tags (replaces existing), column_id (single task only),
+      assignee (user ID to assign; requires shared project and v2 API)
 
     Example (single): [{"title": "Pay rent", "taskId": "abc",
                          "projectId": "xyz", "due_date": "2026-07-01",
@@ -546,6 +552,11 @@ async def update_tasks(
                         ticktick_v2.set_task_column(tid, t["column_id"])
                     except Exception as e:
                         logger.warning(f"Updated but column assignment failed: {e}")
+                if t.get("assignee") is not None and ticktick_v2:
+                    try:
+                        ticktick_v2.batch_update_tasks([{"taskId": tid, "assignee": t["assignee"]}])
+                    except Exception as e:
+                        logger.warning(f"Updated but assignee failed: {e}")
                 results.append(f"✏️ «{shown_title}» обновлено")
             except Exception as e:
                 results.append(f"✗ «{shown_title}»: {e}")
@@ -570,6 +581,8 @@ async def update_tasks(
                 ch["priority"] = t["priority"]
             if t.get("tags") is not None:
                 ch["tags"] = t["tags"]
+            if t.get("assignee") is not None:
+                ch["assignee"] = t["assignee"]
             for src, dst in (("due_date", "dueDate"), ("start_date", "startDate")):
                 if t.get(src):
                     val, all_day = _normalize_date(t[src])
