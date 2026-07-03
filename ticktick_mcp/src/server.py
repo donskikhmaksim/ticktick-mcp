@@ -2506,6 +2506,38 @@ async def get_changes(since: str, until: str = None,
 
 
 @mcp.tool(annotations=READONLY)
+async def get_project_members(project_id: str) -> str:
+    """
+    List the members of a shared project — owner and collaborators — with
+    their user IDs (requires v2 API). Use a member's userId as the assignee
+    field in create_tasks/update_tasks to assign a task to them.
+
+    Args:
+        project_id: ID of the shared project
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        members = ticktick_v2.get_project_members(project_id)
+        if not members:
+            return ("Участники не найдены — проект не расшарен "
+                    "или у API нет доступа к нему.")
+        pname = _v2_project_names().get(project_id, project_id)
+        out = f"Участники проекта «{pname}» ({len(members)}):\n"
+        for m in members:
+            name = m.get("displayName") or m.get("username") or "?"
+            uid = m.get("userId") or m.get("userCode") or "?"
+            role = " (владелец)" if m.get("isOwner") or m.get("owner") else ""
+            status = "" if m.get("accepted", True) else "  [приглашение не принято]"
+            out += f"- {name}{role} — userId: {uid}{status}\n"
+        return out
+    except Exception as e:
+        logger.error(f"Error in get_project_members: {e}")
+        return f"Error fetching project members: {str(e)}"
+
+
+@mcp.tool(annotations=READONLY)
 async def list_project_columns(project_id: str) -> str:
     """
     List the kanban columns/sections of a project, with their IDs (uses the

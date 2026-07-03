@@ -396,6 +396,13 @@ class TickTickV2Client:
         return self._request("POST", f"/project/{project_id}/task/{task_id}/comment",
                              json=body)
 
+    # ---- project members / shares -----------------------------------------
+    def get_project_members(self, project_id: str) -> List[Dict]:
+        """List users a project is shared with (owner + collaborators).
+        Each entry carries userId/username/displayName and acceptance status."""
+        data = self._request("GET", f"/project/{project_id}/shares")
+        return data if isinstance(data, list) else []
+
     # ---- statistics ------------------------------------------------------
     def get_statistics(self) -> Dict:
         data = self._request("GET", "/statistics/general")
