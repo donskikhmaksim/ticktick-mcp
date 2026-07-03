@@ -2295,8 +2295,21 @@ async def get_task_info(task_id: str) -> str:
             for k in kids:
                 km = "x" if k.get("status") in (2, -1) else " "
                 out += f"  [{km}] {k.get('title')}  (id:{k.get('id')})\n"
-        if not items and not kids:
-            out += "\n(no checklist items or subtasks)\n"
+        # Attachments
+        attachments = t.get("attachments") or []
+        if attachments:
+            out += f"\nВложения ({len(attachments)}):\n"
+            for a in attachments:
+                name = a.get("fileName") or a.get("name") or "(без имени)"
+                size = a.get("fileSize")
+                size_str = f"  {size // 1024} KB" if size else ""
+                url = a.get("fileUrl") or a.get("url") or ""
+                out += f"  📎 {name}{size_str}"
+                if url:
+                    out += f"\n     {url}"
+                out += "\n"
+        if not items and not kids and not attachments:
+            out += "\n(нет чеклистов, подзадач и вложений)\n"
         return out
     except Exception as e:
         logger.error(f"Error in get_task_info: {e}")
