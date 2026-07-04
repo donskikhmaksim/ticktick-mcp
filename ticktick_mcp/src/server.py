@@ -982,24 +982,45 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
 
 @mcp.tool(annotations=READONLY)
 async def get_all_tasks() -> str:
-    """Get all tasks from TickTick. Ignores closed projects."""
+    """
+    Get ALL open tasks across every project and the Inbox in one fast call.
+
+    Preferred over get_project_tasks when you need a full picture — this uses
+    the v2 sync state (single request, includes Inbox) when available, falling
+    back to the official API otherwise.
+    """
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
-    
+
     try:
+        if ticktick_v2:
+            tasks = ticktick_v2.get_open_tasks()
+            if not tasks:
+                return "Задач не найдено."
+            names = _v2_project_names()
+            by_project: Dict[str, list] = {}
+            for t in tasks:
+                pid = t.get("projectId", "")
+                by_project.setdefault(pid, []).append(t)
+            out = f"Все открытые задачи ({len(tasks)}):\n\n"
+            for pid, ptasks in by_project.items():
+                pname = names.get(pid, pid or "Inbox")
+                top = [t for t in ptasks if not t.get("parentId")]
+                out += f"── {pname} ({len(top)} задач) ──\n"
+                out += format_task_tree(top, 500)
+                out += "\n"
+            return out
+
+        # Fallback: official API per project
         projects = ticktick.get_projects()
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
-        
-        def all_tasks_filter(task: Dict[str, Any]) -> bool:
-            return True  # Include all tasks
-        
-        return _get_project_tasks_by_filter(projects, all_tasks_filter, "included")
-        
+        return _get_project_tasks_by_filter(projects, lambda t: True, "included")
+
     except Exception as e:
         logger.error(f"Error in get_all_tasks: {e}")
-        return f"Error retrieving projects: {str(e)}"
+        return f"Error retrieving tasks: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def get_tasks_by_priority(priority_id: int) -> str:
