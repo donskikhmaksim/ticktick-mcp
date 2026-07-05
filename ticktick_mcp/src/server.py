@@ -386,21 +386,30 @@ def _build_v2_task_obj(node: Dict, project_id: str, task_id: str,
 
 
 def _flatten_task_tree(node: Dict, project_id: str, parent_id: str = None,
-                       level: int = 0, max_level: int = 3) -> List[Dict]:
-    """Recursively flatten a nested task tree into a flat list of v2 objects.
-    IDs are pre-generated so the entire tree can go in one batch/task call.
+                       level: int = 0, max_level: int = 3):
+    """Recursively flatten a nested task tree.
+    Returns (tasks, relations) where:
+      tasks     — list of v2 task objects WITHOUT parentId (TickTick ignores it in batch/task)
+      relations — list of {"parentId","taskId","projectId"} for batch/taskParent call
+    IDs are pre-generated so both calls can be built before any HTTP request.
     max_level=3 means task + 3 levels of nesting (4 levels total)."""
     import uuid as _uuid
     task_id = _uuid.uuid4().hex[:24]
-    result = [_build_v2_task_obj(node, project_id, task_id, parent_id)]
+    obj = _build_v2_task_obj(node, project_id, task_id, parent_id=None)
+    tasks = [obj]
+    relations = []
+    if parent_id:
+        relations.append({"parentId": parent_id, "taskId": task_id,
+                          "projectId": project_id})
     if level < max_level:
         for child in (node.get("subtasks") or []):
             if isinstance(child, str):
                 child = {"title": child}
-            result.extend(
-                _flatten_task_tree(child, project_id, task_id, level + 1, max_level)
-            )
-    return result
+            child_tasks, child_rels = _flatten_task_tree(
+                child, project_id, task_id, level + 1, max_level)
+            tasks.extend(child_tasks)
+            relations.extend(child_rels)
+    return tasks, relations
 
 
 @mcp.tool()
@@ -491,19 +500,22 @@ async def create_tasks(
         has_advanced = t.get("repeat_flag") or t.get("reminders")
 
         try:
-            # ── PATH A: nested dict subtasks → whole tree via v2 batch ──
+            # ── PATH A: nested dict subtasks → tree via two v2 calls ──
             if ticktick_v2 and has_nested and not has_advanced:
-                tree = _flatten_task_tree(t, project_id,
-                                          parent_id=t.get("parent_id"))
-                ticktick_v2.batch_create_tasks(tree)
+                tasks_flat, relations = _flatten_task_tree(
+                    t, project_id, parent_id=t.get("parent_id"))
+                ticktick_v2.batch_create_tasks(tasks_flat)
+                if relations:
+                    ticktick_v2._request("POST", "/batch/taskParent",
+                                         json=relations)
                 ticktick_v2.invalidate_cache()
-                root_id = tree[0]["id"]
+                root_id = tasks_flat[0]["id"]
                 if t.get("column_id"):
                     try:
                         ticktick_v2.set_task_column(root_id, t["column_id"])
                     except Exception as e:
                         logger.warning(f"Column failed: {e}")
-                total = len(tree)
+                total = len(tasks_flat)
                 line = f"✓ «{title}» + {total - 1} подзадач (дерево, {total} всего)"
                 created.append(line)
                 continue
@@ -553,18 +565,22 @@ async def create_tasks(
             sub_items = t.get("subtasks") or []
             sub_count = 0
             if sub_items and task_id and ticktick_v2:
-                import uuid as _uuid
-                batch = []
+                all_sub_tasks = []
+                all_sub_rels = []
                 for s in sub_items:
                     if isinstance(s, str):
                         s = {"title": s}
-                    sid = _uuid.uuid4().hex[:24]
-                    batch.extend(_flatten_task_tree(s, project_id,
-                                                    parent_id=task_id))
+                    st_tasks, st_rels = _flatten_task_tree(
+                        s, project_id, parent_id=task_id)
+                    all_sub_tasks.extend(st_tasks)
+                    all_sub_rels.extend(st_rels)
                 try:
-                    ticktick_v2.batch_create_tasks(batch)
+                    ticktick_v2.batch_create_tasks(all_sub_tasks)
+                    if all_sub_rels:
+                        ticktick_v2._request("POST", "/batch/taskParent",
+                                             json=all_sub_rels)
                     ticktick_v2.invalidate_cache()
-                    sub_count = len(batch)
+                    sub_count = len(all_sub_tasks)
                 except Exception as e:
                     logger.warning(f"Batch subtasks failed: {e}")
 
