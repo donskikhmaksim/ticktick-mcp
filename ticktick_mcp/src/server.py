@@ -358,13 +358,59 @@ async def get_task(project_id: str, task_id: str) -> str:
         logger.error(f"Error in get_task: {e}")
         return f"Error retrieving task: {str(e)}"
 
+def _build_v2_task_obj(node: Dict, project_id: str, task_id: str,
+                       parent_id: str = None) -> Dict:
+    """Convert a task definition dict into a v2 batch task object."""
+    obj: Dict[str, Any] = {
+        "id": task_id,
+        "title": node.get("title", ""),
+        "projectId": project_id,
+        "status": 0,
+        "priority": node.get("priority", 0),
+    }
+    if parent_id:
+        obj["parentId"] = parent_id
+    for src, dst in (("due_date", "dueDate"), ("start_date", "startDate")):
+        if node.get(src):
+            val, all_day = _normalize_date(node[src])
+            obj[dst] = val
+            if all_day:
+                obj["isAllDay"] = True
+    if node.get("content"):
+        obj["content"] = node["content"]
+    if node.get("tags"):
+        obj["tags"] = node["tags"]
+    if node.get("assignee") is not None:
+        obj["assignee"] = node["assignee"]
+    return obj
+
+
+def _flatten_task_tree(node: Dict, project_id: str, parent_id: str = None,
+                       level: int = 0, max_level: int = 3) -> List[Dict]:
+    """Recursively flatten a nested task tree into a flat list of v2 objects.
+    IDs are pre-generated so the entire tree can go in one batch/task call.
+    max_level=3 means task + 3 levels of nesting (4 levels total)."""
+    import uuid as _uuid
+    task_id = _uuid.uuid4().hex[:24]
+    result = [_build_v2_task_obj(node, project_id, task_id, parent_id)]
+    if level < max_level:
+        for child in (node.get("subtasks") or []):
+            if isinstance(child, str):
+                child = {"title": child}
+            result.extend(
+                _flatten_task_tree(child, project_id, task_id, level + 1, max_level)
+            )
+    return result
+
+
 @mcp.tool()
 async def create_tasks(
     summary: str,
     tasks: List[Dict[str, Any]]
 ) -> str:
     """
-    Create one or more tasks in TickTick, optionally with subtasks.
+    Create one or more tasks in TickTick with full nested subtask support
+    (up to 4 levels: task → subtask → sub-subtask → sub-sub-subtask).
 
     summary (FIRST arg): one-line human sentence IN THE USER'S LANGUAGE shown
     at the TOP of the confirmation dialog, e.g.
@@ -374,28 +420,45 @@ async def create_tasks(
     For a single task, pass a one-element list. For multiple tasks, pass all items
     at once — do NOT call this tool in a loop.
 
-    Supported fields per item:
-      title (required), project_id (required),
+    ── Supported fields per task/subtask object ──
+      title (required at root), project_id (required at root only — inherited by subtasks),
       content, start_date, due_date,
-      priority (0=None/1=Low/3=Medium/5=High, default 0),
-      repeat_flag (RRULE; use build_recurrence_rule),
-      reminders (list of triggers; use build_reminder),
-      is_all_day, tags (list of names; requires v2 API),
-      column_id (kanban section; use list_project_columns; requires v2 API),
-      parent_id (parent task ID — makes this task a subtask; requires v2 API),
-      subtasks (list of subtask titles to batch-create under this task; requires v2 API)
+      priority (0=None / 1=Low / 3=Medium / 5=High, default 0),
+      tags (list of tag names; requires v2),
+      assignee (user ID; requires shared project + v2),
+      column_id (kanban section ID; root task only; use list_project_columns),
+      parent_id (existing task ID to attach root as a subtask; requires v2),
+      repeat_flag (RRULE; root task only via official API; use build_recurrence_rule),
+      reminders (list of triggers; root task only via official API; use build_reminder),
+      subtasks (list of strings OR list of full task objects — recursive, up to 3 levels deep)
 
     Dates: use "YYYY-MM-DD" for all-day; full ISO "YYYY-MM-DDThh:mm:ss+0000"
     only when the user specified an exact time. Do NOT invent a time.
 
-    Example (single): [{"title": "Buy milk", "project_id": "abc",
-                         "due_date": "2026-07-05", "priority": 1}]
-    Example (batch):  [{"title": "A", "project_id": "x"},
-                       {"title": "B", "project_id": "x", "priority": 5}]
-    Example (with subtasks): [{"title": "Epic", "project_id": "x",
-                                "subtasks": ["Step 1", "Step 2", "Step 3"]}]
-    Example (as subtask):    [{"title": "Step 4", "project_id": "x",
-                                "parent_id": "<parent_task_id>"}]
+    ── Examples ──
+
+    Simple batch:
+      [{"title": "A", "project_id": "x"},
+       {"title": "B", "project_id": "x", "priority": 5, "due_date": "2026-07-10"}]
+
+    Nested structure (strings):
+      [{"title": "Epic", "project_id": "x",
+        "subtasks": ["Step 1", "Step 2", "Step 3"]}]
+
+    Nested structure with full params (up to 4 levels):
+      [{"title": "Q3 Launch", "project_id": "x", "priority": 5,
+        "subtasks": [
+          {"title": "Design", "due_date": "2026-07-15", "priority": 3,
+           "subtasks": [
+             {"title": "Mockups", "due_date": "2026-07-10",
+              "subtasks": [{"title": "Mobile screens"}]}
+           ]},
+          {"title": "Dev", "due_date": "2026-07-20",
+           "subtasks": [{"title": "Backend"}, {"title": "Frontend"}]}
+        ]}]
+
+    Attach as subtask of existing task:
+      [{"title": "New step", "project_id": "x", "parent_id": "<existing_task_id>"}]
 
     Args:
         summary: Human-readable confirmation line (see above)
@@ -421,7 +484,31 @@ async def create_tasks(
         if priority not in [0, 1, 3, 5]:
             failed.append(f"#{i+1} «{title}»: неверный приоритет")
             continue
+
+        has_nested = any(
+            isinstance(s, dict) for s in (t.get("subtasks") or [])
+        )
+        has_advanced = t.get("repeat_flag") or t.get("reminders")
+
         try:
+            # ── PATH A: nested dict subtasks → whole tree via v2 batch ──
+            if ticktick_v2 and has_nested and not has_advanced:
+                tree = _flatten_task_tree(t, project_id,
+                                          parent_id=t.get("parent_id"))
+                ticktick_v2.batch_create_tasks(tree)
+                ticktick_v2.invalidate_cache()
+                root_id = tree[0]["id"]
+                if t.get("column_id"):
+                    try:
+                        ticktick_v2.set_task_column(root_id, t["column_id"])
+                    except Exception as e:
+                        logger.warning(f"Column failed: {e}")
+                total = len(tree)
+                line = f"✓ «{title}» + {total - 1} подзадач (дерево, {total} всего)"
+                created.append(line)
+                continue
+
+            # ── PATH B: official API for root + v2 batch for flat subtasks ──
             task = ticktick.create_task(
                 title=title,
                 project_id=project_id,
@@ -437,67 +524,55 @@ async def create_tasks(
                 failed.append(f"#{i+1} «{title}»: {task['error']}")
                 continue
             task_id = task.get("id")
-            if t.get("tags") and ticktick_v2 and task_id:
-                try:
-                    ticktick_v2.set_task_tags(task_id, t["tags"])
-                except Exception as e:
-                    logger.warning(f"Created but tagging failed: {e}")
-            if t.get("assignee") is not None and ticktick_v2 and task_id:
-                try:
-                    ticktick_v2.batch_update_tasks([{"taskId": task_id, "assignee": t["assignee"]}])
-                except Exception as e:
-                    logger.warning(f"Created but assignee failed: {e}")
-            if t.get("column_id") and ticktick_v2 and task_id:
-                try:
-                    ticktick_v2.set_task_column(task_id, t["column_id"])
-                except Exception as e:
-                    logger.warning(f"Created but column failed: {e}")
-            # Attach to parent if parent_id given
-            if t.get("parent_id") and ticktick_v2 and task_id:
-                try:
-                    ticktick_v2.batch_set_task_parent([task_id], t["parent_id"], project_id)
-                except Exception as e:
-                    logger.warning(f"Created but parent link failed: {e}")
 
-            # Batch-create subtasks via v2
-            sub_titles = t.get("subtasks") or []
-            sub_ok = []
-            sub_fail = []
-            if sub_titles and task_id:
-                if ticktick_v2:
-                    import uuid as _uuid
-                    batch = [
-                        {"id": _uuid.uuid4().hex[:24], "title": st,
-                         "projectId": project_id, "parentId": task_id,
-                         "status": 0, "priority": 0}
-                        for st in sub_titles
-                    ]
+            if ticktick_v2 and task_id:
+                if t.get("tags"):
                     try:
-                        ticktick_v2.batch_create_tasks(batch)
-                        ticktick_v2.invalidate_cache()
-                        sub_ok = sub_titles
+                        ticktick_v2.set_task_tags(task_id, t["tags"])
                     except Exception as e:
-                        logger.warning(f"Batch subtask creation failed, retrying one-by-one: {e}")
-                        for st_title in sub_titles:
-                            try:
-                                st = ticktick.create_subtask(st_title, task_id, project_id)
-                                (sub_ok if 'error' not in st else sub_fail).append(st_title)
-                            except Exception:
-                                sub_fail.append(st_title)
-                else:
-                    for st_title in sub_titles:
-                        try:
-                            st = ticktick.create_subtask(st_title, task_id, project_id)
-                            (sub_ok if 'error' not in st else sub_fail).append(st_title)
-                        except Exception:
-                            sub_fail.append(st_title)
+                        logger.warning(f"Tagging failed: {e}")
+                if t.get("assignee") is not None:
+                    try:
+                        ticktick_v2.batch_update_tasks([{"taskId": task_id,
+                                                         "assignee": t["assignee"]}])
+                    except Exception as e:
+                        logger.warning(f"Assignee failed: {e}")
+                if t.get("column_id"):
+                    try:
+                        ticktick_v2.set_task_column(task_id, t["column_id"])
+                    except Exception as e:
+                        logger.warning(f"Column failed: {e}")
+                if t.get("parent_id"):
+                    try:
+                        ticktick_v2.batch_set_task_parent(
+                            [task_id], t["parent_id"], project_id)
+                    except Exception as e:
+                        logger.warning(f"Parent link failed: {e}")
+
+            # Subtasks (flat strings or dicts without deeper nesting)
+            sub_items = t.get("subtasks") or []
+            sub_count = 0
+            if sub_items and task_id and ticktick_v2:
+                import uuid as _uuid
+                batch = []
+                for s in sub_items:
+                    if isinstance(s, str):
+                        s = {"title": s}
+                    sid = _uuid.uuid4().hex[:24]
+                    batch.extend(_flatten_task_tree(s, project_id,
+                                                    parent_id=task_id))
+                try:
+                    ticktick_v2.batch_create_tasks(batch)
+                    ticktick_v2.invalidate_cache()
+                    sub_count = len(batch)
+                except Exception as e:
+                    logger.warning(f"Batch subtasks failed: {e}")
 
             line = f"✓ «{title}»"
-            if sub_ok:
-                line += f" + {len(sub_ok)} подзадач"
-            if sub_fail:
-                line += f" (подзадачи не созданы: {', '.join(sub_fail)})"
+            if sub_count:
+                line += f" + {sub_count} подзадач"
             created.append(line)
+
         except Exception as e:
             failed.append(f"#{i+1} «{title}»: {e}")
 
