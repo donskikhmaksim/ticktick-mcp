@@ -382,7 +382,8 @@ async def create_tasks(
       reminders (list of triggers; use build_reminder),
       is_all_day, tags (list of names; requires v2 API),
       column_id (kanban section; use list_project_columns; requires v2 API),
-      subtasks (list of subtask titles; requires v2 API)
+      parent_id (parent task ID — makes this task a subtask; requires v2 API),
+      subtasks (list of subtask titles to batch-create under this task; requires v2 API)
 
     Dates: use "YYYY-MM-DD" for all-day; full ISO "YYYY-MM-DDThh:mm:ss+0000"
     only when the user specified an exact time. Do NOT invent a time.
@@ -391,6 +392,10 @@ async def create_tasks(
                          "due_date": "2026-07-05", "priority": 1}]
     Example (batch):  [{"title": "A", "project_id": "x"},
                        {"title": "B", "project_id": "x", "priority": 5}]
+    Example (with subtasks): [{"title": "Epic", "project_id": "x",
+                                "subtasks": ["Step 1", "Step 2", "Step 3"]}]
+    Example (as subtask):    [{"title": "Step 4", "project_id": "x",
+                                "parent_id": "<parent_task_id>"}]
 
     Args:
         summary: Human-readable confirmation line (see above)
@@ -447,15 +452,46 @@ async def create_tasks(
                     ticktick_v2.set_task_column(task_id, t["column_id"])
                 except Exception as e:
                     logger.warning(f"Created but column failed: {e}")
+            # Attach to parent if parent_id given
+            if t.get("parent_id") and ticktick_v2 and task_id:
+                try:
+                    ticktick_v2.batch_set_task_parent([task_id], t["parent_id"], project_id)
+                except Exception as e:
+                    logger.warning(f"Created but parent link failed: {e}")
+
+            # Batch-create subtasks via v2
+            sub_titles = t.get("subtasks") or []
             sub_ok = []
             sub_fail = []
-            if t.get("subtasks") and task_id:
-                for st_title in t["subtasks"]:
+            if sub_titles and task_id:
+                if ticktick_v2:
+                    import uuid as _uuid
+                    batch = [
+                        {"id": _uuid.uuid4().hex[:24], "title": st,
+                         "projectId": project_id, "parentId": task_id,
+                         "status": 0, "priority": 0}
+                        for st in sub_titles
+                    ]
                     try:
-                        st = ticktick.create_subtask(st_title, task_id, project_id)
-                        (sub_ok if 'error' not in st else sub_fail).append(st_title)
-                    except Exception:
-                        sub_fail.append(st_title)
+                        ticktick_v2.batch_create_tasks(batch)
+                        ticktick_v2.invalidate_cache()
+                        sub_ok = sub_titles
+                    except Exception as e:
+                        logger.warning(f"Batch subtask creation failed, retrying one-by-one: {e}")
+                        for st_title in sub_titles:
+                            try:
+                                st = ticktick.create_subtask(st_title, task_id, project_id)
+                                (sub_ok if 'error' not in st else sub_fail).append(st_title)
+                            except Exception:
+                                sub_fail.append(st_title)
+                else:
+                    for st_title in sub_titles:
+                        try:
+                            st = ticktick.create_subtask(st_title, task_id, project_id)
+                            (sub_ok if 'error' not in st else sub_fail).append(st_title)
+                        except Exception:
+                            sub_fail.append(st_title)
+
             line = f"✓ «{title}»"
             if sub_ok:
                 line += f" + {len(sub_ok)} подзадач"
