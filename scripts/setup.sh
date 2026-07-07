@@ -84,6 +84,12 @@ MCP_SECRET=$(LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 32)
 echo "Создаю проект..."
 railway init --name "ticktick-mcp" 2>&1 | tail -1
 
+# Сервис на Railway появляется только после первого деплоя — переменные
+# можно задавать только когда он уже существует, поэтому сначала up,
+# потом variables (это вызовет автоматический рестарт с новыми значениями).
+echo "Загружаю и собираю (займёт 1–2 минуты)..."
+railway up --detach --quiet 2>&1 | tail -2
+
 echo "Задаю переменные окружения..."
 railway variables set \
   MCP_TRANSPORT=streamable-http \
@@ -92,14 +98,11 @@ railway variables set \
   TICKTICK_CLIENT_SECRET="$CLIENT_SECRET" \
   USER_TIMEZONE="$TIMEZONE"
 
-echo "Загружаю и собираю (займёт 1–2 минуты)..."
-railway up --detach --quiet 2>&1 | tail -2
-
 echo "Генерирую домен..."
 DOMAIN_OUTPUT=$(railway domain 2>&1)
 DOMAIN=$(echo "$DOMAIN_OUTPUT" | grep -oE '[a-z0-9-]+\.up\.railway\.app' | head -1)
 
-echo "Жду запуска сервиса..."
+echo "Жду запуска сервиса (после применения переменных)..."
 until curl -sf "https://$DOMAIN/health" &>/dev/null; do
   sleep 5
 done
