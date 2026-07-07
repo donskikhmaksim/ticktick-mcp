@@ -35,6 +35,24 @@ step() { echo -e "\n${BOLD}${CYAN}▶ $1${RESET}"; }
 ok()   { echo -e "${GREEN}✓ $1${RESET}"; }
 ask()  { echo -e "${YELLOW}➜ $1${RESET}"; }
 
+# Runs a command, shows only its last line on success but the FULL output on
+# failure — so real errors (e.g. Railway account/resource limits) are never
+# silently swallowed by a trailing `tail -1`.
+run_step() {
+  local out
+  if out=$("$@" 2>&1); then
+    echo "$out" | tail -1
+  else
+    local code=$?
+    echo ""
+    echo "❌ Команда упала: $*"
+    echo "── полный вывод ──────────────────────────"
+    echo "$out"
+    echo "───────────────────────────────────────────"
+    return $code
+  fi
+}
+
 clear
 echo -e "${BOLD}╔══════════════════════════════════════════╗"
 echo -e "║   TickTick MCP — установка               ║"
@@ -55,7 +73,7 @@ if ! command -v railway &>/dev/null; then
     export PATH="$HOME/.railway/bin:$PATH"
   fi
 fi
-ok "Railway CLI $(railway --version 2>&1 | head -1)"
+ok "Railway CLI $(set +o pipefail; railway --version 2>&1 | head -1)"
 
 # ── Шаг 2: Логин в Railway ─────────────────────────────────────────────────
 step "2/4  Войди в Railway"
@@ -79,19 +97,60 @@ cd "$WORK_DIR"
 echo "Скачиваю репозиторий..."
 git clone --depth 1 https://github.com/donskikhmaksim/ticktick-mcp . --quiet
 
-MCP_SECRET=$(LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 32)
+# `head -c` closes the pipe as soon as it has enough bytes, so `tr` gets
+# SIGPIPE (exit 141) even though it worked correctly — under `pipefail` that
+# makes the whole line "fail" and silently kills the script right here.
+# Disable pipefail just for this one pipeline.
+MCP_SECRET=$(set +o pipefail; LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 32)
 
-echo "Создаю проект..."
-railway init --name "ticktick-mcp" 2>&1 | tail -1
+# Если скрипт уже запускался раньше и создал проект "ticktick-mcp" — переиспользуем
+# его вместо создания нового. Иначе каждый повторный запуск плодит пустые проекты,
+# которые впустую жгут лимиты аккаунта Railway (особенно на бесплатном плане).
+EXISTING_PROJECT_ID=$(railway list --json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    projects = json.load(sys.stdin)
+    for p in projects:
+        if p.get('name') == 'ticktick-mcp' and not p.get('deletedAt'):
+            print(p['id'])
+            break
+except Exception:
+    pass
+" 2>/dev/null || true)
+
+if [[ -n "$EXISTING_PROJECT_ID" ]]; then
+  echo "Нашёл существующий проект ticktick-mcp — переиспользую его..."
+  if ! run_step railway link -p "$EXISTING_PROJECT_ID"; then
+    echo "Не смог переиспользовать — создаю новый проект..."
+    EXISTING_PROJECT_ID=""
+  fi
+fi
+
+if [[ -z "$EXISTING_PROJECT_ID" ]]; then
+  echo "Создаю проект..."
+  if ! run_step railway init --name "ticktick-mcp"; then
+    echo ""
+    echo "Не получилось создать проект на Railway. Частая причина — исчерпан"
+    echo "лимит бесплатного плана (Railway trial) или не привязана карта."
+    echo "Зайди на railway.app → Account Settings → Billing и проверь план,"
+    echo "затем запусти команду ещё раз."
+    exit 1
+  fi
+fi
 
 # Сервис на Railway появляется только после первого деплоя — переменные
 # можно задавать только когда он уже существует, поэтому сначала up,
 # потом variables (это вызовет автоматический рестарт с новыми значениями).
 echo "Загружаю и собираю (займёт 1–2 минуты)..."
-railway up --detach --quiet 2>&1 | tail -2
+if ! run_step railway up --detach; then
+  echo ""
+  echo "Деплой не прошёл. Частая причина — лимит ресурсов на бесплатном"
+  echo "плане Railway. Проверь: railway.app → Account Settings → Billing."
+  exit 1
+fi
 
 echo "Задаю переменные окружения..."
-railway variables set \
+run_step railway variables set \
   MCP_TRANSPORT=streamable-http \
   MCP_SECRET="$MCP_SECRET" \
   TICKTICK_CLIENT_ID="$CLIENT_ID" \
