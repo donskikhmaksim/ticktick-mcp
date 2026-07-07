@@ -158,7 +158,8 @@ run_step railway variables set \
   USER_TIMEZONE="$TIMEZONE"
 
 echo "Генерирую домен..."
-DOMAIN=$(railway domain --json 2>/dev/null | python3 -c "
+DOMAIN_RAW=$(set +o pipefail; railway domain --json 2>&1)
+DOMAIN=$(echo "$DOMAIN_RAW" | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -169,7 +170,11 @@ except Exception:
 " 2>/dev/null || true)
 
 if [[ -z "$DOMAIN" ]]; then
-  echo "❌ Не удалось получить домен. Проверь вручную: railway domain --json"
+  echo "❌ Не удалось получить домен. Вот что ответил Railway:"
+  echo "── полный вывод ──────────────────────────"
+  echo "$DOMAIN_RAW"
+  echo "───────────────────────────────────────────"
+  echo "Попробуй вручную: railway domain --json --service ticktick-mcp"
   exit 1
 fi
 
