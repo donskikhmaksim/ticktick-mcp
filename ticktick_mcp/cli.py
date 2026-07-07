@@ -49,14 +49,26 @@ def main():
         args.command = "run"
     
     # For the run command, check if auth is set up
+    transport = args.transport if getattr(args, "transport", None) else os.getenv("MCP_TRANSPORT", "stdio")
+    skip_interactive_auth_prompt = False
     if args.command == "run" and not check_auth_setup():
-        # In a non-interactive environment (e.g. Railway container) there is
+        # streamable-http (Railway): keep the server up without a token so
+        # the built-in /setup/<MCP_SECRET> OAuth flow is reachable — a person
+        # authorizes their own TickTick account in the browser and the token
+        # gets picked up without ever touching this machine's env/TTY.
+        if transport == "streamable-http":
+            print("No TICKTICK_ACCESS_TOKEN yet — starting anyway. "
+                  "Visit https://<your-domain>/setup/<MCP_SECRET> to authorize.",
+                  file=sys.stderr)
+            skip_interactive_auth_prompt = True
+        # stdio in a non-interactive environment (e.g. a script piping in):
         # no TTY to run the browser OAuth flow — fail fast with guidance.
-        if not sys.stdin.isatty():
+        elif not sys.stdin.isatty():
             print("No TICKTICK_ACCESS_TOKEN configured. Set it (and optional "
                   "TICKTICK_USERNAME/TICKTICK_PASSWORD) in the environment.",
                   file=sys.stderr)
             sys.exit(1)
+    if args.command == "run" and not check_auth_setup() and not skip_interactive_auth_prompt:
         print("""
 ╔════════════════════════════════════════════════╗
 ║      TickTick MCP Server - Authentication      ║

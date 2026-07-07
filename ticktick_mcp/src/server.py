@@ -1,13 +1,17 @@
 import asyncio
+import hmac
 import json
 import os
 import logging
+import urllib.parse
 from datetime import datetime, timezone, date, timedelta
 from typing import Dict, List, Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from dotenv import load_dotenv
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from .ticktick_client import TickTickClient, _normalize_date
 from .ticktick_v2_client import TickTickV2Client
@@ -88,6 +92,165 @@ def initialize_client():
     except Exception as e:
         logger.error(f"Failed to initialize TickTick client: {e}")
         return False
+
+
+# --- Self-service OAuth setup (interim flow) --------------------------------
+# Lets a person authorize their own TickTick account straight from the
+# deployed instance, without cloning the repo or running anything locally.
+#
+# TickTick only accepts a redirect_uri that is pre-registered for the OAuth
+# app, and every instance gets a random Railway domain — so this instance
+# cannot be the OAuth redirect target itself. Instead:
+#   open /setup/<MCP_SECRET>
+#     -> redirect to the shared oauth-proxy's /start (its redirect_uri IS
+#        pre-registered), carrying this instance's own URL + secret in `state`
+#     -> person logs into TickTick there
+#     -> oauth-proxy exchanges the code for tokens (holds the client_secret,
+#        which never touches this instance during setup) and redirects the
+#        browser back to THIS instance's /auth/accept with the tokens
+#     -> /auth/accept hot-swaps the in-memory client so the server works
+#        immediately, and shows the tokens so the person can paste them into
+#        Railway Variables (durability across restarts — the filesystem here
+#        is ephemeral).
+OAUTH_PROXY_URL = os.getenv(
+    "TICKTICK_OAUTH_PROXY_URL", "https://ticktick-oauth-proxy-production.up.railway.app"
+).rstrip("/")
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request: Request) -> Response:
+    return JSONResponse({"status": "ok", "ticktick_connected": ticktick is not None})
+
+
+@mcp.custom_route("/setup/{secret}", methods=["GET"])
+async def setup_start(request: Request) -> Response:
+    secret = request.path_params.get("secret", "")
+    if not SECRET or not hmac.compare_digest(secret, SECRET):
+        return HTMLResponse(_setup_error_page("Неверная ссылка. Проверь MCP_SECRET."), status_code=403)
+
+    return_to = f"https://{request.url.netloc}"
+    params = {"return_to": return_to, "secret": secret}
+    return RedirectResponse(f"{OAUTH_PROXY_URL}/start?" + urllib.parse.urlencode(params))
+
+
+@mcp.custom_route("/auth/accept", methods=["POST"])
+async def setup_accept(request: Request) -> Response:
+    # Tokens arrive as a POST body (auto-submitted form from oauth-proxy),
+    # not query params — query strings end up in access logs and history.
+    form = await request.form()
+    secret = form.get("secret", "")
+    access_token = form.get("access_token", "")
+    refresh_token = form.get("refresh_token", "")
+
+    if not SECRET or not hmac.compare_digest(secret, SECRET):
+        return HTMLResponse(_setup_error_page("Неверная ссылка — запусти /setup заново."), status_code=403)
+    if not access_token:
+        return HTMLResponse(_setup_error_page("Не пришёл токен от прокси."), status_code=400)
+
+    # Hot-swap: make the server usable immediately, no redeploy required.
+    os.environ["TICKTICK_ACCESS_TOKEN"] = access_token
+    if refresh_token:
+        os.environ["TICKTICK_REFRESH_TOKEN"] = refresh_token
+    initialize_client()
+
+    return HTMLResponse(_setup_success_page(access_token, refresh_token))
+
+
+def _setup_success_page(access_token: str, refresh_token: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TickTick подключён</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #f5f5f5; min-height: 100vh; padding: 40px 16px; }}
+  .card {{ background: white; border-radius: 12px; max-width: 640px;
+           margin: 0 auto; padding: 40px; box-shadow: 0 2px 16px rgba(0,0,0,.08); }}
+  h1 {{ font-size: 22px; color: #1a1a1a; margin-bottom: 8px; }}
+  .subtitle {{ color: #666; font-size: 15px; margin-bottom: 32px; line-height: 1.5; }}
+  .token-block {{ margin-bottom: 24px; }}
+  label {{ display: block; font-size: 13px; font-weight: 600; color: #444;
+           margin-bottom: 6px; }}
+  .token-row {{ display: flex; gap: 8px; }}
+  .token-value {{ flex: 1; font-family: monospace; font-size: 12px;
+                  background: #f8f8f8; border: 1px solid #e0e0e0;
+                  border-radius: 8px; padding: 10px 12px; word-break: break-all;
+                  color: #333; max-height: 80px; overflow-y: auto; }}
+  button {{ flex-shrink: 0; background: #0066ff; color: white; border: none;
+            border-radius: 8px; padding: 0 16px; font-size: 14px; cursor: pointer;
+            height: 40px; align-self: flex-start; }}
+  button.copied {{ background: #22a55a; }}
+  .step {{ background: #f0f7ff; border-radius: 8px; padding: 16px 20px;
+           margin-top: 28px; font-size: 14px; color: #1a4a8a; line-height: 1.6; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>✅ TickTick подключён</h1>
+  <p class="subtitle">Сервер уже работает — можно проверять в Claude прямо сейчас.
+  Но на всякий случай сохрани токены в Railway Variables, чтобы они пережили перезапуск.</p>
+
+  <div class="token-block">
+    <label>TICKTICK_ACCESS_TOKEN</label>
+    <div class="token-row">
+      <div class="token-value" id="at">{access_token}</div>
+      <button onclick="copy('at', this)">Копировать</button>
+    </div>
+  </div>
+
+  <div class="token-block">
+    <label>TICKTICK_REFRESH_TOKEN</label>
+    <div class="token-row">
+      <div class="token-value" id="rt">{refresh_token}</div>
+      <button onclick="copy('rt', this)">Копировать</button>
+    </div>
+  </div>
+
+  <div class="step">
+    <strong>Дальше:</strong> Railway → твой сервис → Variables → вставь оба значения
+    в TICKTICK_ACCESS_TOKEN и TICKTICK_REFRESH_TOKEN (если их там ещё нет).
+    Потом — токен v2 (кука из Chrome), если нужны расширенные функции.
+  </div>
+</div>
+<script>
+function copy(id, btn) {{
+  navigator.clipboard.writeText(document.getElementById(id).textContent.trim());
+  const orig = btn.textContent;
+  btn.textContent = "Скопировано ✓";
+  btn.classList.add("copied");
+  setTimeout(() => {{ btn.textContent = orig; btn.classList.remove("copied"); }}, 2000);
+}}
+</script>
+</body>
+</html>"""
+
+
+def _setup_error_page(detail: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Ошибка авторизации</title>
+<style>
+  body {{ font-family: -apple-system, sans-serif; background: #f5f5f5;
+         min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }}
+  .card {{ background: white; border-radius: 12px; max-width: 520px; width: 100%;
+           padding: 40px; box-shadow: 0 2px 16px rgba(0,0,0,.08); text-align: center; }}
+  h1 {{ color: #c0392b; margin-bottom: 12px; }}
+  p {{ color: #555; font-size: 14px; margin-bottom: 8px; }}
+  code {{ background: #f0f0f0; padding: 2px 6px; border-radius: 4px; font-size: 12px; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Что-то пошло не так</h1>
+  <p>Детали: <code>{detail}</code></p>
+</div>
+</body>
+</html>"""
 
 # Format a task object from TickTick for better display
 def format_task(task: Dict) -> str:
@@ -2716,8 +2879,13 @@ async def list_project_columns(project_id: str) -> str:
 def main():
     """Main entry point for the MCP server."""
     if not initialize_client():
-        logger.error("Failed to initialize TickTick client. Please check your API credentials.")
-        return
+        # Don't stop the server: on streamable-http this leaves /setup and
+        # /health reachable so a person can authorize via the browser and
+        # the client hot-swaps in without a redeploy. Tools that need
+        # `ticktick` already lazily retry initialize_client() on first call.
+        logger.warning("TickTick client not initialized yet. "
+                        "Visit /setup/<MCP_SECRET> in a browser to authorize, "
+                        "or set TICKTICK_ACCESS_TOKEN and restart.")
 
     if TRANSPORT == "streamable-http":
         logger.info(f"Starting TickTick MCP server (streamable-http) on "
