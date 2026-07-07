@@ -6,7 +6,6 @@ set -e
 
 NAME="${1:-Друг}"
 TIMEZONE="${2:-Europe/Moscow}"
-OAUTH_URL="https://ticktick-oauth-proxy-production.up.railway.app/start"
 
 # Читаем ключи из Railway
 VARS=$(cd "$(dirname "$0")/.." && railway variables --service ticktick-mcp --json -- 2>/dev/null)
@@ -23,8 +22,7 @@ cat <<EOF
 bash <(curl -fsSL ${REPO}/raw/main/scripts/setup.sh) \\
   --client-id "${CLIENT_ID}" \\
   --client-secret "${CLIENT_SECRET}" \\
-  --timezone "${TIMEZONE}" \\
-  --oauth-url "${OAUTH_URL}"
+  --timezone "${TIMEZONE}"
 ────────────────────────────────────────────────────────
 
 Он запускает в терминале — и скрипт сделает всё сам.
