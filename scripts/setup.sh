@@ -2,7 +2,7 @@
 # TickTick MCP — автоматическая установка
 # Этот скрипт запускается один раз и настраивает всё за тебя
 
-set -e
+set -eo pipefail
 
 # ── Парсинг аргументов ─────────────────────────────────────────────────────
 CLIENT_ID=""
@@ -99,16 +99,34 @@ railway variables set \
   USER_TIMEZONE="$TIMEZONE"
 
 echo "Генерирую домен..."
-DOMAIN_OUTPUT=$(railway domain 2>&1)
-DOMAIN=$(echo "$DOMAIN_OUTPUT" | grep -oE '[a-z0-9-]+\.up\.railway\.app' | head -1)
+DOMAIN=$(railway domain --json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    url = data['domains'][0]
+    print(url.replace('https://', '').replace('http://', '').rstrip('/'))
+except Exception:
+    pass
+" 2>/dev/null || true)
 
-echo "Жду запуска сервиса (после применения переменных)..."
+if [[ -z "$DOMAIN" ]]; then
+  echo "❌ Не удалось получить домен. Проверь вручную: railway domain --json"
+  exit 1
+fi
+
+echo "Жду запуска сервиса (после применения переменных, обычно 30–90 сек)..."
+ATTEMPTS=0
 until curl -sf "https://$DOMAIN/health" &>/dev/null; do
+  ATTEMPTS=$((ATTEMPTS + 1))
+  if [[ $ATTEMPTS -gt 40 ]]; then
+    echo ""
+    echo "❌ Сервис не отвечает больше 3 минут. Возможно, сборка упала."
+    echo "   Проверь логи командой: railway logs"
+    echo "   Или напиши тому, кто прислал тебе эту команду, и пришли вывод railway logs."
+    exit 1
+  fi
   sleep 5
 done
-
-cd /
-rm -rf "$WORK_DIR"
 
 ok "Сервер живёт на https://$DOMAIN"
 
@@ -161,11 +179,19 @@ if [[ "$ENABLE_V2" == "y" || "$ENABLE_V2" == "Y" ]]; then
   echo ""
 
   if [[ -n "$V2_TOKEN" ]]; then
-    cd "$WORK_DIR" 2>/dev/null || cd /tmp
-    railway variables set TICKTICK_V2_TOKEN="$V2_TOKEN" --service ticktick-mcp 2>&1 | tail -1
-    ok "Расширенные функции включены"
+    cd "$WORK_DIR"
+    if railway variables set TICKTICK_V2_TOKEN="$V2_TOKEN" 2>&1 | tail -1; then
+      ok "Расширенные функции включены"
+    else
+      echo "⚠️  Не получилось сохранить куку автоматически. Не страшно — добавь её"
+      echo "   вручную в Railway → твой сервис → Variables → TICKTICK_V2_TOKEN, или"
+      echo "   попроси того, кто дал тебе инструкцию, помочь."
+    fi
   fi
 fi
+
+cd /
+rm -rf "$WORK_DIR"
 
 # ── Готово ──────────────────────────────────────────────────────────────────
 CONNECTOR_URL="https://$DOMAIN/mcp/$MCP_SECRET"
