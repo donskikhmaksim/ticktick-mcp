@@ -49,7 +49,9 @@ Fills the gaps the official API lacks:
 | `TICKTICK_CLIENT_ID` / `TICKTICK_CLIENT_SECRET` | for auth flow | TickTick developer app creds |
 | `TICKTICK_V2_TOKEN` | optional | the `t` cookie — enables the v2 API |
 | `MCP_TRANSPORT` | for remote | `streamable-http` (default `stdio`) |
-| `MCP_SECRET` | strongly recommended | secret appended to URL path: `/mcp/<secret>` |
+| `MCP_SECRET` | strongly recommended | secret appended to URL path: `/mcp/<secret>`; also gates the self-service `/setup/<secret>` route |
+| `TICKTICK_OAUTH_PROXY_URL` | optional | URL of the shared OAuth proxy for the `/setup` flow (defaults to the hosted proxy) |
+| `USER_TIMEZONE` | optional | IANA timezone for due-date handling (e.g. `Europe/Moscow`); defaults to UTC |
 | `MCP_HOST` / `PORT` | auto on Railway | bind address / port |
 
 ## Local setup
@@ -88,6 +90,24 @@ MCP_TRANSPORT=streamable-http MCP_SECRET=dev123 MCP_PORT=8000 \
    - `PORT` is injected by Railway — do not set it.
 4. Generate a public domain (Railway → Settings → Networking → Generate Domain).
 5. Your MCP URL is: `https://<your-app>.up.railway.app/mcp/<MCP_SECRET>`
+
+Railway health-checks `/health` (configured in `railway.toml`).
+
+## Self-service OAuth (`/setup` + the oauth-proxy)
+
+Instead of running the local `auth` flow, an instance can obtain its own
+TickTick tokens through the browser with no CLI:
+
+1. `scripts/setup.sh` provisions the instance and hands the owner a
+   `https://<your-app>.up.railway.app/setup/<MCP_SECRET>` link.
+2. `/setup/<MCP_SECRET>` redirects to the shared **oauth-proxy** (see
+   [`oauth-proxy/README.md`](oauth-proxy/README.md)), which owns the single
+   TickTick-registered `redirect_uri`.
+3. After TickTick consent, the proxy relays the tokens back (signed `state`,
+   POST body) to this instance's `/auth/accept`, which hot-swaps the in-memory
+   client — no redeploy.
+
+Set `TICKTICK_OAUTH_PROXY_URL` if you host your own proxy.
 
 ## Connect from your phone
 

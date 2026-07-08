@@ -1,11 +1,11 @@
 import asyncio
 import hmac
-import json
 import os
 import logging
 import urllib.parse
-from datetime import datetime, timezone, date, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional
+from zoneinfo import ZoneInfo
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -55,12 +55,15 @@ def initialize_client():
                          "locally, or set it in the Railway environment.")
             return False
 
-        # Initialize the official Open API client
-        ticktick = TickTickClient()
+        # Initialize the official Open API client into a LOCAL first. Only
+        # commit it to the module global after validation succeeds — otherwise a
+        # failed init leaves `ticktick` truthy and the lazy-retry guard
+        # `if not ticktick` never retries.
+        local_ticktick = TickTickClient()
         logger.info("TickTick Open API client initialized")
 
         # Test API connectivity
-        projects = ticktick.get_projects()
+        projects = local_ticktick.get_projects()
         if 'error' in projects:
             logger.error(f"Failed to access TickTick API: {projects['error']}")
             logger.error("Your access token may have expired. Re-run 'uv run -m ticktick_mcp.cli auth'.")
@@ -71,17 +74,22 @@ def initialize_client():
         # inbox, move). Preferred auth is the browser `t` cookie via
         # TICKTICK_V2_TOKEN; username/password is a deprecated fallback.
         # Failure here is non-fatal — the Open API still works.
+        local_v2 = None
         candidate = TickTickV2Client()
         if candidate.enabled:
             try:
                 candidate.authenticate()
-                ticktick_v2 = candidate
+                local_v2 = candidate
                 logger.info("TickTick v2 API enabled (tags/completed/inbox/move)")
             except Exception as e:
-                ticktick_v2 = None
+                local_v2 = None
                 logger.warning(f"v2 API unavailable, continuing with Open API only: {e}")
         else:
             logger.info("v2 API disabled (set TICKTICK_V2_TOKEN to enable)")
+
+        # Commit the validated clients to the module globals only now.
+        ticktick = local_ticktick
+        ticktick_v2 = local_v2
 
         # Official-API writes must drop the v2 sync cache so v2 reads stay
         # consistent (e.g. create a task via the official API, then move it).
@@ -128,7 +136,12 @@ async def setup_start(request: Request) -> Response:
     if not SECRET or not hmac.compare_digest(secret, SECRET):
         return HTMLResponse(_setup_error_page("Неверная ссылка. Проверь MCP_SECRET."), status_code=403)
 
-    return_to = f"https://{request.url.netloc}"
+    # Prefer Railway's injected public domain over the client-supplied Host
+    # header — otherwise a spoofed Host could make the proxy relay tokens to an
+    # attacker's return_to. Fall back to the request host only for local dev.
+    public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    netloc = public_domain or request.url.netloc
+    return_to = f"https://{netloc}"
     params = {"return_to": return_to, "secret": secret}
     return RedirectResponse(f"{OAUTH_PROXY_URL}/start?" + urllib.parse.urlencode(params))
 
@@ -252,6 +265,10 @@ def _setup_error_page(detail: str) -> str:
 </body>
 </html>"""
 
+# Single source of truth for TickTick's priority levels (0/1/3/5).
+PRIORITY_MAP = {0: "None", 1: "Low", 3: "Medium", 5: "High"}
+
+
 # Format a task object from TickTick for better display
 def format_task(task: Dict) -> str:
     """Format a task into a human-readable string."""
@@ -268,9 +285,8 @@ def format_task(task: Dict) -> str:
         formatted += f"Due Date: {task.get('dueDate')}\n"
     
     # Add priority if available
-    priority_map = {0: "None", 1: "Low", 3: "Medium", 5: "High"}
     priority = task.get('priority', 0)
-    formatted += f"Priority: {priority_map.get(priority, str(priority))}\n"
+    formatted += f"Priority: {PRIORITY_MAP.get(priority, str(priority))}\n"
     
     # Add status if available
     status = "Completed" if task.get('status') == 2 else "Active"
@@ -392,7 +408,8 @@ def format_task_list(tasks: List[Dict], limit: int = 100) -> str:
 
 
 def format_task_tree(tasks: List[Dict], limit: int = 200) -> str:
-    """Render tasks as a hierarchy: subtasks indented under their parent.
+    """Render tasks as a hierarchy: subtasks indented under their parent,
+    recursing to ARBITRARY depth (grandchildren, great-grandchildren, …).
     If a subtask's parent is not in this list, it appears at the top level."""
     names = _v2_project_names()
     task_ids = {t.get("id") for t in tasks if t.get("id")}
@@ -402,22 +419,56 @@ def format_task_tree(tasks: List[Dict], limit: int = 200) -> str:
         pid = t.get("parentId")
         if pid and pid in task_ids:
             children.setdefault(pid, []).append(t)
-    lines = []
-    count = 0
+
+    lines: List[str] = []
+    seen = set()  # guard against cyclic parentId references
+
+    def walk(task: Dict, depth: int) -> None:
+        if len(lines) >= limit:
+            return
+        tid = task.get("id")
+        if tid in seen:
+            return
+        seen.add(tid)
+        if depth == 0:
+            lines.append(format_task_line(task, names.get(task.get("projectId"))))
+        else:
+            lines.append("  " * depth + "↳ " + format_task_line(task))
+        for kid in children.get(tid or "", []):
+            if len(lines) >= limit:
+                return
+            walk(kid, depth + 1)
+
     for t in top:
-        if count >= limit:
+        if len(lines) >= limit:
             break
-        lines.append(format_task_line(t, names.get(t.get("projectId"))))
-        count += 1
-        for kid in children.get(t.get("id") or "", []):
-            if count >= limit:
-                break
-            lines.append("  ↳ " + format_task_line(kid))
-            count += 1
+        walk(t, 0)
+
     out = "\n".join(lines)
     if len(tasks) > limit:
         out += f"\n... and {len(tasks) - limit} more."
     return out
+
+
+# --- Readiness helpers ------------------------------------------------------
+
+_INIT_FAIL_MSG = "Failed to initialize TickTick client. Please check your API credentials."
+
+
+def _ensure_official() -> Optional[str]:
+    """Return an error string if the official-API client isn't ready, else None.
+    Lazily (re-)initializes it on first use. Analogous to _ensure_ready (v2)."""
+    if not ticktick:
+        if not initialize_client():
+            return _INIT_FAIL_MSG
+    return None
+
+
+async def _run_blocking(func, *args, **kwargs):
+    """Run a synchronous (requests-based) client call off the event loop so it
+    doesn't block /health and other streamable-http sessions. Uniform wrapper
+    used by tools that touch the blocking clients."""
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 
 # MCP Tools
@@ -425,12 +476,12 @@ def format_task_tree(tasks: List[Dict], limit: int = 200) -> str:
 @mcp.tool(annotations=READONLY)
 async def get_projects() -> str:
     """Get all projects from TickTick."""
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
-    
+    err = _ensure_official()
+    if err:
+        return err
+
     try:
-        projects = ticktick.get_projects()
+        projects = await _run_blocking(lambda: ticktick.get_projects())
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
         
@@ -454,12 +505,12 @@ async def get_project(project_id: str) -> str:
     Args:
         project_id: ID of the project
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
     
     try:
-        project = ticktick.get_project(project_id)
+        project = await _run_blocking(lambda: ticktick.get_project(project_id))
         if 'error' in project:
             return f"Error fetching project: {project['error']}"
         
@@ -476,12 +527,12 @@ async def get_project_tasks(project_id: str) -> str:
     Args:
         project_id: ID of the project
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
     
     try:
-        project_data = ticktick.get_project_with_data(project_id)
+        project_data = await _run_blocking(lambda: ticktick.get_project_with_data(project_id))
         if 'error' in project_data:
             return f"Error fetching project data: {project_data['error']}"
         
@@ -507,12 +558,12 @@ async def get_task(project_id: str, task_id: str) -> str:
         project_id: ID of the project
         task_id: ID of the task
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
     
     try:
-        task = ticktick.get_task(project_id, task_id)
+        task = await _run_blocking(lambda: ticktick.get_task(project_id, task_id))
         if 'error' in task:
             return f"Error fetching task: {task['error']}"
         
@@ -636,9 +687,9 @@ async def create_tasks(
         summary: Human-readable confirmation line (see above)
         tasks: List of task definition objects — one item for a single task
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
 
     if not tasks:
         return "No tasks provided."
@@ -667,15 +718,15 @@ async def create_tasks(
             if ticktick_v2 and has_nested and not has_advanced:
                 tasks_flat, relations = _flatten_task_tree(
                     t, project_id, parent_id=t.get("parent_id"))
-                ticktick_v2.batch_create_tasks(tasks_flat)
+                await _run_blocking(lambda: ticktick_v2.batch_create_tasks(tasks_flat))
                 if relations:
-                    ticktick_v2._request("POST", "/batch/taskParent",
-                                         json=relations)
-                ticktick_v2.invalidate_cache()
+                    await _run_blocking(lambda: ticktick_v2._request(
+                        "POST", "/batch/taskParent", json=relations))
+                await _run_blocking(lambda: ticktick_v2.invalidate_cache())
                 root_id = tasks_flat[0]["id"]
                 if t.get("column_id"):
                     try:
-                        ticktick_v2.set_task_column(root_id, t["column_id"])
+                        await _run_blocking(lambda: ticktick_v2.set_task_column(root_id, t["column_id"]))
                     except Exception as e:
                         logger.warning(f"Column failed: {e}")
                 total = len(tasks_flat)
@@ -684,7 +735,8 @@ async def create_tasks(
                 continue
 
             # ── PATH B: official API for root + v2 batch for flat subtasks ──
-            task = ticktick.create_task(
+            task = await _run_blocking(
+                ticktick.create_task,
                 title=title,
                 project_id=project_id,
                 content=t.get("content"),
@@ -703,24 +755,24 @@ async def create_tasks(
             if ticktick_v2 and task_id:
                 if t.get("tags"):
                     try:
-                        ticktick_v2.set_task_tags(task_id, t["tags"])
+                        await _run_blocking(lambda: ticktick_v2.set_task_tags(task_id, t["tags"]))
                     except Exception as e:
                         logger.warning(f"Tagging failed: {e}")
                 if t.get("assignee") is not None:
                     try:
-                        ticktick_v2.batch_update_tasks([{"taskId": task_id,
-                                                         "assignee": t["assignee"]}])
+                        await _run_blocking(lambda: ticktick_v2.batch_update_tasks(
+                            [{"taskId": task_id, "assignee": t["assignee"]}]))
                     except Exception as e:
                         logger.warning(f"Assignee failed: {e}")
                 if t.get("column_id"):
                     try:
-                        ticktick_v2.set_task_column(task_id, t["column_id"])
+                        await _run_blocking(lambda: ticktick_v2.set_task_column(task_id, t["column_id"]))
                     except Exception as e:
                         logger.warning(f"Column failed: {e}")
                 if t.get("parent_id"):
                     try:
-                        ticktick_v2.batch_set_task_parent(
-                            [task_id], t["parent_id"], project_id)
+                        await _run_blocking(lambda: ticktick_v2.batch_set_task_parent(
+                            [task_id], t["parent_id"], project_id))
                     except Exception as e:
                         logger.warning(f"Parent link failed: {e}")
 
@@ -738,11 +790,11 @@ async def create_tasks(
                     all_sub_tasks.extend(st_tasks)
                     all_sub_rels.extend(st_rels)
                 try:
-                    ticktick_v2.batch_create_tasks(all_sub_tasks)
+                    await _run_blocking(lambda: ticktick_v2.batch_create_tasks(all_sub_tasks))
                     if all_sub_rels:
-                        ticktick_v2._request("POST", "/batch/taskParent",
-                                             json=all_sub_rels)
-                    ticktick_v2.invalidate_cache()
+                        await _run_blocking(lambda: ticktick_v2._request(
+                            "POST", "/batch/taskParent", json=all_sub_rels))
+                    await _run_blocking(lambda: ticktick_v2.invalidate_cache())
                     sub_count = len(all_sub_tasks)
                 except Exception as e:
                     logger.warning(f"Batch subtasks failed: {e}")
@@ -803,9 +855,9 @@ async def update_tasks(
         summary: Human-readable confirmation line (see above)
         tasks: List of task change objects — one item for a single task
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
 
     has_advanced = any(t.get("repeat_flag") or t.get("reminders") or t.get("column_id")
                        for t in tasks)
@@ -823,7 +875,8 @@ async def update_tasks(
                 continue
             try:
                 pid = _resolve_project_id(tid, pid)
-                task = ticktick.update_task(
+                task = await _run_blocking(
+                    ticktick.update_task,
                     task_id=tid,
                     project_id=pid,
                     title=new_title,
@@ -839,17 +892,17 @@ async def update_tasks(
                     continue
                 if t.get("tags") is not None and ticktick_v2:
                     try:
-                        ticktick_v2.set_task_tags(tid, t["tags"])
+                        await _run_blocking(lambda: ticktick_v2.set_task_tags(tid, t["tags"]))
                     except Exception as e:
                         logger.warning(f"Updated but tagging failed: {e}")
                 if t.get("column_id") and ticktick_v2:
                     try:
-                        ticktick_v2.set_task_column(tid, t["column_id"])
+                        await _run_blocking(lambda: ticktick_v2.set_task_column(tid, t["column_id"]))
                     except Exception as e:
                         logger.warning(f"Updated but column assignment failed: {e}")
                 if t.get("assignee") is not None and ticktick_v2:
                     try:
-                        ticktick_v2.batch_update_tasks([{"taskId": tid, "assignee": t["assignee"]}])
+                        await _run_blocking(lambda: ticktick_v2.batch_update_tasks([{"taskId": tid, "assignee": t["assignee"]}]))
                     except Exception as e:
                         logger.warning(f"Updated but assignee failed: {e}")
                 results.append(f"✏️ «{shown_title}» обновлено")
@@ -885,7 +938,7 @@ async def update_tasks(
                     if all_day:
                         ch["isAllDay"] = True
             changes.append(ch)
-        ticktick_v2.batch_update_tasks(changes)
+        await _run_blocking(lambda: ticktick_v2.batch_update_tasks(changes))
         labels_str = ", ".join(f"«{l}»" for l in labels)
         return f"✏️ Обновлено {len(changes)}: {labels_str}"
     except Exception as e:
@@ -913,14 +966,14 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
         summary: Human-readable confirmation line (see above)
         tasks: List of {"title","taskId","projectId"} objects — one item for single task
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
     try:
         if ticktick_v2 and len(tasks) > 1:
             ids = [t.get("taskId") or t.get("task_id") for t in tasks]
             titles = [t.get("title") or _lookup_task_title(i) for t, i in zip(tasks, ids)]
-            ticktick_v2.batch_complete_tasks(ids)
+            await _run_blocking(lambda: ticktick_v2.batch_complete_tasks(ids))
             titles_str = ", ".join(f"«{t}»" for t in titles)
             return f"✓ Завершено {len(ids)}: {titles_str}"
         else:
@@ -931,7 +984,7 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
                 title = t.get("title") or _lookup_task_title(tid)
                 pid = _resolve_project_id(tid, pid)
                 pname = t.get("projectName") or _v2_project_names().get(pid, "")
-                res = ticktick.complete_task(pid, tid)
+                res = await _run_blocking(lambda: ticktick.complete_task(pid, tid))
                 if 'error' in res:
                     results.append(f"✗ «{title}»: {res['error']}")
                 else:
@@ -969,7 +1022,7 @@ async def delete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
                   "projectId": t.get("projectId") or t.get("project_id")} for t in tasks]
         titles = ([t.get("title") for t in tasks] if all(t.get("title") for t in tasks)
                   else [_lookup_task_title(i["taskId"]) for i in items])
-        ticktick_v2.batch_delete_tasks(items)
+        await _run_blocking(lambda: ticktick_v2.batch_delete_tasks(items))
         titles_str = ", ".join(f"«{t}»" for t in titles)
         return f"🗑 Удалено {len(items)}: {titles_str}"
     except Exception as e:
@@ -1010,22 +1063,21 @@ async def delete_task_with_subtasks(
     try:
         project_id = _resolve_project_id(task_id, project_id)
 
-        # Find subtasks from v2 cache
+        # Find subtasks from v2 cache (_ensure_ready guarantees ticktick_v2)
         subtasks = []
-        if ticktick_v2:
-            try:
-                all_open = ticktick_v2.get_open_tasks()
-                subtasks = [t for t in all_open if t.get("parentId") == task_id]
-            except Exception:
-                pass
+        try:
+            all_open = await _run_blocking(lambda: ticktick_v2.get_open_tasks())
+            subtasks = [t for t in all_open if t.get("parentId") == task_id]
+        except Exception:
+            pass
 
         # Delete subtasks first (batch)
         if subtasks:
             items = [{"taskId": t["id"], "projectId": t.get("projectId", project_id)} for t in subtasks]
-            ticktick_v2.batch_delete_tasks(items)
+            await _run_blocking(lambda: ticktick_v2.batch_delete_tasks(items))
 
         # Delete parent via official API
-        result = ticktick.delete_task(project_id, task_id)
+        result = await _run_blocking(lambda: ticktick.delete_task(project_id, task_id))
         if 'error' in result:
             return f"Error deleting parent task: {result['error']}"
 
@@ -1054,16 +1106,17 @@ async def create_project(
         color: Color code (hex format) (optional)
         view_mode: View mode - one of list, kanban, or timeline (optional)
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
     
     # Validate view_mode
     if view_mode not in ["list", "kanban", "timeline"]:
         return "Invalid view_mode. Must be one of: list, kanban, timeline."
     
     try:
-        project = ticktick.create_project(
+        project = await _run_blocking(
+            ticktick.create_project,
             name=name,
             color=color,
             view_mode=view_mode
@@ -1086,12 +1139,12 @@ async def delete_project(project_name: str, project_id: str) -> str:
         project_name: Name of the project (shown first in confirmation dialog)
         project_id: ID of the project
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
     
     try:
-        result = ticktick.delete_project(project_id)
+        result = await _run_blocking(lambda: ticktick.delete_project(project_id))
         if 'error' in result:
             return f"Error deleting project: {result['error']}"
         
@@ -1105,45 +1158,69 @@ async def delete_project(project_name: str, project_id: str) -> str:
 
 # Helper Functions
 
-PRIORITY_MAP = {0: "None", 1: "Low", 3: "Medium", 5: "High"}
+# User's local timezone. Date comparisons for "today"/"overdue"/"due in N days"
+# happen in this zone, not UTC, so an all-day task stored at local-midnight
+# isn't off-by-one. Matches USER_TIMEZONE used by the client's date handling.
+_USER_TZ = ZoneInfo(os.getenv("USER_TIMEZONE", "UTC"))
+
+
+def _parse_ticktick_datetime(value: str) -> Optional[datetime]:
+    """Parse a TickTick date string robustly. TickTick usually emits
+    '%Y-%m-%dT%H:%M:%S.%f%z' but not always (missing millis, 'Z' suffix,
+    date-only). Try several formats plus fromisoformat; return an
+    aware datetime (assume UTC if no tz), or None if unparseable."""
+    if not value or not isinstance(value, str):
+        return None
+    raw = value.strip()
+    # datetime.fromisoformat handles most ISO variants; normalize a trailing Z.
+    candidates = [raw]
+    if raw.endswith("Z"):
+        candidates.append(raw[:-1] + "+00:00")
+    for c in candidates:
+        try:
+            dt = datetime.fromisoformat(c)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(raw, fmt)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _task_due_local_date(task: Dict[str, Any]):
+    """Return the task's due date as a date in the user's local timezone, or
+    None if there's no/unparseable due date."""
+    dt = _parse_ticktick_datetime(task.get('dueDate'))
+    if dt is None:
+        return None
+    return dt.astimezone(_USER_TZ).date()
+
+
+def _today_local():
+    return datetime.now(_USER_TZ).date()
+
 
 def _is_task_due_today(task: Dict[str, Any]) -> bool:
-    """Check if a task is due today."""
-    due_date = task.get('dueDate')
-    if not due_date:
-        return False
-    
-    try:
-        task_due_date = datetime.strptime(due_date, "%Y-%m-%dT%H:%M:%S.%f%z").date()
-        today_date = datetime.now(timezone.utc).date()
-        return task_due_date == today_date
-    except (ValueError, TypeError):
-        return False
+    """Check if a task is due today (in the user's local timezone)."""
+    d = _task_due_local_date(task)
+    return d is not None and d == _today_local()
 
 def _is_task_overdue(task: Dict[str, Any]) -> bool:
     """Check if a task is overdue."""
-    due_date = task.get('dueDate')
-    if not due_date:
+    dt = _parse_ticktick_datetime(task.get('dueDate'))
+    if dt is None:
         return False
-    
-    try:
-        task_due = datetime.strptime(due_date, "%Y-%m-%dT%H:%M:%S.%f%z")
-        return task_due < datetime.now(timezone.utc)
-    except (ValueError, TypeError):
-        return False
+    return dt < datetime.now(timezone.utc)
 
 def _is_task_due_in_days(task: Dict[str, Any], days: int) -> bool:
-    """Check if a task is due in exactly X days."""
-    due_date = task.get('dueDate')
-    if not due_date:
-        return False
-    
-    try:
-        task_due_date = datetime.strptime(due_date, "%Y-%m-%dT%H:%M:%S.%f%z").date()
-        target_date = (datetime.now(timezone.utc) + timedelta(days=days)).date()
-        return task_due_date == target_date
-    except (ValueError, TypeError):
-        return False
+    """Check if a task is due in exactly X days (in the user's local timezone)."""
+    d = _task_due_local_date(task)
+    return d is not None and d == _today_local() + timedelta(days=days)
 
 def _task_matches_search(task: Dict[str, Any], search_term: str) -> bool:
     """Check if a task matches the search term (case-insensitive)."""
@@ -1168,55 +1245,19 @@ def _task_matches_search(task: Dict[str, Any], search_term: str) -> bool:
     
     return False
 
-def _validate_task_data(task_data: Dict[str, Any], task_index: int) -> Optional[str]:
-    """
-    Validate a single task's data for batch creation.
-    
-    Returns:
-        None if valid, error message string if invalid
-    """
-    # Check required fields
-    if 'title' not in task_data or not task_data['title']:
-        return f"Task {task_index + 1}: 'title' is required and cannot be empty"
-    
-    if 'project_id' not in task_data or not task_data['project_id']:
-        return f"Task {task_index + 1}: 'project_id' is required and cannot be empty"
-    
-    # Validate priority if provided
-    priority = task_data.get('priority')
-    if priority is not None and priority not in [0, 1, 3, 5]:
-        return f"Task {task_index + 1}: Invalid priority {priority}. Must be 0 (None), 1 (Low), 3 (Medium), or 5 (High)"
-    
-    # Validate dates if provided
-    for date_field in ['start_date', 'due_date']:
-        date_str = task_data.get(date_field)
-        if date_str:
-            try:
-                # Try to parse the date to validate it
-                # Handle both with and without timezone info
-                if date_str.endswith('Z'):
-                    datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                elif '+' in date_str or date_str.endswith(('00', '30')):
-                    datetime.fromisoformat(date_str)
-                else:
-                    # Assume local timezone if no timezone specified
-                    datetime.fromisoformat(date_str)
-            except ValueError:
-                return f"Task {task_index + 1}: Invalid {date_field} format '{date_str}'. Use ISO format: YYYY-MM-DDTHH:mm:ss or with timezone"
-    
-    return None
-
-def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name: str) -> str:
+def _get_project_tasks_by_filter(filter_func, filter_name: str) -> str:
     """
     Helper function to filter tasks across all projects.
-    
+
     Args:
-        projects: List of project dictionaries
         filter_func: Function that takes a task and returns True if it matches the filter
         filter_name: Name of the filter for output formatting
-    
+
     Returns:
         Formatted string of filtered tasks
+
+    Fetches projects only on the official-API fallback path; when v2 is
+    available no per-project HTTP calls are made at all.
     """
     # Prefer the v2 open-task pool: it includes the Inbox (which the official
     # API leaves out of the project list) and is a single call instead of one
@@ -1224,10 +1265,6 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
     if ticktick_v2:
         try:
             state = ticktick_v2.get_state()
-            inbox = state.get("inboxId")
-            names = {p["id"]: p.get("name")
-                     for p in (state.get("projectProfiles") or [])}
-            names[inbox] = "Inbox"
             tasks = state.get("syncTaskBean", {}).get("update", []) or []
             matched = [t for t in tasks if filter_func(t)]
             if not matched:
@@ -1237,6 +1274,10 @@ def _get_project_tasks_by_filter(projects: List[Dict], filter_func, filter_name:
         except Exception as e:
             logger.warning(f"v2 task pool failed, falling back to official API: {e}")
 
+    # Official-API fallback: fetch the project list only now that we need it.
+    projects = ticktick.get_projects()
+    if 'error' in projects:
+        return f"Error fetching projects: {projects['error']}"
     if not projects:
         return "No projects found."
 
@@ -1279,13 +1320,13 @@ async def get_all_tasks() -> str:
     the v2 sync state (single request, includes Inbox) when available, falling
     back to the official API otherwise.
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
 
     try:
         if ticktick_v2:
-            tasks = ticktick_v2.get_open_tasks()
+            tasks = await _run_blocking(lambda: ticktick_v2.get_open_tasks())
             if not tasks:
                 return "Задач не найдено."
             names = _v2_project_names()
@@ -1302,11 +1343,8 @@ async def get_all_tasks() -> str:
                 out += "\n"
             return out
 
-        # Fallback: official API per project
-        projects = ticktick.get_projects()
-        if 'error' in projects:
-            return f"Error fetching projects: {projects['error']}"
-        return _get_project_tasks_by_filter(projects, lambda t: True, "included")
+        # Fallback: official API per project (projects fetched inside helper)
+        return _get_project_tasks_by_filter(lambda t: True, "included")
 
     except Exception as e:
         logger.error(f"Error in get_all_tasks: {e}")
@@ -1320,90 +1358,74 @@ async def get_tasks_by_priority(priority_id: int) -> str:
     Args:
         priority_id: Priority of tasks to retrieve {0: "None", 1: "Low", 3: "Medium", 5: "High"}
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
     
     if priority_id not in PRIORITY_MAP:
         return f"Invalid priority_id. Valid values: {list(PRIORITY_MAP.keys())}"
     
     try:
-        projects = ticktick.get_projects()
-        if 'error' in projects:
-            return f"Error fetching projects: {projects['error']}"
-        
         def priority_filter(task: Dict[str, Any]) -> bool:
             return task.get('priority', 0) == priority_id
-        
+
         priority_name = f"{PRIORITY_MAP[priority_id]} ({priority_id})"
-        return _get_project_tasks_by_filter(projects, priority_filter, f"priority '{priority_name}'")
-        
+        return _get_project_tasks_by_filter(priority_filter, f"priority '{priority_name}'")
+
     except Exception as e:
         logger.error(f"Error in get_tasks_by_priority: {e}")
-        return f"Error retrieving projects: {str(e)}"
+        return f"Error retrieving tasks by priority: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def get_tasks_due_today() -> str:
     """Get all tasks from TickTick that are due today. Ignores closed projects."""
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
     
     try:
-        projects = ticktick.get_projects()
-        if 'error' in projects:
-            return f"Error fetching projects: {projects['error']}"
-        
         def today_filter(task: Dict[str, Any]) -> bool:
             return _is_task_due_today(task)
-        
-        return _get_project_tasks_by_filter(projects, today_filter, "due today")
-        
+
+        return _get_project_tasks_by_filter(today_filter, "due today")
+
     except Exception as e:
         logger.error(f"Error in get_tasks_due_today: {e}")
-        return f"Error retrieving projects: {str(e)}"
+        return f"Error retrieving tasks due today: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def get_overdue_tasks() -> str:
     """Get all overdue tasks from TickTick. Ignores closed projects."""
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
     
     try:
-        projects = ticktick.get_projects()
-        if 'error' in projects:
-            return f"Error fetching projects: {projects['error']}"
-        
         def overdue_filter(task: Dict[str, Any]) -> bool:
             return _is_task_overdue(task)
-        
-        return _get_project_tasks_by_filter(projects, overdue_filter, "overdue")
-        
+
+        return _get_project_tasks_by_filter(overdue_filter, "overdue")
+
     except Exception as e:
         logger.error(f"Error in get_overdue_tasks: {e}")
-        return f"Error retrieving projects: {str(e)}"
+        return f"Error retrieving overdue tasks: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def get_tasks_due_tomorrow() -> str:
-    """Get all tasks from TickTick that are due today. Ignores closed projects."""
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
-    
+    """Get all tasks from TickTick that are due tomorrow. Ignores closed projects."""
+    err = _ensure_official()
+    if err:
+        return err
+
     try:
-        projects = ticktick.get_projects()
-        if 'error' in projects:
-            return f"Error fetching projects: {projects['error']}"
-        
-        def today_filter(task: Dict[str, Any]) -> bool:
+        def tomorrow_filter(task: Dict[str, Any]) -> bool:
             return _is_task_due_in_days(task, 1)
-        
-        return _get_project_tasks_by_filter(projects, today_filter, "due today")
-        
+
+        return _get_project_tasks_by_filter(tomorrow_filter, "due tomorrow")
+
     except Exception as e:
-        logger.error(f"Error in get_tasks_due_today: {e}")
-        return f"Error retrieving projects: {str(e)}"
+        logger.error(f"Error in get_tasks_due_tomorrow: {e}")
+        return f"Error retrieving tasks due tomorrow: {str(e)}"
     
 @mcp.tool(annotations=READONLY)
 async def get_tasks_due_in_days(days: int) -> str:
@@ -1413,58 +1435,44 @@ async def get_tasks_due_in_days(days: int) -> str:
     Args:
         days: Number of days from today (0 = today, 1 = tomorrow, etc.)
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
     
     if days < 0:
         return "Days must be a non-negative integer."
     
     try:
-        projects = ticktick.get_projects()
-        if 'error' in projects:
-            return f"Error fetching projects: {projects['error']}"
-        
         def days_filter(task: Dict[str, Any]) -> bool:
             return _is_task_due_in_days(task, days)
-        
+
         day_description = "today" if days == 0 else f"in {days} day{'s' if days != 1 else ''}"
-        return _get_project_tasks_by_filter(projects, days_filter, f"due {day_description}")
-        
+        return _get_project_tasks_by_filter(days_filter, f"due {day_description}")
+
     except Exception as e:
         logger.error(f"Error in get_tasks_due_in_days: {e}")
-        return f"Error retrieving projects: {str(e)}"
+        return f"Error retrieving tasks due in days: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def get_tasks_due_this_week() -> str:
     """Get all tasks from TickTick that are due within the next 7 days. Ignores closed projects."""
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
     
     try:
-        projects = ticktick.get_projects()
-        if 'error' in projects:
-            return f"Error fetching projects: {projects['error']}"
-        
         def week_filter(task: Dict[str, Any]) -> bool:
-            due_date = task.get('dueDate')
-            if not due_date:
+            d = _task_due_local_date(task)
+            if d is None:
                 return False
-            
-            try:
-                task_due_date = datetime.strptime(due_date, "%Y-%m-%dT%H:%M:%S.%f%z").date()
-                today = datetime.now(timezone.utc).date()
-                week_from_today = today + timedelta(days=7)
-                return today <= task_due_date <= week_from_today
-            except (ValueError, TypeError):
-                return False
-        
-        return _get_project_tasks_by_filter(projects, week_filter, "due this week")
-        
+            today = _today_local()
+            return today <= d <= today + timedelta(days=7)
+
+        return _get_project_tasks_by_filter(week_filter, "due this week")
+
     except Exception as e:
         logger.error(f"Error in get_tasks_due_this_week: {e}")
-        return f"Error retrieving projects: {str(e)}"
+        return f"Error retrieving tasks due this week: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def search_tasks(search_term: str) -> str:
@@ -1474,9 +1482,9 @@ async def search_tasks(search_term: str) -> str:
     Args:
         search_term: Text to search for (case-insensitive)
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
     
     if not search_term.strip():
         return "Search term cannot be empty."
@@ -1485,7 +1493,8 @@ async def search_tasks(search_term: str) -> str:
         # Prefer the v2 open-task pool: it includes the Inbox (which the
         # official API omits from the project list) and is one fast call.
         if ticktick_v2:
-            tasks = [t for t in ticktick_v2.get_open_tasks()
+            open_tasks = await _run_blocking(ticktick_v2.get_open_tasks)
+            tasks = [t for t in open_tasks
                      if _task_matches_search(t, search_term)]
             if not tasks:
                 return f"No tasks found matching '{search_term}'."
@@ -1493,18 +1502,14 @@ async def search_tasks(search_term: str) -> str:
                     + format_task_tree(tasks, 100))
 
         # Fallback (no v2): iterate official projects — note this misses the Inbox.
-        projects = ticktick.get_projects()
-        if 'error' in projects:
-            return f"Error fetching projects: {projects['error']}"
-
         def search_filter(task: Dict[str, Any]) -> bool:
             return _task_matches_search(task, search_term)
 
-        return _get_project_tasks_by_filter(projects, search_filter, f"matching '{search_term}'")
+        return _get_project_tasks_by_filter(search_filter, f"matching '{search_term}'")
 
     except Exception as e:
         logger.error(f"Error in search_tasks: {e}")
-        return f"Error retrieving projects: {str(e)}"
+        return f"Error searching tasks: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def get_recurring_tasks(search_term: str = "") -> str:
@@ -1518,21 +1523,21 @@ async def get_recurring_tasks(search_term: str = "") -> str:
         search_term: Optional text to further filter by title/content (case-insensitive).
                      Leave empty to return all recurring tasks.
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
 
     try:
         if ticktick_v2:
-            all_open = ticktick_v2.get_open_tasks()
+            all_open = await _run_blocking(lambda: ticktick_v2.get_open_tasks())
         else:
-            projects = ticktick.get_projects()
+            projects = await _run_blocking(lambda: ticktick.get_projects())
             if 'error' in projects:
                 return f"Ошибка получения проектов: {projects['error']}"
             all_open = []
             for p in projects:
                 pid = p.get("id")
-                data = ticktick.get_project_with_data(pid)
+                data = await _run_blocking(lambda: ticktick.get_project_with_data(pid))
                 all_open.extend(data.get("tasks", []))
 
         tasks = [t for t in all_open if t.get("repeatFlag")]
@@ -1558,26 +1563,22 @@ async def get_engaged_tasks() -> str:
     Get all tasks from TickTick that are "Engaged".
     This includes tasks marked as high priority (5), due today or overdue.
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
     
     try:
-        projects = ticktick.get_projects()
-        if 'error' in projects:
-            return f"Error fetching projects: {projects['error']}"
-        
         def engaged_filter(task: Dict[str, Any]) -> bool:
             is_high_priority = task.get('priority', 0) == 5
             is_overdue = _is_task_overdue(task)
             is_today = _is_task_due_today(task)
             return is_high_priority or is_overdue or is_today
-        
-        return _get_project_tasks_by_filter(projects, engaged_filter, "engaged")
-        
+
+        return _get_project_tasks_by_filter(engaged_filter, "engaged")
+
     except Exception as e:
         logger.error(f"Error in get_engaged_tasks: {e}")
-        return f"Error retrieving projects: {str(e)}"
+        return f"Error retrieving engaged tasks: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def get_next_tasks() -> str:
@@ -1585,25 +1586,21 @@ async def get_next_tasks() -> str:
     Get all tasks from TickTick that are "Next".
     This includes tasks marked as medium priority (3) or due tomorrow.
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
     
     try:
-        projects = ticktick.get_projects()
-        if 'error' in projects:
-            return f"Error fetching projects: {projects['error']}"
-        
         def next_filter(task: Dict[str, Any]) -> bool:
             is_medium_priority = task.get('priority', 0) == 3
             is_due_tomorrow = _is_task_due_in_days(task, 1)
             return is_medium_priority or is_due_tomorrow
-        
-        return _get_project_tasks_by_filter(projects, next_filter, "next")
-        
+
+        return _get_project_tasks_by_filter(next_filter, "next")
+
     except Exception as e:
         logger.error(f"Error in get_next_tasks: {e}")
-        return f"Error retrieving projects: {str(e)}"
+        return f"Error retrieving next tasks: {str(e)}"
 
 @mcp.tool()
 async def create_subtask(
@@ -1625,16 +1622,17 @@ async def create_subtask(
         content: Optional content/description for the subtask
         priority: Priority level (0: None, 1: Low, 3: Medium, 5: High) (optional)
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
     
     # Validate priority
     if priority not in [0, 1, 3, 5]:
         return "Invalid priority. Must be 0 (None), 1 (Low), 3 (Medium), or 5 (High)."
     
     try:
-        subtask = ticktick.create_subtask(
+        subtask = await _run_blocking(
+            ticktick.create_subtask,
             subtask_title=subtask_title,
             parent_task_id=parent_task_id,
             project_id=project_id,
@@ -1651,8 +1649,9 @@ async def create_subtask(
         return f"Error creating subtask: {str(e)}"
 
 # ---------------------------------------------------------------------------
-# v2 API tools (unofficial). Available only when TICKTICK_USERNAME/PASSWORD
-# are configured. They cover what the official Open API cannot do.
+# v2 API tools (unofficial). Available when TICKTICK_V2_TOKEN (the `t` cookie
+# from a logged-in ticktick.com browser session) is configured. They cover
+# what the official Open API cannot do.
 # ---------------------------------------------------------------------------
 
 _V2_DISABLED_MSG = (
@@ -1671,13 +1670,11 @@ async def get_completed_tasks(limit: int = 50) -> str:
     Args:
         limit: Maximum number of completed tasks to return (default 50)
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
-    if not ticktick_v2:
-        return _V2_DISABLED_MSG
+    err = _ensure_ready()
+    if err:
+        return err
     try:
-        tasks = ticktick_v2.get_completed_tasks(limit=limit)
+        tasks = await _run_blocking(lambda: ticktick_v2.get_completed_tasks(limit=limit))
         if not tasks:
             return "No completed tasks found."
         out = f"Completed tasks ({len(tasks)}):\n\n"
@@ -1690,13 +1687,11 @@ async def get_completed_tasks(limit: int = 50) -> str:
 @mcp.tool(annotations=READONLY)
 async def list_tags() -> str:
     """List all tags in the account (requires v2 API)."""
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
-    if not ticktick_v2:
-        return _V2_DISABLED_MSG
+    err = _ensure_ready()
+    if err:
+        return err
     try:
-        tags = ticktick_v2.get_tags()
+        tags = await _run_blocking(lambda: ticktick_v2.get_tags())
         if not tags:
             return "No tags found."
         lines = [f"- {t.get('label', t.get('name', '?'))}" for t in tags]
@@ -1714,13 +1709,11 @@ async def get_tasks_by_tag(tag: str) -> str:
     Args:
         tag: Tag label, with or without the leading '#'
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
-    if not ticktick_v2:
-        return _V2_DISABLED_MSG
+    err = _ensure_ready()
+    if err:
+        return err
     try:
-        tasks = ticktick_v2.get_tasks_by_tag(tag)
+        tasks = await _run_blocking(lambda: ticktick_v2.get_tasks_by_tag(tag))
         if not tasks:
             return f"No open tasks found with tag '{tag}'."
         out = f"Tasks tagged '{tag}' ({len(tasks)}):\n\n"
@@ -1733,13 +1726,11 @@ async def get_tasks_by_tag(tag: str) -> str:
 @mcp.tool(annotations=READONLY)
 async def get_inbox_tasks() -> str:
     """Get open tasks in the Inbox (requires v2 API)."""
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
-    if not ticktick_v2:
-        return _V2_DISABLED_MSG
+    err = _ensure_ready()
+    if err:
+        return err
     try:
-        tasks = ticktick_v2.get_inbox_tasks()
+        tasks = await _run_blocking(lambda: ticktick_v2.get_inbox_tasks())
         if not tasks:
             return "No open tasks in the Inbox."
         out = f"Inbox tasks ({len(tasks)}):\n\n"
@@ -1776,7 +1767,7 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]],
         ids = [t.get("taskId") or t.get("task_id") for t in tasks]
         titles = [t.get("title") or _lookup_task_title(i) for t, i in zip(tasks, ids)]
         to_name = to_project_name or _v2_project_names().get(to_project_id, to_project_id)
-        ticktick_v2.batch_move_tasks(ids, to_project_id)
+        await _run_blocking(lambda: ticktick_v2.batch_move_tasks(ids, to_project_id))
         titles_str = ", ".join(f"«{t}»" for t in titles)
         return f"↪ Перемещено {len(ids)} → «{to_name}»: {titles_str}"
     except Exception as e:
@@ -1792,11 +1783,9 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]],
 
 def _ensure_ready() -> Optional[str]:
     """Return an error string if the client/v2 isn't ready, else None."""
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
-    if not ticktick_v2:
-        return _V2_DISABLED_MSG
+    err = _ensure_ready()
+    if err:
+        return err
     return None
 
 
@@ -1807,10 +1796,9 @@ async def get_habits() -> str:
     if err:
         return err
     try:
-        habits = ticktick_v2.get_habits()
+        habits = await _run_blocking(lambda: ticktick_v2.get_habits())
         if not habits:
             return "No habits found."
-        active = [h for h in habits if h.get("status") == 0 or h.get("status") == 1]
         out = f"Habits ({len(habits)}):\n\n"
         for h in habits:
             out += (f"- {h.get('name','?')}  (id: {h.get('id')})\n"
@@ -1842,7 +1830,7 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
     if status not in (0, 1, 2):
         return "Invalid status. Use 2 (done), 1 (failed), or 0 (not done)."
     try:
-        ticktick_v2.checkin_habit(habit_id, date=date, status=status, value=value)
+        await _run_blocking(lambda: ticktick_v2.checkin_habit(habit_id, date=date, status=status, value=value))
         when = date or "today"
         labels = {2: "done", 1: "failed", 0: "not done"}
         return f"Habit '{habit_name}' checked in for {when} as '{labels[status]}'."
@@ -1868,7 +1856,7 @@ async def get_habit_checkins(habit_name: str, habit_id: str, after_date: str) ->
         # afterStamp is exclusive (>) on the API side; subtract 1 so the
         # requested date itself is included (YYYYMMDD is monotonic).
         stamp = int(after_date.replace("-", "")) - 1
-        result = ticktick_v2.get_habit_checkins([habit_id], stamp)
+        result = await _run_blocking(lambda: ticktick_v2.get_habit_checkins([habit_id], stamp))
         entries = result.get(habit_id, [])
         if not entries:
             return f"No check-ins for '{habit_name}' since {after_date}."
@@ -1892,7 +1880,7 @@ async def list_filters() -> str:
     if err:
         return err
     try:
-        filters = ticktick_v2.get_filters()
+        filters = await _run_blocking(lambda: ticktick_v2.get_filters())
         if not filters:
             return "No filters found."
         out = f"Filters ({len(filters)}):\n\n"
@@ -1937,7 +1925,7 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]],
         ids = [t.get("taskId") or t.get("task_id") for t in tasks]
         titles = [t.get("title") or _lookup_task_title(i) for t, i in zip(tasks, ids)]
         pname = parent_task_title or _lookup_task_title(parent_task_id)
-        ticktick_v2.batch_set_task_parent(ids, parent_task_id, project_id)
+        await _run_blocking(lambda: ticktick_v2.batch_set_task_parent(ids, parent_task_id, project_id))
         titles_str = ", ".join(f"«{t}»" for t in titles)
         return f"🔗 Вложено {len(ids)} под «{pname}»: {titles_str}"
     except Exception as e:
@@ -1961,7 +1949,7 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
     if err:
         return err
     try:
-        ticktick_v2.unset_task_parent(task_id, parent_task_id, project_id)
+        await _run_blocking(lambda: ticktick_v2.unset_task_parent(task_id, parent_task_id, project_id))
         return f"Task '{task_title}' detached from parent '{parent_task_title}'."
     except Exception as e:
         logger.error(f"Error in unset_task_parent: {e}")
@@ -1993,7 +1981,7 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]]) -> str:
                     "tags": t.get("tags") or []} for t in tasks]
         labels = [t.get("title") or _lookup_task_title(c["taskId"])
                   for t, c in zip(tasks, changes)]
-        ticktick_v2.batch_update_tasks(changes)
+        await _run_blocking(lambda: ticktick_v2.batch_update_tasks(changes))
         labels_str = ", ".join(f"«{l}»" for l in labels)
         return f"🏷 Теги обновлены у {len(changes)}: {labels_str}"
     except Exception as e:
@@ -2071,7 +2059,7 @@ async def run_filter(filter: str) -> str:
     if err:
         return err
     try:
-        tasks = ticktick_v2.run_filter(filter)
+        tasks = await _run_blocking(lambda: ticktick_v2.run_filter(filter))
         if not tasks:
             return f"Filter '{filter}' matched no open tasks."
         out = f"Filter '{filter}' — {len(tasks)} task(s):\n\n"
@@ -2092,7 +2080,7 @@ async def list_project_groups() -> str:
     if err:
         return err
     try:
-        groups = ticktick_v2.list_project_groups()
+        groups = await _run_blocking(lambda: ticktick_v2.list_project_groups())
         groups = [g for g in groups if not g.get("deleted")]
         if not groups:
             return "No project groups found."
@@ -2110,7 +2098,7 @@ async def create_project_group(name: str) -> str:
     if err:
         return err
     try:
-        gid = ticktick_v2.create_project_group(name)
+        gid = await _run_blocking(lambda: ticktick_v2.create_project_group(name))
         return f"Project group '{name}' created (id: {gid})."
     except Exception as e:
         logger.error(f"Error in create_project_group: {e}")
@@ -2130,7 +2118,7 @@ async def delete_project_group(group_name: str, group_id: str) -> str:
     if err:
         return err
     try:
-        ticktick_v2.delete_project_group(group_id)
+        await _run_blocking(lambda: ticktick_v2.delete_project_group(group_id))
         return f"Project group '{group_name}' deleted (projects ungrouped)."
     except Exception as e:
         logger.error(f"Error in delete_project_group: {e}")
@@ -2151,7 +2139,7 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
     if err:
         return err
     try:
-        ticktick_v2.move_project_to_group(project_id, group_id)
+        await _run_blocking(lambda: ticktick_v2.move_project_to_group(project_id, group_id))
         dest = "ungrouped" if group_id == "NONE" else f"group {group_id}"
         return f"Project '{project_name}' moved to {dest}."
     except Exception as e:
@@ -2177,7 +2165,7 @@ async def get_task_comments(task_title: str, project_id: str, task_id: str) -> s
     if err:
         return err
     try:
-        comments = ticktick_v2.get_task_comments(project_id, task_id)
+        comments = await _run_blocking(lambda: ticktick_v2.get_task_comments(project_id, task_id))
         if not comments:
             return f"No comments on task '{task_title}'."
         out = f"Comments on '{task_title}' ({len(comments)}):\n"
@@ -2205,7 +2193,7 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
     if err:
         return err
     try:
-        ticktick_v2.add_task_comment(project_id, task_id, text)
+        await _run_blocking(lambda: ticktick_v2.add_task_comment(project_id, task_id, text))
         return f"Comment added to '{task_title}'."
     except Exception as e:
         logger.error(f"Error in add_task_comment: {e}")
@@ -2223,7 +2211,7 @@ async def get_statistics() -> str:
     if err:
         return err
     try:
-        s = ticktick_v2.get_statistics()
+        s = await _run_blocking(lambda: ticktick_v2.get_statistics())
         if not s:
             return "No statistics available."
         return (
@@ -2250,7 +2238,7 @@ async def get_trash(limit: int = 50) -> str:
     if err:
         return err
     try:
-        tasks = ticktick_v2.get_trash(limit)
+        tasks = await _run_blocking(lambda: ticktick_v2.get_trash(limit))
         if not tasks:
             return "Trash is empty."
         out = f"Trashed tasks ({len(tasks)}):\n\n"
@@ -2284,7 +2272,7 @@ async def restore_tasks(summary: str, tasks: List[Dict[str, str]],
         ids = [t.get("taskId") or t.get("task_id") for t in tasks]
         titles = [t.get("title") or _lookup_task_title(t.get("taskId") or t.get("task_id") or "")
                   for t in tasks]
-        ticktick_v2.batch_restore_tasks(ids, to_project_id)
+        await _run_blocking(lambda: ticktick_v2.batch_restore_tasks(ids, to_project_id))
         titles_str = ", ".join(f"«{t}»" for t in titles)
         return f"↩ Восстановлено из корзины {len(ids)}: {titles_str}"
     except Exception as e:
@@ -2293,7 +2281,7 @@ async def restore_tasks(summary: str, tasks: List[Dict[str, str]],
 
 
 @mcp.tool()
-async def attach_file_to_task(task_id: str, project_id: str, task_title: str = None,
+async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
                               url: str = None,
                               content_base64: str = None, filename: str = None) -> str:
     """
@@ -2317,8 +2305,8 @@ async def attach_file_to_task(task_id: str, project_id: str, task_title: str = N
     title = task_title or _lookup_task_title(task_id)
     try:
         pid = _resolve_project_id(task_id, project_id)
-        att = ticktick_v2.upload_attachment(
-            pid, task_id, url=url, content_base64=content_base64, filename=filename)
+        att = await _run_blocking(lambda: ticktick_v2.upload_attachment(
+            pid, task_id, url=url, content_base64=content_base64, filename=filename))
         return (f"Attached '{att.get('fileName', filename)}' "
                 f"({att.get('size', '?')} bytes) to '{title}'")
     except Exception as e:
@@ -2337,7 +2325,7 @@ async def create_tag(name: str, color: str = None) -> str:
     if err:
         return err
     try:
-        ticktick_v2.create_tag(name, color)
+        await _run_blocking(lambda: ticktick_v2.create_tag(name, color))
         return f"Tag '{name}' created."
     except Exception as e:
         logger.error(f"Error in create_tag: {e}")
@@ -2351,7 +2339,7 @@ async def rename_tag(old_name: str, new_name: str) -> str:
     if err:
         return err
     try:
-        ticktick_v2.rename_tag(old_name, new_name)
+        await _run_blocking(lambda: ticktick_v2.rename_tag(old_name, new_name))
         return f"Tag '{old_name}' renamed to '{new_name}'."
     except Exception as e:
         logger.error(f"Error in rename_tag: {e}")
@@ -2365,7 +2353,7 @@ async def delete_tag(name: str) -> str:
     if err:
         return err
     try:
-        ticktick_v2.delete_tag(name)
+        await _run_blocking(lambda: ticktick_v2.delete_tag(name))
         return f"Tag '{name}' deleted."
     except Exception as e:
         logger.error(f"Error in delete_tag: {e}")
@@ -2397,7 +2385,7 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None) -> st
         return err
     title = task_title or _lookup_task_title(task_id)
     try:
-        ticktick_v2.abandon_task(task_id)
+        await _run_blocking(lambda: ticktick_v2.abandon_task(task_id))
         return f"✗ Не буду делать: «{title}»"
     except Exception as e:
         logger.error(f"Error in abandon_task: {e}")
@@ -2422,7 +2410,7 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None) -> 
         return err
     title = task_title or _lookup_task_title(task_id)
     try:
-        copy = ticktick_v2.duplicate_task(task_id)
+        copy = await _run_blocking(lambda: ticktick_v2.duplicate_task(task_id))
         return f"Дублировано: «{title}» → новый id: {copy.get('id')}"
     except Exception as e:
         logger.error(f"Error in duplicate_task: {e}")
@@ -2450,7 +2438,7 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
     if err:
         return err
     try:
-        ticktick_v2.update_task_comment(project_id, task_id, comment_id, text)
+        await _run_blocking(lambda: ticktick_v2.update_task_comment(project_id, task_id, comment_id, text))
         return f"Comment on '{task_title}' updated."
     except Exception as e:
         logger.error(f"Error in update_task_comment: {e}")
@@ -2472,7 +2460,7 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str, co
     if err:
         return err
     try:
-        ticktick_v2.delete_task_comment(project_id, task_id, comment_id)
+        await _run_blocking(lambda: ticktick_v2.delete_task_comment(project_id, task_id, comment_id))
         return f"Comment on '{task_title}' deleted."
     except Exception as e:
         logger.error(f"Error in delete_task_comment: {e}")
@@ -2496,12 +2484,12 @@ async def update_project(project_name: str, project_id: str, name: str = None,
         color: New color hex like '#F18181' (optional)
         view_mode: 'list', 'kanban', or 'timeline' (optional)
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
     try:
-        proj = ticktick.update_project(project_id, name=name, color=color,
-                                       view_mode=view_mode)
+        proj = await _run_blocking(lambda: ticktick.update_project(
+            project_id, name=name, color=color, view_mode=view_mode))
         if 'error' in proj:
             return f"Error updating project: {proj['error']}"
         return "Project updated:\n\n" + format_project(proj)
@@ -2524,7 +2512,7 @@ async def archive_project(project_name: str, project_id: str, archived: bool = T
     if err:
         return err
     try:
-        ticktick_v2.archive_project(project_id, closed=archived)
+        await _run_blocking(lambda: ticktick_v2.archive_project(project_id, closed=archived))
         return f"Project '{project_name}' {'archived' if archived else 'unarchived'}."
     except Exception as e:
         logger.error(f"Error in archive_project: {e}")
@@ -2549,9 +2537,9 @@ async def search_all_tasks(query: str, include_completed: bool = True) -> str:
         return err
     try:
         q = query.lower()
-        pool = list(ticktick_v2.get_open_tasks())
+        pool = list(await _run_blocking(ticktick_v2.get_open_tasks))
         if include_completed:
-            pool += ticktick_v2.get_completed_tasks(limit=100)
+            pool += await _run_blocking(lambda: ticktick_v2.get_completed_tasks(limit=100))
         matches = [t for t in pool
                    if q in (t.get("title", "") or "").lower()
                    or q in (t.get("content", "") or "").lower()]
@@ -2578,7 +2566,7 @@ async def get_task_info(task_id: str) -> str:
     if err:
         return err
     try:
-        state = ticktick_v2.get_state()
+        state = await _run_blocking(lambda: ticktick_v2.get_state())
         owner = (state.get("inboxId") or "").replace("inbox", "")
         names = _v2_project_names()
         tasks = state.get("syncTaskBean", {}).get("update", []) or []
@@ -2587,7 +2575,7 @@ async def get_task_info(task_id: str) -> str:
             return (f"Task {task_id} not found among open tasks "
                     "(it may be completed or in the trash).")
 
-        pr = {0: "None", 1: "Low", 3: "Medium", 5: "High"}.get(t.get("priority", 0))
+        pr = PRIORITY_MAP.get(t.get("priority", 0))
         status = {0: "Active", 2: "Completed", -1: "Won't do"}.get(t.get("status", 0), t.get("status"))
         creator = str(t.get("creator", ""))
         who = "you" if creator == owner else f"user {creator}"
@@ -2677,7 +2665,7 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
     if err:
         return err
     try:
-        events = ticktick_v2.get_task_activity(project_id, task_id)
+        events = await _run_blocking(lambda: ticktick_v2.get_task_activity(project_id, task_id))
         if not events:
             return ("No activity found for this task. "
                     "The endpoint may not be available — try providing the exact URL "
@@ -2768,10 +2756,10 @@ async def get_changes(since: str, until: str = None,
         names = _v2_project_names()
         pname = lambda pid: names.get(pid, pid or "?")
 
-        open_tasks = ticktick_v2.get_open_tasks()
-        completed = ticktick_v2.get_completed_tasks(
-            limit=100, from_str=since + " 00:00:00", to_str=until + " 23:59:59")
-        trash = ticktick_v2.get_trash(limit=300)
+        open_tasks = await _run_blocking(lambda: ticktick_v2.get_open_tasks())
+        completed = await _run_blocking(lambda: ticktick_v2.get_completed_tasks(
+            limit=100, from_str=since + " 00:00:00", to_str=until + " 23:59:59"))
+        trash = await _run_blocking(lambda: ticktick_v2.get_trash(limit=300))
 
         if project_id:
             open_tasks = [t for t in open_tasks if t.get("projectId") == project_id]
@@ -2830,7 +2818,7 @@ async def get_project_members(project_id: str) -> str:
     if err:
         return err
     try:
-        members = ticktick_v2.get_project_members(project_id)
+        members = await _run_blocking(lambda: ticktick_v2.get_project_members(project_id))
         if not members:
             return ("Участники не найдены — проект не расшарен "
                     "или у API нет доступа к нему.")
@@ -2857,11 +2845,11 @@ async def list_project_columns(project_id: str) -> str:
     Args:
         project_id: ID of the project
     """
-    if not ticktick:
-        if not initialize_client():
-            return "Failed to initialize TickTick client. Please check your API credentials."
+    err = _ensure_official()
+    if err:
+        return err
     try:
-        data = ticktick.get_project_with_data(project_id)
+        data = await _run_blocking(lambda: ticktick.get_project_with_data(project_id))
         if 'error' in data:
             return f"Error fetching project: {data['error']}"
         cols = data.get("columns", []) or []

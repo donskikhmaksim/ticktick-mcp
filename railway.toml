@@ -3,5 +3,6 @@ builder = "dockerfile"
 
 [deploy]
 startCommand = "python -m ticktick_mcp.cli run"
+healthcheckPath = "/health"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3

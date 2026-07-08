@@ -1,13 +1,13 @@
 import os
 import re
-import json
 import base64
+import threading
 import requests
 import logging
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List
 
 from zoneinfo import ZoneInfo
 
@@ -59,7 +59,12 @@ class TickTickClient:
         self.client_secret = os.getenv("TICKTICK_CLIENT_SECRET")
         self.access_token = os.getenv("TICKTICK_ACCESS_TOKEN")
         self.refresh_token = os.getenv("TICKTICK_REFRESH_TOKEN")
-        
+
+        # Serialize token refreshes: without this, two concurrent 401s both
+        # refresh, and the second one uses an already-rotated (consumed)
+        # refresh token, permanently breaking auth.
+        self._refresh_lock = threading.Lock()
+
         if not self.access_token:
             raise ValueError("TICKTICK_ACCESS_TOKEN environment variable is not set. "
                             "Please run 'uv run -m ticktick_mcp.authenticate' to set up your credentials.")
@@ -73,63 +78,159 @@ class TickTickClient:
             "User-Agent": 'curl/8.7.1'
         }
     
-    def _refresh_access_token(self) -> bool:
+    def _refresh_access_token(self, prev_access_token: str = None) -> bool:
         """
         Refresh the access token using the refresh token.
-        
+
+        Thread-safe: only one refresh runs at a time. If another thread already
+        refreshed the token while this one waited for the lock (detected via
+        prev_access_token no longer matching the current one), this call skips
+        the network round-trip and returns success — so a rotated refresh token
+        is never consumed twice.
+
+        Args:
+            prev_access_token: the access token the caller saw 401 on; used to
+                detect that another thread already refreshed under the lock.
+
         Returns:
-            True if successful, False otherwise
+            True if a valid (possibly already-refreshed) token is in place.
         """
         if not self.refresh_token:
             logger.warning("No refresh token available. Cannot refresh access token.")
             return False
-            
+
         if not self.client_id or not self.client_secret:
             logger.warning("Client ID or Client Secret missing. Cannot refresh access token.")
             return False
-            
-        # Prepare the token request
-        token_data = {
-            "grant_type": "refresh_token",
-            "refresh_token": self.refresh_token
-        }
-        
-        # Prepare Basic Auth credentials
-        auth_str = f"{self.client_id}:{self.client_secret}"
-        auth_bytes = auth_str.encode('ascii')
-        auth_b64 = base64.b64encode(auth_bytes).decode('ascii')
-        
-        headers = {
-            "Authorization": f"Basic {auth_b64}",
-            "Content-Type": "application/x-www-form-urlencoded"
-        }
-        
+
+        with self._refresh_lock:
+            # Another thread may have refreshed while we waited for the lock.
+            # If so, our old (prev) token differs from the current one — reuse it.
+            if prev_access_token is not None and self.access_token != prev_access_token:
+                logger.info("Token already refreshed by another thread; reusing it.")
+                return True
+
+            # Prepare the token request
+            token_data = {
+                "grant_type": "refresh_token",
+                "refresh_token": self.refresh_token
+            }
+
+            # Prepare Basic Auth credentials
+            auth_str = f"{self.client_id}:{self.client_secret}"
+            auth_bytes = auth_str.encode('ascii')
+            auth_b64 = base64.b64encode(auth_bytes).decode('ascii')
+
+            headers = {
+                "Authorization": f"Basic {auth_b64}",
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
+
+            try:
+                # Send the token request
+                response = requests.post(self.token_url, data=token_data, headers=headers, timeout=REQUEST_TIMEOUT)
+                response.raise_for_status()
+
+                # Parse the response — guard against a 200 with a non-JSON body.
+                try:
+                    tokens = response.json()
+                except ValueError:
+                    logger.error("Token refresh returned a non-JSON body; cannot refresh.")
+                    return False
+
+                # Update the tokens
+                self.access_token = tokens.get('access_token')
+                if 'refresh_token' in tokens:
+                    self.refresh_token = tokens.get('refresh_token')
+
+                # Update the headers
+                self.headers["Authorization"] = f"Bearer {self.access_token}"
+
+                # Persist the rotated tokens so they survive a container restart.
+                self._persist_tokens(tokens)
+
+                logger.info("Access token refreshed successfully.")
+                return True
+
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error refreshing access token: {e}")
+                return False
+
+    def _persist_tokens(self, tokens: Dict[str, str]) -> None:
+        """
+        Persist refreshed tokens so they survive a process/container restart.
+
+        Isolated, pluggable, and defensive: any failure here is logged but never
+        raised, so an in-memory refresh still succeeds even if persistence fails.
+
+        On Railway the working-directory .env is EPHEMERAL — a refresh-token
+        rotation followed by a restart would break auth permanently. So when
+        Railway API credentials are present, upsert the variables via Railway's
+        GraphQL API. Otherwise (local dev) fall back to writing ./.env.
+        """
         try:
-            # Send the token request
-            response = requests.post(self.token_url, data=token_data, headers=headers, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
-            
-            # Parse the response
-            tokens = response.json()
-            
-            # Update the tokens
-            self.access_token = tokens.get('access_token')
-            if 'refresh_token' in tokens:
-                self.refresh_token = tokens.get('refresh_token')
-                
-            # Update the headers
-            self.headers["Authorization"] = f"Bearer {self.access_token}"
-            
-            # Save the tokens to the .env file
+            if self._persist_tokens_to_railway(tokens):
+                return
+        except Exception as e:
+            logger.warning(f"Railway token persistence failed (continuing): {e}")
+
+        try:
             self._save_tokens_to_env(tokens)
-            
-            logger.info("Access token refreshed successfully.")
-            return True
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error refreshing access token: {e}")
-            return False
-    
+        except Exception as e:
+            logger.warning(f"Local .env token persistence failed (continuing): {e}")
+
+    def _persist_tokens_to_railway(self, tokens: Dict[str, str]) -> bool:
+        """
+        Upsert TICKTICK_ACCESS_TOKEN/TICKTICK_REFRESH_TOKEN into the Railway
+        service via the GraphQL variableUpsert mutation, so they persist across
+        restarts. Returns True if Railway persistence was attempted and all
+        upserts succeeded; False if Railway env is not configured (fall back to
+        .env). Raises on a hard failure so the caller can log a warning.
+        """
+        api_token = os.getenv("RAILWAY_API_TOKEN") or os.getenv("RAILWAY_TOKEN")
+        service_id = os.getenv("RAILWAY_SERVICE_ID")
+        project_id = os.getenv("RAILWAY_PROJECT_ID")
+        environment_id = os.getenv("RAILWAY_ENVIRONMENT_ID")
+        if not (api_token and service_id and project_id):
+            return False  # not on Railway with API access → caller uses .env
+
+        to_set = {"TICKTICK_ACCESS_TOKEN": tokens.get("access_token", "")}
+        if tokens.get("refresh_token"):
+            to_set["TICKTICK_REFRESH_TOKEN"] = tokens["refresh_token"]
+
+        mutation = (
+            "mutation variableUpsert($input: VariableUpsertInput!) {"
+            " variableUpsert(input: $input) }"
+        )
+        endpoint = os.getenv("RAILWAY_API_URL", "https://backboard.railway.app/graphql/v2")
+        headers = {
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json",
+        }
+        for name, value in to_set.items():
+            variables = {
+                "input": {
+                    "projectId": project_id,
+                    "serviceId": service_id,
+                    "name": name,
+                    "value": value,
+                }
+            }
+            if environment_id:
+                variables["input"]["environmentId"] = environment_id
+            resp = requests.post(endpoint, json={"query": mutation, "variables": variables},
+                                 headers=headers, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            try:
+                body = resp.json()
+            except ValueError:
+                raise RuntimeError("Railway API returned a non-JSON response.")
+            if body.get("errors"):
+                raise RuntimeError(f"Railway variableUpsert error: {body['errors']}")
+
+        logger.info("Refreshed tokens persisted to Railway variables.")
+        return True
+
     def _save_tokens_to_env(self, tokens: Dict[str, str]) -> None:
         """
         Save the tokens to the .env file.
@@ -195,9 +296,10 @@ class TickTickClient:
             # Check if the request was unauthorized (401)
             if response.status_code == 401:
                 logger.info("Access token expired. Attempting to refresh...")
-                
-                # Try to refresh the access token
-                if self._refresh_access_token():
+
+                # Try to refresh the access token (pass the token we saw 401 on
+                # so a concurrent refresh under the lock isn't repeated).
+                if self._refresh_access_token(prev_access_token=self.access_token):
                     # Retry the request with the new token
                     if method == "GET":
                         response = self.session.get(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
@@ -220,8 +322,15 @@ class TickTickClient:
             # Return empty dict for 204 No Content
             if response.status_code == 204 or response.text == "":
                 return {}
-            
-            return response.json()
+
+            # Guard against a 200 with a non-JSON body (e.g. a Cloudflare/HTML
+            # interstitial): return the normal error convention instead of
+            # letting JSONDecodeError escape.
+            try:
+                return response.json()
+            except ValueError:
+                logger.error("API returned a non-JSON response body.")
+                return {"error": "Non-JSON response from TickTick API."}
         except requests.exceptions.RequestException as e:
             logger.error(f"API request failed: {e}")
             return {"error": str(e)}

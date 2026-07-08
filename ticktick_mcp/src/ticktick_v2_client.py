@@ -122,9 +122,16 @@ class TickTickV2Client:
                 "TickTick now gates this behind a captcha — use TICKTICK_V2_TOKEN "
                 "(the `t` cookie from a logged-in browser) instead."
             )
-        token = resp.json().get("token")
+        try:
+            body = resp.json()
+        except ValueError:
+            raise TickTickAuthError(
+                "v2 login returned a non-JSON body (likely a captcha/HTML page). "
+                "Use TICKTICK_V2_TOKEN (the `t` cookie) instead."
+            )
+        token = body.get("token")
         if not token:
-            raise TickTickAuthError(f"v2 login returned no token: {resp.json()}")
+            raise TickTickAuthError(f"v2 login returned no token: {body}")
         self.token = token
         self.session.cookies.set("t", token)
         logger.info("TickTick v2 authenticated via password (deprecated path)")
@@ -146,7 +153,17 @@ class TickTickV2Client:
         resp.raise_for_status()
         if resp.status_code == 204 or not resp.text:
             return {}
-        data = resp.json()
+        # A 200 with a non-JSON body (e.g. a Cloudflare/HTML interstitial)
+        # means the session isn't really authenticated — surface it as an auth
+        # error rather than letting a raw JSONDecodeError escape.
+        try:
+            data = resp.json()
+        except ValueError:
+            raise TickTickAuthError(
+                "TickTick v2 returned a non-JSON response (likely an HTML "
+                "login/interstitial page). Re-extract the `t` cookie and "
+                "update TICKTICK_V2_TOKEN."
+            )
         # v2 signals auth/permission problems in the body even on HTTP 200.
         if isinstance(data, dict) and data.get("errorCode") in (
             "user_not_sign_on", "not_login", "access_forbidden"
@@ -476,7 +493,14 @@ class TickTickV2Client:
                 "TickTick v2 session token is invalid or expired. Re-extract "
                 "the `t` cookie and update TICKTICK_V2_TOKEN.")
         resp.raise_for_status()
-        return resp.json() if resp.text else {}
+        if not resp.text:
+            return {}
+        try:
+            return resp.json()
+        except ValueError:
+            # Upload succeeded (2xx) but body wasn't JSON; don't crash the tool.
+            logger.warning("Attachment upload returned a non-JSON body.")
+            return {}
 
     # ---- smart-list (filter) execution -----------------------------------
     def run_filter(self, filter_id_or_name: str) -> List[Dict]:

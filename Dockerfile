@@ -10,8 +10,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 RUN pip install --no-cache-dir -e .
 
+# Run as an unprivileged user
+RUN useradd --create-home --uid 10001 appuser \
+    && chown -R appuser /app
+USER appuser
+
 # Railway provides PORT; the server binds 0.0.0.0:$PORT via env.
 ENV MCP_TRANSPORT=streamable-http \
-    MCP_HOST=0.0.0.0
+    MCP_HOST=0.0.0.0 \
+    MCP_PORT=8000
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT', os.environ.get('MCP_PORT','8000'))+'/health').read()" || exit 1
 
 CMD ["python", "-m", "ticktick_mcp.cli", "run"]
