@@ -98,12 +98,13 @@ Run 'uv run -m ticktick_mcp.cli auth' to set up authentication later.
         sys.exit(auth_main())
     elif args.command == "run":
         # Let an explicit --transport flag override the MCP_TRANSPORT env var
-        # that server.main() reads.
-        if args.transport:
+        # that server.main() reads. `args.command` defaults to "run" even when
+        # no subparser ran, so `transport`/`debug` may be absent — use getattr.
+        if getattr(args, "transport", None):
             os.environ["MCP_TRANSPORT"] = args.transport
 
         # Configure logging based on debug flag
-        log_level = logging.DEBUG if args.debug else logging.INFO
+        log_level = logging.DEBUG if getattr(args, "debug", False) else logging.INFO
         logging.basicConfig(
             level=log_level,
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"

@@ -73,6 +73,22 @@ if ! command -v railway &>/dev/null; then
     export PATH="$HOME/.railway/bin:$PATH"
   fi
 fi
+
+if ! command -v railway &>/dev/null; then
+  echo "❌ Railway CLI не установился. Установи вручную: https://docs.railway.com/guides/cli"
+  exit 1
+fi
+
+# Весь скрипт использует синтаксис Railway CLI 4.x+ (railway list --json,
+# deployment list, variables set --service). На более старой версии команды
+# отличаются и всё тихо ломается — лучше сразу попросить обновиться.
+RW_VERSION=$(set +o pipefail; railway --version 2>&1 | grep -oE '[0-9]+' | head -1 || echo 0)
+if [[ "${RW_VERSION:-0}" -lt 4 ]]; then
+  echo "❌ Слишком старая версия Railway CLI ($(railway --version 2>&1))."
+  echo "   Обнови: brew upgrade railway  (или переустанови по ссылке"
+  echo "   https://docs.railway.com/guides/cli), затем запусти команду ещё раз."
+  exit 1
+fi
 ok "Railway CLI $(set +o pipefail; railway --version 2>&1 | head -1)"
 
 # ── Шаг 2: Логин в Railway ─────────────────────────────────────────────────
@@ -92,6 +108,8 @@ ok "Авторизован в Railway"
 step "3/4  Деплою сервер"
 
 WORK_DIR=$(mktemp -d)
+# Гарантированно чистим временную папку на любом выходе (в т.ч. при ошибке).
+trap 'rm -rf "$WORK_DIR"' EXIT
 cd "$WORK_DIR"
 
 echo "Скачиваю репозиторий..."
@@ -159,12 +177,14 @@ fi
 # можно задавать только когда он уже существует, поэтому сначала up,
 # потом variables (это вызовет автоматический рестарт с новыми значениями).
 echo "Загружаю и собираю (займёт 1–2 минуты)..."
+# NB: вызываем run_step напрямую в if — нельзя оборачивать в $(...), иначе
+# stdout самой команды попадёт в переменную вместе с yes/no и сломает проверку.
 if [[ -n "$SERVICE_NAME" ]]; then
-  UP_OK=$(run_step railway up --detach --service "$SERVICE_NAME" && echo yes || echo no)
+  UP_CMD=(railway up --detach --service "$SERVICE_NAME")
 else
-  UP_OK=$(run_step railway up --detach && echo yes || echo no)
+  UP_CMD=(railway up --detach)
 fi
-if [[ "$UP_OK" != "yes" ]]; then
+if ! run_step "${UP_CMD[@]}"; then
   echo ""
   echo "Деплой не прошёл. Частая причина — лимит ресурсов на бесплатном"
   echo "плане Railway. Проверь: railway.app → Account Settings → Billing."
@@ -215,7 +235,7 @@ DEPLOY_ATTEMPTS=0
 DEPLOY_LIST_RAW=""
 while true; do
   DEPLOY_ATTEMPTS=$((DEPLOY_ATTEMPTS + 1))
-  DEPLOY_LIST_RAW=$(set +o pipefail; railway deployment list --json --limit 5 2>&1)
+  DEPLOY_LIST_RAW=$(set +o pipefail; railway deployment list --json --service "$SERVICE_NAME" --limit 5 2>&1)
   if [[ $DEPLOY_ATTEMPTS -gt 60 ]]; then
     echo "❌ Новый деплой не подтвердился за 5 минут. Вот что видит Railway:"
     echo "── полный вывод ──────────────────────────"
@@ -342,7 +362,7 @@ if [[ "$ENABLE_V2" == "y" || "$ENABLE_V2" == "Y" ]]; then
 
   if [[ -n "$V2_TOKEN" ]]; then
     cd "$WORK_DIR"
-    if railway variables set TICKTICK_V2_TOKEN="$V2_TOKEN" 2>&1 | tail -1; then
+    if run_step railway variables set --service "$SERVICE_NAME" TICKTICK_V2_TOKEN="$V2_TOKEN"; then
       ok "Расширенные функции включены"
     else
       echo "⚠️  Не получилось сохранить куку автоматически. Не страшно — добавь её"
@@ -352,8 +372,8 @@ if [[ "$ENABLE_V2" == "y" || "$ENABLE_V2" == "Y" ]]; then
   fi
 fi
 
+# WORK_DIR удаляется автоматически через trap EXIT.
 cd /
-rm -rf "$WORK_DIR"
 
 # ── Готово ──────────────────────────────────────────────────────────────────
 CONNECTOR_URL="https://$DOMAIN/mcp/$MCP_SECRET"
