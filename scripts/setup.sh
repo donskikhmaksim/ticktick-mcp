@@ -173,15 +173,21 @@ run_step railway variables set \
 # Ждём НОВЫЙ деплой (с правильными переменными), а не просто "сервис отвечает" —
 # старый контейнер ещё какое-то время продолжает отвечать на /health со
 # старыми (пустыми) переменными, пока Railway не переключит трафик на новый.
-echo "Жду пока Railway применит переменные и пересоберёт контейнер..."
+echo "Жду пока Railway применит переменные и пересоберёт контейнер (может занять до 5 минут)..."
 DEPLOY_ATTEMPTS=0
+DEPLOY_LIST_RAW=""
 while true; do
   DEPLOY_ATTEMPTS=$((DEPLOY_ATTEMPTS + 1))
-  if [[ $DEPLOY_ATTEMPTS -gt 40 ]]; then
-    echo "❌ Новый деплой не подтвердился за 3+ минуты. Проверь: railway logs"
+  DEPLOY_LIST_RAW=$(set +o pipefail; railway deployment list --json --limit 5 2>&1)
+  if [[ $DEPLOY_ATTEMPTS -gt 60 ]]; then
+    echo "❌ Новый деплой не подтвердился за 5 минут. Вот что видит Railway:"
+    echo "── полный вывод ──────────────────────────"
+    echo "$DEPLOY_LIST_RAW"
+    echo "───────────────────────────────────────────"
+    echo "Проверь также: railway logs"
     exit 1
   fi
-  LATEST=$(railway deployment list --json --limit 1 2>/dev/null | python3 -c "
+  LATEST=$(echo "$DEPLOY_LIST_RAW" | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -195,7 +201,10 @@ except Exception:
     break
   fi
   if [[ "$LATEST_STATUS" == "FAILED" || "$LATEST_STATUS" == "CRASHED" ]]; then
-    echo "❌ Новый деплой упал (статус: $LATEST_STATUS). Проверь: railway logs"
+    echo "❌ Новый деплой упал (статус: $LATEST_STATUS). Вот последние деплои:"
+    echo "── полный вывод ──────────────────────────"
+    echo "$DEPLOY_LIST_RAW"
+    echo "───────────────────────────────────────────"
     exit 1
   fi
   sleep 5
@@ -203,11 +212,19 @@ done
 
 echo "Генерирую домен..."
 DOMAIN_RAW=$(set +o pipefail; railway domain --json 2>&1)
+# The first-ever call for a service (creating its domain) returns
+# {"domain": "https://..."} — a single string. Any later call (domain
+# already exists) returns {"domains": ["https://..."]} — a list. Since this
+# script always hits the "first call" path for a brand new service, only
+# handling the plural shape meant this failed on every single fresh install.
 DOMAIN=$(echo "$DOMAIN_RAW" | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
-    url = data['domains'][0]
+    if data.get('domains'):
+        url = data['domains'][0]
+    else:
+        url = data['domain']
     print(url.replace('https://', '').replace('http://', '').rstrip('/'))
 except Exception:
     pass
