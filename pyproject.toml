@@ -30,6 +30,8 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "ruff",
+    "fastapi",  # oauth-proxy tests import its FastAPI app
+    "httpx",    # starlette TestClient + oauth-proxy
 ]
 
 [project.scripts]
@@ -37,7 +39,7 @@ ticktick-mcp = "ticktick_mcp.cli:main"
 ticktick-auth = "ticktick_mcp.authenticate:main"
 
 [project.urls]
-Repository = "https://github.com/parkjs814/ticktick-mcp"
+Repository = "https://github.com/donskikhmaksim/ticktick-mcp"
 
 [tool.setuptools.packages.find]
 include = ["ticktick_mcp*"]

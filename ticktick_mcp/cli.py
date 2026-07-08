@@ -7,7 +7,6 @@ import sys
 import os
 import argparse
 import logging
-from pathlib import Path
 from dotenv import load_dotenv
 
 from .src.server import main as server_main
@@ -39,8 +38,8 @@ def main():
              "Use streamable-http for remote/Railway deployment."
     )
     
-    # 'auth' command for authentication
-    auth_parser = subparsers.add_parser("auth", help="Authenticate with TickTick")
+    # 'auth' command for authentication (registered via side effect)
+    subparsers.add_parser("auth", help="Authenticate with TickTick")
     
     args = parser.parse_args()
     

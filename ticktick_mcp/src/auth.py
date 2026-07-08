@@ -8,7 +8,6 @@ without manually copying and pasting tokens.
 
 import os
 import webbrowser
-import json
 import time
 import base64
 import http.server
@@ -16,7 +15,6 @@ import socketserver
 import urllib.parse
 import requests
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Any
 from dotenv import load_dotenv
 import logging
 
@@ -213,8 +211,8 @@ class TickTickAuth:
         # Get the authorization URL
         auth_url = self.get_authorization_url(scopes, state)
         
-        print(f"Opening browser for TickTick authorization...")
-        print(f"If the browser doesn't open automatically, please visit this URL:")
+        print("Opening browser for TickTick authorization...")
+        print("If the browser doesn't open automatically, please visit this URL:")
         print(auth_url)
         
         # Open the browser for the user to authorize
@@ -306,7 +304,7 @@ class TickTickAuth:
                 try:
                     error_details = e.response.json()
                     return f"Error exchanging code for token: {error_details}"
-                except:
+                except (ValueError, AttributeError):
                     return f"Error exchanging code for token: {e.response.text}"
             return f"Error exchanging code for token: {str(e)}"
     

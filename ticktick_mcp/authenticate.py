@@ -7,7 +7,6 @@ and obtaining the necessary access tokens for the TickTick MCP server.
 """
 
 import sys
-import os
 import logging
 from typing import Optional
 from pathlib import Path

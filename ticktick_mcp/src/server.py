@@ -939,7 +939,7 @@ async def update_tasks(
                         ch["isAllDay"] = True
             changes.append(ch)
         await _run_blocking(lambda: ticktick_v2.batch_update_tasks(changes))
-        labels_str = ", ".join(f"«{l}»" for l in labels)
+        labels_str = ", ".join(f"«{lbl}»" for lbl in labels)
         return f"✏️ Обновлено {len(changes)}: {labels_str}"
     except Exception as e:
         logger.error(f"Error in update_tasks: {e}")
@@ -1125,7 +1125,7 @@ async def create_project(
         if 'error' in project:
             return f"Error creating project: {project['error']}"
         
-        return f"Project created successfully:\n\n" + format_project(project)
+        return "Project created successfully:\n\n" + format_project(project)
     except Exception as e:
         logger.error(f"Error in create_project: {e}")
         return f"Error creating project: {str(e)}"
@@ -1643,7 +1643,7 @@ async def create_subtask(
         if 'error' in subtask:
             return f"Error creating subtask: {subtask['error']}"
         
-        return f"Subtask created successfully:\n\n" + format_task(subtask)
+        return "Subtask created successfully:\n\n" + format_task(subtask)
     except Exception as e:
         logger.error(f"Error in create_subtask: {e}")
         return f"Error creating subtask: {str(e)}"
@@ -1982,7 +1982,7 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]]) -> str:
         labels = [t.get("title") or _lookup_task_title(c["taskId"])
                   for t, c in zip(tasks, changes)]
         await _run_blocking(lambda: ticktick_v2.batch_update_tasks(changes))
-        labels_str = ", ".join(f"«{l}»" for l in labels)
+        labels_str = ", ".join(f"«{lbl}»" for lbl in labels)
         return f"🏷 Теги обновлены у {len(changes)}: {labels_str}"
     except Exception as e:
         logger.error(f"Error in set_task_tags: {e}")
@@ -2754,7 +2754,9 @@ async def get_changes(since: str, until: str = None,
 
     try:
         names = _v2_project_names()
-        pname = lambda pid: names.get(pid, pid or "?")
+
+        def pname(pid):
+            return names.get(pid, pid or "?")
 
         open_tasks = await _run_blocking(lambda: ticktick_v2.get_open_tasks())
         completed = await _run_blocking(lambda: ticktick_v2.get_completed_tasks(
