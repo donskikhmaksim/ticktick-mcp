@@ -282,23 +282,24 @@ step "4/4  Войди в свой TickTick"
 SETUP_URL="https://$DOMAIN/setup/$MCP_SECRET"
 
 echo ""
-echo "Сейчас откроется страница входа TickTick."
-echo "Войди в ${BOLD}свой${RESET} аккаунт и нажми Allow — токены подхватятся"
-echo "автоматически, без копирования и вставки."
+echo -e "Открой ${BOLD}эту ссылку${RESET} в браузере и войди в ${BOLD}свой${RESET} TickTick, нажми Allow —"
+echo "токены подхватятся автоматически, без копирования и вставки:"
 echo ""
-ask "Нажми Enter чтобы открыть браузер..."
-read -r
+echo -e "  ${CYAN}$SETUP_URL${RESET}"
+echo ""
+echo -e "${YELLOW}Настраиваешь для другого человека?${RESET} Отправь эту ссылку ему —"
+echo "он открывает её у себя и логинится в СВОЙ TickTick аккаунт."
+echo ""
 
+# Пытаемся открыть браузер локально (если это машина того же человека).
+# На удалённой машине без браузера просто ничего не произойдёт — ссылка выше.
 if command -v open &>/dev/null; then
-  open "$SETUP_URL"
+  open "$SETUP_URL" 2>/dev/null || true
 elif command -v xdg-open &>/dev/null; then
-  xdg-open "$SETUP_URL"
-else
-  echo "Открой в браузере: $SETUP_URL"
+  xdg-open "$SETUP_URL" 2>/dev/null || true
 fi
 
-echo ""
-ask "Когда увидишь «TickTick подключён» в браузере, вернись сюда и нажми Enter..."
+ask "Когда на странице появится «TickTick подключён» — вернись сюда и нажми Enter..."
 read -r
 
 # ── Опционально: расширенные функции (кука v2) ─────────────────────────────
@@ -312,12 +313,12 @@ read -r ENABLE_V2
 
 if [[ "$ENABLE_V2" == "y" || "$ENABLE_V2" == "Y" ]]; then
   echo ""
-  echo "  1. Открой ${BOLD}ticktick.com${RESET} в Chrome и войди в свой аккаунт"
-  echo "  2. Нажми ${BOLD}F12${RESET} (или Option+Cmd+I на Mac)"
-  echo "  3. Выбери вкладку ${BOLD}Application${RESET}"
+  echo -e "  1. Открой ${BOLD}ticktick.com${RESET} в Chrome и войди в свой аккаунт"
+  echo -e "  2. Нажми ${BOLD}F12${RESET} (или Option+Cmd+I на Mac)"
+  echo -e "  3. Выбери вкладку ${BOLD}Application${RESET}"
   echo "  4. Слева: Storage → Cookies → https://ticktick.com"
-  echo "  5. В поле Filter введи: ${BOLD}t${RESET}"
-  echo "  6. Найди строку с именем ${BOLD}t${RESET} (одна буква)"
+  echo -e "  5. В поле Filter введи: ${BOLD}t${RESET}"
+  echo -e "  6. Найди строку с именем ${BOLD}t${RESET} (одна буква)"
   echo "  7. Двойной клик по значению в колонке Value → скопируй"
   echo ""
   ask "Вставь значение куки t:"
