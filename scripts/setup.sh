@@ -216,6 +216,22 @@ except Exception:
 " 2>/dev/null || true)
 fi
 
+# Если сервис уже существует и в нём УЖЕ задан MCP_SECRET — переиспользуем его,
+# а не генерируем новый. Иначе повторный запуск менял бы ссылку-коннектор, и
+# друг был бы вынужден переподключать коннектор в Claude. Так же повторный
+# запуск = просто переавторизация, ссылка не меняется.
+EXISTING_SECRET=$(railway variables --service "$SERVICE_NAME" --json -- 2>/dev/null | python3 -c "
+import sys, json
+try:
+    print(json.load(sys.stdin).get('MCP_SECRET', ''))
+except Exception:
+    pass
+" 2>/dev/null || true)
+if [[ -n "$EXISTING_SECRET" ]]; then
+  MCP_SECRET="$EXISTING_SECRET"
+  echo "Переиспользую существующий ключ — ссылка-коннектор не изменится."
+fi
+
 # Постоянный том для токенов — чтобы авторизация переживала перезапуски
 # контейнера (иначе токен из /setup живёт только в памяти и теряется при
 # рестарте). Идемпотентно: если том уже есть на /data, Railway вернёт ошибку,
