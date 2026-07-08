@@ -237,7 +237,9 @@ fi
 # рестарте). Идемпотентно: если том уже есть на /data, Railway вернёт ошибку,
 # которую мы молча глотаем.
 echo "Подключаю постоянный диск для токенов..."
-railway volume add -m /data --service "$SERVICE_NAME" &>/dev/null || true
+# NB: `railway volume add` НЕ принимает --service (берёт залинкованный сервис).
+# Идемпотентно: если том уже есть, Railway вернёт ошибку — молча глотаем.
+railway volume add -m /data &>/dev/null || true
 
 echo "Задаю переменные окружения..."
 run_step railway variables set \
