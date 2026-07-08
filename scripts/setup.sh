@@ -106,23 +106,40 @@ MCP_SECRET=$(set +o pipefail; LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head 
 # Если скрипт уже запускался раньше и создал проект "ticktick-mcp" — переиспользуем
 # его вместо создания нового. Иначе каждый повторный запуск плодит пустые проекты,
 # которые впустую жгут лимиты аккаунта Railway (особенно на бесплатном плане).
-EXISTING_PROJECT_ID=$(railway list --json 2>/dev/null | python3 -c "
+# Заодно смотрим, сколько внутри сервисов: если их 2+ (осталось от прежних
+# неудачных попыток), Railway не может сам угадать нужный — раньше это роняло
+# скрипт с непонятной ошибкой "Multiple services found".
+EXISTING=$(railway list --json 2>/dev/null | python3 -c "
 import sys, json
 try:
     projects = json.load(sys.stdin)
     for p in projects:
         if p.get('name') == 'ticktick-mcp' and not p.get('deletedAt'):
-            print(p['id'])
+            services = [e['node']['name'] for e in p.get('services', {}).get('edges', [])]
+            print(p['id'] + '\t' + ','.join(services))
             break
 except Exception:
     pass
 " 2>/dev/null || true)
 
+EXISTING_PROJECT_ID="${EXISTING%%$'\t'*}"
+EXISTING_SERVICES="${EXISTING#*$'\t'}"
+SERVICE_NAME=""
+
 if [[ -n "$EXISTING_PROJECT_ID" ]]; then
   echo "Нашёл существующий проект ticktick-mcp — переиспользую его..."
+  SERVICE_COUNT=$(echo "$EXISTING_SERVICES" | tr ',' '\n' | grep -c . || true)
+  if [[ "$SERVICE_COUNT" -gt 1 ]]; then
+    echo "❌ В проекте ticktick-mcp несколько сервисов от прошлых попыток: $EXISTING_SERVICES"
+    echo "   Зайди на railway.app → проект ticktick-mcp → удали лишние сервисы"
+    echo "   (оставь один или ни одного), затем запусти команду ещё раз."
+    exit 1
+  fi
   if ! run_step railway link -p "$EXISTING_PROJECT_ID"; then
     echo "Не смог переиспользовать — создаю новый проект..."
     EXISTING_PROJECT_ID=""
+  elif [[ "$SERVICE_COUNT" -eq 1 ]]; then
+    SERVICE_NAME="$EXISTING_SERVICES"
   fi
 fi
 
@@ -142,18 +159,37 @@ fi
 # можно задавать только когда он уже существует, поэтому сначала up,
 # потом variables (это вызовет автоматический рестарт с новыми значениями).
 echo "Загружаю и собираю (займёт 1–2 минуты)..."
-if ! run_step railway up --detach; then
+if [[ -n "$SERVICE_NAME" ]]; then
+  UP_OK=$(run_step railway up --detach --service "$SERVICE_NAME" && echo yes || echo no)
+else
+  UP_OK=$(run_step railway up --detach && echo yes || echo no)
+fi
+if [[ "$UP_OK" != "yes" ]]; then
   echo ""
   echo "Деплой не прошёл. Частая причина — лимит ресурсов на бесплатном"
   echo "плане Railway. Проверь: railway.app → Account Settings → Billing."
   exit 1
 fi
 
+# Если сервис только что создался с нуля — узнаём его настоящее имя и
+# закрепляем его во всех следующих командах, чтобы Railway больше никогда
+# не пришлось гадать, какой сервис имеется в виду.
+if [[ -z "$SERVICE_NAME" ]]; then
+  SERVICE_NAME=$(railway status --json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d['services']['edges'][0]['node']['name'])
+except Exception:
+    pass
+" 2>/dev/null || true)
+fi
+
 # Запоминаем ID деплоя ДО того как меняем переменные — иначе после
 # variables set (который асинхронно запускает новый деплой) можно легко
 # спутать старый контейнер (ещё без правильного MCP_SECRET) с новым, потому
 # что /health отвечает 200 у обоих, пока Railway не переключит трафик.
-PRE_VARS_DEPLOY_ID=$(railway deployment list --json --limit 1 2>/dev/null | python3 -c "
+PRE_VARS_DEPLOY_ID=$(railway deployment list --json --service "$SERVICE_NAME" --limit 1 2>/dev/null | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -164,6 +200,7 @@ except Exception:
 
 echo "Задаю переменные окружения..."
 run_step railway variables set \
+  --service "$SERVICE_NAME" \
   MCP_TRANSPORT=streamable-http \
   MCP_SECRET="$MCP_SECRET" \
   TICKTICK_CLIENT_ID="$CLIENT_ID" \
