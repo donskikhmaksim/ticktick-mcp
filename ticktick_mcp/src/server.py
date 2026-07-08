@@ -1782,10 +1782,13 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]],
 # ---------------------------------------------------------------------------
 
 def _ensure_ready() -> Optional[str]:
-    """Return an error string if the client/v2 isn't ready, else None."""
-    err = _ensure_ready()
-    if err:
-        return err
+    """Return an error string if the v2 client isn't ready, else None.
+    Lazily (re-)initializes the clients on first use; v2 is optional and only
+    present when TICKTICK_V2_TOKEN is set and valid."""
+    if not ticktick_v2:
+        initialize_client()
+    if not ticktick_v2:
+        return _V2_DISABLED_MSG
     return None
 
 
