@@ -107,7 +107,70 @@ TickTick tokens through the browser with no CLI:
    POST body) to this instance's `/auth/accept`, which hot-swaps the in-memory
    client — no redeploy.
 
-Set `TICKTICK_OAUTH_PROXY_URL` if you host your own proxy.
+## Isolation & privacy
+
+**Every self-hosted instance is a fully separate tenant.** You deploy your own
+instance, generate your own random `MCP_SECRET` (which is the URL path only you
+know), and authorize *your* TickTick account. Tasks go only to your account, and
+your `https://<your-app>/mcp/<MCP_SECRET>` URL is the one you plug into
+tg-ai-assistant (or any MCP client). No one shares an instance, a secret, or a
+token with anyone else.
+
+The one shared component in the default setup is the OAuth **proxy**. Depending
+on how much you want to depend on the maintainer's infrastructure, choose one of
+three auth paths, in order of privacy:
+
+1. **Fully isolated (recommended).** Register *your own* TickTick developer app
+   at [developer.ticktick.com](https://developer.ticktick.com), put
+   `TICKTICK_CLIENT_ID` / `TICKTICK_CLIENT_SECRET` in your `.env`, and authorize
+   with the **local flow**:
+
+   ```bash
+   uv run -m ticktick_mcp.cli auth
+   ```
+
+   This opens a browser, exchanges the code with *your* client credentials
+   locally, and writes `TICKTICK_ACCESS_TOKEN` to your `.env`. It **never
+   touches the shared proxy** (or any maintainer infrastructure). Paste the
+   resulting token into your Railway `TICKTICK_ACCESS_TOKEN` variable. This is
+   the only path with zero dependency on the maintainer.
+
+2. **Self-hosted proxy.** If you want the browser-based `/setup` flow but still
+   full isolation, host `oauth-proxy/` yourself (see
+   [`oauth-proxy/README.md`](oauth-proxy/README.md)). Register your own TickTick
+   app with its redirect URI pointing at *your* proxy's `REDIRECT_URI`
+   (`https://<your-proxy>/callback`), then point your instance at it:
+
+   ```
+   TICKTICK_OAUTH_PROXY_URL=https://<your-proxy-domain>
+   ```
+
+   Now the code exchange runs on infrastructure you control.
+
+3. **Default shared proxy (convenient, acceptable).** If you leave
+   `TICKTICK_OAUTH_PROXY_URL` unset, `/setup` uses the maintainer-operated proxy
+   at `https://ticktick-oauth-proxy-production.up.railway.app`, which uses the
+   maintainer's TickTick dev-app `client_id`/`secret`. That proxy **momentarily
+   relays** your access token back to your instance and does **not** persist
+   tokens — but you are still depending on, and observable by, the maintainer's
+   infrastructure during the exchange. For full isolation prefer option 1 or 2.
+
+Set `TICKTICK_OAUTH_PROXY_URL` if you host your own proxy (option 2), or leave it
+unset to use the default shared proxy (option 3). Option 1 ignores the proxy
+entirely.
+
+### Standing up your own instance — the sequence
+
+1. **Deploy your own instance** (Railway → Deploy from GitHub, per the section
+   above) — or run `scripts/setup.sh`, which does this for you.
+2. **Generate your own `MCP_SECRET`** (`openssl rand -hex 24`) and set it in
+   Railway. This becomes your private URL path.
+3. **Authorize YOUR TickTick** — either the local `auth` flow (option 1) or the
+   `/setup/<MCP_SECRET>` browser flow (option 2/3). Log in to *your own*
+   TickTick account when the consent screen appears.
+4. **Use YOUR resulting URL** — `https://<your-app>/mcp/<MCP_SECRET>` — as the
+   connector URL in tg-ai-assistant (or the Claude app). That URL, with your
+   secret and your token, is what keeps your data yours.
 
 ## Connect from your phone
 
