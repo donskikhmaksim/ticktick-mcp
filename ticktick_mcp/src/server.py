@@ -46,13 +46,14 @@ ticktick_v2 = None    # unofficial v2 API (email/password), optional
 def initialize_client():
     global ticktick, ticktick_v2
     try:
-        # Credentials come from environment variables (.env locally, Railway
-        # dashboard in production). No file write-back needed.
+        # Credentials come from the durable volume file first (freshest after a
+        # /setup or a token refresh on a previous container), then env vars.
         load_dotenv()
 
-        if os.getenv("TICKTICK_ACCESS_TOKEN") is None:
-            logger.error("No TICKTICK_ACCESS_TOKEN set. Run 'uv run -m ticktick_mcp.cli auth' "
-                         "locally, or set it in the Railway environment.")
+        from .ticktick_client import load_token_file
+        if not os.getenv("TICKTICK_ACCESS_TOKEN") and not load_token_file().get("access_token"):
+            logger.error("No TICKTICK_ACCESS_TOKEN set (env or volume). "
+                         "Visit /setup/<MCP_SECRET> in a browser to authorize.")
             return False
 
         # Initialize the official Open API client into a LOCAL first. Only
