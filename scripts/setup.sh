@@ -216,19 +216,6 @@ except Exception:
 " 2>/dev/null || true)
 fi
 
-# Запоминаем ID деплоя ДО того как меняем переменные — иначе после
-# variables set (который асинхронно запускает новый деплой) можно легко
-# спутать старый контейнер (ещё без правильного MCP_SECRET) с новым, потому
-# что /health отвечает 200 у обоих, пока Railway не переключит трафик.
-PRE_VARS_DEPLOY_ID=$(railway deployment list --json --service "$SERVICE_NAME" --limit 1 2>/dev/null | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    print(d[0]['id'] if d else '')
-except Exception:
-    pass
-" 2>/dev/null || true)
-
 echo "Задаю переменные окружения..."
 run_step railway variables set \
   --service "$SERVICE_NAME" \
@@ -238,53 +225,11 @@ run_step railway variables set \
   TICKTICK_CLIENT_SECRET="$CLIENT_SECRET" \
   USER_TIMEZONE="$TIMEZONE"
 
-# Ждём НОВЫЙ деплой (с правильными переменными), а не просто "сервис отвечает" —
-# старый контейнер ещё какое-то время продолжает отвечать на /health со
-# старыми (пустыми) переменными, пока Railway не переключит трафик на новый.
-echo "Жду пока Railway применит переменные и пересоберёт контейнер (может занять до 5 минут)..."
-DEPLOY_ATTEMPTS=0
-DEPLOY_LIST_RAW=""
-while true; do
-  DEPLOY_ATTEMPTS=$((DEPLOY_ATTEMPTS + 1))
-  DEPLOY_LIST_RAW=$(set +o pipefail; railway deployment list --json --service "$SERVICE_NAME" --limit 5 2>&1)
-  if [[ $DEPLOY_ATTEMPTS -gt 60 ]]; then
-    echo "❌ Новый деплой не подтвердился за 5 минут. Вот что видит Railway:"
-    echo "── полный вывод ──────────────────────────"
-    echo "$DEPLOY_LIST_RAW"
-    echo "───────────────────────────────────────────"
-    echo "Проверь также: railway logs"
-    exit 1
-  fi
-  LATEST=$(echo "$DEPLOY_LIST_RAW" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    print(d[0]['id'] + ' ' + d[0]['status'] if d else '')
-except Exception:
-    pass
-" 2>/dev/null || true)
-  LATEST_ID="${LATEST%% *}"
-  LATEST_STATUS="${LATEST##* }"
-  if [[ -n "$LATEST_ID" && "$LATEST_ID" != "$PRE_VARS_DEPLOY_ID" && "$LATEST_STATUS" == "SUCCESS" ]]; then
-    break
-  fi
-  if [[ "$LATEST_STATUS" == "FAILED" || "$LATEST_STATUS" == "CRASHED" ]]; then
-    echo "❌ Новый деплой упал (статус: $LATEST_STATUS). Вот последние деплои:"
-    echo "── полный вывод ──────────────────────────"
-    echo "$DEPLOY_LIST_RAW"
-    echo "───────────────────────────────────────────"
-    exit 1
-  fi
-  sleep 5
-done
-
 echo "Генерирую домен..."
-DOMAIN_RAW=$(set +o pipefail; railway domain --json 2>&1)
+DOMAIN_RAW=$(set +o pipefail; railway domain --service "$SERVICE_NAME" --json 2>&1)
 # The first-ever call for a service (creating its domain) returns
 # {"domain": "https://..."} — a single string. Any later call (domain
-# already exists) returns {"domains": ["https://..."]} — a list. Since this
-# script always hits the "first call" path for a brand new service, only
-# handling the plural shape meant this failed on every single fresh install.
+# already exists) returns {"domains": ["https://..."]} — a list. Handle both.
 DOMAIN=$(echo "$DOMAIN_RAW" | python3 -c "
 import sys, json
 try:
@@ -303,19 +248,27 @@ if [[ -z "$DOMAIN" ]]; then
   echo "── полный вывод ──────────────────────────"
   echo "$DOMAIN_RAW"
   echo "───────────────────────────────────────────"
-  echo "Попробуй вручную: railway domain --json --service ticktick-mcp"
+  echo "Попробуй вручную: railway domain --json --service $SERVICE_NAME"
   exit 1
 fi
 
-echo "Проверяю, что домен уже отвечает..."
+# Вместо угадывания по ID деплоя (Railway может применить переменные к тому же
+# деплою, не создавая новый) — проверяем НАПРЯМУЮ то, что нам важно: живой
+# контейнер отвечает на /setup/<секрет> кодом 307. Это одновременно значит,
+# что сервис поднялся И что в нём уже стоит правильный MCP_SECRET. Пока
+# переменные не применились, старый контейнер отдаёт на этот путь 403.
+echo "Жду пока Railway применит переменные и поднимет контейнер (обычно 1–3 минуты)..."
 ATTEMPTS=0
-until curl -sf "https://$DOMAIN/health" &>/dev/null; do
+while true; do
+  CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://$DOMAIN/setup/$MCP_SECRET" 2>/dev/null || echo 000)
+  if [[ "$CODE" == "307" || "$CODE" == "302" ]]; then
+    break
+  fi
   ATTEMPTS=$((ATTEMPTS + 1))
-  if [[ $ATTEMPTS -gt 40 ]]; then
+  if [[ $ATTEMPTS -gt 60 ]]; then
     echo ""
-    echo "❌ Сервис не отвечает больше 3 минут. Возможно, сборка упала."
-    echo "   Проверь логи командой: railway logs"
-    echo "   Или напиши тому, кто прислал тебе эту команду, и пришли вывод railway logs."
+    echo "❌ Сервис не подтвердил новый MCP_SECRET за 5 минут (последний ответ: $CODE)."
+    echo "   Проверь логи: railway logs --service $SERVICE_NAME"
     exit 1
   fi
   sleep 5
