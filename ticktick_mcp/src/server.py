@@ -2854,6 +2854,85 @@ async def get_project_members(project_id: str) -> str:
         return f"Error fetching project members: {str(e)}"
 
 
+def _build_assignee_index(tasks: List[Dict]) -> Dict[str, str]:
+    """Map assignee userId -> display name by scanning shared projects the
+    tasks live in. Best-effort: names for ids we can resolve, ids otherwise."""
+    id_to_name: Dict[str, str] = {}
+    project_ids = {t.get("projectId") for t in tasks if t.get("assignee")}
+    for pid in project_ids:
+        if not pid:
+            continue
+        try:
+            for m in ticktick_v2.get_project_members(pid):
+                uid = str(m.get("userId") or m.get("userCode") or "")
+                nm = m.get("displayName") or m.get("username")
+                if uid and nm:
+                    id_to_name[uid] = nm
+        except Exception:
+            continue
+    return id_to_name
+
+
+@mcp.tool(annotations=READONLY)
+async def get_tasks_by_assignee(assignee: str, include_completed: bool = False) -> str:
+    """
+    List tasks assigned to a specific person (requires v2 API). Assignment
+    exists only for tasks in SHARED projects that were explicitly assigned via
+    TickTick's "Assignee" field — a task merely mentioning someone, or created
+    by them, is NOT assigned and won't appear here.
+
+    Args:
+        assignee: a person's name (matched against shared-project members,
+                  case-insensitive substring) OR their numeric userId.
+        include_completed: also include completed tasks (default: only open).
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        tasks = await _run_blocking(lambda: ticktick_v2.get_open_tasks())
+        assigned = [t for t in tasks if t.get("assignee")]
+        if not assigned:
+            return ("Ни у одной открытой задачи нет назначенного исполнителя. "
+                    "Назначение работает только в общих (shared) проектах через "
+                    "поле «Assignee» в TickTick — задачи, где человек просто упомянут "
+                    "или которые он создал, не считаются назначенными.")
+
+        id_to_name = await _run_blocking(lambda: _build_assignee_index(assigned))
+        name_to_ids: Dict[str, List[str]] = {}
+        for uid, nm in id_to_name.items():
+            name_to_ids.setdefault(nm.lower(), []).append(uid)
+
+        q = assignee.strip().lower()
+        # resolve query -> set of target userIds
+        target_ids = set()
+        if q.isdigit():
+            target_ids.add(q)
+        else:
+            for nm, ids in name_to_ids.items():
+                if q in nm:
+                    target_ids.update(ids)
+        if not target_ids:
+            known = ", ".join(sorted(set(id_to_name.values()))) or "(никого не удалось определить)"
+            return (f"Не нашёл исполнителя «{assignee}» среди участников общих проектов.\n"
+                    f"Известные исполнители: {known}\n"
+                    "Можно также передать числовой userId.")
+
+        matched = [t for t in assigned if str(t.get("assignee")) in target_ids]
+        if not include_completed:
+            matched = [t for t in matched if t.get("status", 0) == 0]
+        if not matched:
+            return f"Нет {'' if include_completed else 'незавершённых '}задач на «{assignee}»."
+
+        who = id_to_name.get(next(iter(target_ids)), assignee)
+        header = (f"Задачи на «{who}» "
+                  f"({'все' if include_completed else 'незавершённые'}) — {len(matched)}:")
+        return header + "\n" + format_task_tree(matched, 200)
+    except Exception as e:
+        logger.error(f"Error in get_tasks_by_assignee: {e}")
+        return f"Error fetching tasks by assignee: {str(e)}"
+
+
 @mcp.tool(annotations=READONLY)
 async def list_project_columns(project_id: str) -> str:
     """
