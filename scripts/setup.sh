@@ -93,16 +93,27 @@ ok "Railway CLI $(set +o pipefail; railway --version 2>&1 | head -1)"
 
 # ── Шаг 2: Логин в Railway ─────────────────────────────────────────────────
 step "2/4  Войди в Railway"
-echo ""
-echo "Сейчас откроется браузер — войди в свой аккаунт Railway."
-echo "(Если аккаунта нет — создай на railway.app, это бесплатно)"
-echo ""
-ask "Нажми Enter чтобы открыть браузер..."
-read -r
 
-railway login
+# Не логинимся вхолостую, если сессия уже есть — иначе браузер с кнопкой
+# Authorize открывается при каждом запуске, хотя пользователь уже вошёл.
+if railway whoami &>/dev/null; then
+  ok "Уже авторизован в Railway ($(set +o pipefail; railway whoami 2>/dev/null | tail -1))"
+else
+  echo ""
+  echo "Сейчас откроется браузер — войди в свой аккаунт Railway."
+  echo "(Если аккаунта нет — создай на railway.app, это бесплатно)"
+  echo ""
+  ask "Нажми Enter чтобы открыть браузер..."
+  read -r
 
-ok "Авторизован в Railway"
+  railway login
+
+  if ! railway whoami &>/dev/null; then
+    echo "❌ Вход в Railway не удался. Попробуй ещё раз или войди вручную: railway login"
+    exit 1
+  fi
+  ok "Авторизован в Railway"
+fi
 
 # ── Шаг 3: Деплой ───────────────────────────────────────────────────────────
 step "3/4  Деплою сервер"
