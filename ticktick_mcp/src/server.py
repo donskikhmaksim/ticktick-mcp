@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from .ticktick_client import TickTickClient, _normalize_date
+from .ticktick_client import TickTickClient, _normalize_date, save_token_file
 from .ticktick_v2_client import TickTickV2Client
 
 # Set up logging
@@ -160,16 +160,49 @@ async def setup_accept(request: Request) -> Response:
     if not access_token:
         return HTMLResponse(_setup_error_page("Не пришёл токен от прокси."), status_code=400)
 
-    # Hot-swap: make the server usable immediately, no redeploy required.
+    # Persist to the durable volume file FIRST so the tokens survive a restart
+    # even if this process dies right after; then hot-swap the in-memory client
+    # so the server is usable immediately with no redeploy.
+    persisted = save_token_file({"access_token": access_token, "refresh_token": refresh_token})
     os.environ["TICKTICK_ACCESS_TOKEN"] = access_token
     if refresh_token:
         os.environ["TICKTICK_REFRESH_TOKEN"] = refresh_token
     initialize_client()
 
-    return HTMLResponse(_setup_success_page(access_token, refresh_token))
+    return HTMLResponse(_setup_success_page(access_token, refresh_token, persisted))
 
 
-def _setup_success_page(access_token: str, refresh_token: str) -> str:
+def _setup_success_page(access_token: str, refresh_token: str, persisted: bool = False) -> str:
+    if persisted:
+        subtitle = ("Сервер уже работает — проверяй в Claude прямо сейчас. "
+                    "Токены сохранены надёжно и переживут перезапуск, ничего "
+                    "больше делать не нужно.")
+        tokens_html = ""
+        step_html = ('<div class="step"><strong>Готово.</strong> Можно закрыть эту '
+                     'страницу и вернуться в Claude. Если нужны расширенные функции '
+                     '(теги, привычки, корзина) — добавь куку v2 из Chrome позже.</div>')
+    else:
+        subtitle = ("Сервер уже работает — можно проверять в Claude прямо сейчас. "
+                    "Но том для постоянного хранения недоступен, поэтому сохрани "
+                    "токены в Railway Variables вручную, иначе они пропадут при перезапуске.")
+        tokens_html = f"""
+  <div class="token-block">
+    <label>TICKTICK_ACCESS_TOKEN</label>
+    <div class="token-row">
+      <div class="token-value" id="at">{access_token}</div>
+      <button onclick="copy('at', this)">Копировать</button>
+    </div>
+  </div>
+  <div class="token-block">
+    <label>TICKTICK_REFRESH_TOKEN</label>
+    <div class="token-row">
+      <div class="token-value" id="rt">{refresh_token}</div>
+      <button onclick="copy('rt', this)">Копировать</button>
+    </div>
+  </div>"""
+        step_html = ('<div class="step"><strong>Дальше:</strong> Railway → твой сервис → '
+                     'Variables → вставь оба значения в TICKTICK_ACCESS_TOKEN и '
+                     'TICKTICK_REFRESH_TOKEN.</div>')
     return f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -203,30 +236,9 @@ def _setup_success_page(access_token: str, refresh_token: str) -> str:
 <body>
 <div class="card">
   <h1>✅ TickTick подключён</h1>
-  <p class="subtitle">Сервер уже работает — можно проверять в Claude прямо сейчас.
-  Но на всякий случай сохрани токены в Railway Variables, чтобы они пережили перезапуск.</p>
-
-  <div class="token-block">
-    <label>TICKTICK_ACCESS_TOKEN</label>
-    <div class="token-row">
-      <div class="token-value" id="at">{access_token}</div>
-      <button onclick="copy('at', this)">Копировать</button>
-    </div>
-  </div>
-
-  <div class="token-block">
-    <label>TICKTICK_REFRESH_TOKEN</label>
-    <div class="token-row">
-      <div class="token-value" id="rt">{refresh_token}</div>
-      <button onclick="copy('rt', this)">Копировать</button>
-    </div>
-  </div>
-
-  <div class="step">
-    <strong>Дальше:</strong> Railway → твой сервис → Variables → вставь оба значения
-    в TICKTICK_ACCESS_TOKEN и TICKTICK_REFRESH_TOKEN (если их там ещё нет).
-    Потом — токен v2 (кука из Chrome), если нужны расширенные функции.
-  </div>
+  <p class="subtitle">{subtitle}</p>
+  {tokens_html}
+  {step_html}
 </div>
 <script>
 function copy(id, btn) {{

@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import base64
 import threading
 import requests
@@ -17,6 +18,47 @@ logger = logging.getLogger(__name__)
 # Hard cap on every TickTick HTTP call so a stalled connection can never hang
 # the whole MCP request indefinitely.
 REQUEST_TIMEOUT = 20
+
+# Durable token store on a Railway Volume (survives restarts/redeploys without
+# needing a Railway API token or manual paste into Variables). Defaults to a
+# file under /data; set TICKTICK_TOKEN_STORE to override or "" to disable.
+TOKEN_STORE_PATH = os.getenv("TICKTICK_TOKEN_STORE", "/data/ticktick_tokens.json").strip()
+
+
+def load_token_file() -> Dict[str, str]:
+    """Read persisted tokens from the volume file, or {} if absent/unreadable."""
+    if not TOKEN_STORE_PATH:
+        return {}
+    try:
+        with open(TOKEN_STORE_PATH, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+def save_token_file(tokens: Dict[str, str]) -> bool:
+    """Persist tokens to the volume file. Best-effort: returns False (never
+    raises) if the directory isn't writable (e.g. no volume mounted)."""
+    if not TOKEN_STORE_PATH:
+        return False
+    try:
+        path = Path(TOKEN_STORE_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = load_token_file()
+        merged = {**existing}
+        for k in ("access_token", "refresh_token"):
+            if tokens.get(k):
+                merged[k] = tokens[k]
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(merged, f)
+        tmp.replace(path)  # atomic
+        return True
+    except OSError as e:
+        logger.warning(f"Volume token persistence unavailable ({e}); "
+                       "tokens will not survive a restart unless set in Railway Variables.")
+        return False
 
 _DATE_ONLY = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
@@ -57,8 +99,11 @@ class TickTickClient:
         self.session = requests.Session()
         self.client_id = os.getenv("TICKTICK_CLIENT_ID")
         self.client_secret = os.getenv("TICKTICK_CLIENT_SECRET")
-        self.access_token = os.getenv("TICKTICK_ACCESS_TOKEN")
-        self.refresh_token = os.getenv("TICKTICK_REFRESH_TOKEN")
+        # Prefer tokens persisted to the volume (freshest after a refresh or a
+        # /setup that happened on a previous container), falling back to env.
+        persisted = load_token_file()
+        self.access_token = persisted.get("access_token") or os.getenv("TICKTICK_ACCESS_TOKEN")
+        self.refresh_token = persisted.get("refresh_token") or os.getenv("TICKTICK_REFRESH_TOKEN")
 
         # Serialize token refreshes: without this, two concurrent 401s both
         # refresh, and the second one uses an already-rotated (consumed)
@@ -168,12 +213,21 @@ class TickTickClient:
         Railway API credentials are present, upsert the variables via Railway's
         GraphQL API. Otherwise (local dev) fall back to writing ./.env.
         """
+        # 1) Durable volume file (default on Railway with a mounted /data volume).
+        try:
+            if save_token_file(tokens):
+                return
+        except Exception as e:
+            logger.warning(f"Volume token persistence failed (continuing): {e}")
+
+        # 2) Railway API (only if an API token is configured).
         try:
             if self._persist_tokens_to_railway(tokens):
                 return
         except Exception as e:
             logger.warning(f"Railway token persistence failed (continuing): {e}")
 
+        # 3) Local .env (dev fallback).
         try:
             self._save_tokens_to_env(tokens)
         except Exception as e:

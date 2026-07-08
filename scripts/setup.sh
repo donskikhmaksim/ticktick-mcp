@@ -216,6 +216,13 @@ except Exception:
 " 2>/dev/null || true)
 fi
 
+# Постоянный том для токенов — чтобы авторизация переживала перезапуски
+# контейнера (иначе токен из /setup живёт только в памяти и теряется при
+# рестарте). Идемпотентно: если том уже есть на /data, Railway вернёт ошибку,
+# которую мы молча глотаем.
+echo "Подключаю постоянный диск для токенов..."
+railway volume add -m /data --service "$SERVICE_NAME" &>/dev/null || true
+
 echo "Задаю переменные окружения..."
 run_step railway variables set \
   --service "$SERVICE_NAME" \
