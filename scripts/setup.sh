@@ -149,6 +149,19 @@ if ! run_step railway up --detach; then
   exit 1
 fi
 
+# Запоминаем ID деплоя ДО того как меняем переменные — иначе после
+# variables set (который асинхронно запускает новый деплой) можно легко
+# спутать старый контейнер (ещё без правильного MCP_SECRET) с новым, потому
+# что /health отвечает 200 у обоих, пока Railway не переключит трафик.
+PRE_VARS_DEPLOY_ID=$(railway deployment list --json --limit 1 2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d[0]['id'] if d else '')
+except Exception:
+    pass
+" 2>/dev/null || true)
+
 echo "Задаю переменные окружения..."
 run_step railway variables set \
   MCP_TRANSPORT=streamable-http \
@@ -156,6 +169,37 @@ run_step railway variables set \
   TICKTICK_CLIENT_ID="$CLIENT_ID" \
   TICKTICK_CLIENT_SECRET="$CLIENT_SECRET" \
   USER_TIMEZONE="$TIMEZONE"
+
+# Ждём НОВЫЙ деплой (с правильными переменными), а не просто "сервис отвечает" —
+# старый контейнер ещё какое-то время продолжает отвечать на /health со
+# старыми (пустыми) переменными, пока Railway не переключит трафик на новый.
+echo "Жду пока Railway применит переменные и пересоберёт контейнер..."
+DEPLOY_ATTEMPTS=0
+while true; do
+  DEPLOY_ATTEMPTS=$((DEPLOY_ATTEMPTS + 1))
+  if [[ $DEPLOY_ATTEMPTS -gt 40 ]]; then
+    echo "❌ Новый деплой не подтвердился за 3+ минуты. Проверь: railway logs"
+    exit 1
+  fi
+  LATEST=$(railway deployment list --json --limit 1 2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d[0]['id'] + ' ' + d[0]['status'] if d else '')
+except Exception:
+    pass
+" 2>/dev/null || true)
+  LATEST_ID="${LATEST%% *}"
+  LATEST_STATUS="${LATEST##* }"
+  if [[ -n "$LATEST_ID" && "$LATEST_ID" != "$PRE_VARS_DEPLOY_ID" && "$LATEST_STATUS" == "SUCCESS" ]]; then
+    break
+  fi
+  if [[ "$LATEST_STATUS" == "FAILED" || "$LATEST_STATUS" == "CRASHED" ]]; then
+    echo "❌ Новый деплой упал (статус: $LATEST_STATUS). Проверь: railway logs"
+    exit 1
+  fi
+  sleep 5
+done
 
 echo "Генерирую домен..."
 DOMAIN_RAW=$(set +o pipefail; railway domain --json 2>&1)
@@ -178,7 +222,7 @@ if [[ -z "$DOMAIN" ]]; then
   exit 1
 fi
 
-echo "Жду запуска сервиса (после применения переменных, обычно 30–90 сек)..."
+echo "Проверяю, что домен уже отвечает..."
 ATTEMPTS=0
 until curl -sf "https://$DOMAIN/health" &>/dev/null; do
   ATTEMPTS=$((ATTEMPTS + 1))
