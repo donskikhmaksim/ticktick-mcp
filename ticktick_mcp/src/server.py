@@ -2547,6 +2547,7 @@ async def search_all_tasks(
     scope: Literal["both", "open", "closed"] = "both",
     match: Literal["substring", "word"] = "substring",
     fields: Literal["all", "title", "content"] = "all",
+    search_comments: bool = False,
 ) -> str:
     """
     Search tasks with selectable scope, match mode, and which fields to look in.
@@ -2566,12 +2567,18 @@ async def search_all_tasks(
       • 'word'      query matches as a whole word — "boa" no longer matches
                     "board". Use this to cut noise from short queries.
 
-    fields — which fields to search:
+    fields — which fields to search (title/content, always fast):
       • 'all'     (default) task title AND content (the note body).
       • 'title'   only the task title (its name).
       • 'content' only the note body.
-      (Comments are NOT searched — TickTick has no bulk comment API, so it would
-      cost one request per task. Tracked as a separate task if needed.)
+
+    search_comments — also search task COMMENTS (default False). SLOW: TickTick
+      has no bulk comment API, so comments are fetched one task at a time. To
+      bound the cost we only fetch comments for tasks with commentCount > 0 (when
+      that field is present) and stop after a fixed number of fetches, noting in
+      the output how many were scanned and whether the cap was hit. Comment hits
+      are reported in their own group. Turn this on only when you specifically
+      need to find a task by something written in its comments.
 
     Args:
         query: Text to search for.
@@ -2579,6 +2586,7 @@ async def search_all_tasks(
         scope: 'both' | 'open' | 'closed'.
         match: 'substring' | 'word'.
         fields: 'all' | 'title' | 'content'.
+        search_comments: also search comments (slow; default False).
     """
     err = _ensure_ready()
     if err:
@@ -2605,15 +2613,15 @@ async def search_all_tasks(
         want_open = scope in ("both", "open")
         want_closed = scope in ("both", "closed")
 
-        open_matches: List[Dict[str, Any]] = []
+        open_pool: List[Dict[str, Any]] = []
         if want_open:
-            pool = list(await _run_blocking(ticktick_v2.get_open_tasks))
+            open_pool = list(await _run_blocking(ticktick_v2.get_open_tasks))
             if include_completed:
-                pool += await _run_blocking(lambda: ticktick_v2.get_completed_tasks(limit=100))
-            open_matches = [t for t in pool if _hit(t)]
+                open_pool += await _run_blocking(lambda: ticktick_v2.get_completed_tasks(limit=100))
+        open_matches = [t for t in open_pool if _hit(t)]
 
         # Closed/archived projects: not in the sync pool — fetch each one's data.
-        closed_matches: List[Dict[str, Any]] = []
+        closed_pool: List[Dict[str, Any]] = []
         if want_closed:
             projects = await _run_blocking(ticktick.get_projects)
             if isinstance(projects, list):
@@ -2624,12 +2632,43 @@ async def search_all_tasks(
                     data = await _run_blocking(
                         lambda pid=pid: ticktick.get_project_with_data(pid)
                     )
-                    for t in (data.get("tasks", []) or []):
-                        if _hit(t):
-                            closed_matches.append(t)
+                    closed_pool += data.get("tasks", []) or []
+        closed_matches = [t for t in closed_pool if _hit(t)]
 
-        if not open_matches and not closed_matches:
-            return f"No tasks matched '{query}' (scope={scope}, match={match}, fields={fields})."
+        # Comments: slow opt-in. Fetch per task (no bulk API), skip tasks known to
+        # have zero comments, and stop after a fixed number of fetches.
+        COMMENT_FETCH_CAP = 150
+        comment_matches: List[Dict[str, Any]] = []
+        comment_fetches = 0
+        comment_capped = False
+        if search_comments:
+            already = {t.get("id") for t in open_matches + closed_matches}
+            for t in open_pool + closed_pool:
+                tid, pid = t.get("id"), t.get("projectId")
+                if not tid or not pid or tid in already:
+                    continue
+                if t.get("commentCount") == 0:  # skip only when explicitly zero
+                    continue
+                if comment_fetches >= COMMENT_FETCH_CAP:
+                    comment_capped = True
+                    break
+                comment_fetches += 1
+                try:
+                    comments = await _run_blocking(
+                        lambda pid=pid, tid=tid: ticktick_v2.get_task_comments(pid, tid)
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                # A comment's text lives in its "title" field.
+                if any(_text_hit(c.get("title", "") or "") for c in comments):
+                    comment_matches.append(t)
+                    already.add(tid)
+
+        if not open_matches and not closed_matches and not comment_matches:
+            base = f"No tasks matched '{query}' (scope={scope}, match={match}, fields={fields}"
+            if search_comments:
+                base += f", comments: scanned {comment_fetches} task(s)"
+            return base + ")."
 
         out = f"Matches for '{query}' (scope={scope}, match={match}, fields={fields}):\n\n"
         if want_open:
@@ -2641,6 +2680,18 @@ async def search_all_tasks(
             out += (
                 "\n".join(format_task(t) for t in closed_matches[:100])
                 if closed_matches
+                else "(none)\n"
+            )
+            out += "\n"
+        if search_comments:
+            cap_note = " — CAP HIT, not all tasks scanned" if comment_capped else ""
+            out += (
+                f"── Comment matches ({len(comment_matches)}; "
+                f"fetched comments for {comment_fetches} task(s){cap_note}) ──\n"
+            )
+            out += (
+                "\n".join(format_task(t) for t in comment_matches[:100])
+                if comment_matches
                 else "(none)\n"
             )
         return out
