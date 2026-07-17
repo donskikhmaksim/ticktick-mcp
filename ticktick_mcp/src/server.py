@@ -1,10 +1,11 @@
 import asyncio
 import hmac
 import os
+import re
 import logging
 import urllib.parse
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Literal, Optional
 from zoneinfo import ZoneInfo
 
 from mcp.server.fastmcp import FastMCP
@@ -2541,49 +2542,73 @@ async def archive_project(project_name: str, project_id: str, archived: bool = T
 
 @mcp.tool(annotations=READONLY)
 async def search_all_tasks(
-    query: str, include_completed: bool = True, include_closed: bool = True
+    query: str,
+    include_completed: bool = True,
+    scope: Literal["both", "open", "closed"] = "both",
+    match: Literal["substring", "word", "exact"] = "substring",
 ) -> str:
     """
-    Search tasks by title/content (case-insensitive substring). Returns results
-    in TWO separate groups: matches in OPEN projects, and matches in
-    CLOSED/archived projects.
+    Search tasks by title/content, with selectable scope and match mode.
 
-    Why two groups: the fast sync pool omits archived projects entirely, so
-    tasks in a closed project (which can still be active — e.g. a wrapped-up
-    project with leftover to-dos) never show up in an open-only search. They are
-    fetched separately and reported apart so it's obvious which project state a
-    hit came from.
+    scope — which projects to look in:
+      • 'both'   (default) open AND closed/archived projects, reported as two
+                 separate groups.
+      • 'open'   only open projects.
+      • 'closed' only closed/archived projects.
+      The v2 sync pool omits archived projects, so tasks in a CLOSED project
+      (which can still be active) are fetched separately — that's why they're a
+      distinct group and why an open-only search never shows them.
 
-    Note: this is a plain substring match, so a short query (e.g. "boa") also
-    matches inside longer words ("dashboard", "board"). Use a more specific
-    query to narrow it down.
+    match — how the query is compared (case-insensitive):
+      • 'substring' (default) query appears anywhere in title OR content —
+                    so a short query like "boa" also hits inside "board".
+      • 'word'      query matches as a whole word in title OR content —
+                    "boa" no longer matches "board". Use this to cut noise.
+      • 'exact'     the task's TITLE (its name) equals the query exactly;
+                    content is ignored.
 
     Args:
-        query: Text to search for (case-insensitive substring of title/content)
-        include_completed: Also search recently completed tasks (default True)
-        include_closed: Also search tasks in closed/archived projects (default True)
+        query: Text to search for.
+        include_completed: Also search recently completed tasks (default True).
+        scope: 'both' | 'open' | 'closed'.
+        match: 'substring' | 'word' | 'exact'.
     """
     err = _ensure_ready()
     if err:
         return err
     try:
         q = query.lower()
+        if match == "word":
+            pat = re.compile(r"\b" + re.escape(query) + r"\b", re.IGNORECASE | re.UNICODE)
 
-        def _hit(t: Dict[str, Any]) -> bool:
-            return (
-                q in (t.get("title", "") or "").lower()
-                or q in (t.get("content", "") or "").lower()
-            )
+            def _hit(t: Dict[str, Any]) -> bool:
+                return bool(
+                    pat.search(t.get("title", "") or "")
+                    or pat.search(t.get("content", "") or "")
+                )
+        elif match == "exact":
+            def _hit(t: Dict[str, Any]) -> bool:
+                return (t.get("title", "") or "").strip().lower() == q
+        else:  # substring
+            def _hit(t: Dict[str, Any]) -> bool:
+                return (
+                    q in (t.get("title", "") or "").lower()
+                    or q in (t.get("content", "") or "").lower()
+                )
 
-        # Open projects: the v2 sync pool (+ recently completed).
-        pool = list(await _run_blocking(ticktick_v2.get_open_tasks))
-        if include_completed:
-            pool += await _run_blocking(lambda: ticktick_v2.get_completed_tasks(limit=100))
-        open_matches = [t for t in pool if _hit(t)]
+        want_open = scope in ("both", "open")
+        want_closed = scope in ("both", "closed")
+
+        open_matches: List[Dict[str, Any]] = []
+        if want_open:
+            pool = list(await _run_blocking(ticktick_v2.get_open_tasks))
+            if include_completed:
+                pool += await _run_blocking(lambda: ticktick_v2.get_completed_tasks(limit=100))
+            open_matches = [t for t in pool if _hit(t)]
 
         # Closed/archived projects: not in the sync pool — fetch each one's data.
         closed_matches: List[Dict[str, Any]] = []
-        if include_closed:
+        if want_closed:
             projects = await _run_blocking(ticktick.get_projects)
             if isinstance(projects, list):
                 for p in projects:
@@ -2598,16 +2623,20 @@ async def search_all_tasks(
                             closed_matches.append(t)
 
         if not open_matches and not closed_matches:
-            return f"No tasks matched '{query}'."
+            return f"No tasks matched '{query}' (scope={scope}, match={match})."
 
-        out = f"Matches for '{query}':\n\n"
-        out += f"── Open projects ({len(open_matches)}) ──\n"
-        out += format_task_tree(open_matches, 100) if open_matches else "(none)\n"
-        out += f"\n── Closed / archived projects ({len(closed_matches)}) ──\n"
-        if closed_matches:
-            out += "\n".join(format_task(t) for t in closed_matches[:100])
-        else:
-            out += "(none)\n"
+        out = f"Matches for '{query}' (scope={scope}, match={match}):\n\n"
+        if want_open:
+            out += f"── Open projects ({len(open_matches)}) ──\n"
+            out += format_task_tree(open_matches, 100) if open_matches else "(none)\n"
+            out += "\n"
+        if want_closed:
+            out += f"── Closed / archived projects ({len(closed_matches)}) ──\n"
+            out += (
+                "\n".join(format_task(t) for t in closed_matches[:100])
+                if closed_matches
+                else "(none)\n"
+            )
         return out
     except Exception as e:
         logger.error(f"Error in search_all_tasks: {e}")
