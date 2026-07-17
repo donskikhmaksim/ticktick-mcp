@@ -2545,10 +2545,11 @@ async def search_all_tasks(
     query: str,
     include_completed: bool = True,
     scope: Literal["both", "open", "closed"] = "both",
-    match: Literal["substring", "word", "exact"] = "substring",
+    match: Literal["substring", "word"] = "substring",
+    fields: Literal["all", "title", "content"] = "all",
 ) -> str:
     """
-    Search tasks by title/content, with selectable scope and match mode.
+    Search tasks with selectable scope, match mode, and which fields to look in.
 
     scope — which projects to look in:
       • 'both'   (default) open AND closed/archived projects, reported as two
@@ -2560,18 +2561,24 @@ async def search_all_tasks(
       distinct group and why an open-only search never shows them.
 
     match — how the query is compared (case-insensitive):
-      • 'substring' (default) query appears anywhere in title OR content —
+      • 'substring' (default) query appears anywhere in the searched field —
                     so a short query like "boa" also hits inside "board".
-      • 'word'      query matches as a whole word in title OR content —
-                    "boa" no longer matches "board". Use this to cut noise.
-      • 'exact'     the task's TITLE (its name) equals the query exactly;
-                    content is ignored.
+      • 'word'      query matches as a whole word — "boa" no longer matches
+                    "board". Use this to cut noise from short queries.
+
+    fields — which fields to search:
+      • 'all'     (default) task title AND content (the note body).
+      • 'title'   only the task title (its name).
+      • 'content' only the note body.
+      (Comments are NOT searched — TickTick has no bulk comment API, so it would
+      cost one request per task. Tracked as a separate task if needed.)
 
     Args:
         query: Text to search for.
         include_completed: Also search recently completed tasks (default True).
         scope: 'both' | 'open' | 'closed'.
-        match: 'substring' | 'word' | 'exact'.
+        match: 'substring' | 'word'.
+        fields: 'all' | 'title' | 'content'.
     """
     err = _ensure_ready()
     if err:
@@ -2581,20 +2588,19 @@ async def search_all_tasks(
         if match == "word":
             pat = re.compile(r"\b" + re.escape(query) + r"\b", re.IGNORECASE | re.UNICODE)
 
-            def _hit(t: Dict[str, Any]) -> bool:
-                return bool(
-                    pat.search(t.get("title", "") or "")
-                    or pat.search(t.get("content", "") or "")
-                )
-        elif match == "exact":
-            def _hit(t: Dict[str, Any]) -> bool:
-                return (t.get("title", "") or "").strip().lower() == q
+            def _text_hit(text: str) -> bool:
+                return bool(pat.search(text or ""))
         else:  # substring
-            def _hit(t: Dict[str, Any]) -> bool:
-                return (
-                    q in (t.get("title", "") or "").lower()
-                    or q in (t.get("content", "") or "").lower()
-                )
+
+            def _text_hit(text: str) -> bool:
+                return q in (text or "").lower()
+
+        def _hit(t: Dict[str, Any]) -> bool:
+            if fields in ("all", "title") and _text_hit(t.get("title", "") or ""):
+                return True
+            if fields in ("all", "content") and _text_hit(t.get("content", "") or ""):
+                return True
+            return False
 
         want_open = scope in ("both", "open")
         want_closed = scope in ("both", "closed")
@@ -2623,9 +2629,9 @@ async def search_all_tasks(
                             closed_matches.append(t)
 
         if not open_matches and not closed_matches:
-            return f"No tasks matched '{query}' (scope={scope}, match={match})."
+            return f"No tasks matched '{query}' (scope={scope}, match={match}, fields={fields})."
 
-        out = f"Matches for '{query}' (scope={scope}, match={match}):\n\n"
+        out = f"Matches for '{query}' (scope={scope}, match={match}, fields={fields}):\n\n"
         if want_open:
             out += f"── Open projects ({len(open_matches)}) ──\n"
             out += format_task_tree(open_matches, 100) if open_matches else "(none)\n"
