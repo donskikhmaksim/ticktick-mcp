@@ -2188,7 +2188,8 @@ async def get_task_comments(task_title: str, project_id: str, task_id: str) -> s
         out = f"Comments on '{task_title}' ({len(comments)}):\n"
         for c in comments:
             who = (c.get("userProfile") or {}).get("displayName") or c.get("userName", "?")
-            out += f"- [{who}] {c.get('title','')}\n"
+            # Include the comment id — delete_task_comment/update_task_comment need it.
+            out += f"- (id:{c.get('id')}) [{who}] {c.get('title','')}\n"
         return out
     except Exception as e:
         logger.error(f"Error in get_task_comments: {e}")
