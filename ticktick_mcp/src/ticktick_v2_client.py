@@ -143,7 +143,14 @@ class TickTickV2Client:
         # Any write invalidates the cached sync state so reads stay fresh.
         if method != "GET":
             self._state_cache = None
+        # Retry on 429/5xx with exponential backoff (1s, 2s) — TickTick
+        # rate-limits bursts; a short wait usually clears it.
         resp = self.session.request(method, url, **kwargs)
+        for attempt in range(2):
+            if resp.status_code not in (429, 500, 503):
+                break
+            time.sleep(2 ** attempt)
+            resp = self.session.request(method, url, **kwargs)
         if resp.status_code in (401, 403):
             raise TickTickAuthError(
                 "TickTick v2 session token is invalid or expired. Re-extract the "

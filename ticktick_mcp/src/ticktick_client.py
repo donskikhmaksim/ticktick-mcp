@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import json
 import base64
 import threading
@@ -337,16 +338,27 @@ class TickTickClient:
         url = f"{self.base_url}{endpoint}"
         
         try:
+            def _issue():
+                if method == "GET":
+                    return self.session.get(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
+                elif method == "POST":
+                    return self.session.post(url, headers=self.headers, json=data, timeout=REQUEST_TIMEOUT)
+                elif method == "DELETE":
+                    return self.session.delete(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
+
             # Make the request
-            if method == "GET":
-                response = self.session.get(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
-            elif method == "POST":
-                response = self.session.post(url, headers=self.headers, json=data, timeout=REQUEST_TIMEOUT)
-            elif method == "DELETE":
-                response = self.session.delete(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
-            else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
-            
+            response = _issue()
+
+            # Retry on 429/5xx with exponential backoff (1s, 2s) — rate limits
+            # on bursts usually clear after a short wait.
+            for _attempt in range(2):
+                if response.status_code not in (429, 500, 503):
+                    break
+                time.sleep(2 ** _attempt)
+                response = _issue()
+
             # Check if the request was unauthorized (401)
             if response.status_code == 401:
                 logger.info("Access token expired. Attempting to refresh...")

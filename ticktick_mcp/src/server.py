@@ -285,13 +285,9 @@ PRIORITY_MAP = {0: "None", 1: "Low", 3: "Medium", 5: "High"}
 
 # Format a task object from TickTick for better display
 def format_task(task: Dict) -> str:
-    """Format a task into a human-readable string."""
-    formatted = f"ID: {task.get('id', 'No ID')}\n"
-    formatted += f"Title: {task.get('title', 'No title')}\n"
-    
-    # Add project ID
-    formatted += f"Project ID: {task.get('projectId', 'None')}\n"
-    
+    """Format a task into a human-readable string (title first, ids at the end)."""
+    formatted = f"Title: {task.get('title', 'No title')}\n"
+
     # Add dates if available
     if task.get('startDate'):
         formatted += f"Start Date: {task.get('startDate')}\n"
@@ -317,15 +313,16 @@ def format_task(task: Dict) -> str:
         for i, item in enumerate(items, 1):
             status = "✓" if item.get('status') == 1 else "□"
             formatted += f"{i}. [{status}] {item.get('title', 'No title')}\n"
-    
+
+    # Ids last — needed for follow-up calls, but not the headline.
+    formatted += f"(id: {task.get('id', '?')} | project: {task.get('projectId', '?')})\n"
     return formatted
 
 # Format a project object from TickTick for better display
 def format_project(project: Dict) -> str:
-    """Format a project into a human-readable string."""
+    """Format a project into a human-readable string (name first, id at the end)."""
     formatted = f"Name: {project.get('name', 'No name')}\n"
-    formatted += f"ID: {project.get('id', 'No ID')}\n"
-    
+
     # Add color if available
     if project.get('color'):
         formatted += f"Color: {project.get('color')}\n"
@@ -341,7 +338,9 @@ def format_project(project: Dict) -> str:
     # Add kind if available
     if project.get('kind'):
         formatted += f"Kind: {project.get('kind')}\n"
-    
+
+    # Id last — needed for follow-up calls, but not the headline.
+    formatted += f"(id: {project.get('id', '?')})\n"
     return formatted
 
 _PRIO_SHORT = {0: "", 1: "P-Low", 3: "P-Med", 5: "P-High"}
@@ -369,17 +368,26 @@ def format_task_line(task: Dict, project_name: str = None) -> str:
 
 
 def _v2_project_names() -> Dict:
-    """Map projectId -> name (incl. Inbox) from the cached v2 state."""
-    if not ticktick_v2:
-        return {}
-    try:
-        st = ticktick_v2.get_state()
-        names = {p["id"]: p.get("name") for p in (st.get("projectProfiles") or [])}
-        if st.get("inboxId"):
-            names[st["inboxId"]] = "Inbox"
-        return names
-    except Exception:
-        return {}
+    """Map projectId -> name (incl. Inbox) from the cached v2 state,
+    falling back to the official v1 API so results stay human-readable
+    even when v2 is unavailable."""
+    if ticktick_v2:
+        try:
+            st = ticktick_v2.get_state()
+            names = {p["id"]: p.get("name") for p in (st.get("projectProfiles") or [])}
+            if st.get("inboxId"):
+                names[st["inboxId"]] = "Inbox"
+            if names:
+                return names
+        except Exception:
+            pass
+    # v1 fallback: one get_projects call — names instead of raw ids.
+    if ticktick:
+        try:
+            return {p.get("id"): p.get("name") for p in (ticktick.get_projects() or [])}
+        except Exception:
+            pass
+    return {}
 
 
 def _lookup_task_title(task_id: str) -> str:
@@ -2116,7 +2124,7 @@ async def create_project_group(name: str) -> str:
         return err
     try:
         gid = await _run_blocking(lambda: ticktick_v2.create_project_group(name))
-        return f"Project group '{name}' created (id: {gid})."
+        return f"Группа проектов «{name}» создана. (id: {gid})"
     except Exception as e:
         logger.error(f"Error in create_project_group: {e}")
         return f"Error creating project group: {str(e)}"
@@ -2429,7 +2437,7 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None) -> 
     title = task_title or _lookup_task_title(task_id)
     try:
         copy = await _run_blocking(lambda: ticktick_v2.duplicate_task(task_id))
-        return f"Дублировано: «{title}» → новый id: {copy.get('id')}"
+        return f"Дублировано: «{title}» → копия «{copy.get('title') or title}»"
     except Exception as e:
         logger.error(f"Error in duplicate_task: {e}")
         return f"Error duplicating task: {str(e)}"
