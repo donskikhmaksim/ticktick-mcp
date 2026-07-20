@@ -506,14 +506,24 @@ async def get_projects() -> str:
         projects = await _run_blocking(lambda: ticktick.get_projects())
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
-        
+
+        # The official /project endpoint omits the built-in Inbox. Prepend it
+        # (id from the v2 state) so consumers can see and target system projects.
+        if ticktick_v2:
+            try:
+                inbox_id = ticktick_v2.get_state().get("inboxId")
+                if inbox_id and not any(p.get("id") == inbox_id for p in projects):
+                    projects = [{"id": inbox_id, "name": "Inbox", "kind": "TASK"}] + projects
+            except Exception as e:
+                logger.warning(f"Could not add Inbox to project list: {e}")
+
         if not projects:
             return "No projects found."
-        
+
         result = f"Found {len(projects)} projects:\n\n"
         for i, project in enumerate(projects, 1):
             result += f"Project {i}:\n" + format_project(project) + "\n"
-        
+
         return result
     except Exception as e:
         logger.error(f"Error in get_projects: {e}")
