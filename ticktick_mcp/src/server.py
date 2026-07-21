@@ -1033,6 +1033,12 @@ async def create_tasks(
         parts.append("Проверка назначения:\n" + "\n".join(warnings))
     if failed:
         parts.append(f"Ошибки ({len(failed)}):\n" + "\n".join(failed))
+    if to_verify:
+        rid = _op_journal("create", [
+            {"taskId": v_id, "title": v_title,
+             "expect": {"projectId": v_pid, **({"columnId": v_col} if v_col else {})}}
+            for v_title, v_id, v_pid, v_col in to_verify], summary)
+        parts.append(_report_line(rid))
     return "\n\n".join(parts)
 
 @mcp.tool()
@@ -1085,6 +1091,7 @@ async def update_tasks(
 
     if len(tasks) == 1 or has_advanced:
         results = []
+        _single_updates = []
         for t in tasks:
             tid = t.get("taskId") or t.get("task_id")
             pid = t.get("projectId") or t.get("project_id") or ""
@@ -1132,8 +1139,25 @@ async def update_tasks(
                     except Exception as e:
                         logger.warning(f"Updated but assignee failed: {e}")
                 results.append(f"✏️ «{shown_title}» обновлено")
+                changes = {}
+                if new_title is not None:
+                    changes["title"] = new_title
+                if t.get("content") is not None:
+                    changes["content"] = t["content"]
+                if priority is not None:
+                    changes["priority"] = priority
+                if t.get("tags") is not None:
+                    changes["tags"] = t["tags"]
+                for src, dst in (("due_date", "dueDate"), ("start_date", "startDate")):
+                    if t.get(src):
+                        changes[dst] = _normalize_date(t[src])[0]
+                _single_updates.append({"taskId": tid, "title": new_title or shown_title,
+                                        "expect": {"changes": changes}})
             except Exception as e:
                 results.append(f"✗ «{shown_title}»: {e}")
+        if _single_updates:
+            rid = _op_journal("update", _single_updates, summary)
+            results.append(_report_line(rid))
         return "\n".join(results)
 
     # Multiple tasks, no advanced fields — use v2 batch
@@ -1181,6 +1205,13 @@ async def update_tasks(
             lines.append(f"↷ Не найдены среди открытых {len(missing)} "
                          "(неверный id/завершены): "
                          + ", ".join(f"«{m['title']}»" for m in missing))
+        if changes:
+            rid = _op_journal("update", [
+                {"taskId": ch["taskId"],
+                 "title": ch.get("title") or "",
+                 "expect": {"changes": {k: v for k, v in ch.items() if k != "taskId"}}}
+                for ch in changes], summary)
+            lines.append(_report_line(rid))
         return "\n".join(lines) if lines else "Ничего не обновлено."
     except Exception as e:
         logger.error(f"Error in update_tasks: {e}")
@@ -1238,14 +1269,24 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
             if failed:
                 lines.append(f"❌ НЕ завершены {len(failed)} (всё ещё открыты): "
                              + ", ".join(f"«{t}»" for t in failed))
+            if found:
+                rid = _op_journal("complete", [
+                    {"taskId": f["taskId"], "title": f["title"]} for f in found], summary)
+                lines.append(_report_line(rid))
             return "\n".join(lines) if lines else "Ничего не завершено."
         else:
             results = []
+            _done_items = []
             for t in tasks:
                 tid = t.get("taskId") or t.get("task_id")
                 pid = t.get("projectId") or t.get("project_id") or ""
                 title = t.get("title") or _lookup_task_title(tid)
-                pid = _resolve_project_id(tid, pid)
+                # Identity guard for the single-completion path too.
+                g = _guard_task(tid, t.get("title") or "", pid)
+                if g.status == "mismatch":
+                    results.append(f"🛑 НЕ завершил «{t.get('title')}» — {g.message}")
+                    continue
+                pid = g.project_id or _resolve_project_id(tid, pid)
                 pname = t.get("projectName") or _v2_project_names().get(pid, "")
                 res = await _run_blocking(lambda: ticktick.complete_task(pid, tid))
                 if 'error' in res:
@@ -1253,6 +1294,10 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
                 else:
                     where = f" в «{pname}»" if pname else ""
                     results.append(f"✓ «{title}»{where}")
+                    _done_items.append({"taskId": tid, "title": title})
+            if _done_items:
+                rid = _op_journal("complete", _done_items, summary)
+                results.append(_report_line(rid))
             return "\n".join(results)
     except Exception as e:
         logger.error(f"Error in complete_tasks: {e}")
@@ -1284,13 +1329,13 @@ async def delete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
         return "Нечего удалять: список пуст."
     # SINGLE task → direct delete allowed, but only fully armed: the title is
     # REQUIRED (identity guard always on), the snapshot is journaled, and
-    # deletion_report works for it. BULK (>cap) → two-phase manifest only
+    # operation_report works for it. BULK (>cap) → two-phase manifest only
     # (plan → text approval → execute → independent report).
     direct_cap = int(os.environ.get("DIRECT_DELETE_CAP", "1"))
     if len(tasks) > direct_cap:
         return (f"🛑 Пакетное удаление ({len(tasks)} задач) — только через "
                 "манифест: plan_task_deletion → (аппрув) → execute_task_deletion "
-                "→ deletion_report. Напрямую можно удалить только "
+                "→ operation_report. Напрямую можно удалить только "
                 f"{direct_cap} задачу за вызов.")
     if any(not (t.get("title") or "").strip() for t in tasks):
         return ("🛑 Для прямого удаления обязателен title каждой задачи — "
@@ -1305,7 +1350,7 @@ async def delete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
         by_id = _open_by_id(fresh=True)
         found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
         # Journal full snapshots BEFORE deleting (same guarantee as the manifest
-        # path) — deletion_report("direct-…") then works for point deletes too.
+        # path) — operation_report("direct-…") then works for point deletes too.
         record_id = "direct-" + uuid.uuid4().hex[:8]
         journal = ""
         if found:
@@ -1348,7 +1393,7 @@ async def delete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
                 "(delete не сработал): " + ", ".join(f"«{t}»" for t in failed))
         if journal and deleted:
             lines.append(f"🧾 Снапшот в журнале; независимая проверка: "
-                         f"deletion_report(manifest_id=\"{record_id}\").")
+                         f"operation_report(record_id=\"{record_id}\").")
         return "\n".join(lines) if lines else "Ничего не удалено."
     except Exception as e:
         logger.error(f"Error in delete_tasks: {e}")
@@ -1371,9 +1416,9 @@ _JOURNAL_DIR = os.environ.get("TICKTICK_DATA_DIR", "/data")
 
 
 def _journal_write(record: Dict) -> str:
-    """Append a JSON record to the deletion journal (best-effort). Returns the
+    """Append a JSON record to the mutation journal (best-effort). Returns the
     journal path or '' if unwritable. The journal holds FULL task snapshots so
-    anything deleted by mistake can be recreated by hand."""
+    anything mutated by mistake can be reconstructed by hand."""
     try:
         os.makedirs(_JOURNAL_DIR, exist_ok=True)
         path = os.path.join(_JOURNAL_DIR, "deletion_journal.jsonl")
@@ -1381,8 +1426,36 @@ def _journal_write(record: Dict) -> str:
             f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
         return path
     except Exception as e:
-        logger.warning(f"deletion journal unwritable: {e}")
+        logger.warning(f"mutation journal unwritable: {e}")
         return ""
+
+
+def _snapshot_of(live: Optional[Dict]) -> Dict:
+    """Compact snapshot of a live task for the journal."""
+    return {k: (live or {}).get(k) for k in
+            ("title", "content", "desc", "dueDate", "startDate", "priority",
+             "tags", "projectId", "parentId", "columnId", "isAllDay")
+            if (live or {}).get(k) is not None}
+
+
+def _op_journal(op: str, items: List[Dict], summary: str = "") -> str:
+    """Record a mutation operation: op ∈ create/update/complete/delete/move/
+    tags/parent/abandon. Each item: {taskId, title, snapshot?, expect?}.
+    Returns the record id ("<op>-<hex>") to hand to operation_report, or ''
+    when the journal is unavailable (report then impossible — say so)."""
+    rid = f"{op}-{uuid.uuid4().hex[:8]}"
+    path = _journal_write({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "record": rid, "op": op, "summary": summary, "items": items,
+    })
+    return rid if path else ""
+
+
+def _report_line(rid: str) -> str:
+    """Standard footer pointing at the independent post-check."""
+    if not rid:
+        return "🧾 Журнал недоступен — независимая проверка невозможна."
+    return f"🧾 Независимая проверка: operation_report(record_id=\"{rid}\")."
 
 
 def _prune_manifests() -> None:
@@ -1411,7 +1484,7 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
     own reply to the user (tool-result blocks may be collapsed in some UIs —
     your message is always fully visible). Then, after the human approves, call
     execute_task_deletion(manifest_id, confirm="DELETE <N>"), and afterwards
-    deletion_report(manifest_id) for the independent outcome check.
+    operation_report(record_id) for the independent outcome check.
 
     Nothing is deleted by this tool. Manifests are one-shot and expire in 1 h.
 
@@ -1549,27 +1622,95 @@ async def execute_task_deletion(manifest_id: str, confirm: str = "") -> str:
             lines.append(f"🧾 Снапшоты удалённого — в журнале: {journal} "
                          "(восстановление: restore_tasks из корзины, либо "
                          "пересоздание из снапшота).")
-        lines.append(f"Независимая проверка: deletion_report(manifest_id=\"{manifest_id}\").")
+        lines.append(f"Независимая проверка: operation_report(record_id=\"{manifest_id}\").")
         return "\n".join(lines) if lines else "Ничего не удалено."
     except Exception as e:
         logger.error(f"Error in execute_task_deletion: {e}")
         return f"Error executing deletion manifest: {str(e)}"
 
 
-@mcp.tool(annotations=READONLY)
-async def deletion_report(manifest_id: str) -> str:
-    """
-    Independent post-execution report for a deletion manifest. Read-only.
+def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
+                 names: Dict) -> str:
+    """One verdict line for one journaled item, judged from CURRENT live state."""
+    tid = item.get("taskId")
+    title = item.get("title") or (item.get("snapshot") or {}).get("title") \
+        or f"[task {str(tid)[:8]}…]"
+    live = live_map.get(tid)
+    exp = item.get("expect") or {}
 
-    Reads what execute_task_deletion RECORDED in the on-disk journal (full task
-    snapshots taken just before deletion) and re-checks each task against the
-    CURRENT live TickTick state. The verdict is built by the server from data,
-    not from anyone's narrative — call it after every execute_task_deletion and
-    reprint the output VERBATIM to the user, so the outcome they see is the
+    if op == "delete":
+        return (f"  ❌ «{title}» — ВСЁ ЕЩЁ существует (удаление не состоялось "
+                "или восстановлена)" if live else f"  ✅ «{title}» — удалена")
+    if op in ("complete", "abandon"):
+        verb = "закрыта" if op == "complete" else "отмечена «не буду делать»"
+        return (f"  ❌ «{title}» — всё ещё среди открытых" if live
+                else f"  ✅ «{title}» — {verb} (ушла из открытых)")
+    if live is None:
+        return f"  ❌ «{title}» — не найдена среди открытых (ожидалась живой)"
+    if op == "create":
+        probs = []
+        want_pid = exp.get("projectId")
+        if want_pid and live.get("projectId") != want_pid:
+            probs.append(f"в «{names.get(live.get('projectId'), '?')}», а не "
+                         f"«{names.get(want_pid, want_pid)}»")
+        if exp.get("columnId") and live.get("columnId") != exp.get("columnId"):
+            probs.append("раздел не применился")
+        return (f"  ⚠️ «{title}» — создана, но: " + "; ".join(probs)) if probs \
+            else f"  ✅ «{title}» — создана там, где просили"
+    if op == "move":
+        want = exp.get("projectId")
+        return (f"  ✅ «{title}» — в «{names.get(want, want)}»"
+                if live.get("projectId") == want else
+                f"  ❌ «{title}» — осталась в «{names.get(live.get('projectId'), '?')}»")
+    if op == "tags":
+        want = set(exp.get("tags") or [])
+        got = set(live.get("tags") or [])
+        return (f"  ✅ «{title}» — теги {sorted(got)}" if want == got else
+                f"  ❌ «{title}» — теги {sorted(got)}, ожидались {sorted(want)}")
+    if op == "parent":
+        want = exp.get("parentId")  # None = detached
+        got = live.get("parentId")
+        ok = (got == want) if want else not got
+        return (f"  ✅ «{title}» — родитель применён" if ok else
+                f"  ❌ «{title}» — parentId={got!r}, ожидался {want!r}")
+    if op == "update":
+        changes = exp.get("changes") or {}
+        diffs = []
+        for field, want in changes.items():
+            got = live.get(field)
+            if field in ("dueDate", "startDate") and isinstance(got, str) \
+                    and isinstance(want, str):
+                if got[:10] != want[:10]:
+                    diffs.append(f"{field}: {got!r} ≠ {want!r}")
+            elif field == "tags":
+                if set(got or []) != set(want or []):
+                    diffs.append(f"tags: {got} ≠ {want}")
+            elif got != want:
+                diffs.append(f"{field}: {got!r} ≠ {want!r}")
+        return (f"  ❌ «{title}» — не применилось: " + "; ".join(diffs)) if diffs \
+            else f"  ✅ «{title}» — все изменения на месте"
+    return f"  ✓ «{title}» — записана в журнал (тип {op} не проверяется автоматически)"
+
+
+@mcp.tool(annotations=READONLY)
+async def operation_report(record_id: str) -> str:
+    """
+    Independent post-execution report for ANY journaled mutation. Read-only.
+
+    Every mutating tool (create/update/complete/delete/move/tags/parent/abandon)
+    returns a record_id like "create-a1b2c3d4". This tool re-reads what was
+    RECORDED in the on-disk journal at execution time and re-checks every item
+    against the CURRENT live TickTick state: created tasks must exist in the
+    requested project/column, updates must show the new field values, deletions
+    must be gone, moves must sit in the target project, etc. The verdict is
+    built by the server from data — call it after any mutation the user cares
+    about and reprint the output VERBATIM, so the outcome they see is the
     server's, not a paraphrase.
 
+    Accepts both "<op>-<hex>" record ids and deletion manifest ids.
+
     Args:
-        manifest_id: id of an executed manifest (from plan_task_deletion)
+        record_id: id returned by a mutating tool (or a deletion manifest id)
     """
     err = _ensure_ready()
     if err:
@@ -1584,37 +1725,38 @@ async def deletion_report(manifest_id: str) -> str:
                         rec = json.loads(line)
                     except ValueError:
                         continue
-                    if rec.get("manifest") == manifest_id:
+                    if rec.get("record") == record_id or rec.get("manifest") == record_id:
                         records.append(rec)
         except FileNotFoundError:
-            return (f"🧾 Журнал не найден ({path}) — либо манифест {manifest_id} "
-                    "не исполнялся, либо журнал недоступен. Отчёт дать не могу.")
+            return (f"🧾 Журнал не найден ({path}) — операция {record_id} не "
+                    "записана, отчёт дать не могу.")
         if not records:
-            return (f"🧾 В журнале нет записей по манифесту {manifest_id} — "
-                    "он не исполнялся (или исполнился без единого удаления).")
+            return (f"🧾 В журнале нет записей по {record_id} — операция не "
+                    "исполнялась или журнал был недоступен в момент записи.")
         live = _open_by_id(fresh=True)
-        gone, present = [], []
+        names = _v2_project_names()
         when = records[-1].get("ts", "?")
+        lines = [f"🧾 НЕЗАВИСИМЫЙ ОТЧЁТ по операции {record_id} ({when}):"]
+        ok = bad = 0
         for rec in records:
-            for snap in rec.get("deleted", []):
-                tid = snap.get("taskId")
-                title = snap.get("title") or f"[task {str(tid)[:8]}…]"
-                (present if tid in live else gone).append(title)
-        lines = [f"🧾 НЕЗАВИСИМЫЙ ОТЧЁТ по манифесту {manifest_id} (исполнен {when}):"]
-        if gone:
-            lines.append(f"  ✅ Подтверждено удалены {len(gone)}:")
-            lines += [f"    - «{t}»" for t in gone]
-        if present:
-            lines.append(f"  ❌ ВСЁ ЕЩЁ СУЩЕСТВУЮТ {len(present)} (удаление не "
-                         "состоялось или восстановлены):")
-            lines += [f"    - «{t}»" for t in present]
-        lines.append("Источник: журнал снапшотов + живое состояние TickTick. "
-                     "Восстановление удалённого: restore_tasks (корзина) или "
-                     "пересоздание из снапшота в журнале.")
+            op = rec.get("op") or "delete"
+            items = rec.get("items") or [
+                {"taskId": s.get("taskId"), "title": s.get("title"), "snapshot": s}
+                for s in rec.get("deleted", [])
+            ]
+            for item in items:
+                line = _verify_item(op, item, live, names)
+                lines.append(line)
+                if line.lstrip().startswith("✅"):
+                    ok += 1
+                elif line.lstrip().startswith("❌"):
+                    bad += 1
+        lines.append(f"Итог: ✅ {ok} подтверждено, ❌ {bad} расхождений. "
+                     "Источник: журнал операции + живое состояние TickTick.")
         return "\n".join(lines)
     except Exception as e:
-        logger.error(f"Error in deletion_report: {e}")
-        return f"Error building deletion report: {str(e)}"
+        logger.error(f"Error in operation_report: {e}")
+        return f"Error building operation report: {str(e)}"
 
 
 @mcp.tool()
@@ -1651,7 +1793,7 @@ async def delete_task_with_subtasks(
         return ("🛑 Удаление дерева — только через манифест. Используй "
                 "plan_task_deletion с {\"taskId\": ..., \"title\": ..., "
                 "\"with_subtasks\": true} — план сам развернёт подзадачи, покажет "
-                "полный список на аппрув, а deletion_report подтвердит результат.")
+                "полный список на аппрув, а operation_report подтвердит результат.")
 
     title = task_title or _lookup_task_title(task_id)
     try:
@@ -2391,6 +2533,11 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]],
         if failed:
             lines.append(f"❌ НЕ перемещено {len(failed)} (остались на месте): "
                          + ", ".join(f"«{t}»" for t in failed))
+        if found:
+            rid = _op_journal("move", [
+                {"taskId": f["taskId"], "title": f["title"],
+                 "expect": {"projectId": to_project_id}} for f in found], summary)
+            lines.append(_report_line(rid))
         return "\n".join(lines) if lines else "Ничего не перемещено."
     except Exception as e:
         logger.error(f"Error in move_tasks: {e}")
@@ -2568,6 +2715,11 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]],
         if missing:
             lines.append(f"↷ Не найдены среди открытых {len(missing)}: "
                          + ", ".join(f"«{m['title']}»" for m in missing))
+        if ok_ids:
+            rid = _op_journal("parent", [
+                {"taskId": f["taskId"], "title": f["title"],
+                 "expect": {"parentId": parent_task_id}} for f in found], summary)
+            lines.append(_report_line(rid))
         return "\n".join(lines) if lines else "Ничего не вложено."
     except Exception as e:
         logger.error(f"Error in set_task_parent: {e}")
@@ -2596,7 +2748,11 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
                     "Ничего не тронул.")
         await _run_blocking(lambda: ticktick_v2.unset_task_parent(
             task_id, parent_task_id, g.project_id or project_id))
-        return f"Task '{task_title}' detached from parent '{parent_task_title}'."
+        rid = _op_journal("parent", [{"taskId": task_id, "title": task_title,
+                                      "expect": {"parentId": None}}],
+                          f"Отцепить «{task_title}»")
+        return (f"Task '{task_title}' detached from parent '{parent_task_title}'.\n"
+                + _report_line(rid))
     except Exception as e:
         logger.error(f"Error in unset_task_parent: {e}")
         return f"Error detaching subtask: {str(e)}"
@@ -2640,6 +2796,13 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]]) -> str:
         if missing:
             lines.append(f"↷ Не найдены среди открытых {len(missing)}: "
                          + ", ".join(f"«{m['title']}»" for m in missing))
+        if changes:
+            tags_by_id = {c["taskId"]: c["tags"] for c in changes}
+            rid = _op_journal("tags", [
+                {"taskId": f["taskId"], "title": f["title"],
+                 "expect": {"tags": tags_by_id.get(f["taskId"], [])}}
+                for f in found], summary)
+            lines.append(_report_line(rid))
         return "\n".join(lines) if lines else "Ничего не изменено."
     except Exception as e:
         logger.error(f"Error in set_task_tags: {e}")
@@ -3057,7 +3220,8 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None) -> st
                 "Ничего не тронул.")
     try:
         await _run_blocking(lambda: ticktick_v2.abandon_task(task_id))
-        return f"✗ Не буду делать: «{title}»"
+        rid = _op_journal("abandon", [{"taskId": task_id, "title": title}], summary)
+        return f"✗ Не буду делать: «{title}»\n" + _report_line(rid)
     except Exception as e:
         logger.error(f"Error in abandon_task: {e}")
         return f"Error abandoning task: {str(e)}"
