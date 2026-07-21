@@ -806,18 +806,22 @@ def _flatten_task_tree(node: Dict, project_id: str, parent_id: str = None,
 @mcp.tool()
 async def create_tasks(
     summary: str,
-    tasks: List[Dict[str, Any]]
+    tasks: List[Dict[str, Any]],
+    automation_key: str = ""
 ) -> str:
     """
     Create one or more tasks in TickTick with full nested subtask support
     (up to 4 levels: task → subtask → sub-subtask → sub-sub-subtask).
 
-    PROTOCOL (interactive chats): do NOT call this directly. First call
-    plan_task_creation (read-only) — it returns the server's echo of exactly
-    what would be created and where; reprint it VERBATIM, get the user's
-    explicit "да/ок", then execute_task_creation(manifest_id, confirm=...).
-    Direct create_tasks is for HEADLESS/API clients, or when the user has just
-    dictated this exact list verbatim and re-asking would be pure repetition.
+    ⛔ INTERACTIVE ASSISTANTS: this tool will REFUSE your call. Use
+    plan_task_creation (read-only) → reprint its echo VERBATIM → get the
+    user's explicit «да/ок» → execute_task_creation(manifest_id, confirm=...)
+    → operation_report. Do NOT try to fill automation_key — you don't know it
+    and guessing is a protocol violation.
+
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation, which
+    bypasses the interactive plan/approve requirement.
 
     summary (FIRST arg): one-line human sentence IN THE USER'S LANGUAGE shown
     at the TOP of the confirmation dialog, e.g.
@@ -876,6 +880,11 @@ async def create_tasks(
         the created task's id as `(id:<id>)` so callers can link it without a
         follow-up title search.
     """
+    if not (SECRET and automation_key and hmac.compare_digest(automation_key, SECRET)):
+        return ("🛑 Прямое создание — только для автоматики. Интерактивный флоу: "
+                "plan_task_creation (покажи эхо пользователю дословно) → явное "
+                "«да» → execute_task_creation(manifest_id, confirm=\"CREATE N\") "
+                "→ operation_report. Ничего не создано.")
     return await _create_tasks_impl(summary, tasks)
 
 
