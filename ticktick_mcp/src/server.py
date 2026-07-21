@@ -708,6 +708,11 @@ async def create_tasks(
     Args:
         summary: Human-readable confirmation line (see above)
         tasks: List of task definition objects — one item for a single task
+
+    Returns:
+        A formatted summary. Each successfully-created root task line ends with
+        the created task's id as `(id:<id>)` so callers can link it without a
+        follow-up title search.
     """
     err = _ensure_official()
     if err:
@@ -753,6 +758,8 @@ async def create_tasks(
                         logger.warning(f"Column failed: {e}")
                 total = len(tasks_flat)
                 line = f"✓ «{title}» + {total - 1} подзадач (дерево, {total} всего)"
+                if root_id:
+                    line += f" (id:{root_id})"
                 created.append(line)
                 continue
 
@@ -824,6 +831,8 @@ async def create_tasks(
             line = f"✓ «{title}»"
             if sub_count:
                 line += f" + {sub_count} подзадач"
+            if task_id:
+                line += f" (id:{task_id})"
             created.append(line)
 
         except Exception as e:
