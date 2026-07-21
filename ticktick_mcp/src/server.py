@@ -1,8 +1,11 @@
 import asyncio
 import hmac
+import json
 import os
 import re
+import time
 import unicodedata
+import uuid
 import logging
 import urllib.parse
 from datetime import datetime, timezone, timedelta
@@ -420,59 +423,113 @@ def _resolve_project_id(task_id: str, given: str) -> str:
     return given
 
 
-def _open_by_id() -> Dict[str, Dict]:
-    """Fresh {taskId: task} map of the v2 OPEN-task state, or {} if unavailable."""
+def _open_by_id(fresh: bool = False) -> Dict[str, Dict]:
+    """{taskId: task} of the v2 OPEN-task state, or {} if unavailable.
+    fresh=True drops the cache first, so a just-renamed/moved/completed task is
+    seen — used by the write guard so it never checks against a stale title."""
     if not ticktick_v2:
         return {}
     try:
+        if fresh:
+            ticktick_v2.invalidate_cache()
         return {t.get("id"): t for t in ticktick_v2.get_open_tasks() if t.get("id")}
     except Exception:
         return {}
 
 
+# Zero-width / variation-selector chars that can silently differ between two
+# otherwise-identical titles (emoji VS16, ZWJ, ZWSP, BOM).
+_INVISIBLE = ("️", "‍", "​", "﻿", "‎", "‏")
+
+
 def _norm_name(s: str) -> str:
-    """Loose comparison key for a title/project name: NFKC, lowercased, inner
-    whitespace collapsed, leading/trailing non-word chars stripped (drops a
-    control marker like «👁 », emoji, punctuation) so a caller's plain title
-    still matches the stored one that carries a marker prefix."""
-    s = unicodedata.normalize("NFKC", s or "").lower()
-    s = re.sub(r"\s+", " ", s).strip()
-    return re.sub(r"^[\W_]+|[\W_]+$", "", s)
+    """Comparison key for a title/project name. NFKC-normalise, drop invisible
+    joiners, lowercase, collapse inner whitespace, strip leading/trailing
+    non-word chars — so a control marker («👁 »), emoji, surrounding punctuation,
+    case and spacing never cause a false mismatch, while the meaningful text is
+    preserved exactly."""
+    s = unicodedata.normalize("NFKC", s or "")
+    for z in _INVISIBLE:
+        s = s.replace(z, "")
+    s = re.sub(r"\s+", " ", s.lower()).strip()
+    return re.sub(r"^[\W_]+|[\W_]+$", "", s, flags=re.UNICODE)
 
 
 def _names_agree(expected: str, actual: str) -> bool:
-    """Whether a caller-supplied name matches the live one. Empty expected → no
-    claim to verify (agree). Tolerant: equal after normalisation, or one is a
-    substring of the other (covers a «👁 »/tag marker prefix or a trailing
-    « — deadline» note) — but a wholly different task still fails."""
-    a, b = _norm_name(expected), _norm_name(actual)
+    """True if a caller-supplied name matches the live one. Empty expected → no
+    claim to verify (True). Otherwise EXACT match after normalisation — NOT a
+    loose substring: «Позвонить» must NOT match «Позвонить Пете», and different
+    numbers/amounts ($10 000 vs $11 000) fail. Marker/case/space differences pass."""
+    a = _norm_name(expected)
     if not a:
         return True
-    if not b:
-        return False
-    return a == b or a in b or b in a
+    return a == _norm_name(actual)
+
+
+class _Guard:
+    """Result of the identity guard for one task. status ∈ {ok, mismatch, missing}."""
+    __slots__ = ("status", "project_id", "title", "message")
+
+    def __init__(self, status, project_id="", title="", message=""):
+        self.status = status
+        self.project_id = project_id   # the task's CURRENT projectId (corrected)
+        self.title = title             # the live title
+        self.message = message
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+
+def _guard_task(
+    task_id: str,
+    expected_title: str = "",
+    project_id: str = "",
+    expected_project: str = "",
+    *,
+    fresh: bool = True,
+    by_id: Optional[Dict[str, Dict]] = None,
+) -> "_Guard":
+    """Identity guard for a SINGLE-task mutation: confirm the id points at the
+    task the caller means BEFORE touching it, using fresh live state.
+
+    - id not among open tasks              → status 'missing' (can't verify)
+    - id resolves to a DIFFERENT title     → status 'mismatch' (REFUSE — wrong task)
+    - id in a different project than asked  → status 'mismatch'
+    - otherwise                            → status 'ok', project_id corrected
+
+    Title check is armed only when `expected_title` is given (back-compatible)."""
+    by_id = _open_by_id(fresh=fresh) if by_id is None else by_id
+    live = by_id.get(task_id)
+    if not live:
+        return _Guard("missing", project_id, expected_title,
+                      f"id {str(task_id)[:8]}… не среди открытых задач "
+                      "(завершена/удалена/неверный id)")
+    real_pid = live.get("projectId") or project_id
+    real_title = live.get("title") or ""
+    names = _v2_project_names()
+    if not _names_agree(expected_title, real_title):
+        return _Guard("mismatch", real_pid, real_title,
+                      f"id указывает на «{real_title}», а НЕ «{expected_title}»")
+    if expected_project and not _names_agree(expected_project, names.get(real_pid, "")):
+        return _Guard("mismatch", real_pid, real_title,
+                      f"id в проекте «{names.get(real_pid, '')}», а НЕ «{expected_project}»")
+    return _Guard("ok", real_pid, real_title)
 
 
 def _split_tasks_by_state(
-    tasks: List[Dict], by_id: Optional[Dict[str, Dict]] = None
+    tasks: List[Dict], by_id: Optional[Dict[str, Dict]] = None, fresh: bool = True
 ) -> tuple:
-    """Split requested task dicts against the OPEN-task state so a mutating tool
-    acts only on the RIGHT task and reports REAL results, not the request.
+    """Split requested task dicts against FRESH open-task state so a batch
+    mutating tool acts only on the RIGHT task and reports REAL results.
 
-    Returns (found, mismatch, missing):
-      found    — [{taskId, projectId, title}] the id is open AND (when the caller
-                 supplied a title/projectName) it AGREES with the live task. Safe
-                 to mutate. projectId is corrected to the task's CURRENT one (a
-                 stale one makes the official API silently no-op the write).
-      mismatch — id is open but the caller's title/projectName does NOT match the
-                 live task: a stale/wrong id pointing at a DIFFERENT task. Each is
-                 {taskId, expected, actual, project} — the guard REFUSES these so
-                 we never delete/complete/move the wrong task by a bad id.
-      missing  — id not among open tasks (already deleted/completed, or wrong id).
-
-    Cross-check is opt-in per item: pass "title" (and optionally "projectName")
-    to arm it; omit them and the item is trusted by id alone (back-compatible)."""
-    by_id = _open_by_id() if by_id is None else by_id
+    Returns (found, mismatch, missing) — see _guard_task for the per-item rules.
+      found    — [{taskId, projectId, title}] id open AND name agrees (or no name
+                 given); projectId corrected to the CURRENT one.
+      mismatch — [{taskId, expected, actual, project}] id resolves to a DIFFERENT
+                 task/project — REFUSED, never touched.
+      missing  — [{taskId, projectId, title}] id not among open tasks."""
+    by_id = _open_by_id(fresh=fresh) if by_id is None else by_id
     names = _v2_project_names()
     found, mismatch, missing = [], [], []
     for t in tasks:
@@ -480,23 +537,31 @@ def _split_tasks_by_state(
         given_pid = t.get("projectId") or t.get("project_id") or ""
         exp_title = t.get("title") or ""
         exp_proj = t.get("projectName") or ""
-        live = by_id.get(tid)
-        if not live:
+        g = _guard_task(tid, exp_title, given_pid, exp_proj, by_id=by_id)
+        if g.status == "missing":
             missing.append({"taskId": tid, "projectId": given_pid,
                             "title": exp_title or f"[task {str(tid)[:8]}…]"})
-            continue
-        real_pid = live.get("projectId") or given_pid
-        real_title = live.get("title") or ""
-        real_proj = names.get(real_pid, "")
-        if not _names_agree(exp_title, real_title) or not _names_agree(exp_proj, real_proj):
-            mismatch.append({"taskId": tid,
-                             "expected": exp_title or "(без названия)",
-                             "actual": real_title or "(без названия)",
-                             "project": real_proj})
-            continue
-        found.append({"taskId": tid, "title": exp_title or real_title,
-                      "projectId": real_pid})
+        elif g.status == "mismatch":
+            mismatch.append({"taskId": tid, "expected": exp_title or "(без названия)",
+                             "actual": g.title or "(без названия)",
+                             "project": names.get(g.project_id, "")})
+        else:
+            found.append({"taskId": tid, "title": exp_title or g.title,
+                          "projectId": g.project_id})
     return found, mismatch, missing
+
+
+def _guard_project(project_id: str, expected_name: str = "") -> Optional[str]:
+    """Identity guard for a PROJECT mutation: if the caller supplied the project
+    name, verify project_id still resolves to it. Returns an error string to
+    return to the caller (refusal), or None when it's safe to proceed."""
+    if not expected_name:
+        return None
+    real = _v2_project_names().get(project_id, "")
+    if real and not _names_agree(expected_name, real):
+        return (f"🛑 Отказ — project_id указывает на «{real}», а НЕ "
+                f"«{expected_name}» (защита от «не того проекта»). Ничего не тронул.")
+    return None
 
 
 def _mismatch_report(mismatch: List[Dict], verb: str) -> str:
@@ -994,8 +1059,13 @@ async def update_tasks(
             if priority is not None and priority not in [0, 1, 3, 5]:
                 results.append(f"✗ «{shown_title}»: неверный приоритет (допустимо 0/1/3/5)")
                 continue
+            # Identity guard: refuse to edit a DIFFERENT task if the id is stale.
+            g = _guard_task(tid, t.get("title") or "", pid)
+            if g.status == "mismatch":
+                results.append(f"🛑 НЕ обновил «{t.get('title')}» — {g.message}")
+                continue
             try:
-                pid = _resolve_project_id(tid, pid)
+                pid = g.project_id or _resolve_project_id(tid, pid)
                 task = await _run_blocking(
                     ticktick.update_task,
                     task_id=tid,
@@ -1036,10 +1106,15 @@ async def update_tasks(
     if err:
         return err
     try:
+        # Identity guard first: only edit ids that resolve to the RIGHT task.
+        found, mismatch, missing = _split_tasks_by_state(tasks)
+        ok_ids = {f["taskId"] for f in found}
         changes = []
         labels = []
         for t in tasks:
             tid = t.get("taskId") or t.get("task_id")
+            if tid not in ok_ids:
+                continue
             labels.append(t.get("title") or _lookup_task_title(tid))
             ch = {"taskId": tid}
             if t.get("new_title") is not None:
@@ -1059,9 +1134,19 @@ async def update_tasks(
                     if all_day:
                         ch["isAllDay"] = True
             changes.append(ch)
-        await _run_blocking(lambda: ticktick_v2.batch_update_tasks(changes))
-        labels_str = ", ".join(f"«{lbl}»" for lbl in labels)
-        return f"✏️ Обновлено {len(changes)}: {labels_str}"
+        if changes:
+            await _run_blocking(lambda: ticktick_v2.batch_update_tasks(changes))
+        lines = []
+        if labels:
+            lines.append(f"✏️ Обновлено {len(labels)}: "
+                         + ", ".join(f"«{lbl}»" for lbl in labels))
+        if mismatch:
+            lines.append(_mismatch_report(mismatch, "обновил"))
+        if missing:
+            lines.append(f"↷ Не найдены среди открытых {len(missing)} "
+                         "(неверный id/завершены): "
+                         + ", ".join(f"«{m['title']}»" for m in missing))
+        return "\n".join(lines) if lines else "Ничего не обновлено."
     except Exception as e:
         logger.error(f"Error in update_tasks: {e}")
         return f"Error updating tasks: {str(e)}"
@@ -1201,6 +1286,178 @@ async def delete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
         logger.error(f"Error in delete_tasks: {e}")
         return f"Error deleting tasks: {str(e)}"
 
+
+# ---------------------------------------------------------------------------
+# Two-phase deletion (plan → approve → execute) — for agent/autonomous flows
+# ---------------------------------------------------------------------------
+# The identity guard stops a STALE id, but cannot stop a consistent-but-wrong
+# reference (a real id of a DIFFERENT task with its own real title). The
+# manifest closes that hole: plan_task_deletion resolves the request against
+# live state and returns the SERVER's echo of exactly what would be deleted;
+# a human approves THAT echo; execute_task_deletion then deletes exactly the
+# stored manifest — the caller cannot alter the set at execution time.
+
+_MANIFESTS: Dict[str, Dict] = {}
+_MANIFEST_TTL = 3600.0  # seconds; a stale plan must be re-planned
+_JOURNAL_DIR = os.environ.get("TICKTICK_DATA_DIR", "/data")
+
+
+def _journal_write(record: Dict) -> str:
+    """Append a JSON record to the deletion journal (best-effort). Returns the
+    journal path or '' if unwritable. The journal holds FULL task snapshots so
+    anything deleted by mistake can be recreated by hand."""
+    try:
+        os.makedirs(_JOURNAL_DIR, exist_ok=True)
+        path = os.path.join(_JOURNAL_DIR, "deletion_journal.jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        return path
+    except Exception as e:
+        logger.warning(f"deletion journal unwritable: {e}")
+        return ""
+
+
+def _prune_manifests() -> None:
+    now = time.monotonic()
+    for mid in [m for m, v in _MANIFESTS.items()
+                if now - v["created"] > _MANIFEST_TTL or v.get("consumed")]:
+        _MANIFESTS.pop(mid, None)
+
+
+@mcp.tool()
+async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
+                             max_items: int = 50) -> str:
+    """
+    Phase 1 of SAFE deletion for agent/autonomous flows: build a deletion
+    MANIFEST without deleting anything.
+
+    Each requested {taskId, title?, projectId?} is resolved against LIVE state:
+    ids that don't exist or whose live title doesn't match the given one are
+    EXCLUDED and reported. The returned manifest lists exactly what WOULD be
+    deleted — as the SERVER sees it, not as the caller claims. Show this list
+    to the human for approval, then call execute_task_deletion(manifest_id,
+    confirm="DELETE <N>").
+
+    Nothing is deleted by this tool. Manifests are one-shot and expire in 1 h.
+
+    Args:
+        summary: one-line human sentence (confirmation dialog)
+        tasks: List of {"taskId","title","projectId"} — title recommended
+        max_items: refuse to plan more than this many deletions (blast cap)
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    _prune_manifests()
+    if not tasks:
+        return "Пустой список — планировать нечего."
+    if len(tasks) > max_items:
+        return (f"🛑 Отказ: запрошено {len(tasks)} удалений — больше капа "
+                f"{max_items}. Разбей на части или подними max_items осознанно.")
+    by_id = _open_by_id(fresh=True)
+    found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
+    names = _v2_project_names()
+    mid = uuid.uuid4().hex[:12]
+    items = []
+    for f in found:
+        live = by_id.get(f["taskId"]) or {}
+        items.append({
+            "taskId": f["taskId"], "projectId": f["projectId"],
+            "title": live.get("title") or f["title"],
+            "project": names.get(f["projectId"], ""),
+            "snapshot": {k: live.get(k) for k in
+                         ("title", "content", "desc", "dueDate", "startDate",
+                          "priority", "tags", "projectId", "parentId", "isAllDay")
+                         if live.get(k) is not None},
+        })
+    _MANIFESTS[mid] = {"items": items, "created": time.monotonic(),
+                       "summary": summary, "consumed": False}
+    lines = [f"📋 МАНИФЕСТ УДАЛЕНИЯ {mid} — будет удалено {len(items)}:"]
+    for i, it in enumerate(items, 1):
+        lines.append(f"  {i}. «{it['title']}»  [{it['project']}]  (id:{it['taskId']})")
+    if mismatch:
+        lines.append(_mismatch_report(mismatch, "включил в план"))
+    if missing:
+        lines.append(f"↷ Исключены (не среди открытых) {len(missing)}: "
+                     + ", ".join(f"«{m['title']}»" for m in missing))
+    lines.append(f"\nДля исполнения: execute_task_deletion(manifest_id=\"{mid}\", "
+                 f"confirm=\"DELETE {len(items)}\"). Действует 1 час, одноразово. "
+                 "НИЧЕГО ещё не удалено.")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def execute_task_deletion(manifest_id: str, confirm: str = "") -> str:
+    """
+    Phase 2: execute a deletion manifest created by plan_task_deletion.
+
+    Deletes EXACTLY the manifest's items — the caller cannot add or swap tasks
+    here. Safety on execution: `confirm` must be the literal string
+    "DELETE <N>" where N is the manifest's item count (forces the caller to
+    have read the plan); every item is re-verified against live state (renamed
+    since planning → skipped); full task snapshots are appended to the deletion
+    journal before the delete; the effect is post-verified against fresh state.
+
+    Args:
+        manifest_id: id returned by plan_task_deletion
+        confirm: literal "DELETE <N>" with N = number of items in the manifest
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    _prune_manifests()
+    m = _MANIFESTS.get(manifest_id)
+    if not m:
+        return (f"🛑 Манифест {manifest_id} не найден/истёк/уже исполнен. "
+                "Сначала plan_task_deletion.")
+    expected = f"DELETE {len(m['items'])}"
+    if confirm.strip() != expected:
+        return (f"🛑 Подтверждение не совпало: нужно confirm=\"{expected}\" "
+                f"(получено {confirm!r}). Ничего не удалено.")
+    try:
+        m["consumed"] = True
+        by_id = _open_by_id(fresh=True)
+        ready, drifted = [], []
+        for it in m["items"]:
+            live = by_id.get(it["taskId"])
+            if live and _names_agree(it["title"], live.get("title") or ""):
+                ready.append({"taskId": it["taskId"],
+                              "projectId": live.get("projectId") or it["projectId"],
+                              "title": it["title"], "snapshot": it["snapshot"]})
+            else:
+                drifted.append(it["title"])
+        journal = _journal_write({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "manifest": manifest_id, "summary": m.get("summary"),
+            "deleted": [{**r["snapshot"], "taskId": r["taskId"]} for r in ready],
+        }) if ready else ""
+        if ready:
+            await _run_blocking(lambda: ticktick_v2.batch_delete_tasks(
+                [{"taskId": r["taskId"], "projectId": r["projectId"]} for r in ready]))
+            await _run_blocking(lambda: ticktick_v2.invalidate_cache())
+        still = _open_by_id()
+        deleted = [r["title"] for r in ready if r["taskId"] not in still]
+        failed = [r["title"] for r in ready if r["taskId"] in still]
+        lines = []
+        if deleted:
+            lines.append(f"🗑 Удалено {len(deleted)}/{len(m['items'])}: "
+                         + ", ".join(f"«{t}»" for t in deleted))
+        if drifted:
+            lines.append(f"⏭ Пропущены {len(drifted)} (изменились после плана — "
+                         "перепланируй): " + ", ".join(f"«{t}»" for t in drifted))
+        if failed:
+            lines.append(f"❌ НЕ удалено {len(failed)} (всё ещё в TickTick): "
+                         + ", ".join(f"«{t}»" for t in failed))
+        if journal:
+            lines.append(f"🧾 Снапшоты удалённого — в журнале: {journal} "
+                         "(восстановление: restore_tasks из корзины, либо "
+                         "пересоздание из снапшота).")
+        return "\n".join(lines) if lines else "Ничего не удалено."
+    except Exception as e:
+        logger.error(f"Error in execute_task_deletion: {e}")
+        return f"Error executing deletion manifest: {str(e)}"
+
+
 @mcp.tool()
 async def delete_task_with_subtasks(
     summary: str,
@@ -1233,7 +1490,12 @@ async def delete_task_with_subtasks(
 
     title = task_title or _lookup_task_title(task_id)
     try:
-        project_id = _resolve_project_id(task_id, project_id)
+        # Identity guard: never delete a DIFFERENT parent by a stale id.
+        g = _guard_task(task_id, task_title or "", project_id)
+        if g.status == "mismatch":
+            return (f"🛑 НЕ удалил — id НЕ совпал с названием (защита от «не той "
+                    f"задачи»): «{task_title}» → по id это «{g.title}». Ничего не тронул.")
+        project_id = g.project_id or _resolve_project_id(task_id, project_id)
 
         # Find subtasks from v2 cache (_ensure_ready guarantees ticktick_v2)
         subtasks = []
@@ -1314,12 +1576,14 @@ async def delete_project(project_name: str, project_id: str) -> str:
     err = _ensure_official()
     if err:
         return err
-    
+    refuse = _guard_project(project_id, project_name)
+    if refuse:
+        return refuse
     try:
         result = await _run_blocking(lambda: ticktick.delete_project(project_id))
         if 'error' in result:
             return f"Error deleting project: {result['error']}"
-        
+
         return f"Project '{project_name}' deleted successfully."
     except Exception as e:
         logger.error(f"Error in delete_project: {e}")
@@ -2118,12 +2382,28 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]],
     if err:
         return err
     try:
-        ids = [t.get("taskId") or t.get("task_id") for t in tasks]
-        titles = [t.get("title") or _lookup_task_title(i) for t, i in zip(tasks, ids)]
-        pname = parent_task_title or _lookup_task_title(parent_task_id)
-        await _run_blocking(lambda: ticktick_v2.batch_set_task_parent(ids, parent_task_id, project_id))
-        titles_str = ", ".join(f"«{t}»" for t in titles)
-        return f"🔗 Вложено {len(ids)} под «{pname}»: {titles_str}"
+        # Guard the parent AND the children against live state.
+        pg = _guard_task(parent_task_id, parent_task_title or "", project_id)
+        if pg.status == "mismatch":
+            return (f"🛑 НЕ вложил — родитель по id это «{pg.title}», а НЕ "
+                    f"«{parent_task_title}». Ничего не тронул.")
+        parent_pid = pg.project_id or project_id
+        found, mismatch, missing = _split_tasks_by_state(tasks)
+        ok_ids = [f["taskId"] for f in found]
+        if ok_ids:
+            await _run_blocking(lambda: ticktick_v2.batch_set_task_parent(
+                ok_ids, parent_task_id, parent_pid))
+        pname = parent_task_title or pg.title or _lookup_task_title(parent_task_id)
+        lines = []
+        if found:
+            lines.append(f"🔗 Вложено {len(found)} под «{pname}»: "
+                         + ", ".join(f"«{f['title']}»" for f in found))
+        if mismatch:
+            lines.append(_mismatch_report(mismatch, "вложил"))
+        if missing:
+            lines.append(f"↷ Не найдены среди открытых {len(missing)}: "
+                         + ", ".join(f"«{m['title']}»" for m in missing))
+        return "\n".join(lines) if lines else "Ничего не вложено."
     except Exception as e:
         logger.error(f"Error in set_task_parent: {e}")
         return f"Error nesting tasks: {str(e)}"
@@ -2145,7 +2425,12 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
     if err:
         return err
     try:
-        await _run_blocking(lambda: ticktick_v2.unset_task_parent(task_id, parent_task_id, project_id))
+        g = _guard_task(task_id, task_title or "", project_id)
+        if g.status == "mismatch":
+            return (f"🛑 НЕ отцепил — id это «{g.title}», а НЕ «{task_title}». "
+                    "Ничего не тронул.")
+        await _run_blocking(lambda: ticktick_v2.unset_task_parent(
+            task_id, parent_task_id, g.project_id or project_id))
         return f"Task '{task_title}' detached from parent '{parent_task_title}'."
     except Exception as e:
         logger.error(f"Error in unset_task_parent: {e}")
@@ -2173,13 +2458,24 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]]) -> str:
     if err:
         return err
     try:
+        found, mismatch, missing = _split_tasks_by_state(tasks)
+        ok = {f["taskId"]: f for f in found}
         changes = [{"taskId": t.get("taskId") or t.get("task_id"),
-                    "tags": t.get("tags") or []} for t in tasks]
-        labels = [t.get("title") or _lookup_task_title(c["taskId"])
-                  for t, c in zip(tasks, changes)]
-        await _run_blocking(lambda: ticktick_v2.batch_update_tasks(changes))
-        labels_str = ", ".join(f"«{lbl}»" for lbl in labels)
-        return f"🏷 Теги обновлены у {len(changes)}: {labels_str}"
+                    "tags": t.get("tags") or []}
+                   for t in tasks
+                   if (t.get("taskId") or t.get("task_id")) in ok]
+        if changes:
+            await _run_blocking(lambda: ticktick_v2.batch_update_tasks(changes))
+        lines = []
+        if found:
+            lines.append(f"🏷 Теги обновлены у {len(found)}: "
+                         + ", ".join(f"«{f['title']}»" for f in found))
+        if mismatch:
+            lines.append(_mismatch_report(mismatch, "тегировал"))
+        if missing:
+            lines.append(f"↷ Не найдены среди открытых {len(missing)}: "
+                         + ", ".join(f"«{m['title']}»" for m in missing))
+        return "\n".join(lines) if lines else "Ничего не изменено."
     except Exception as e:
         logger.error(f"Error in set_task_tags: {e}")
         return f"Error setting tags: {str(e)}"
@@ -2390,7 +2686,12 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
     if err:
         return err
     try:
-        await _run_blocking(lambda: ticktick_v2.add_task_comment(project_id, task_id, text))
+        g = _guard_task(task_id, task_title or "", project_id)
+        if g.status == "mismatch":
+            return (f"🛑 НЕ добавил комментарий — id это «{g.title}», а НЕ "
+                    f"«{task_title}». Ничего не тронул.")
+        await _run_blocking(lambda: ticktick_v2.add_task_comment(
+            g.project_id or project_id, task_id, text))
         return f"Comment added to '{task_title}'."
     except Exception as e:
         logger.error(f"Error in add_task_comment: {e}")
@@ -2500,8 +2801,12 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
     if not url and not content_base64:
         return "Provide either a url or content_base64 for the file."
     title = task_title or _lookup_task_title(task_id)
+    g = _guard_task(task_id, task_title or "", project_id)
+    if g.status == "mismatch":
+        return (f"🛑 НЕ прикрепил — id это «{g.title}», а НЕ «{task_title}». "
+                "Ничего не тронул.")
     try:
-        pid = _resolve_project_id(task_id, project_id)
+        pid = g.project_id or _resolve_project_id(task_id, project_id)
         att = await _run_blocking(lambda: ticktick_v2.upload_attachment(
             pid, task_id, url=url, content_base64=content_base64, filename=filename))
         return (f"Attached '{att.get('fileName', filename)}' "
@@ -2581,6 +2886,10 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None) -> st
     if err:
         return err
     title = task_title or _lookup_task_title(task_id)
+    g = _guard_task(task_id, task_title or "")
+    if g.status == "mismatch":
+        return (f"🛑 НЕ отметил — id это «{g.title}», а НЕ «{task_title}». "
+                "Ничего не тронул.")
     try:
         await _run_blocking(lambda: ticktick_v2.abandon_task(task_id))
         return f"✗ Не буду делать: «{title}»"
@@ -2606,6 +2915,10 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None) -> 
     if err:
         return err
     title = task_title or _lookup_task_title(task_id)
+    g = _guard_task(task_id, task_title or "")
+    if g.status == "mismatch":
+        return (f"🛑 НЕ дублировал — id это «{g.title}», а НЕ «{task_title}». "
+                "Ничего не тронул.")
     try:
         copy = await _run_blocking(lambda: ticktick_v2.duplicate_task(task_id))
         return f"Дублировано: «{title}» → копия «{copy.get('title') or title}»"
@@ -2684,6 +2997,9 @@ async def update_project(project_name: str, project_id: str, name: str = None,
     err = _ensure_official()
     if err:
         return err
+    refuse = _guard_project(project_id, project_name)
+    if refuse:
+        return refuse
     try:
         proj = await _run_blocking(lambda: ticktick.update_project(
             project_id, name=name, color=color, view_mode=view_mode))
@@ -2708,6 +3024,9 @@ async def archive_project(project_name: str, project_id: str, archived: bool = T
     err = _ensure_ready()
     if err:
         return err
+    refuse = _guard_project(project_id, project_name)
+    if refuse:
+        return refuse
     try:
         await _run_blocking(lambda: ticktick_v2.archive_project(project_id, closed=archived))
         return f"Project '{project_name}' {'archived' if archived else 'unarchived'}."
