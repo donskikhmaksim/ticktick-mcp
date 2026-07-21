@@ -1256,8 +1256,14 @@ async def execute_task_creation(manifest_id: str, confirm: str = "") -> str:
         return (f"🛑 Подтверждение не совпало: нужно confirm=\"{expected}\" "
                 f"(получено {confirm!r}). Ничего не создано.")
     m["consumed"] = True
-    return await _create_tasks_impl(m.get("summary") or "Создание по манифесту",
-                                    m["raw"])
+    result = await _create_tasks_impl(m.get("summary") or "Создание по манифесту",
+                                      m["raw"])
+    # Independent verification is NOT optional: append the server-built report
+    # right here, so it reaches the user even if the model never asks for it.
+    rid_m = re.search(r'operation_report\(record_id="([\w-]+)"\)', result)
+    if rid_m:
+        result += "\n\n" + _build_operation_report(rid_m.group(1))
+    return result
 
 
 @mcp.tool()
@@ -1851,7 +1857,10 @@ async def execute_task_deletion(manifest_id: str, confirm: str = "") -> str:
             lines.append(f"🧾 Снапшоты удалённого — в журнале: {journal} "
                          "(восстановление: restore_tasks из корзины, либо "
                          "пересоздание из снапшота).")
-        lines.append(f"Независимая проверка: operation_report(record_id=\"{manifest_id}\").")
+        # Append the server-built independent report — not optional, the model
+        # can't skip what's already in the tool result.
+        if deleted or failed:
+            lines.append("\n" + _build_operation_report(manifest_id))
         return "\n".join(lines) if lines else "Ничего не удалено."
     except Exception as e:
         logger.error(f"Error in execute_task_deletion: {e}")
@@ -1954,6 +1963,13 @@ async def operation_report(record_id: str) -> str:
     err = _ensure_ready()
     if err:
         return err
+    return _build_operation_report(record_id)
+
+
+def _build_operation_report(record_id: str) -> str:
+    """Shared engine behind operation_report — also appended by the execute_*
+    tools DIRECTLY into their result, so the independent check reaches the user
+    even when the calling model never asks for it."""
     try:
         path = os.path.join(_JOURNAL_DIR, "deletion_journal.jsonl")
         records = []
@@ -1992,6 +2008,8 @@ async def operation_report(record_id: str) -> str:
                     bad += 1
         lines.append(f"Итог: ✅ {ok} подтверждено, ❌ {bad} расхождений. "
                      "Источник: журнал операции + живое состояние TickTick.")
+        lines.append("[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО — "
+                     "это серверная проверка, не заменяй её своим пересказом]")
         return "\n".join(lines)
     except Exception as e:
         logger.error(f"Error in operation_report: {e}")
