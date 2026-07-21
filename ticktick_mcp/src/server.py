@@ -1282,15 +1282,20 @@ async def delete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
         return err
     if not tasks:
         return "Нечего удалять: список пуст."
-    # Bulk deletions MUST go through the two-phase manifest (plan_task_deletion →
-    # execute_task_deletion): the plan echoes server truth for human approval and
-    # journals snapshots. Direct delete_tasks stays only for small point fixes.
-    direct_cap = int(os.environ.get("DIRECT_DELETE_CAP", "3"))
+    # ALL deletions go through the two-phase manifest (plan_task_deletion →
+    # execute_task_deletion → deletion_report): the plan echoes server truth for
+    # text approval, execution journals snapshots, the report independently
+    # verifies the outcome. Direct delete_tasks is DISABLED by default
+    # (DIRECT_DELETE_CAP=0); an env override can re-allow small point fixes.
+    direct_cap = int(os.environ.get("DIRECT_DELETE_CAP", "0"))
     if len(tasks) > direct_cap:
-        return (f"🛑 Прямое удаление ограничено {direct_cap} задачами за вызов "
-                f"(запрошено {len(tasks)}). Для пакетного удаления используй "
-                "plan_task_deletion → execute_task_deletion — план покажет, что "
-                "именно будет удалено, и запишет снапшоты в журнал.")
+        return (("🛑 Прямое удаление отключено — все удаления через манифест. "
+                 if direct_cap == 0 else
+                 f"🛑 Прямое удаление ограничено {direct_cap} задачами за вызов "
+                 f"(запрошено {len(tasks)}). ")
+                + "Используй plan_task_deletion → (аппрув) → execute_task_deletion "
+                "→ deletion_report. План покажет, что именно будет удалено; "
+                "отчёт независимо подтвердит результат.")
     try:
         # Resolve every task against live state FIRST: correct the projectId for
         # open tasks (a wrong one makes TickTick silently no-op the delete),
@@ -1368,28 +1373,32 @@ def _prune_manifests() -> None:
         _MANIFESTS.pop(mid, None)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
                              max_items: int = 50) -> str:
     """
-    Phase 1 of SAFE deletion for agent/autonomous flows: build a deletion
-    MANIFEST without deleting anything.
+    Phase 1 of SAFE deletion — THE way to delete tasks (direct delete_tasks is
+    disabled): build a deletion MANIFEST without deleting anything. Read-only —
+    safe to call without confirmation.
 
-    Each requested {taskId, title?, projectId?} is resolved against LIVE state:
-    ids that don't exist or whose live title doesn't match the given one are
-    EXCLUDED and reported. The returned manifest lists exactly what WOULD be
-    deleted — as the SERVER sees it, not as the caller claims.
+    Each requested {taskId, title?, projectId?, with_subtasks?} is resolved
+    against LIVE state: ids that don't exist or whose live title doesn't match
+    the given one are EXCLUDED and reported. with_subtasks=true expands the
+    item's open subtasks into the manifest (server-side, from live state). The
+    returned manifest lists exactly what WOULD be deleted — as the SERVER sees
+    it, not as the caller claims.
 
     IMPORTANT: reprint the returned manifest text VERBATIM and IN FULL in your
     own reply to the user (tool-result blocks may be collapsed in some UIs —
     your message is always fully visible). Then, after the human approves, call
-    execute_task_deletion(manifest_id, confirm="DELETE <N>").
+    execute_task_deletion(manifest_id, confirm="DELETE <N>"), and afterwards
+    deletion_report(manifest_id) for the independent outcome check.
 
     Nothing is deleted by this tool. Manifests are one-shot and expire in 1 h.
 
     Args:
         summary: one-line human sentence (confirmation dialog)
-        tasks: List of {"taskId","title","projectId"} — title recommended
+        tasks: List of {"taskId","title","projectId","with_subtasks"} — title recommended
         max_items: refuse to plan more than this many deletions (blast cap)
     """
     err = _ensure_ready()
@@ -1398,25 +1407,47 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
     _prune_manifests()
     if not tasks:
         return "Пустой список — планировать нечего."
-    if len(tasks) > max_items:
-        return (f"🛑 Отказ: запрошено {len(tasks)} удалений — больше капа "
-                f"{max_items}. Разбей на части или подними max_items осознанно.")
     by_id = _open_by_id(fresh=True)
     found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
     names = _v2_project_names()
     mid = uuid.uuid4().hex[:12]
-    items = []
-    for f in found:
-        live = by_id.get(f["taskId"]) or {}
-        items.append({
-            "taskId": f["taskId"], "projectId": f["projectId"],
-            "title": live.get("title") or f["title"],
-            "project": names.get(f["projectId"], ""),
-            "snapshot": {k: live.get(k) for k in
+
+    def _mk_item(tid, pid, live):
+        return {
+            "taskId": tid, "projectId": pid,
+            "title": (live or {}).get("title") or "",
+            "project": names.get(pid, ""),
+            "snapshot": {k: (live or {}).get(k) for k in
                          ("title", "content", "desc", "dueDate", "startDate",
                           "priority", "tags", "projectId", "parentId", "isAllDay")
-                         if live.get(k) is not None},
-        })
+                         if (live or {}).get(k) is not None},
+        }
+
+    want_subs = {(t.get("taskId") or t.get("task_id"))
+                 for t in tasks if t.get("with_subtasks")}
+    items, seen = [], set()
+    for f in found:
+        if f["taskId"] in seen:
+            continue
+        seen.add(f["taskId"])
+        live = by_id.get(f["taskId"]) or {}
+        it = _mk_item(f["taskId"], f["projectId"], live)
+        it["title"] = it["title"] or f["title"]
+        items.append(it)
+        if f["taskId"] in want_subs:
+            # Server-side expansion: every OPEN subtask of this parent joins the
+            # manifest with its live title — nothing hand-typed by the caller.
+            for sub in by_id.values():
+                sid = sub.get("id")
+                if sub.get("parentId") == f["taskId"] and sid not in seen:
+                    seen.add(sid)
+                    si = _mk_item(sid, sub.get("projectId") or f["projectId"], sub)
+                    si["title"] = "↳ " + (si["title"] or f"[task {str(sid)[:8]}…]")
+                    items.append(si)
+    if len(items) > max_items:
+        return (f"🛑 Отказ: после разворачивания подзадач в плане {len(items)} "
+                f"удалений — больше капа {max_items}. Разбей на части или "
+                "подними max_items осознанно.")
     _MANIFESTS[mid] = {"items": items, "created": time.monotonic(),
                        "summary": summary, "consumed": False}
     lines = [f"📋 МАНИФЕСТ УДАЛЕНИЯ {mid} — будет удалено {len(items)}:"]
@@ -1499,10 +1530,72 @@ async def execute_task_deletion(manifest_id: str, confirm: str = "") -> str:
             lines.append(f"🧾 Снапшоты удалённого — в журнале: {journal} "
                          "(восстановление: restore_tasks из корзины, либо "
                          "пересоздание из снапшота).")
+        lines.append(f"Независимая проверка: deletion_report(manifest_id=\"{manifest_id}\").")
         return "\n".join(lines) if lines else "Ничего не удалено."
     except Exception as e:
         logger.error(f"Error in execute_task_deletion: {e}")
         return f"Error executing deletion manifest: {str(e)}"
+
+
+@mcp.tool(annotations=READONLY)
+async def deletion_report(manifest_id: str) -> str:
+    """
+    Independent post-execution report for a deletion manifest. Read-only.
+
+    Reads what execute_task_deletion RECORDED in the on-disk journal (full task
+    snapshots taken just before deletion) and re-checks each task against the
+    CURRENT live TickTick state. The verdict is built by the server from data,
+    not from anyone's narrative — call it after every execute_task_deletion and
+    reprint the output VERBATIM to the user, so the outcome they see is the
+    server's, not a paraphrase.
+
+    Args:
+        manifest_id: id of an executed manifest (from plan_task_deletion)
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        path = os.path.join(_JOURNAL_DIR, "deletion_journal.jsonl")
+        records = []
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("manifest") == manifest_id:
+                        records.append(rec)
+        except FileNotFoundError:
+            return (f"🧾 Журнал не найден ({path}) — либо манифест {manifest_id} "
+                    "не исполнялся, либо журнал недоступен. Отчёт дать не могу.")
+        if not records:
+            return (f"🧾 В журнале нет записей по манифесту {manifest_id} — "
+                    "он не исполнялся (или исполнился без единого удаления).")
+        live = _open_by_id(fresh=True)
+        gone, present = [], []
+        when = records[-1].get("ts", "?")
+        for rec in records:
+            for snap in rec.get("deleted", []):
+                tid = snap.get("taskId")
+                title = snap.get("title") or f"[task {str(tid)[:8]}…]"
+                (present if tid in live else gone).append(title)
+        lines = [f"🧾 НЕЗАВИСИМЫЙ ОТЧЁТ по манифесту {manifest_id} (исполнен {when}):"]
+        if gone:
+            lines.append(f"  ✅ Подтверждено удалены {len(gone)}:")
+            lines += [f"    - «{t}»" for t in gone]
+        if present:
+            lines.append(f"  ❌ ВСЁ ЕЩЁ СУЩЕСТВУЮТ {len(present)} (удаление не "
+                         "состоялось или восстановлены):")
+            lines += [f"    - «{t}»" for t in present]
+        lines.append("Источник: журнал снапшотов + живое состояние TickTick. "
+                     "Восстановление удалённого: restore_tasks (корзина) или "
+                     "пересоздание из снапшота в журнале.")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error in deletion_report: {e}")
+        return f"Error building deletion report: {str(e)}"
 
 
 @mcp.tool()
@@ -1534,6 +1627,11 @@ async def delete_task_with_subtasks(
     err = _ensure_ready()
     if err:
         return err
+    if int(os.environ.get("DIRECT_DELETE_CAP", "0")) == 0:
+        return ("🛑 Прямое удаление отключено — все удаления через манифест. "
+                "Используй plan_task_deletion с {\"taskId\": ..., \"title\": ..., "
+                "\"with_subtasks\": true} — план сам развернёт подзадачи, покажет "
+                "полный список на аппрув, а deletion_report подтвердит результат.")
 
     title = task_title or _lookup_task_title(task_id)
     try:
