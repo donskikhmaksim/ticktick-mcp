@@ -812,6 +812,13 @@ async def create_tasks(
     Create one or more tasks in TickTick with full nested subtask support
     (up to 4 levels: task → subtask → sub-subtask → sub-sub-subtask).
 
+    PROTOCOL (interactive chats): do NOT call this directly. First call
+    plan_task_creation (read-only) — it returns the server's echo of exactly
+    what would be created and where; reprint it VERBATIM, get the user's
+    explicit "да/ок", then execute_task_creation(manifest_id, confirm=...).
+    Direct create_tasks is for HEADLESS/API clients, or when the user has just
+    dictated this exact list verbatim and re-asking would be pure repetition.
+
     summary (FIRST arg): one-line human sentence IN THE USER'S LANGUAGE shown
     at the TOP of the confirmation dialog, e.g.
     «Создаю задачу „Позвонить маме" в „Личное", срок 2026-07-01, приоритет высокий»
@@ -869,6 +876,12 @@ async def create_tasks(
         the created task's id as `(id:<id>)` so callers can link it without a
         follow-up title search.
     """
+    return await _create_tasks_impl(summary, tasks)
+
+
+async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
+    """Shared creation engine behind create_tasks (direct/headless) and
+    execute_task_creation (approved manifest)."""
     err = _ensure_official()
     if err:
         return err
@@ -1041,6 +1054,109 @@ async def create_tasks(
         parts.append(_report_line(rid))
     return "\n\n".join(parts)
 
+
+@mcp.tool(annotations=READONLY)
+async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
+                             max_items: int = 50) -> str:
+    """
+    Phase 1 of confirmed creation — THE way to create tasks in an interactive
+    chat: build a creation MANIFEST without creating anything. Read-only.
+
+    Accepts the same task objects as create_tasks (title, project_id, content,
+    due_date, priority, tags, column_id, subtasks, …). The server resolves each
+    destination (project id → real name; unknown project → the item is refused)
+    and returns a numbered echo of exactly what WOULD be created and where.
+
+    IMPORTANT: reprint the returned text VERBATIM and IN FULL to the user, ask
+    for explicit confirmation («ок?»), and only after their yes call
+    execute_task_creation(manifest_id, confirm="CREATE <N>"). Afterwards run
+    operation_report and reprint it — the flow is: спроси → сделай → докажи.
+
+    Args:
+        summary: one-line human sentence describing the batch
+        tasks: same objects create_tasks takes
+        max_items: refuse to plan more than this many creations
+    """
+    err = _ensure_official()
+    if err:
+        return err
+    _prune_manifests()
+    if not tasks:
+        return "Пустой список — планировать нечего."
+    if len(tasks) > max_items:
+        return (f"🛑 Отказ: {len(tasks)} создани(й) — больше капа {max_items}. "
+                "Разбей на части или подними max_items осознанно.")
+    names = _v2_project_names()
+    good, refused = [], []
+    for i, t in enumerate(tasks, 1):
+        title = t.get("title")
+        pid = t.get("project_id") or t.get("projectId") or ""
+        if not title or not pid:
+            refused.append(f"#{i}: нет title или project_id")
+            continue
+        pname = names.get(pid)
+        if names and pname is None:
+            refused.append(f"#{i} «{title}»: проект {pid} не найден")
+            continue
+        exp_name = t.get("project_name") or t.get("projectName") or ""
+        if exp_name and pname and not _names_agree(exp_name, pname):
+            refused.append(f"#{i} «{title}»: project_id это «{pname}», а НЕ "
+                           f"«{exp_name}»")
+            continue
+        good.append((t, pname or pid))
+    mid = uuid.uuid4().hex[:12]
+    _MANIFESTS[mid] = {"kind": "create", "raw": [t for t, _ in good],
+                       "created": time.monotonic(), "summary": summary,
+                       "consumed": False}
+    lines = [f"📋 МАНИФЕСТ СОЗДАНИЯ {mid} — будет создано {len(good)}:"]
+    for i, (t, pname) in enumerate(good, 1):
+        bits = [f"  {i}. «{t.get('title')}» → «{pname}»"]
+        if t.get("due_date"):
+            bits.append(f"срок {t['due_date']}")
+        if t.get("priority"):
+            bits.append(f"приоритет {PRIORITY_MAP.get(t.get('priority'), t.get('priority'))}")
+        subs = t.get("subtasks") or []
+        if subs:
+            bits.append(f"+{len(subs)} подзадач")
+        lines.append(", ".join(bits))
+    if refused:
+        lines.append(f"🛑 Исключены {len(refused)}: " + "; ".join(refused))
+    lines.append(f"\nДля исполнения (после явного «да» пользователя): "
+                 f"execute_task_creation(manifest_id=\"{mid}\", "
+                 f"confirm=\"CREATE {len(good)}\"). Действует 1 час, одноразово. "
+                 "НИЧЕГО ещё не создано.")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def execute_task_creation(manifest_id: str, confirm: str = "") -> str:
+    """
+    Phase 2: create exactly what plan_task_creation planned and the user
+    approved. `confirm` must be the literal "CREATE <N>" with N = item count.
+    Runs the normal creation engine (id echo, destination post-verify,
+    operation_report record). One-shot.
+
+    Args:
+        manifest_id: id from plan_task_creation
+        confirm: literal "CREATE <N>"
+    """
+    err = _ensure_official()
+    if err:
+        return err
+    _prune_manifests()
+    m = _MANIFESTS.get(manifest_id)
+    if not m or m.get("kind") != "create":
+        return (f"🛑 Манифест создания {manifest_id} не найден/истёк/уже "
+                "исполнен. Сначала plan_task_creation.")
+    expected = f"CREATE {len(m['raw'])}"
+    if confirm.strip() != expected:
+        return (f"🛑 Подтверждение не совпало: нужно confirm=\"{expected}\" "
+                f"(получено {confirm!r}). Ничего не создано.")
+    m["consumed"] = True
+    return await _create_tasks_impl(m.get("summary") or "Создание по манифесту",
+                                    m["raw"])
+
+
 @mcp.tool()
 async def update_tasks(
     summary: str,
@@ -1048,6 +1164,11 @@ async def update_tasks(
 ) -> str:
     """
     Update one or more tasks in TickTick.
+
+    PROTOCOL (interactive chats): before calling, tell the user in plain text
+    exactly what will change on which tasks and get their explicit «да/ок»
+    (skip only when the user just dictated this exact change). After the call,
+    run operation_report(record_id) and reprint it verbatim.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
     at the TOP of the confirmation dialog, e.g. «Меняю задачу „Оплатить аренду":
@@ -1221,6 +1342,10 @@ async def update_tasks(
 async def complete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
     """
     Mark one or more tasks as complete in one call.
+
+    PROTOCOL (interactive chats): before calling, name the exact tasks you're
+    about to complete and get the user's explicit «да/ок» (skip only when the
+    user just named them). Afterwards run operation_report and reprint it.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
     at the TOP of the confirmation dialog, e.g. «Завершаю задачу „Купить молоко"
@@ -1540,7 +1665,8 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
         return (f"🛑 Отказ: после разворачивания подзадач в плане {len(items)} "
                 f"удалений — больше капа {max_items}. Разбей на части или "
                 "подними max_items осознанно.")
-    _MANIFESTS[mid] = {"items": items, "created": time.monotonic(),
+    _MANIFESTS[mid] = {"kind": "delete", "items": items,
+                       "created": time.monotonic(),
                        "summary": summary, "consumed": False}
     lines = [f"📋 МАНИФЕСТ УДАЛЕНИЯ {mid} — будет удалено {len(items)}:"]
     for i, it in enumerate(items, 1):
@@ -1577,9 +1703,9 @@ async def execute_task_deletion(manifest_id: str, confirm: str = "") -> str:
         return err
     _prune_manifests()
     m = _MANIFESTS.get(manifest_id)
-    if not m:
-        return (f"🛑 Манифест {manifest_id} не найден/истёк/уже исполнен. "
-                "Сначала plan_task_deletion.")
+    if not m or m.get("kind") != "delete":
+        return (f"🛑 Манифест удаления {manifest_id} не найден/истёк/уже "
+                "исполнен. Сначала plan_task_deletion.")
     expected = f"DELETE {len(m['items'])}"
     if confirm.strip() != expected:
         return (f"🛑 Подтверждение не совпало: нужно confirm=\"{expected}\" "
@@ -2499,6 +2625,10 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]],
     """
     Move one or more open tasks to a destination list in one call (requires v2 API).
     All tasks go to the same destination.
+
+    PROTOCOL (interactive chats): before calling, name the tasks and the
+    destination in plain text and get the user's explicit «да/ок». Afterwards
+    run operation_report and reprint it verbatim.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
     at the TOP of the confirmation dialog, e.g. «Перемещаю задачу „Купить молоко"
