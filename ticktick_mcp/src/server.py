@@ -419,6 +419,45 @@ def _resolve_project_id(task_id: str, given: str) -> str:
     return given
 
 
+def _open_by_id() -> Dict[str, Dict]:
+    """Fresh {taskId: task} map of the v2 OPEN-task state, or {} if unavailable."""
+    if not ticktick_v2:
+        return {}
+    try:
+        return {t.get("id"): t for t in ticktick_v2.get_open_tasks() if t.get("id")}
+    except Exception:
+        return {}
+
+
+def _split_tasks_by_state(
+    tasks: List[Dict], by_id: Optional[Dict[str, Dict]] = None
+) -> tuple:
+    """Split requested task dicts against the OPEN-task state so a mutating tool
+    can report REAL results instead of echoing the request.
+
+    Returns (found, missing):
+      found   — [{taskId, projectId, title}] with the task's CURRENT projectId
+                (correcting a stale/guessed one — the official API silently
+                no-ops a delete/complete/update whose projectId is wrong, which
+                is exactly how "🗑 Удалено N" once lied about deleting nothing).
+      missing — [{taskId, projectId, title}] for ids NOT among open tasks (already
+                deleted/completed, or a wrong id). The caller decides whether to
+                still attempt (e.g. delete can target a completed task) and MUST
+                NOT report these as confirmed.
+    `title` prefers the caller's label, else the live title, else a short stub."""
+    by_id = _open_by_id() if by_id is None else by_id
+    found, missing = [], []
+    for t in tasks:
+        tid = t.get("taskId") or t.get("task_id")
+        given_pid = t.get("projectId") or t.get("project_id") or ""
+        live = by_id.get(tid)
+        title = t.get("title") or (live or {}).get("title") or f"[task {str(tid)[:8]}…]"
+        entry = {"taskId": tid, "title": title,
+                 "projectId": (live or {}).get("projectId") or given_pid}
+        (found if live else missing).append(entry)
+    return found, missing
+
+
 def format_task_list(tasks: List[Dict], limit: int = 100) -> str:
     """Compact, one-line-per-task rendering with project names resolved once."""
     names = _v2_project_names()
@@ -1002,11 +1041,30 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
         return err
     try:
         if ticktick_v2 and len(tasks) > 1:
-            ids = [t.get("taskId") or t.get("task_id") for t in tasks]
-            titles = [t.get("title") or _lookup_task_title(i) for t, i in zip(tasks, ids)]
-            await _run_blocking(lambda: ticktick_v2.batch_complete_tasks(ids))
-            titles_str = ", ".join(f"«{t}»" for t in titles)
-            return f"✓ Завершено {len(ids)}: {titles_str}"
+            # Verify against live state: batch_complete silently skips ids that
+            # aren't open, so reporting by request count would over-claim.
+            found, missing = _split_tasks_by_state(tasks)
+            done, failed = [], []
+            if found:
+                await _run_blocking(lambda: ticktick_v2.batch_complete_tasks(
+                    [f["taskId"] for f in found]))
+                await _run_blocking(lambda: ticktick_v2.invalidate_cache())
+                still_open = _open_by_id()  # a completed task leaves the open pool
+                done = [f["title"] for f in found if f["taskId"] not in still_open]
+                failed = [f["title"] for f in found if f["taskId"] in still_open]
+            lines = []
+            if done:
+                lines.append(f"✓ Завершено {len(done)}: "
+                             + ", ".join(f"«{t}»" for t in done))
+            if missing:
+                lines.append(
+                    f"↷ Не найдены среди открытых {len(missing)} "
+                    "(возможно уже завершены/неверный id): "
+                    + ", ".join(f"«{t['title']}»" for t in missing))
+            if failed:
+                lines.append(f"❌ НЕ завершены {len(failed)} (всё ещё открыты): "
+                             + ", ".join(f"«{t}»" for t in failed))
+            return "\n".join(lines) if lines else "Ничего не завершено."
         else:
             results = []
             for t in tasks:
@@ -1048,14 +1106,40 @@ async def delete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
     err = _ensure_ready()
     if err:
         return err
+    if not tasks:
+        return "Нечего удалять: список пуст."
     try:
-        items = [{"taskId": t.get("taskId") or t.get("task_id"),
-                  "projectId": t.get("projectId") or t.get("project_id")} for t in tasks]
-        titles = ([t.get("title") for t in tasks] if all(t.get("title") for t in tasks)
-                  else [_lookup_task_title(i["taskId"]) for i in items])
+        # Resolve every task against live state FIRST: correct the projectId for
+        # open tasks (a wrong one makes TickTick silently no-op the delete), and
+        # separate ids that aren't among open tasks (already gone, or completed).
+        found, missing = _split_tasks_by_state(tasks)
+        # Attempt to delete both: `found` with corrected pids, `missing` with the
+        # caller's pid (it may be a completed task, still deletable) — but only
+        # `found` can be positively verified afterwards.
+        attempt = found + missing
+        items = [{"taskId": e["taskId"], "projectId": e["projectId"]} for e in attempt]
         await _run_blocking(lambda: ticktick_v2.batch_delete_tasks(items))
-        titles_str = ", ".join(f"«{t}»" for t in titles)
-        return f"🗑 Удалено {len(items)}: {titles_str}"
+        # Post-verify against FRESH state: which open ones actually disappeared.
+        await _run_blocking(lambda: ticktick_v2.invalidate_cache())
+        still_open = _open_by_id()
+        deleted = [e["title"] for e in found if e["taskId"] not in still_open]
+        failed = [e["title"] for e in found if e["taskId"] in still_open]
+        unverified = [e["title"] for e in missing]  # attempted, not confirmable here
+
+        lines = []
+        if deleted:
+            lines.append(f"🗑 Удалено {len(deleted)}: "
+                         + ", ".join(f"«{t}»" for t in deleted))
+        if unverified:
+            lines.append(
+                f"↷ Отправлено на удаление, но НЕ подтверждено {len(unverified)} "
+                "(нет среди открытых — возможно уже удалены/завершены; проверьте): "
+                + ", ".join(f"«{t}»" for t in unverified))
+        if failed:
+            lines.append(
+                f"❌ НЕ удалено {len(failed)} — задачи ВСЁ ЕЩЁ в TickTick "
+                "(delete не сработал): " + ", ".join(f"«{t}»" for t in failed))
+        return "\n".join(lines) if lines else "Ничего не удалено."
     except Exception as e:
         logger.error(f"Error in delete_tasks: {e}")
         return f"Error deleting tasks: {str(e)}"
@@ -1795,12 +1879,31 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]],
     if err:
         return err
     try:
-        ids = [t.get("taskId") or t.get("task_id") for t in tasks]
-        titles = [t.get("title") or _lookup_task_title(i) for t, i in zip(tasks, ids)]
         to_name = to_project_name or _v2_project_names().get(to_project_id, to_project_id)
-        await _run_blocking(lambda: ticktick_v2.batch_move_tasks(ids, to_project_id))
-        titles_str = ", ".join(f"«{t}»" for t in titles)
-        return f"↪ Перемещено {len(ids)} → «{to_name}»: {titles_str}"
+        found, missing = _split_tasks_by_state(tasks)
+        moved, failed = [], []
+        if found:
+            await _run_blocking(lambda: ticktick_v2.batch_move_tasks(
+                [f["taskId"] for f in found], to_project_id))
+            await _run_blocking(lambda: ticktick_v2.invalidate_cache())
+            fresh = _open_by_id()  # verify the task actually landed in the target
+            for f in found:
+                cur = fresh.get(f["taskId"])
+                (moved if (cur and cur.get("projectId") == to_project_id)
+                 else failed).append(f["title"])
+        lines = []
+        if moved:
+            lines.append(f"↪ Перемещено {len(moved)} → «{to_name}»: "
+                         + ", ".join(f"«{t}»" for t in moved))
+        if missing:
+            lines.append(
+                f"↷ Не найдены среди открытых {len(missing)} "
+                "(неверный id/уже завершены): "
+                + ", ".join(f"«{t['title']}»" for t in missing))
+        if failed:
+            lines.append(f"❌ НЕ перемещено {len(failed)} (остались на месте): "
+                         + ", ".join(f"«{t}»" for t in failed))
+        return "\n".join(lines) if lines else "Ничего не перемещено."
     except Exception as e:
         logger.error(f"Error in move_tasks: {e}")
         return f"Error moving tasks: {str(e)}"
