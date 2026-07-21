@@ -1055,6 +1055,61 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
+def _suggest_destinations(titles: List[str], names: Dict[str, str]) -> List[Dict]:
+    """Ask the Claude shim to propose a destination project PER TASK.
+
+    Returns aligned [{project_id, project, confidence: sure|unsure, reason}]
+    (empty list on any failure — caller then asks the user instead of guessing).
+    Uses CLAUDE_CLI_URL/CLAUDE_CLI_TOKEN/CLAUDE_CLI_MODEL env (the same
+    claude-p-shim the bot uses)."""
+    url = os.environ.get("CLAUDE_CLI_URL")
+    token = os.environ.get("CLAUDE_CLI_TOKEN")
+    if not url or not titles:
+        return []
+    import requests as _rq
+    proj_list = "\n".join(f"- {n}" for n in names.values())
+    numbered = "\n".join(f"{i}. {t}" for i, t in enumerate(titles))
+    prompt = (
+        "Разложи задачи по проектам владельца. Список проектов:\n"
+        f"{proj_list}\n\nЗадачи:\n{numbered}\n\n"
+        "Для КАЖДОЙ задачи выбери самый подходящий проект. confidence='sure' "
+        "только когда назначение очевидно; иначе 'unsure' + короткий уточняющий "
+        "вопрос в reason (например «какой банк — личное или бизнес?»). Никогда "
+        "не выбирай проекты типа «Тест». Ответ СТРОГО JSON-массивом:\n"
+        '[{"i": 0, "project": "<имя из списка>", "confidence": "sure|unsure", '
+        '"reason": "<кратко>"}]'
+    )
+    try:
+        r = _rq.post(url, json={
+            "system": "Ты раскладываешь задачи по проектам. Отвечай только JSON.",
+            "prompt": prompt,
+            "model": os.environ.get("CLAUDE_CLI_MODEL", "sonnet"),
+        }, headers={"Authorization": f"Bearer {token}"}, timeout=90)
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("ok"):
+            return []
+        text = data.get("result") or ""
+        a, b = text.find("["), text.rfind("]")
+        arr = json.loads(text[a:b + 1])
+        by_name = {_norm_name(v): k for k, v in names.items()}
+        out = [{} for _ in titles]
+        for it in arr:
+            idx = int(it.get("i", -1))
+            if not (0 <= idx < len(titles)):
+                continue
+            pid = by_name.get(_norm_name(it.get("project") or ""))
+            if not pid:
+                continue
+            out[idx] = {"project_id": pid, "project": names.get(pid, ""),
+                        "confidence": it.get("confidence") or "unsure",
+                        "reason": (it.get("reason") or "").strip()}
+        return out
+    except Exception as e:
+        logger.warning(f"destination suggester failed: {e}")
+        return []
+
+
 @mcp.tool(annotations=READONLY)
 async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
                              max_items: int = 50) -> str:
@@ -1063,9 +1118,13 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     chat: build a creation MANIFEST without creating anything. Read-only.
 
     Accepts the same task objects as create_tasks (title, project_id, content,
-    due_date, priority, tags, column_id, subtasks, …). The server resolves each
-    destination (project id → real name; unknown project → the item is refused)
-    and returns a numbered echo of exactly what WOULD be created and where.
+    due_date, priority, tags, column_id, subtasks, …). project_id is OPTIONAL:
+    when the user didn't name a project, OMIT it — the server itself looks at
+    the owner's project list and proposes a destination PER TASK (sure /
+    ❓-unsure with a clarifying question). Do NOT guess a project yourself and
+    NEVER default to a sandbox like «Тест». The echo also flags title
+    duplicates already open in the destination. The user answers per item
+    («2 — в Fix&Roll»); re-plan with explicit project_id for corrections.
 
     IMPORTANT: reprint the returned text VERBATIM and IN FULL to the user, ask
     for explicit confirmation («ок?»), and only after their yes call
@@ -1087,12 +1146,15 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
         return (f"🛑 Отказ: {len(tasks)} создани(й) — больше капа {max_items}. "
                 "Разбей на части или подними max_items осознанно.")
     names = _v2_project_names()
-    good, refused = [], []
+    good, refused, pending = [], [], []  # pending: no project given → suggest
     for i, t in enumerate(tasks, 1):
         title = t.get("title")
         pid = t.get("project_id") or t.get("projectId") or ""
-        if not title or not pid:
-            refused.append(f"#{i}: нет title или project_id")
+        if not title:
+            refused.append(f"#{i}: нет title")
+            continue
+        if not pid:
+            pending.append((i, t))
             continue
         pname = names.get(pid)
         if names and pname is None:
@@ -1103,14 +1165,40 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
             refused.append(f"#{i} «{title}»: project_id это «{pname}», а НЕ "
                            f"«{exp_name}»")
             continue
-        good.append((t, pname or pid))
+        good.append((t, pname or pid, None))
+
+    # No project named → the SERVER thinks: per-task destination suggestions
+    # via the Claude shim (sure/unsure + a clarifying question when unsure).
+    if pending:
+        sugs = await _run_blocking(lambda: _suggest_destinations(
+            [t.get("title") for _, t in pending], names))
+        for (i, t), sug in zip(pending, sugs or [{}] * len(pending)):
+            if sug.get("project_id"):
+                t = dict(t)
+                t["project_id"] = sug["project_id"]
+                good.append((t, sug["project"], sug))
+            else:
+                refused.append(f"#{i} «{t.get('title')}»: проект не указан "
+                               "(подсказчик недоступен) — назови проект")
+
+    # Duplicate radar: same-normalised title already open in the destination.
+    open_titles: Dict[str, set] = {}
+    for lt in _open_by_id().values():
+        open_titles.setdefault(lt.get("projectId") or "", set()).add(
+            _norm_name(lt.get("title") or ""))
+
     mid = uuid.uuid4().hex[:12]
-    _MANIFESTS[mid] = {"kind": "create", "raw": [t for t, _ in good],
+    _MANIFESTS[mid] = {"kind": "create", "raw": [t for t, _, _ in good],
                        "created": time.monotonic(), "summary": summary,
                        "consumed": False}
     lines = [f"📋 МАНИФЕСТ СОЗДАНИЯ {mid} — будет создано {len(good)}:"]
-    for i, (t, pname) in enumerate(good, 1):
+    for i, (t, pname, sug) in enumerate(good, 1):
         bits = [f"  {i}. «{t.get('title')}» → «{pname}»"]
+        if sug:
+            if (sug.get("confidence") or "unsure") == "sure":
+                bits.append(f"(моё предложение: {sug.get('reason') or 'подходит по смыслу'})")
+            else:
+                bits.append(f"❓ НЕ уверен — {sug.get('reason') or 'уточни проект'}")
         if t.get("due_date"):
             bits.append(f"срок {t['due_date']}")
         if t.get("priority"):
@@ -1118,9 +1206,15 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
         subs = t.get("subtasks") or []
         if subs:
             bits.append(f"+{len(subs)} подзадач")
+        if _norm_name(t.get("title") or "") in open_titles.get(t.get("project_id") or t.get("projectId") or "", set()):
+            bits.append("⚠️ задача с таким названием УЖЕ есть в этом проекте")
         lines.append(", ".join(bits))
     if refused:
         lines.append(f"🛑 Исключены {len(refused)}: " + "; ".join(refused))
+    if any(s and (s.get("confidence") or "unsure") != "sure" for _, _, s in good):
+        lines.append("\n❗ По задачам с ❓ уточни проект — пользователь может "
+                     "ответить пунктами («2 — в Fix&Roll»), тогда перепланируй "
+                     "с явными project_id.")
     lines.append(f"\nДля исполнения (после явного «да» пользователя): "
                  f"execute_task_creation(manifest_id=\"{mid}\", "
                  f"confirm=\"CREATE {len(good)}\"). Действует 1 час, одноразово. "
