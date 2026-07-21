@@ -1655,8 +1655,18 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
                          f"«{names.get(want_pid, want_pid)}»")
         if exp.get("columnId") and live.get("columnId") != exp.get("columnId"):
             probs.append("раздел не применился")
-        return (f"  ⚠️ «{title}» — создана, но: " + "; ".join(probs)) if probs \
-            else f"  ✅ «{title}» — создана там, где просили"
+        if probs:
+            return f"  ⚠️ «{title}» — создана, но: " + "; ".join(probs)
+        # State the FACTS, not agreement-with-intent: the reader must SEE where
+        # it landed, so a wrong-but-consistent request is still visible.
+        facts = [f"в «{names.get(live.get('projectId'), live.get('projectId'))}»"]
+        if live.get("columnId"):
+            facts.append("раздел применён")
+        if live.get("dueDate"):
+            facts.append(f"срок {str(live['dueDate'])[:10]}")
+        if live.get("priority"):
+            facts.append(f"приоритет {PRIORITY_MAP.get(live['priority'], live['priority'])}")
+        return f"  ✅ «{title}» — создана {', '.join(facts)}"
     if op == "move":
         want = exp.get("projectId")
         return (f"  ✅ «{title}» — в «{names.get(want, want)}»"
