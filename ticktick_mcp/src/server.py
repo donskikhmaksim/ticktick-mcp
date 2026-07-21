@@ -879,11 +879,21 @@ async def create_tasks(
     created = []
     failed = []
 
+    to_verify = []  # (title, id, expected_pid, expected_col) — checked at the end
+
     for i, t in enumerate(tasks):
         title = t.get("title")
         project_id = t.get("project_id") or t.get("projectId")
         if not title or not project_id:
             failed.append(f"#{i+1}: missing title or project_id")
+            continue
+        # Destination guard: when the caller names the project, verify the id
+        # actually IS that project — a wrong id would file the task somewhere
+        # else entirely (the create-side twin of «не та задача»).
+        exp_proj = t.get("project_name") or t.get("projectName") or ""
+        refuse = _guard_project(project_id, exp_proj)
+        if refuse:
+            failed.append(f"#{i+1} «{title}»: {refuse}")
             continue
         priority = t.get("priority", 0)
         if priority not in [0, 1, 3, 5]:
@@ -915,6 +925,7 @@ async def create_tasks(
                 line = f"✓ «{title}» + {total - 1} подзадач (дерево, {total} всего)"
                 if root_id:
                     line += f" (id:{root_id})"
+                    to_verify.append((title, root_id, project_id, t.get("column_id")))
                 created.append(line)
                 continue
 
@@ -988,14 +999,38 @@ async def create_tasks(
                 line += f" + {sub_count} подзадач"
             if task_id:
                 line += f" (id:{task_id})"
+                to_verify.append((title, task_id, project_id, t.get("column_id")))
             created.append(line)
 
         except Exception as e:
             failed.append(f"#{i+1} «{title}»: {e}")
 
+    # Post-verify DESTINATION against fresh state: each created task must
+    # actually sit in the requested project (and column, when one was asked).
+    # A creation that landed elsewhere is reported, not silently celebrated.
+    warnings = []
+    if to_verify and ticktick_v2:
+        fresh = _open_by_id(fresh=True)
+        names = _v2_project_names()
+        for v_title, v_id, v_pid, v_col in to_verify:
+            live = fresh.get(v_id)
+            if not live:
+                warnings.append(f"⚠️ «{v_title}»: создание НЕ подтвердилось "
+                                "(нет среди открытых) — проверь")
+                continue
+            real_pid = live.get("projectId")
+            if real_pid and real_pid != v_pid:
+                warnings.append(
+                    f"⚠️ «{v_title}»: попала в «{names.get(real_pid, real_pid)}», "
+                    f"а НЕ в запрошенный «{names.get(v_pid, v_pid)}»")
+            if v_col and live.get("columnId") != v_col:
+                warnings.append(f"⚠️ «{v_title}»: раздел (column) не применился")
+
     parts = []
     if created:
         parts.append(f"Создано {len(created)}:\n" + "\n".join(created))
+    if warnings:
+        parts.append("Проверка назначения:\n" + "\n".join(warnings))
     if failed:
         parts.append(f"Ошибки ({len(failed)}):\n" + "\n".join(failed))
     return "\n\n".join(parts)
@@ -1247,6 +1282,15 @@ async def delete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
         return err
     if not tasks:
         return "Нечего удалять: список пуст."
+    # Bulk deletions MUST go through the two-phase manifest (plan_task_deletion →
+    # execute_task_deletion): the plan echoes server truth for human approval and
+    # journals snapshots. Direct delete_tasks stays only for small point fixes.
+    direct_cap = int(os.environ.get("DIRECT_DELETE_CAP", "3"))
+    if len(tasks) > direct_cap:
+        return (f"🛑 Прямое удаление ограничено {direct_cap} задачами за вызов "
+                f"(запрошено {len(tasks)}). Для пакетного удаления используй "
+                "plan_task_deletion → execute_task_deletion — план покажет, что "
+                "именно будет удалено, и запишет снапшоты в журнал.")
     try:
         # Resolve every task against live state FIRST: correct the projectId for
         # open tasks (a wrong one makes TickTick silently no-op the delete),
@@ -1334,9 +1378,12 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
     Each requested {taskId, title?, projectId?} is resolved against LIVE state:
     ids that don't exist or whose live title doesn't match the given one are
     EXCLUDED and reported. The returned manifest lists exactly what WOULD be
-    deleted — as the SERVER sees it, not as the caller claims. Show this list
-    to the human for approval, then call execute_task_deletion(manifest_id,
-    confirm="DELETE <N>").
+    deleted — as the SERVER sees it, not as the caller claims.
+
+    IMPORTANT: reprint the returned manifest text VERBATIM and IN FULL in your
+    own reply to the user (tool-result blocks may be collapsed in some UIs —
+    your message is always fully visible). Then, after the human approves, call
+    execute_task_deletion(manifest_id, confirm="DELETE <N>").
 
     Nothing is deleted by this tool. Manifests are one-shot and expire in 1 h.
 
