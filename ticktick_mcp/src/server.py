@@ -1282,27 +1282,43 @@ async def delete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
         return err
     if not tasks:
         return "Нечего удалять: список пуст."
-    # ALL deletions go through the two-phase manifest (plan_task_deletion →
-    # execute_task_deletion → deletion_report): the plan echoes server truth for
-    # text approval, execution journals snapshots, the report independently
-    # verifies the outcome. Direct delete_tasks is DISABLED by default
-    # (DIRECT_DELETE_CAP=0); an env override can re-allow small point fixes.
-    direct_cap = int(os.environ.get("DIRECT_DELETE_CAP", "0"))
+    # SINGLE task → direct delete allowed, but only fully armed: the title is
+    # REQUIRED (identity guard always on), the snapshot is journaled, and
+    # deletion_report works for it. BULK (>cap) → two-phase manifest only
+    # (plan → text approval → execute → independent report).
+    direct_cap = int(os.environ.get("DIRECT_DELETE_CAP", "1"))
     if len(tasks) > direct_cap:
-        return (("🛑 Прямое удаление отключено — все удаления через манифест. "
-                 if direct_cap == 0 else
-                 f"🛑 Прямое удаление ограничено {direct_cap} задачами за вызов "
-                 f"(запрошено {len(tasks)}). ")
-                + "Используй plan_task_deletion → (аппрув) → execute_task_deletion "
-                "→ deletion_report. План покажет, что именно будет удалено; "
-                "отчёт независимо подтвердит результат.")
+        return (f"🛑 Пакетное удаление ({len(tasks)} задач) — только через "
+                "манифест: plan_task_deletion → (аппрув) → execute_task_deletion "
+                "→ deletion_report. Напрямую можно удалить только "
+                f"{direct_cap} задачу за вызов.")
+    if any(not (t.get("title") or "").strip() for t in tasks):
+        return ("🛑 Для прямого удаления обязателен title каждой задачи — "
+                "сверка id↔название должна быть взведена. Добавь title "
+                "(или используй plan_task_deletion).")
     try:
         # Resolve every task against live state FIRST: correct the projectId for
         # open tasks (a wrong one makes TickTick silently no-op the delete),
         # REFUSE ids whose title/project don't match the caller's (guards against
         # deleting the wrong task by a stale id), and separate ids that aren't
         # among open tasks (already gone, or completed).
-        found, mismatch, missing = _split_tasks_by_state(tasks)
+        by_id = _open_by_id(fresh=True)
+        found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
+        # Journal full snapshots BEFORE deleting (same guarantee as the manifest
+        # path) — deletion_report("direct-…") then works for point deletes too.
+        record_id = "direct-" + uuid.uuid4().hex[:8]
+        journal = ""
+        if found:
+            journal = _journal_write({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "manifest": record_id, "summary": summary,
+                "deleted": [{**{k: (by_id.get(e["taskId"]) or {}).get(k)
+                                for k in ("title", "content", "desc", "dueDate",
+                                          "startDate", "priority", "tags",
+                                          "projectId", "parentId", "isAllDay")
+                                if (by_id.get(e["taskId"]) or {}).get(k) is not None},
+                             "taskId": e["taskId"]} for e in found],
+            })
         # Attempt to delete found (corrected pids) + missing (caller's pid — may
         # be a completed task, still deletable). Mismatches are NEVER touched.
         attempt = found + missing
@@ -1330,6 +1346,9 @@ async def delete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
             lines.append(
                 f"❌ НЕ удалено {len(failed)} — задачи ВСЁ ЕЩЁ в TickTick "
                 "(delete не сработал): " + ", ".join(f"«{t}»" for t in failed))
+        if journal and deleted:
+            lines.append(f"🧾 Снапшот в журнале; независимая проверка: "
+                         f"deletion_report(manifest_id=\"{record_id}\").")
         return "\n".join(lines) if lines else "Ничего не удалено."
     except Exception as e:
         logger.error(f"Error in delete_tasks: {e}")
@@ -1627,9 +1646,10 @@ async def delete_task_with_subtasks(
     err = _ensure_ready()
     if err:
         return err
-    if int(os.environ.get("DIRECT_DELETE_CAP", "0")) == 0:
-        return ("🛑 Прямое удаление отключено — все удаления через манифест. "
-                "Используй plan_task_deletion с {\"taskId\": ..., \"title\": ..., "
+    if os.environ.get("ALLOW_DIRECT_SUBTREE_DELETE") != "1":
+        # A parent + its subtasks is inherently a BULK delete → manifest only.
+        return ("🛑 Удаление дерева — только через манифест. Используй "
+                "plan_task_deletion с {\"taskId\": ..., \"title\": ..., "
                 "\"with_subtasks\": true} — план сам развернёт подзадачи, покажет "
                 "полный список на аппрув, а deletion_report подтвердит результат.")
 
