@@ -41,6 +41,10 @@ REQUEST_TIMEOUT = 20
 # Completed-task endpoint hard-caps the page size.
 COMPLETED_MAX_LIMIT = 100
 
+# TickTick spaces kanban columns with this default gap so new ones can be
+# slotted between existing columns without renumbering (mirrors the web app).
+COLUMN_SORT_STEP = 1099511627776
+
 
 class TickTickAuthError(RuntimeError):
     """Raised when the v2 session token is missing, invalid, or expired."""
@@ -554,6 +558,52 @@ class TickTickV2Client:
         task["tags"] = [t.lstrip("#").lower() for t in tags]
         return self._request("POST", "/batch/task",
                              json={"add": [], "update": [task], "delete": []})
+
+    def _owner_user_id(self) -> Optional[int]:
+        """Numeric owner id, parsed from the sync inboxId ('inbox<userId>').
+        The v2 /column add payload wants it; TickTick derives its own from the
+        session, so a missing value is tolerated."""
+        inbox = self.inbox_id or self.get_state().get("inboxId") or ""
+        if inbox.startswith("inbox"):
+            try:
+                return int(inbox[len("inbox"):])
+            except ValueError:
+                return None
+        return None
+
+    def get_project_columns(self, project_id: str) -> List[Dict]:
+        """List a project's kanban columns/sections (v2), sorted by position."""
+        data = self._request("GET", f"/column/project/{project_id}")
+        cols = data if isinstance(data, list) else []
+        return sorted(cols, key=lambda c: c.get("sortOrder", 0) or 0)
+
+    def create_column(self, project_id: str, name: str) -> str:
+        """Create a kanban column/section in a project and return its (client-
+        generated) id. The new column is appended after any existing ones.
+        Uses the v2 `/column` batch endpoint, which reports per-item failures
+        in `id2error`."""
+        existing = self.get_project_columns(project_id)
+        if existing:
+            max_sort = max((c.get("sortOrder", 0) or 0) for c in existing)
+            sort_order = max_sort + COLUMN_SORT_STEP
+        else:
+            sort_order = 0
+        cid = uuid.uuid4().hex[:24]
+        column = {
+            "id": cid,
+            "userId": self._owner_user_id(),
+            "createdTime": self._now_iso(),
+            "name": name,
+            "projectId": project_id,
+            "sortOrder": sort_order,
+        }
+        resp = self._request("POST", "/column",
+                             json={"add": [column], "update": [], "delete": []})
+        if isinstance(resp, dict):
+            err = (resp.get("id2error") or {}).get(cid)
+            if err:
+                raise RuntimeError(f"TickTick rejected the column: {err}")
+        return cid
 
     def set_task_column(self, task_id: str, column_id: str) -> Dict:
         """Move a task to a kanban column/section (v2 `columnId`)."""
