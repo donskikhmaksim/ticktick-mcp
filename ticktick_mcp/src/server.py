@@ -3102,6 +3102,31 @@ async def list_project_columns(project_id: str) -> str:
         return f"Error fetching columns: {str(e)}"
 
 
+@mcp.tool()
+async def create_project_column(project_id: str, name: str) -> str:
+    """
+    Create a kanban column/section inside a project (including the Inbox) and
+    return its id (requires v2 API). Use the returned id as column_id in
+    create_task/update_task to route tasks into this section.
+
+    Sections only render in a project's kanban view; switch the project's view
+    to kanban to see them.
+
+    Args:
+        project_id: ID of the project (or the Inbox id from get_projects)
+        name: Name of the new column/section
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        cid = await _run_blocking(lambda: ticktick_v2.create_column(project_id, name))
+        return f"Column «{name}» created in project {project_id}. (id: {cid})"
+    except Exception as e:
+        logger.error(f"Error in create_project_column: {e}")
+        return f"Error creating column: {str(e)}"
+
+
 def main():
     """Main entry point for the MCP server."""
     if not initialize_client():
