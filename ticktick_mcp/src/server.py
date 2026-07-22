@@ -2011,9 +2011,12 @@ def _build_operation_report(record_id: str) -> str:
             for item in items:
                 line = _verify_item(op, item, live, names)
                 lines.append(line)
-                if line.lstrip().startswith("✅"):
+                # Verdict lines are markdown bullets ("- ✅ **«…»**"), so match
+                # the mark anywhere in the prefix, not at line start.
+                head = line[:8]
+                if "✅" in head:
                     ok += 1
-                elif line.lstrip().startswith("❌"):
+                elif "❌" in head:
                     bad += 1
         lines.append("")
         lines.append(f"**Итог: ✅ {ok} подтверждено, ❌ {bad} расхождений.**")
