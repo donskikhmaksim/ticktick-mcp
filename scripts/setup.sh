@@ -57,7 +57,11 @@ run_step() {
     echo ""
     echo "❌ Команда упала: $*"
     echo "── полный вывод ──────────────────────────"
-    echo "$out"
+    # Маскируем секреты перед печатью, чтобы токены не утекли в лог/скриншот.
+    echo "$out" | sed -E \
+      -e 's/(TICKTICK_ACCESS_TOKEN|TICKTICK_REFRESH_TOKEN|TICKTICK_V2_TOKEN|MCP_SECRET|GH_TOKEN|GITHUB_TOKEN)([=:] *)[^[:space:]]+/\1\2***/g' \
+      -e 's/[A-Fa-f0-9]{32,}/***/g' \
+      -e 's/[A-Za-z0-9_-]{40,}/***/g'
     echo "───────────────────────────────────────────"
     return $code
   fi
@@ -126,7 +130,7 @@ if command -v gh &>/dev/null; then
       # На форках GitHub Actions выключены по умолчанию — включаем, чтобы
       # workflow sync-upstream мог подтягивать апдейты апстрима.
       gh api -X PUT "repos/$GH_USER/ticktick-mcp/actions/permissions" \
-        -f enabled=true -f allowed_actions=all &>/dev/null || true
+        -F enabled=true -f allowed_actions=all &>/dev/null || true
       ok "Форк готов: $GH_USER/ticktick-mcp"
     fi
   fi
@@ -282,8 +286,8 @@ run_step railway variables set \
   USER_TIMEZONE="$TIMEZONE"
 
 echo "Запускаю сборку из форка..."
-run_step railway redeploy --service "$SERVICE_NAME" --yes || \
-  run_step railway redeploy --service "$SERVICE_NAME" || true
+run_step railway redeploy --service "$SERVICE_NAME" --from-source --yes || \
+  run_step railway redeploy --service "$SERVICE_NAME" --from-source || true
 
 echo "Генерирую домен..."
 DOMAIN_RAW=$(set +o pipefail; railway domain --service "$SERVICE_NAME" --json 2>&1)
