@@ -978,6 +978,7 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
     failed = []
 
     to_verify = []  # (title, id, expected_pid, expected_col) — checked at the end
+    sub_verify = []  # (title, id) of created SUBTASKS — existence re-checked too
 
     for i, t in enumerate(tasks):
         title = t.get("title")
@@ -1008,22 +1009,44 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
             if ticktick_v2 and has_nested and not has_advanced:
                 tasks_flat, relations = _flatten_task_tree(
                     t, project_id, parent_id=t.get("parent_id"))
-                await _run_blocking(lambda: ticktick_v2.batch_create_tasks(tasks_flat))
+                sub_notes = []
+                resp = await _run_blocking(
+                    lambda: ticktick_v2.batch_create_tasks(tasks_flat))
+                tree_fail = id2error_failures(
+                    resp, [x["id"] for x in tasks_flat])
                 if relations:
-                    await _run_blocking(lambda: ticktick_v2._request(
+                    rel_resp = await _run_blocking(lambda: ticktick_v2._request(
                         "POST", "/batch/taskParent", json=relations))
+                    rel_fail = id2error_failures(
+                        rel_resp, [r.get("taskId") for r in relations])
+                    if rel_fail:
+                        sub_notes.append(
+                            f"⚠️ связи родитель-подзадача не применились у "
+                            f"{len(rel_fail)}: "
+                            + "; ".join(f"{k[:8]}…: {v}" for k, v in rel_fail.items()))
                 await _run_blocking(lambda: ticktick_v2.invalidate_cache())
                 root_id = tasks_flat[0]["id"]
+                if tree_fail:
+                    sub_notes.append(
+                        f"⚠️ TickTick отклонил {len(tree_fail)} из {len(tasks_flat)} "
+                        "задач дерева: "
+                        + "; ".join(f"{k[:8]}…: {v}" for k, v in tree_fail.items()))
                 if t.get("column_id"):
                     try:
                         await _run_blocking(lambda: ticktick_v2.set_task_column(root_id, t["column_id"]))
                     except Exception as e:
                         logger.warning(f"Column failed: {e}")
+                        sub_notes.append(f"⚠️ раздел (column) не применился: {e}")
                 total = len(tasks_flat)
                 line = f"✓ «{title}» + {total - 1} подзадач (дерево, {total} всего)"
                 if root_id:
                     line += f" (id:{root_id})"
                     to_verify.append((title, root_id, project_id, t.get("column_id")))
+                for x in tasks_flat[1:]:
+                    if x["id"] not in tree_fail:
+                        sub_verify.append((x.get("title") or "?", x["id"]))
+                if sub_notes:
+                    line += "\n  " + "\n  ".join(sub_notes)
                 created.append(line)
                 continue
 
@@ -1045,29 +1068,39 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                 continue
             task_id = task.get("id")
 
+            sub_notes = []
             if ticktick_v2 and task_id:
                 if t.get("tags"):
                     try:
                         await _run_blocking(lambda: ticktick_v2.set_task_tags(task_id, t["tags"]))
                     except Exception as e:
                         logger.warning(f"Tagging failed: {e}")
+                        sub_notes.append(f"⚠️ теги не применились: {e}")
                 if t.get("assignee") is not None:
                     try:
                         await _run_blocking(lambda: ticktick_v2.batch_update_tasks(
                             [{"taskId": task_id, "assignee": t["assignee"]}]))
                     except Exception as e:
                         logger.warning(f"Assignee failed: {e}")
+                        sub_notes.append(f"⚠️ исполнитель не назначен: {e}")
                 if t.get("column_id"):
                     try:
                         await _run_blocking(lambda: ticktick_v2.set_task_column(task_id, t["column_id"]))
                     except Exception as e:
                         logger.warning(f"Column failed: {e}")
+                        sub_notes.append(f"⚠️ раздел (column) не применился: {e}")
                 if t.get("parent_id"):
                     try:
                         await _run_blocking(lambda: ticktick_v2.batch_set_task_parent(
                             [task_id], t["parent_id"], project_id))
                     except Exception as e:
                         logger.warning(f"Parent link failed: {e}")
+                        sub_notes.append(f"⚠️ привязка к родителю не применилась: {e}")
+            elif task_id and not ticktick_v2 and (
+                    t.get("tags") or t.get("assignee") is not None
+                    or t.get("parent_id")):
+                sub_notes.append("⚠️ теги/исполнитель/родитель требуют v2 API — "
+                                 "v2 недоступен, эти поля НЕ применены")
 
             # Subtasks (flat strings or dicts without deeper nesting)
             sub_items = t.get("subtasks") or []
@@ -1083,14 +1116,30 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                     all_sub_tasks.extend(st_tasks)
                     all_sub_rels.extend(st_rels)
                 try:
-                    await _run_blocking(lambda: ticktick_v2.batch_create_tasks(all_sub_tasks))
+                    resp = await _run_blocking(
+                        lambda: ticktick_v2.batch_create_tasks(all_sub_tasks))
+                    sub_fail = id2error_failures(
+                        resp, [x["id"] for x in all_sub_tasks])
                     if all_sub_rels:
                         await _run_blocking(lambda: ticktick_v2._request(
                             "POST", "/batch/taskParent", json=all_sub_rels))
                     await _run_blocking(lambda: ticktick_v2.invalidate_cache())
-                    sub_count = len(all_sub_tasks)
+                    sub_count = len(all_sub_tasks) - len(sub_fail)
+                    if sub_fail:
+                        sub_notes.append(
+                            f"⚠️ TickTick отклонил {len(sub_fail)} подзадач: "
+                            + "; ".join(f"{k[:8]}…: {v}" for k, v in sub_fail.items()))
+                    for x in all_sub_tasks:
+                        if x["id"] not in sub_fail:
+                            sub_verify.append((x.get("title") or "?", x["id"]))
                 except Exception as e:
                     logger.warning(f"Batch subtasks failed: {e}")
+                    sub_notes.append(
+                        f"⚠️ подзадачи НЕ созданы ({len(all_sub_tasks)} шт.): {e}")
+            elif sub_items and task_id and not ticktick_v2:
+                sub_notes.append(
+                    f"⚠️ запрошено {len(sub_items)} подзадач, но они требуют "
+                    "v2 API — v2 недоступен, подзадачи НЕ созданы")
 
             line = f"✓ «{title}»"
             if sub_count:
@@ -1098,6 +1147,8 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
             if task_id:
                 line += f" (id:{task_id})"
                 to_verify.append((title, task_id, project_id, t.get("column_id")))
+            if sub_notes:
+                line += "\n  " + "\n  ".join(sub_notes)
             created.append(line)
 
         except Exception as e:
@@ -1107,22 +1158,37 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
     # actually sit in the requested project (and column, when one was asked).
     # A creation that landed elsewhere is reported, not silently celebrated.
     warnings = []
-    if to_verify and ticktick_v2:
+    if (to_verify or sub_verify) and ticktick_v2:
         fresh = _open_by_id(fresh=True)
+        if fresh is None:
+            warnings.append(f"{_UNVERIFIED_MSG} (созданное не перепроверено)")
+            fresh = {}
+            skip_verify = True
+        else:
+            skip_verify = False
         names = _v2_project_names()
-        for v_title, v_id, v_pid, v_col in to_verify:
-            live = fresh.get(v_id)
-            if not live:
-                warnings.append(f"⚠️ «{v_title}»: создание НЕ подтвердилось "
-                                "(нет среди открытых) — проверь")
-                continue
-            real_pid = live.get("projectId")
-            if real_pid and real_pid != v_pid:
+        if not skip_verify:
+            for v_title, v_id, v_pid, v_col in to_verify:
+                live = fresh.get(v_id)
+                if not live:
+                    warnings.append(f"⚠️ «{v_title}»: создание НЕ подтвердилось "
+                                    "(нет среди открытых) — проверь")
+                    continue
+                real_pid = live.get("projectId")
+                if real_pid and real_pid != v_pid:
+                    warnings.append(
+                        f"⚠️ «{v_title}»: попала в «{names.get(real_pid, real_pid)}», "
+                        f"а НЕ в запрошенный «{names.get(v_pid, v_pid)}»")
+                if v_col and live.get("columnId") != v_col:
+                    warnings.append(f"⚠️ «{v_title}»: раздел (column) не применился")
+            # Subtasks: existence check (a rejected subtask must not survive
+            # as a phantom «+ N подзадач» claim).
+            lost_subs = [s_title for s_title, s_id in sub_verify
+                         if s_id not in fresh]
+            if lost_subs:
                 warnings.append(
-                    f"⚠️ «{v_title}»: попала в «{names.get(real_pid, real_pid)}», "
-                    f"а НЕ в запрошенный «{names.get(v_pid, v_pid)}»")
-            if v_col and live.get("columnId") != v_col:
-                warnings.append(f"⚠️ «{v_title}»: раздел (column) не применился")
+                    f"⚠️ подзадачи НЕ подтвердились ({len(lost_subs)}): "
+                    + ", ".join(f"«{t}»" for t in lost_subs))
 
     parts = []
     if created:
@@ -1177,18 +1243,40 @@ def _suggest_destinations(titles: List[str], names: Dict[str, str]) -> List[Dict
         text = data.get("result") or ""
         a, b = text.find("["), text.rfind("]")
         arr = json.loads(text[a:b + 1])
-        by_name = {_norm_name(v): k for k, v in names.items()}
+        # Normalised-name index. Projects whose names differ only in emoji/
+        # punctuation collapse to one key — such a resolution can point at the
+        # WRONG twin, so collisions are demoted to 'unsure' (ask the user).
+        # The '' key (emoji-only project name) is never registered.
+        by_name: Dict[str, str] = {}
+        collisions: Dict[str, List[str]] = {}
+        for k, v in names.items():
+            key = _norm_name(v)
+            if not key:
+                continue
+            if key in by_name:
+                collisions.setdefault(key, [names.get(by_name[key], "")]).append(v)
+            else:
+                by_name[key] = k
         out = [{} for _ in titles]
         for it in arr:
             idx = int(it.get("i", -1))
             if not (0 <= idx < len(titles)):
                 continue
-            pid = by_name.get(_norm_name(it.get("project") or ""))
+            key = _norm_name(it.get("project") or "")
+            if not key:
+                continue
+            pid = by_name.get(key)
             if not pid:
                 continue
-            out[idx] = {"project_id": pid, "project": names.get(pid, ""),
-                        "confidence": it.get("confidence") or "unsure",
-                        "reason": (it.get("reason") or "").strip()}
+            sug = {"project_id": pid, "project": names.get(pid, ""),
+                   "confidence": it.get("confidence") or "unsure",
+                   "reason": (it.get("reason") or "").strip()}
+            if key in collisions:
+                twins = ", ".join(f"«{n}»" for n in collisions[key] if n)
+                sug["confidence"] = "unsure"
+                sug["reason"] = (f"несколько проектов с похожим названием "
+                                 f"({twins}) — какой именно?")
+            out[idx] = sug
         return out
     except Exception as e:
         logger.warning(f"destination suggester failed: {e}")
@@ -2318,49 +2406,15 @@ async def delete_task_with_subtasks(
     err = _ensure_ready()
     if err:
         return err
-    if os.environ.get("ALLOW_DIRECT_SUBTREE_DELETE") != "1":
-        # A parent + its subtasks is inherently a BULK delete → manifest only.
-        return ("🛑 Удаление дерева — только через манифест. Используй "
-                "plan_task_deletion с {\"taskId\": ..., \"title\": ..., "
-                "\"with_subtasks\": true} — план сам развернёт подзадачи, покажет "
-                "полный список на аппрув, а operation_report подтвердит результат.")
-
-    title = task_title or _lookup_task_title(task_id)
-    try:
-        # Identity guard: never delete a DIFFERENT parent by a stale id.
-        g = _guard_task(task_id, task_title or "", project_id)
-        if g.status == "mismatch":
-            return (f"🛑 НЕ удалил — id НЕ совпал с названием (защита от «не той "
-                    f"задачи»): «{task_title}» → по id это «{g.title}». Ничего не тронул.")
-        project_id = g.project_id or _resolve_project_id(task_id, project_id)
-
-        # Find subtasks from v2 cache (_ensure_ready guarantees ticktick_v2)
-        subtasks = []
-        try:
-            all_open = await _run_blocking(lambda: ticktick_v2.get_open_tasks())
-            subtasks = [t for t in all_open if t.get("parentId") == task_id]
-        except Exception:
-            pass
-
-        # Delete subtasks first (batch)
-        if subtasks:
-            items = [{"taskId": t["id"], "projectId": t.get("projectId", project_id)} for t in subtasks]
-            await _run_blocking(lambda: ticktick_v2.batch_delete_tasks(items))
-
-        # Delete parent via official API
-        result = await _run_blocking(lambda: ticktick.delete_task(project_id, task_id))
-        if 'error' in result:
-            return f"Error deleting parent task: {result['error']}"
-
-        pname = project_name or _v2_project_names().get(project_id, "")
-        where = f" from '{pname}'" if pname else ""
-        if subtasks:
-            sub_titles = ", ".join(f"«{t.get('title', t['id'][:8])}»" for t in subtasks)
-            return f"🗑 Удалено «{title}»{where} + {len(subtasks)} подзадач: {sub_titles}"
-        return f"🗑 Удалено «{title}»{where} (подзадач нет)"
-    except Exception as e:
-        logger.error(f"Error in delete_task_with_subtasks: {e}")
-        return f"Error deleting task with subtasks: {str(e)}"
+    # A parent + its subtasks is inherently a BULK delete → manifest ONLY.
+    # (The former ALLOW_DIRECT_SUBTREE_DELETE escape hatch is removed: it had
+    # no journal, no post-verify and an unhandled 'missing' guard — one env
+    # var away from being the only unguarded destructive path in the cluster.)
+    return ("🛑 Удаление дерева — только через манифест. Используй "
+            "plan_task_deletion с {\"taskId\": ..., \"title\": ..., "
+            "\"with_subtasks\": true} — план сам развернёт ВСЁ поддерево "
+            "(включая под-подзадачи), покажет полный список на аппрув, а "
+            "operation_report подтвердит результат.")
 
 
 @mcp.tool()
@@ -2413,15 +2467,19 @@ async def delete_project(project_name: str, project_id: str) -> str:
     err = _ensure_official()
     if err:
         return err
-    refuse = _guard_project(project_id, project_name)
+    # Destructive: verify against FRESH names and FAIL CLOSED when the id
+    # can't be resolved — never delete what can't be identified.
+    refuse = _guard_project(project_id, project_name, fresh=True,
+                            require_known=True)
     if refuse:
         return refuse
+    live_name = _v2_project_names().get(project_id, project_name)
     try:
         result = await _run_blocking(lambda: ticktick.delete_project(project_id))
         if 'error' in result:
             return f"Error deleting project: {result['error']}"
 
-        return f"Project '{project_name}' deleted successfully."
+        return f"Project '{live_name}' deleted successfully."
     except Exception as e:
         logger.error(f"Error in delete_project: {e}")
         return f"Error deleting project: {str(e)}"
@@ -3614,6 +3672,14 @@ async def list_project_groups() -> str:
         return f"Error fetching project groups: {str(e)}"
 
 
+async def _live_groups(fresh: bool = True) -> List[Dict]:
+    """Non-deleted project groups from the (optionally force-fresh) v2 state."""
+    if fresh:
+        await _run_blocking(lambda: ticktick_v2.get_state(force=True))
+    groups = await _run_blocking(lambda: ticktick_v2.list_project_groups())
+    return [g for g in groups if not g.get("deleted")]
+
+
 @mcp.tool()
 async def create_project_group(name: str) -> str:
     """Create a project group (folder) (requires v2 API)."""
@@ -3622,10 +3688,20 @@ async def create_project_group(name: str) -> str:
         return err
     try:
         gid = await _run_blocking(lambda: ticktick_v2.create_project_group(name))
-        return f"Группа проектов «{name}» создана. (id: {gid})"
+    except RuntimeError as e:
+        return f"❌ Группа «{name}» НЕ создана — TickTick отклонил: {e}"
     except Exception as e:
         logger.error(f"Error in create_project_group: {e}")
         return f"Error creating project group: {str(e)}"
+    # Post-verify: the new group must appear in the force-refreshed list.
+    try:
+        groups = await _live_groups()
+        if not any(g.get("id") == gid for g in groups):
+            return (f"❌ Группа «{name}» НЕ подтвердилась — её нет в списке "
+                    "групп после создания, проверь вручную.")
+    except Exception as e:
+        return f"Группа «{name}» отправлена (id: {gid}), но {_UNVERIFIED_MSG} ({e})"
+    return f"Группа проектов «{name}» создана (проверено). (id: {gid})"
 
 
 @mcp.tool()
@@ -3641,8 +3717,25 @@ async def delete_project_group(group_name: str, group_id: str) -> str:
     if err:
         return err
     try:
-        await _run_blocking(lambda: ticktick_v2.delete_project_group(group_id))
-        return f"Project group '{group_name}' deleted (projects ungrouped)."
+        # Identity guard (fresh): the id must exist AND resolve to the name.
+        groups = await _live_groups()
+        grp = next((g for g in groups if g.get("id") == group_id), None)
+        if grp is None:
+            return (f"🛑 НЕ удалил — группы с id {str(group_id)[:12]}… нет в "
+                    "живом списке групп (уже удалена/неверный id). Ничего не тронул.")
+        real = grp.get("name") or ""
+        if not _names_agree(group_name, real):
+            return (f"🛑 НЕ удалил — group_id указывает на «{real}», а НЕ "
+                    f"«{group_name}» (защита от «не той папки»). Ничего не тронул.")
+        resp = await _run_blocking(lambda: ticktick_v2.delete_project_group(group_id))
+        api_err = id2error_failures(resp, [group_id]).get(group_id)
+        if api_err:
+            return f"❌ Группа «{real}» НЕ удалена — TickTick отклонил: {api_err}"
+        # Post-verify: the group must be gone from the fresh list.
+        groups = await _live_groups()
+        if any(g.get("id") == group_id for g in groups):
+            return f"❌ Группа «{real}» ВСЁ ЕЩЁ в списке — удаление не сработало."
+        return f"Project group '{real}' deleted (проверено; проекты остались, просто без папки)."
     except Exception as e:
         logger.error(f"Error in delete_project_group: {e}")
         return f"Error deleting project group: {str(e)}"
@@ -3662,9 +3755,37 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
     if err:
         return err
     try:
+        # Identity guard on the project (fresh, fail-closed) …
+        refuse = _guard_project(project_id, project_name, fresh=True,
+                                require_known=True)
+        if refuse:
+            return refuse
+        # … and the destination group must actually exist (unless ungrouping).
+        dest_name = None
+        if group_id != "NONE":
+            groups = await _live_groups(fresh=False)
+            grp = next((g for g in groups if g.get("id") == group_id), None)
+            if grp is None:
+                return (f"🛑 НЕ переместил — группы с id {str(group_id)[:12]}… "
+                        "нет в живом списке групп (list_project_groups). "
+                        "Ничего не тронул.")
+            dest_name = grp.get("name") or group_id
+        live_pname = _v2_project_names().get(project_id, project_name)
         await _run_blocking(lambda: ticktick_v2.move_project_to_group(project_id, group_id))
-        dest = "ungrouped" if group_id == "NONE" else f"group {group_id}"
-        return f"Project '{project_name}' moved to {dest}."
+        # Post-verify: the project's live groupId must equal the target.
+        await _run_blocking(lambda: ticktick_v2.get_state(force=True))
+        projs = await _run_blocking(lambda: ticktick_v2.list_projects())
+        proj = next((p for p in projs if p.get("id") == project_id), None)
+        got = (proj or {}).get("groupId")
+        want = None if group_id == "NONE" else group_id
+        dest = "без папки (ungrouped)" if group_id == "NONE" else f"папку «{dest_name}»"
+        if proj is None:
+            return (f"Проект «{live_pname}» отправлен в {dest}, но "
+                    f"{_UNVERIFIED_MSG}")
+        if (got or None) != want:
+            return (f"❌ Проект «{live_pname}» НЕ переместился — живой groupId "
+                    f"{got!r}, ожидался {want!r}.")
+        return f"Проект «{live_pname}» перемещён в {dest} (проверено)."
     except Exception as e:
         logger.error(f"Error in move_project_to_group: {e}")
         return f"Error moving project: {str(e)}"
@@ -4191,7 +4312,18 @@ async def update_project(project_name: str, project_id: str, name: str = None,
     err = _ensure_official()
     if err:
         return err
-    refuse = _guard_project(project_id, project_name)
+    if name is None and color is None and view_mode is None:
+        return ("🛑 Нечего менять — все поля (name/color/view_mode) пусты. "
+                "Ничего не тронул.")
+    for label, val in (("name", name), ("color", color), ("view_mode", view_mode)):
+        if val is not None and not str(val).strip():
+            return (f"🛑 Пустая строка в поле {label} — клиент молча выбросил бы "
+                    "её и изменение не применилось бы. Передай значение или "
+                    "убери поле. Ничего не тронул.")
+    if view_mode is not None and view_mode not in ("list", "kanban", "timeline"):
+        return "Invalid view_mode. Must be one of: list, kanban, timeline."
+    refuse = _guard_project(project_id, project_name, fresh=True,
+                            require_known=True)
     if refuse:
         return refuse
     try:
@@ -4218,12 +4350,24 @@ async def archive_project(project_name: str, project_id: str, archived: bool = T
     err = _ensure_ready()
     if err:
         return err
-    refuse = _guard_project(project_id, project_name)
-    if refuse:
-        return refuse
+    if archived:
+        # Archiving pulls the project out of the sync pool — destructive-
+        # adjacent, so verify FRESH and fail closed on an unresolvable id.
+        refuse = _guard_project(project_id, project_name, fresh=True,
+                                require_known=True)
+        if refuse:
+            return refuse
+    else:
+        refuse = _guard_project(project_id, project_name, fresh=True)
+        if refuse:
+            return refuse
+    live_name = _v2_project_names().get(project_id, project_name)
     try:
         await _run_blocking(lambda: ticktick_v2.archive_project(project_id, closed=archived))
-        return f"Project '{project_name}' {'archived' if archived else 'unarchived'}."
+        return f"Project '{live_name}' {'archived' if archived else 'unarchived'}."
+    except RuntimeError as e:
+        return (f"❌ Проект '{live_name}' НЕ "
+                f"{'заархивирован' if archived else 'разархивирован'} — {e}")
     except Exception as e:
         logger.error(f"Error in archive_project: {e}")
         return f"Error archiving project: {str(e)}"
@@ -4787,7 +4931,8 @@ async def list_project_columns(project_id: str) -> str:
 
 
 @mcp.tool()
-async def create_project_column(project_id: str, name: str) -> str:
+async def create_project_column(project_id: str, name: str,
+                                project_name: str = "") -> str:
     """
     Create a kanban column/section inside a project (including the Inbox) and
     return its id (requires v2 API). Use the returned id as column_id in
@@ -4799,13 +4944,25 @@ async def create_project_column(project_id: str, name: str) -> str:
     Args:
         project_id: ID of the project (or the Inbox id from get_projects)
         name: Name of the new column/section
+        project_name: Name of the project (recommended — arms the identity
+            guard so a stale/wrong project_id is refused instead of silently
+            creating the column elsewhere)
     """
     err = _ensure_ready()
     if err:
         return err
+    # Identity guard: the id must resolve to a live project (and to the given
+    # name when one is passed) — a wrong id would create the column elsewhere.
+    refuse = _guard_project(project_id, project_name or "", fresh=True,
+                            require_known=True)
+    if refuse:
+        return refuse
+    live_pname = _v2_project_names().get(project_id, project_id)
     try:
         cid = await _run_blocking(lambda: ticktick_v2.create_column(project_id, name))
-        return f"Column «{name}» created in project {project_id}. (id: {cid})"
+        return f"Column «{name}» created in project «{live_pname}». (id: {cid})"
+    except RuntimeError as e:
+        return f"❌ Раздел «{name}» НЕ создан — {e}"
     except Exception as e:
         logger.error(f"Error in create_project_column: {e}")
         return f"Error creating column: {str(e)}"
