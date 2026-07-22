@@ -1,29 +1,27 @@
-# Auto-deploy to the Anessa Railway account on every push to main.
+# Instant auto-deploy on every push to main — fans out to ALL deployment
+# targets so everyone who onboarded (each target is a shared multi-tenant
+# server) gets the update at once, within ~a minute of the push.
 #
 # Why a GitHub Action instead of Railway's own GitHub auto-deploy:
-# these services live on a DIFFERENT Railway account than the GitHub repo,
-# and the cross-account Railway↔GitHub webhook doesn't fire. This Action is
-# the repo's OWN CI (always reliable), and it uses `railway up` from the
-# freshly-checked-out commit — the only method that ships current code
-# (`railway redeploy` rebuilds the stale uploaded image).
+# some targets live on a DIFFERENT Railway account than this GitHub repo, and
+# the cross-account Railway↔GitHub webhook doesn't fire. This Action is the
+# repo's OWN CI (always reliable) and uses `railway up` from the freshly
+# checked-out commit — the only method that ships current code (`railway
+# redeploy` rebuilds the stale uploaded image).
 #
-# Setup (one-time, by the repo owner):
-#   1. In the Anessa Railway account create a token
-#      (Account → Tokens, OR the ticktick-mcp Project → Settings → Tokens).
-#   2. Add it to this repo's GitHub secrets as RAILWAY_TOKEN
-#      (Settings → Secrets and variables → Actions), or as an org-level secret
-#      shared with all 6 MCP repos.
-# Nothing else is needed — the next push (or a manual "Run workflow") deploys.
+# ADD A DEPLOYMENT TARGET (e.g. another person who self-hosts this server):
+#   1. In THAT Railway account create a token (Account → Tokens).
+#   2. Add it to this repo's GitHub secrets under a unique name, e.g.
+#      RAILWAY_TOKEN_ALICE  (gh secret set RAILWAY_TOKEN_ALICE ...).
+#   3. Add one entry to the `include:` matrix below: name/project/service/token.
+# The next push deploys to every listed target in parallel.
 
-name: Deploy to Railway (Anessa)
+name: Deploy to Railway (instant, all targets)
 
 on:
   push:
     branches: [main]
   workflow_dispatch: {}
-  # Safety net: a daily redeploy in case a push ever slips through.
-  schedule:
-    - cron: "0 9 * * *"
 
 concurrency:
   group: railway-deploy
@@ -32,6 +30,21 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # one target failing must not block the others
+      matrix:
+        include:
+          # ── Anessa's account ──
+          - name: anessa
+            project: f9721307-6f8b-442c-839b-c479b765ee79
+            service: ticktick-mcp
+            token_secret: RAILWAY_TOKEN
+          # ── add more onboarded hosts here (see header) ──
+          # - name: alice
+          #   project: <alice-project-id>
+          #   service: ticktick-mcp
+          #   token_secret: RAILWAY_TOKEN_ALICE
+    name: deploy → ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -39,11 +52,15 @@ jobs:
           node-version: "20"
       - name: Install Railway CLI
         run: npm i -g @railway/cli
-      - name: Deploy current code with railway up
+      - name: railway up (fresh code) → ${{ matrix.name }}
         env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_TOKEN: ${{ secrets[matrix.token_secret] }}
         run: >-
+          if [ -z "$RAILWAY_TOKEN" ]; then
+            echo "::warning::no token for target ${{ matrix.name }} — skipped (add secret ${{ matrix.token_secret }})";
+            exit 0;
+          fi;
           railway up --ci
-          --project f9721307-6f8b-442c-839b-c479b765ee79
+          --project ${{ matrix.project }}
           --environment production
-          --service ticktick-mcp
+          --service ${{ matrix.service }}
