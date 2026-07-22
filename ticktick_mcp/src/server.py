@@ -1200,9 +1200,10 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     _MANIFESTS[mid] = {"kind": "create", "raw": [t for t, _, _ in good],
                        "created": time.monotonic(), "summary": summary,
                        "consumed": False}
-    lines = [f"📋 МАНИФЕСТ СОЗДАНИЯ {mid} — будет создано {len(good)}:"]
+    lines = [f"### 📋 План создания — {len(good)}",
+             f"_Манифест `{mid}` · ничего ещё не создано_", ""]
     for i, (t, pname, sug) in enumerate(good, 1):
-        bits = [f"  {i}. «{t.get('title')}» → «{pname}»"]
+        bits = [f"{i}. **«{t.get('title')}»** → **{pname}**"]
         if sug:
             if (sug.get("confidence") or "unsure") == "sure":
                 bits.append(f"(моё предложение: {sug.get('reason') or 'подходит по смыслу'})")
@@ -1219,15 +1220,16 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
             bits.append("⚠️ задача с таким названием УЖЕ есть в этом проекте")
         lines.append(", ".join(bits))
     if refused:
-        lines.append(f"🛑 Исключены {len(refused)}: " + "; ".join(refused))
+        lines.append("")
+        lines.append(f"🛑 **Исключены {len(refused)}:** " + "; ".join(refused))
     if any(s and (s.get("confidence") or "unsure") != "sure" for _, _, s in good):
-        lines.append("\n❗ По задачам с ❓ уточни проект — пользователь может "
-                     "ответить пунктами («2 — в Fix&Roll»), тогда перепланируй "
-                     "с явными project_id.")
-    lines.append(f"\nДля исполнения (после явного «да» пользователя): "
-                 f"execute_task_creation(manifest_id=\"{mid}\", "
-                 f"confirm=\"CREATE {len(good)}\"). Действует 1 час, одноразово. "
-                 "НИЧЕГО ещё не создано.")
+        lines.append("")
+        lines.append("❗ _По задачам с ❓ уточни проект — можно ответить пунктами "
+                     "(«2 — в Fix&Roll»), тогда план пересоберётся с явными "
+                     "адресами._")
+    lines.append("")
+    lines.append(f"_После явного «да»: `execute_task_creation(manifest_id=\"{mid}\", "
+                 f"confirm=\"CREATE {len(good)}\")` · действует 1 час, одноразово._")
     return "\n".join(lines)
 
 
@@ -1777,17 +1779,18 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
     _MANIFESTS[mid] = {"kind": "delete", "items": items,
                        "created": time.monotonic(),
                        "summary": summary, "consumed": False}
-    lines = [f"📋 МАНИФЕСТ УДАЛЕНИЯ {mid} — будет удалено {len(items)}:"]
+    lines = [f"### 📋 План удаления — {len(items)}",
+             f"_Манифест `{mid}` · ничего ещё не удалено_", ""]
     for i, it in enumerate(items, 1):
-        lines.append(f"  {i}. «{it['title']}»  [{it['project']}]  (id:{it['taskId']})")
+        lines.append(f"{i}. **«{it['title']}»** — {it['project']} (`{it['taskId']}`)")
     if mismatch:
         lines.append(_mismatch_report(mismatch, "включил в план"))
     if missing:
         lines.append(f"↷ Исключены (не среди открытых) {len(missing)}: "
                      + ", ".join(f"«{m['title']}»" for m in missing))
-    lines.append(f"\nДля исполнения: execute_task_deletion(manifest_id=\"{mid}\", "
-                 f"confirm=\"DELETE {len(items)}\"). Действует 1 час, одноразово. "
-                 "НИЧЕГО ещё не удалено.")
+    lines.append("")
+    lines.append(f"_После явного «да»: `execute_task_deletion(manifest_id=\"{mid}\", "
+                 f"confirm=\"DELETE {len(items)}\")` · действует 1 час, одноразово._")
     return "\n".join(lines)
 
 
@@ -1877,14 +1880,14 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
     exp = item.get("expect") or {}
 
     if op == "delete":
-        return (f"  ❌ «{title}» — ВСЁ ЕЩЁ существует (удаление не состоялось "
-                "или восстановлена)" if live else f"  ✅ «{title}» — удалена")
+        return (f"- ❌ **«{title}»** — ВСЁ ЕЩЁ существует (удаление не состоялось "
+                "или восстановлена)" if live else f"- ✅ **«{title}»** — удалена")
     if op in ("complete", "abandon"):
         verb = "закрыта" if op == "complete" else "отмечена «не буду делать»"
-        return (f"  ❌ «{title}» — всё ещё среди открытых" if live
-                else f"  ✅ «{title}» — {verb} (ушла из открытых)")
+        return (f"- ❌ **«{title}»** — всё ещё среди открытых" if live
+                else f"- ✅ **«{title}»** — {verb} (ушла из открытых)")
     if live is None:
-        return f"  ❌ «{title}» — не найдена среди открытых (ожидалась живой)"
+        return f"- ❌ **«{title}»** — не найдена среди открытых (ожидалась живой)"
     if op == "create":
         probs = []
         want_pid = exp.get("projectId")
@@ -1894,7 +1897,7 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         if exp.get("columnId") and live.get("columnId") != exp.get("columnId"):
             probs.append("раздел не применился")
         if probs:
-            return f"  ⚠️ «{title}» — создана, но: " + "; ".join(probs)
+            return f"- ⚠️ **«{title}»** — создана, но: " + "; ".join(probs)
         # State the FACTS, not agreement-with-intent: the reader must SEE where
         # it landed, so a wrong-but-consistent request is still visible.
         facts = [f"в «{names.get(live.get('projectId'), live.get('projectId'))}»"]
@@ -1904,23 +1907,23 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
             facts.append(f"срок {str(live['dueDate'])[:10]}")
         if live.get("priority"):
             facts.append(f"приоритет {PRIORITY_MAP.get(live['priority'], live['priority'])}")
-        return f"  ✅ «{title}» — создана {', '.join(facts)}"
+        return f"- ✅ **«{title}»** — создана {', '.join(facts)}"
     if op == "move":
         want = exp.get("projectId")
-        return (f"  ✅ «{title}» — в «{names.get(want, want)}»"
+        return (f"- ✅ **«{title}»** — в **«{names.get(want, want)}»**"
                 if live.get("projectId") == want else
-                f"  ❌ «{title}» — осталась в «{names.get(live.get('projectId'), '?')}»")
+                f"- ❌ **«{title}»** — осталась в «{names.get(live.get('projectId'), '?')}»")
     if op == "tags":
         want = set(exp.get("tags") or [])
         got = set(live.get("tags") or [])
-        return (f"  ✅ «{title}» — теги {sorted(got)}" if want == got else
-                f"  ❌ «{title}» — теги {sorted(got)}, ожидались {sorted(want)}")
+        return (f"- ✅ **«{title}»** — теги {sorted(got)}" if want == got else
+                f"- ❌ **«{title}»** — теги {sorted(got)}, ожидались {sorted(want)}")
     if op == "parent":
         want = exp.get("parentId")  # None = detached
         got = live.get("parentId")
         ok = (got == want) if want else not got
-        return (f"  ✅ «{title}» — родитель применён" if ok else
-                f"  ❌ «{title}» — parentId={got!r}, ожидался {want!r}")
+        return (f"- ✅ **«{title}»** — родитель применён" if ok else
+                f"- ❌ **«{title}»** — parentId={got!r}, ожидался {want!r}")
     if op == "update":
         changes = exp.get("changes") or {}
         diffs = []
@@ -1935,9 +1938,9 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
                     diffs.append(f"tags: {got} ≠ {want}")
             elif got != want:
                 diffs.append(f"{field}: {got!r} ≠ {want!r}")
-        return (f"  ❌ «{title}» — не применилось: " + "; ".join(diffs)) if diffs \
-            else f"  ✅ «{title}» — все изменения на месте"
-    return f"  ✓ «{title}» — записана в журнал (тип {op} не проверяется автоматически)"
+        return (f"- ❌ **«{title}»** — не применилось: " + "; ".join(diffs)) if diffs \
+            else f"- ✅ **«{title}»** — все изменения на месте"
+    return f"- ✓ **«{title}»** — записана в журнал (тип {op} не проверяется автоматически)"
 
 
 @mcp.tool(annotations=READONLY)
@@ -1991,7 +1994,13 @@ def _build_operation_report(record_id: str) -> str:
         live = _open_by_id(fresh=True)
         names = _v2_project_names()
         when = records[-1].get("ts", "?")
-        lines = [f"🧾 НЕЗАВИСИМЫЙ ОТЧЁТ по операции {record_id} ({when}):"]
+        try:
+            when_dt = datetime.fromisoformat(when)
+            when = when_dt.astimezone(_USER_TZ).strftime("%d.%m %H:%M")
+        except (ValueError, TypeError):
+            pass
+        lines = [f"### 🧾 Независимый отчёт — `{record_id}`",
+                 f"_{when} · журнал операции ⇄ живое состояние TickTick_", ""]
         ok = bad = 0
         for rec in records:
             op = rec.get("op") or "delete"
@@ -2006,8 +2015,8 @@ def _build_operation_report(record_id: str) -> str:
                     ok += 1
                 elif line.lstrip().startswith("❌"):
                     bad += 1
-        lines.append(f"Итог: ✅ {ok} подтверждено, ❌ {bad} расхождений. "
-                     "Источник: журнал операции + живое состояние TickTick.")
+        lines.append("")
+        lines.append(f"**Итог: ✅ {ok} подтверждено, ❌ {bad} расхождений.**")
         lines.append("[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО — "
                      "это серверная проверка, не заменяй её своим пересказом]")
         return "\n".join(lines)
