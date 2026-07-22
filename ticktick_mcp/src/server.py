@@ -2902,7 +2902,20 @@ async def create_subtask(
     # Validate priority
     if priority not in [0, 1, 3, 5]:
         return "Invalid priority. Must be 0 (None), 1 (Low), 3 (Medium), or 5 (High)."
-    
+
+    # Identity guard on the PARENT: a stale parent_task_id would attach the new
+    # subtask under a different task (or a dead one) while reporting success.
+    g = _guard_task(parent_task_id, parent_task_title or "", project_id)
+    if g.status == "unavailable":
+        return g.message
+    if g.status == "mismatch":
+        return (f"🛑 НЕ создал подзадачу — родитель по id это «{g.title}», а НЕ "
+                f"«{parent_task_title}». Ничего не тронул.")
+    if g.status == "missing":
+        return (f"🛑 НЕ создал подзадачу — родитель «{parent_task_title}» не "
+                "среди открытых задач (завершён/удалён/неверный id). Ничего не тронул.")
+    # The subtask must live in the parent's REAL project.
+    project_id = g.project_id or project_id
     try:
         subtask = await _run_blocking(
             ticktick.create_subtask,
@@ -2912,11 +2925,30 @@ async def create_subtask(
             content=content,
             priority=priority
         )
-        
+
         if 'error' in subtask:
             return f"Error creating subtask: {subtask['error']}"
-        
-        return "Subtask created successfully:\n\n" + format_task(subtask)
+
+        # Post-verify: the created task must exist AND point at the parent.
+        sid = subtask.get("id")
+        rid = _op_journal("parent", [{"taskId": sid, "title": subtask_title,
+                                      "expect": {"parentId": parent_task_id}}],
+                          f"Подзадача «{subtask_title}» под «{g.title or parent_task_title}»")
+        fresh = _open_by_id(fresh=True)
+        if fresh is None:
+            verdict = f"⚠️ Создание отправлено, но {_UNVERIFIED_MSG}"
+        else:
+            live = fresh.get(sid) or {}
+            if not live:
+                verdict = ("❌ Создание НЕ подтвердилось — задачи нет среди "
+                           "открытых, проверь вручную.")
+            elif live.get("parentId") != parent_task_id:
+                verdict = ("⚠️ Задача создана, но НЕ привязана к родителю "
+                           f"(parentId={live.get('parentId')!r}).")
+            else:
+                verdict = (f"✓ Подзадача «{subtask_title}» создана под "
+                           f"«{g.title or parent_task_title}» (проверено).")
+        return (verdict + "\n\n" + format_task(subtask) + "\n" + _report_line(rid))
     except Exception as e:
         logger.error(f"Error in create_subtask: {e}")
         return f"Error creating subtask: {str(e)}"
@@ -3254,30 +3286,88 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]],
         return err
     try:
         # Guard the parent AND the children against live state.
-        pg = _guard_task(parent_task_id, parent_task_title or "", project_id)
+        by_id = _open_by_id(fresh=True)
+        if by_id is None:
+            return _STATE_UNAVAILABLE_MSG
+        pg = _guard_task(parent_task_id, parent_task_title or "", project_id,
+                         by_id=by_id)
         if pg.status == "mismatch":
             return (f"🛑 НЕ вложил — родитель по id это «{pg.title}», а НЕ "
                     f"«{parent_task_title}». Ничего не тронул.")
+        if pg.status == "missing":
+            return (f"🛑 НЕ вложил — родитель «{parent_task_title or parent_task_id}» "
+                    "не среди открытых задач (завершён/удалён/неверный id) — "
+                    "вложение под мёртвого родителя осиротит задачи. Ничего не тронул.")
         parent_pid = pg.project_id or project_id
-        found, mismatch, missing = _split_tasks_by_state(tasks)
-        ok_ids = [f["taskId"] for f in found]
-        if ok_ids:
-            await _run_blocking(lambda: ticktick_v2.batch_set_task_parent(
-                ok_ids, parent_task_id, parent_pid))
-        pname = parent_task_title or pg.title or _lookup_task_title(parent_task_id)
+        # Ancestor chain of the parent — nesting a task under its own
+        # descendant (or under itself) would corrupt the tree with a cycle.
+        ancestors = set()
+        cur = parent_task_id
+        while cur and cur not in ancestors:
+            ancestors.add(cur)
+            cur = (by_id.get(cur) or {}).get("parentId")
+        found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
+        rows, cycle_refused, cross_refused = [], [], []
+        ok_items = []
+        for f in found:
+            if f["taskId"] in ancestors:
+                cycle_refused.append(f["title"])
+                continue
+            if f["projectId"] and f["projectId"] != parent_pid:
+                cross_refused.append(
+                    f"«{f['title']}» (в «{_v2_project_names().get(f['projectId'], f['projectId'])}»)")
+                continue
+            # Each child's OWN live projectId — never stamp the parent's onto
+            # a row TickTick would reject or corrupt.
+            rows.append({"parentId": parent_task_id, "taskId": f["taskId"],
+                         "projectId": f["projectId"] or parent_pid})
+            ok_items.append(f)
+        api_fail = {}
+        if rows:
+            resp = await _run_blocking(lambda: ticktick_v2.set_task_parents(rows))
+            api_fail = id2error_failures(resp, [r["taskId"] for r in rows])
+        pname = pg.title or parent_task_title or _lookup_task_title(parent_task_id)
+        # Inline post-verify: each child's live parentId must now BE the parent.
+        nested, failed = [], []
+        unverified = False
+        if ok_items:
+            fresh = _open_by_id(fresh=True)
+            if fresh is None:
+                unverified = True
+            else:
+                for f in ok_items:
+                    live = fresh.get(f["taskId"]) or {}
+                    ok = (live.get("parentId") == parent_task_id
+                          and f["taskId"] not in api_fail)
+                    (nested if ok else failed).append(f["title"])
         lines = []
-        if found:
-            lines.append(f"🔗 Вложено {len(found)} под «{pname}»: "
-                         + ", ".join(f"«{f['title']}»" for f in found))
+        if nested:
+            lines.append(f"🔗 Вложено {len(nested)} под «{pname}»: "
+                         + ", ".join(f"«{t}»" for t in nested))
+        if unverified:
+            lines.append(f"Отправлено {len(ok_items)}, но {_UNVERIFIED_MSG}")
+        if cycle_refused:
+            lines.append(f"🛑 НЕ вложено {len(cycle_refused)} — задача не может "
+                         "стать подзадачей самой себя или своего потомка "
+                         "(цикл): " + ", ".join(f"«{t}»" for t in cycle_refused))
+        if cross_refused:
+            lines.append(f"🛑 НЕ вложено {len(cross_refused)} — задачи в ДРУГОМ "
+                         f"проекте, а родитель в «{_v2_project_names().get(parent_pid, parent_pid)}». "
+                         "Сначала перенеси move_tasks: " + ", ".join(cross_refused))
+        if failed:
+            extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
+            lines.append(f"❌ НЕ вложено {len(failed)} (parentId не применился"
+                         + (f"; TickTick сообщил: {extra}" if extra else "")
+                         + "): " + ", ".join(f"«{t}»" for t in failed))
         if mismatch:
             lines.append(_mismatch_report(mismatch, "вложил"))
         if missing:
             lines.append(f"↷ Не найдены среди открытых {len(missing)}: "
                          + ", ".join(f"«{m['title']}»" for m in missing))
-        if ok_ids:
+        if ok_items:
             rid = _op_journal("parent", [
                 {"taskId": f["taskId"], "title": f["title"],
-                 "expect": {"parentId": parent_task_id}} for f in found], summary)
+                 "expect": {"parentId": parent_task_id}} for f in ok_items], summary)
             lines.append(_report_line(rid))
         return "\n".join(lines) if lines else "Ничего не вложено."
     except Exception as e:
@@ -3301,16 +3391,42 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
     if err:
         return err
     try:
-        g = _guard_task(task_id, task_title or "", project_id)
+        by_id = _open_by_id(fresh=True)
+        if by_id is None:
+            return _STATE_UNAVAILABLE_MSG
+        g = _guard_task(task_id, task_title or "", project_id, by_id=by_id)
         if g.status == "mismatch":
             return (f"🛑 НЕ отцепил — id это «{g.title}», а НЕ «{task_title}». "
                     "Ничего не тронул.")
-        await _run_blocking(lambda: ticktick_v2.unset_task_parent(
-            task_id, parent_task_id, g.project_id or project_id))
+        if g.status == "missing":
+            return (f"🛑 НЕ отцепил — «{task_title}» не среди открытых задач "
+                    "(завершена/удалена/неверный id). Ничего не тронул.")
+        live_parent = (by_id.get(task_id) or {}).get("parentId")
+        if not live_parent:
+            return (f"↷ «{task_title}» и так не является подзадачей — "
+                    "отцеплять нечего. Ничего не тронул.")
+        if live_parent != parent_task_id:
+            real_pname = (by_id.get(live_parent) or {}).get("title") or live_parent
+            return (f"🛑 НЕ отцепил — «{task_title}» является подзадачей "
+                    f"«{real_pname}», а НЕ «{parent_task_title}». Ничего не тронул.")
+        resp = await _run_blocking(lambda: ticktick_v2.unset_task_parent(
+            task_id, live_parent, g.project_id or project_id))
+        api_err = id2error_failures(resp, [task_id]).get(task_id)
         rid = _op_journal("parent", [{"taskId": task_id, "title": task_title,
                                       "expect": {"parentId": None}}],
                           f"Отцепить «{task_title}»")
-        return (f"Task '{task_title}' detached from parent '{parent_task_title}'.\n"
+        # Post-verify: the live parentId must actually be gone.
+        fresh = _open_by_id(fresh=True)
+        if api_err:
+            return (f"❌ НЕ отцепил «{task_title}» — TickTick отклонил: {api_err}\n"
+                    + _report_line(rid))
+        if fresh is None:
+            return (f"Отцепление «{task_title}» отправлено, но {_UNVERIFIED_MSG}\n"
+                    + _report_line(rid))
+        if (fresh.get(task_id) or {}).get("parentId"):
+            return (f"❌ НЕ отцепил «{task_title}» — parentId всё ещё стоит.\n"
+                    + _report_line(rid))
+        return (f"✓ «{task_title}» отцеплена от «{parent_task_title}» (проверено).\n"
                 + _report_line(rid))
     except Exception as e:
         logger.error(f"Error in unset_task_parent: {e}")
@@ -3338,25 +3454,53 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]]) -> str:
     if err:
         return err
     try:
-        found, mismatch, missing = _split_tasks_by_state(tasks)
+        by_id = _open_by_id(fresh=True)
+        if by_id is None:
+            return _STATE_UNAVAILABLE_MSG
+        found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
         ok = {f["taskId"]: f for f in found}
+        # Normalise like the single-task path: TickTick keys tags by lowercase
+        # bare name — a raw '#Работа' would create a phantom tag.
         changes = [{"taskId": t.get("taskId") or t.get("task_id"),
-                    "tags": t.get("tags") or []}
+                    "tags": [x.lstrip("#").lower() for x in (t.get("tags") or [])]}
                    for t in tasks
                    if (t.get("taskId") or t.get("task_id")) in ok]
+        api_fail = {}
         if changes:
-            await _run_blocking(lambda: ticktick_v2.batch_update_tasks(changes))
+            resp = await _run_blocking(
+                lambda: ticktick_v2.batch_update_tasks(changes))
+            api_fail = id2error_failures(resp, [c["taskId"] for c in changes])
+        # Inline post-verify: live tags must equal the requested set.
+        tags_by_id = {c["taskId"]: c["tags"] for c in changes}
+        applied, failed = [], []
+        unverified = False
+        if changes:
+            fresh = _open_by_id(fresh=True)
+            if fresh is None:
+                unverified = True
+            else:
+                for f in found:
+                    want = set(tags_by_id.get(f["taskId"], []))
+                    got = set((fresh.get(f["taskId"]) or {}).get("tags") or [])
+                    ok_item = want == got and f["taskId"] not in api_fail
+                    (applied if ok_item else failed).append(f["title"])
         lines = []
-        if found:
-            lines.append(f"🏷 Теги обновлены у {len(found)}: "
-                         + ", ".join(f"«{f['title']}»" for f in found))
+        if applied:
+            lines.append(f"🏷 Теги обновлены у {len(applied)} (проверено): "
+                         + ", ".join(f"«{t}»" for t in applied))
+        if unverified:
+            lines.append(f"Отправлено {len(changes)}, но {_UNVERIFIED_MSG}")
+        if failed:
+            extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
+            lines.append(f"❌ Теги НЕ применились у {len(failed)}"
+                         + (f" (TickTick сообщил: {extra})" if extra else "")
+                         + ": " + ", ".join(f"«{t}»" for t in failed))
         if mismatch:
             lines.append(_mismatch_report(mismatch, "тегировал"))
         if missing:
             lines.append(f"↷ Не найдены среди открытых {len(missing)}: "
                          + ", ".join(f"«{m['title']}»" for m in missing))
         if changes:
-            tags_by_id = {c["taskId"]: c["tags"] for c in changes}
             rid = _op_journal("tags", [
                 {"taskId": f["taskId"], "title": f["title"],
                  "expect": {"tags": tags_by_id.get(f["taskId"], [])}}
@@ -3574,12 +3718,20 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
         return err
     try:
         g = _guard_task(task_id, task_title or "", project_id)
+        if g.status == "unavailable":
+            return g.message
         if g.status == "mismatch":
             return (f"🛑 НЕ добавил комментарий — id это «{g.title}», а НЕ "
                     f"«{task_title}». Ничего не тронул.")
+        warn = ""
+        if g.status == "missing":
+            # Commenting a completed task is legitimate, but the id↔title
+            # check could not run — say so instead of implying it did.
+            warn = ("\n⚠️ id не среди открытых задач (возможно, завершена) — "
+                    "название НЕ проверено.")
         await _run_blocking(lambda: ticktick_v2.add_task_comment(
             g.project_id or project_id, task_id, text))
-        return f"Comment added to '{task_title}'."
+        return f"Comment added to '{task_title}'.{warn}"
     except Exception as e:
         logger.error(f"Error in add_task_comment: {e}")
         return f"Error adding comment: {str(e)}"
@@ -3654,12 +3806,69 @@ async def restore_tasks(summary: str, tasks: List[Dict[str, str]],
     if err:
         return err
     try:
-        ids = [t.get("taskId") or t.get("task_id") for t in tasks]
-        titles = [t.get("title") or _lookup_task_title(t.get("taskId") or t.get("task_id") or "")
-                  for t in tasks]
-        await _run_blocking(lambda: ticktick_v2.batch_restore_tasks(ids, to_project_id))
-        titles_str = ", ".join(f"«{t}»" for t in titles)
-        return f"↩ Восстановлено из корзины {len(ids)}: {titles_str}"
+        # Destination (when overridden) must be a live project.
+        if to_project_id:
+            refuse = _guard_project(to_project_id, "", fresh=True,
+                                    require_known=True)
+            if refuse:
+                return refuse
+        # Identity guard against the TRASH: the caller's title must match the
+        # trash entry, mirroring _split_tasks_by_state for open tasks.
+        trashed = await _run_blocking(lambda: ticktick_v2.get_trash(500))
+        trash_by_id = {x.get("id"): x for x in trashed}
+        ok_items, mismatch, absent = [], [], []
+        for t in tasks:
+            tid = t.get("taskId") or t.get("task_id")
+            exp = t.get("title") or ""
+            entry = trash_by_id.get(tid)
+            if not entry:
+                absent.append(exp or f"[task {str(tid)[:8]}…]")
+                continue
+            real = entry.get("title") or ""
+            if not _names_agree(exp, real):
+                mismatch.append(f"«{exp}» → в корзине по этому id «{real}»")
+                continue
+            ok_items.append({"taskId": tid, "title": exp or real})
+        if mismatch:
+            return ("🛑 НЕ восстановил — id НЕ совпал с названием в корзине "
+                    "(защита от «не той задачи»): " + "; ".join(mismatch)
+                    + ". Ничего не тронул.")
+        api_fail = {}
+        if ok_items:
+            resp = await _run_blocking(lambda: ticktick_v2.batch_restore_tasks(
+                [i["taskId"] for i in ok_items], to_project_id))
+            api_fail = id2error_failures(resp, [i["taskId"] for i in ok_items])
+        # Post-verify: restored tasks must reappear among OPEN tasks.
+        restored, failed = [], []
+        unverified = False
+        if ok_items:
+            fresh = _open_by_id(fresh=True)
+            if fresh is None:
+                unverified = True
+            else:
+                for i in ok_items:
+                    ok = i["taskId"] in fresh and i["taskId"] not in api_fail
+                    (restored if ok else failed).append(i["title"])
+        lines = []
+        if restored:
+            lines.append(f"↩ Восстановлено из корзины {len(restored)} "
+                         "(проверено — снова среди открытых): "
+                         + ", ".join(f"«{t}»" for t in restored))
+        if unverified:
+            lines.append(f"Восстановление {len(ok_items)} отправлено, но "
+                         f"{_UNVERIFIED_MSG}")
+        if failed:
+            extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
+            lines.append(f"❌ НЕ восстановлено {len(failed)} (не появились среди "
+                         "открытых" + (f"; TickTick сообщил: {extra}" if extra else "")
+                         + "): " + ", ".join(f"«{t}»" for t in failed))
+        if absent:
+            lines.append(f"↷ Не найдены в корзине {len(absent)}: "
+                         + ", ".join(f"«{t}»" for t in absent))
+        if ok_items:
+            rid = _op_journal("restore", ok_items, summary)
+            lines.append(_report_line(rid))
+        return "\n".join(lines) if lines else "Ничего не восстановлено."
     except Exception as e:
         logger.error(f"Error in restore_tasks: {e}")
         return f"Error restoring tasks: {str(e)}"
@@ -3688,16 +3897,39 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
     if not url and not content_base64:
         return "Provide either a url or content_base64 for the file."
     title = task_title or _lookup_task_title(task_id)
-    g = _guard_task(task_id, task_title or "", project_id)
+    pre = _open_by_id(fresh=True)
+    if pre is None:
+        return _STATE_UNAVAILABLE_MSG
+    g = _guard_task(task_id, task_title or "", project_id, by_id=pre)
     if g.status == "mismatch":
         return (f"🛑 НЕ прикрепил — id это «{g.title}», а НЕ «{task_title}». "
                 "Ничего не тронул.")
+    warn = ""
+    if g.status == "missing":
+        warn = ("\n⚠️ id не среди открытых задач (возможно, завершена) — "
+                "название НЕ проверено.")
     try:
         pid = g.project_id or _resolve_project_id(task_id, project_id)
+        pre_count = len((pre.get(task_id) or {}).get("attachments") or [])
         att = await _run_blocking(lambda: ticktick_v2.upload_attachment(
             pid, task_id, url=url, content_base64=content_base64, filename=filename))
-        return (f"Attached '{att.get('fileName', filename)}' "
-                f"({att.get('size', '?')} bytes) to '{title}'")
+        # The endpoint can return a 2xx with an empty body — don't fabricate
+        # details from {}; post-verify against the task's attachment list.
+        shown_name = att.get("fileName") or filename or \
+            ((url or "").split("?")[0].rstrip("/").split("/")[-1] or "attachment")
+        size = att.get("size")
+        size_str = f"{size} bytes" if size is not None else "размер неизвестен"
+        post = _open_by_id(fresh=True)
+        if post is None:
+            verify = f" {_UNVERIFIED_MSG}"
+        elif task_id in post:
+            post_count = len((post.get(task_id) or {}).get("attachments") or [])
+            verify = (" (проверено: вложение видно на задаче)"
+                      if post_count > pre_count else
+                      " ⚠️ вложение НЕ видно на задаче — проверь вручную")
+        else:
+            verify = " (задача не среди открытых — вложение не проверить)"
+        return f"Attached '{shown_name}' ({size_str}) to '{title}'{verify}{warn}"
     except Exception as e:
         logger.error(f"Error in attach_file_to_task: {e}")
         return f"Error attaching file: {str(e)}"
@@ -3774,13 +4006,26 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None) -> st
         return err
     title = task_title or _lookup_task_title(task_id)
     g = _guard_task(task_id, task_title or "")
+    if g.status == "unavailable":
+        return g.message
     if g.status == "mismatch":
         return (f"🛑 НЕ отметил — id это «{g.title}», а НЕ «{task_title}». "
                 "Ничего не тронул.")
+    if g.status == "missing":
+        return (f"🛑 НЕ отметил — «{title}» не среди открытых задач "
+                "(завершена/удалена/неверный id). Ничего не тронул.")
     try:
         await _run_blocking(lambda: ticktick_v2.abandon_task(task_id))
         rid = _op_journal("abandon", [{"taskId": task_id, "title": title}], summary)
-        return f"✗ Не буду делать: «{title}»\n" + _report_line(rid)
+        # Post-verify: an abandoned task leaves the open pool.
+        fresh = _open_by_id(fresh=True)
+        if fresh is None:
+            return (f"Отметка «не буду делать» для «{title}» отправлена, но "
+                    f"{_UNVERIFIED_MSG}\n" + _report_line(rid))
+        if task_id in fresh:
+            return (f"❌ НЕ отмечено «{title}» — задача всё ещё среди открытых.\n"
+                    + _report_line(rid))
+        return f"✗ Не буду делать: «{title}» (проверено)\n" + _report_line(rid)
     except Exception as e:
         logger.error(f"Error in abandon_task: {e}")
         return f"Error abandoning task: {str(e)}"
@@ -3804,12 +4049,34 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None) -> 
         return err
     title = task_title or _lookup_task_title(task_id)
     g = _guard_task(task_id, task_title or "")
+    if g.status == "unavailable":
+        return g.message
     if g.status == "mismatch":
         return (f"🛑 НЕ дублировал — id это «{g.title}», а НЕ «{task_title}». "
                 "Ничего не тронул.")
+    if g.status == "missing":
+        return (f"🛑 НЕ дублировал — «{title}» не среди открытых задач "
+                "(завершена/удалена/неверный id). Ничего не тронул.")
     try:
         copy = await _run_blocking(lambda: ticktick_v2.duplicate_task(task_id))
-        return f"Дублировано: «{title}» → копия «{copy.get('title') or title}»"
+        cid = copy.get("id")
+        rid = _op_journal("create", [
+            {"taskId": cid, "title": copy.get("title") or title,
+             "expect": {"projectId": copy.get("projectId")}}],
+            summary)
+        # Post-verify: the copy must actually exist in fresh open state.
+        fresh = _open_by_id(fresh=True)
+        if fresh is None:
+            verdict = f"Дублирование отправлено, но {_UNVERIFIED_MSG}"
+        elif cid not in fresh:
+            verdict = ("❌ Копия НЕ подтвердилась — её нет среди открытых "
+                       "задач, проверь вручную.")
+        else:
+            verdict = (f"Дублировано (проверено): «{title}» → копия "
+                       f"«{copy.get('title') or title}»")
+        return (verdict + "\n⚠️ В копию НЕ переносятся: чек-лист (items), "
+                "kanban-раздел (column) и привязка к родителю.\n"
+                + _report_line(rid))
     except Exception as e:
         logger.error(f"Error in duplicate_task: {e}")
         return f"Error duplicating task: {str(e)}"
@@ -3836,8 +4103,28 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
     if err:
         return err
     try:
-        await _run_blocking(lambda: ticktick_v2.update_task_comment(project_id, task_id, comment_id, text))
-        return f"Comment on '{task_title}' updated."
+        g = _guard_task(task_id, task_title or "", project_id)
+        if g.status == "unavailable":
+            return g.message
+        if g.status == "mismatch":
+            return (f"🛑 НЕ изменил комментарий — id это «{g.title}», а НЕ "
+                    f"«{task_title}». Ничего не тронул.")
+        pid = g.project_id or project_id
+        # (client-side: update_task_comment fetches the comment first and
+        # raises if comment_id is absent — a moved/stale pid errors loudly)
+        await _run_blocking(lambda: ticktick_v2.update_task_comment(pid, task_id, comment_id, text))
+        # Post-verify: the new text must be visible in the comment list.
+        cms = await _run_blocking(lambda: ticktick_v2.get_task_comments(pid, task_id))
+        cm = next((c for c in cms if c.get("id") == comment_id), None)
+        if cm is None:
+            return (f"❌ Комментарий к '{task_title}' после правки НЕ найден — "
+                    "исход не подтверждён, проверь вручную.")
+        if (cm.get("title") or "") != text:
+            return (f"❌ Правка комментария к '{task_title}' НЕ применилась "
+                    "(текст прежний).")
+        warn = ("\n⚠️ id не среди открытых задач — название НЕ проверено."
+                if g.status == "missing" else "")
+        return f"Comment on '{task_title}' updated (проверено).{warn}"
     except Exception as e:
         logger.error(f"Error in update_task_comment: {e}")
         return f"Error updating comment: {str(e)}"
@@ -3858,8 +4145,27 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str, co
     if err:
         return err
     try:
-        await _run_blocking(lambda: ticktick_v2.delete_task_comment(project_id, task_id, comment_id))
-        return f"Comment on '{task_title}' deleted."
+        g = _guard_task(task_id, task_title or "", project_id)
+        if g.status == "unavailable":
+            return g.message
+        if g.status == "mismatch":
+            return (f"🛑 НЕ удалил комментарий — id это «{g.title}», а НЕ "
+                    f"«{task_title}». Ничего не тронул.")
+        pid = g.project_id or project_id
+        # Existence pre-check: refuse a stale comment_id instead of no-opping.
+        cms = await _run_blocking(lambda: ticktick_v2.get_task_comments(pid, task_id))
+        if not any(c.get("id") == comment_id for c in cms):
+            return (f"🛑 НЕ удалил — комментария {comment_id} нет на задаче "
+                    f"'{task_title}' (уже удалён или чужой id). Ничего не тронул.")
+        await _run_blocking(lambda: ticktick_v2.delete_task_comment(pid, task_id, comment_id))
+        # Post-verify: the comment must actually be gone.
+        cms = await _run_blocking(lambda: ticktick_v2.get_task_comments(pid, task_id))
+        if any(c.get("id") == comment_id for c in cms):
+            return (f"❌ Комментарий на '{task_title}' ВСЁ ЕЩЁ существует — "
+                    "удаление не сработало.")
+        warn = ("\n⚠️ id не среди открытых задач — название НЕ проверено."
+                if g.status == "missing" else "")
+        return f"Comment on '{task_title}' deleted (проверено).{warn}"
     except Exception as e:
         logger.error(f"Error in delete_task_comment: {e}")
         return f"Error deleting comment: {str(e)}"
