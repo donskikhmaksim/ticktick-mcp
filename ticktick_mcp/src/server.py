@@ -19,7 +19,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from .ticktick_client import TickTickClient, _normalize_date, save_token_file
-from .ticktick_v2_client import TickTickV2Client
+from .ticktick_v2_client import TickTickV2Client, id2error_failures
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -423,18 +423,33 @@ def _resolve_project_id(task_id: str, given: str) -> str:
     return given
 
 
-def _open_by_id(fresh: bool = False) -> Dict[str, Dict]:
-    """{taskId: task} of the v2 OPEN-task state, or {} if unavailable.
-    fresh=True drops the cache first, so a just-renamed/moved/completed task is
-    seen — used by the write guard so it never checks against a stale title."""
+# Returned by guards / shown by post-verify when the v2 state can't be read:
+# a failed fetch must NEVER be confused with "the task is gone" (fail CLOSED).
+_STATE_UNAVAILABLE_MSG = (
+    "🛑 Не могу сверить — состояние TickTick недоступно (v2 не отвечает или "
+    "не настроен). Ничего не тронул.")
+_UNVERIFIED_MSG = ("⚠️ Исход НЕ ПОДТВЕРЖДЁН — состояние TickTick недоступно, "
+                   "проверь вручную.")
+
+
+def _open_by_id(fresh: bool = False) -> Optional[Dict[str, Dict]]:
+    """{taskId: task} of the v2 OPEN-task state, or None when the state is
+    UNAVAILABLE (v2 not configured, or the fetch failed). None ≠ {}: an empty
+    dict means «no open tasks», None means «cannot know» — mutation guards must
+    fail CLOSED on None, and post-verify must say UNVERIFIED instead of
+    treating absence-from-nothing as success.
+    fresh=True forces an uncached refetch (get_state(force=True)), so a
+    just-renamed/moved/completed task is seen — used by the write guard so it
+    never checks against a stale title, and by post-verify so a concurrent
+    reader can't repopulate the cache with a pre-write snapshot."""
     if not ticktick_v2:
-        return {}
+        return None
     try:
         if fresh:
-            ticktick_v2.invalidate_cache()
+            ticktick_v2.get_state(force=True)
         return {t.get("id"): t for t in ticktick_v2.get_open_tasks() if t.get("id")}
     except Exception:
-        return {}
+        return None
 
 
 # Zero-width / variation-selector chars that can silently differ between two
@@ -455,19 +470,37 @@ def _norm_name(s: str) -> str:
     return re.sub(r"^[\W_]+|[\W_]+$", "", s, flags=re.UNICODE)
 
 
+def _norm_loose(s: str) -> str:
+    """Looser comparison key: NFKC + drop invisibles + lowercase + collapse
+    whitespace, but KEEP emoji/punctuation. Used when a title consists ONLY of
+    symbols («🔥», «???») — stripping \\W would erase the whole claim and
+    silently disarm the guard."""
+    s = unicodedata.normalize("NFKC", s or "")
+    for z in _INVISIBLE:
+        s = s.replace(z, "")
+    return re.sub(r"\s+", " ", s.lower()).strip()
+
+
 def _names_agree(expected: str, actual: str) -> bool:
     """True if a caller-supplied name matches the live one. Empty expected → no
     claim to verify (True). Otherwise EXACT match after normalisation — NOT a
     loose substring: «Позвонить» must NOT match «Позвонить Пете», and different
-    numbers/amounts ($10 000 vs $11 000) fail. Marker/case/space differences pass."""
+    numbers/amounts ($10 000 vs $11 000) fail. Marker/case/space differences pass.
+    An emoji/punctuation-only claim («🔥») does NOT disarm the check: it is
+    compared loosely (case/space-insensitive) against the raw actual title."""
+    if not (expected or "").strip():
+        return True
     a = _norm_name(expected)
     if not a:
-        return True
+        # The claim normalises to nothing (emoji/punct-only) — compare the
+        # raw strings loosely instead of returning True.
+        return _norm_loose(expected) == _norm_loose(actual)
     return a == _norm_name(actual)
 
 
 class _Guard:
-    """Result of the identity guard for one task. status ∈ {ok, mismatch, missing}."""
+    """Result of the identity guard for one task.
+    status ∈ {ok, mismatch, missing, unavailable}."""
     __slots__ = ("status", "project_id", "title", "message")
 
     def __init__(self, status, project_id="", title="", message=""):
@@ -493,13 +526,18 @@ def _guard_task(
     """Identity guard for a SINGLE-task mutation: confirm the id points at the
     task the caller means BEFORE touching it, using fresh live state.
 
+    - v2 state can't be read at all        → status 'unavailable' (REFUSE — fail closed)
     - id not among open tasks              → status 'missing' (can't verify)
     - id resolves to a DIFFERENT title     → status 'mismatch' (REFUSE — wrong task)
     - id in a different project than asked  → status 'mismatch'
     - otherwise                            → status 'ok', project_id corrected
 
     Title check is armed only when `expected_title` is given (back-compatible)."""
-    by_id = _open_by_id(fresh=fresh) if by_id is None else by_id
+    if by_id is None:
+        by_id = _open_by_id(fresh=fresh)
+    if by_id is None:
+        return _Guard("unavailable", project_id, expected_title,
+                      _STATE_UNAVAILABLE_MSG)
     live = by_id.get(task_id)
     if not live:
         return _Guard("missing", project_id, expected_title,
@@ -524,12 +562,19 @@ def _split_tasks_by_state(
     mutating tool acts only on the RIGHT task and reports REAL results.
 
     Returns (found, mismatch, missing) — see _guard_task for the per-item rules.
-      found    — [{taskId, projectId, title}] id open AND name agrees (or no name
-                 given); projectId corrected to the CURRENT one.
+      found    — [{taskId, projectId, title, armed}] id open AND name agrees (or
+                 no name given — then armed=False: the id↔title check never ran);
+                 projectId corrected to the CURRENT one.
       mismatch — [{taskId, expected, actual, project}] id resolves to a DIFFERENT
                  task/project — REFUSED, never touched.
-      missing  — [{taskId, projectId, title}] id not among open tasks."""
-    by_id = _open_by_id(fresh=fresh) if by_id is None else by_id
+      missing  — [{taskId, projectId, title}] id not among open tasks.
+
+    Raises RuntimeError when the live state is UNAVAILABLE — callers must
+    check _open_by_id() themselves first and refuse (fail closed)."""
+    if by_id is None:
+        by_id = _open_by_id(fresh=fresh)
+    if by_id is None:
+        raise RuntimeError(_STATE_UNAVAILABLE_MSG)
     names = _v2_project_names()
     found, mismatch, missing = [], [], []
     for t in tasks:
@@ -547,18 +592,49 @@ def _split_tasks_by_state(
                              "project": names.get(g.project_id, "")})
         else:
             found.append({"taskId": tid, "title": exp_title or g.title,
-                          "projectId": g.project_id})
+                          "projectId": g.project_id,
+                          "armed": bool((exp_title or "").strip())})
     return found, mismatch, missing
 
 
-def _guard_project(project_id: str, expected_name: str = "") -> Optional[str]:
+def _unarmed_note(found: List[Dict]) -> str:
+    """Warning line when some items were mutated WITHOUT the id↔title check
+    (the caller sent no title, so the guard had nothing to verify). Makes the
+    over-claim visible instead of silently pretending the guard ran."""
+    loose = [f for f in found if not f.get("armed", True)]
+    if not loose:
+        return ""
+    return (f"⚠️ {len(loose)} выполнено БЕЗ сверки названия (title не передан): "
+            + ", ".join(f"«{f['title']}»" for f in loose))
+
+
+def _guard_project(project_id: str, expected_name: str = "", *,
+                   fresh: bool = False, require_known: bool = False) -> Optional[str]:
     """Identity guard for a PROJECT mutation: if the caller supplied the project
     name, verify project_id still resolves to it. Returns an error string to
-    return to the caller (refusal), or None when it's safe to proceed."""
-    if not expected_name:
+    return to the caller (refusal), or None when it's safe to proceed.
+
+    fresh=True drops the v2 cache first so the comparison never runs on a
+    ≤20s-stale name (an in-app rename would otherwise slip through) — use it
+    for destructive callers.
+    require_known=True FAILS CLOSED when the id resolves to no live name
+    (unknown id, or the names fetch failed): a destructive op must never
+    proceed at exactly the moment identity can't be verified."""
+    if not expected_name and not require_known:
         return None
+    if fresh and ticktick_v2:
+        try:
+            ticktick_v2.invalidate_cache()
+        except Exception:
+            pass
     real = _v2_project_names().get(project_id, "")
-    if real and not _names_agree(expected_name, real):
+    if not real:
+        if require_known:
+            return (f"🛑 Отказ — проект по id {str(project_id)[:12]}… не найден "
+                    "среди живых проектов (или имена недоступны) — сверить "
+                    "личность проекта нельзя. Ничего не тронул.")
+        return None
+    if expected_name and not _names_agree(expected_name, real):
         return (f"🛑 Отказ — project_id указывает на «{real}», а НЕ "
                 f"«{expected_name}» (защита от «не того проекта»). Ничего не тронул.")
     return None
@@ -1192,7 +1268,7 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
 
     # Duplicate radar: same-normalised title already open in the destination.
     open_titles: Dict[str, set] = {}
-    for lt in _open_by_id().values():
+    for lt in (_open_by_id() or {}).values():
         open_titles.setdefault(lt.get("projectId") or "", set()).add(
             _norm_name(lt.get("title") or ""))
 
@@ -1338,6 +1414,14 @@ async def update_tasks(
             if g.status == "mismatch":
                 results.append(f"🛑 НЕ обновил «{t.get('title')}» — {g.message}")
                 continue
+            if g.status == "unavailable":
+                results.append(f"🛑 НЕ обновил «{shown_title}» — {g.message}")
+                continue
+            if g.status == "missing":
+                # Not among open tasks: the official API would silently no-op
+                # an update with a stale projectId — refuse instead of lying.
+                results.append(f"🛑 НЕ обновил «{shown_title}» — {g.message}")
+                continue
             try:
                 pid = g.project_id or _resolve_project_id(tid, pid)
                 task = await _run_blocking(
@@ -1355,22 +1439,31 @@ async def update_tasks(
                 if 'error' in task:
                     results.append(f"✗ «{shown_title}»: {task['error']}")
                     continue
+                # Sub-steps (tags/column/assignee) — failures go into the RESULT
+                # text, not only the log: «обновлено» must not hide a lost tag.
+                sub_fails = []
                 if t.get("tags") is not None and ticktick_v2:
                     try:
                         await _run_blocking(lambda: ticktick_v2.set_task_tags(tid, t["tags"]))
                     except Exception as e:
                         logger.warning(f"Updated but tagging failed: {e}")
+                        sub_fails.append(f"теги не применились ({e})")
                 if t.get("column_id") and ticktick_v2:
                     try:
                         await _run_blocking(lambda: ticktick_v2.set_task_column(tid, t["column_id"]))
                     except Exception as e:
                         logger.warning(f"Updated but column assignment failed: {e}")
+                        sub_fails.append(f"раздел (column) не применился ({e})")
                 if t.get("assignee") is not None and ticktick_v2:
                     try:
                         await _run_blocking(lambda: ticktick_v2.batch_update_tasks([{"taskId": tid, "assignee": t["assignee"]}]))
                     except Exception as e:
                         logger.warning(f"Updated but assignee failed: {e}")
-                results.append(f"✏️ «{shown_title}» обновлено")
+                        sub_fails.append(f"исполнитель не назначен ({e})")
+                if (t.get("tags") is not None or t.get("assignee") is not None) \
+                        and not ticktick_v2:
+                    sub_fails.append("теги/исполнитель требуют v2 API — v2 "
+                                     "недоступен, эти поля НЕ применены")
                 changes = {}
                 if new_title is not None:
                     changes["title"] = new_title
@@ -1379,12 +1472,32 @@ async def update_tasks(
                 if priority is not None:
                     changes["priority"] = priority
                 if t.get("tags") is not None:
-                    changes["tags"] = t["tags"]
+                    changes["tags"] = [x.lstrip("#").lower() for x in t["tags"]]
                 for src, dst in (("due_date", "dueDate"), ("start_date", "startDate")):
                     if t.get(src):
                         changes[dst] = _normalize_date(t[src])[0]
-                _single_updates.append({"taskId": tid, "title": new_title or shown_title,
-                                        "expect": {"changes": changes}})
+                # Post-verify: re-read fresh state and diff the requested
+                # fields — the official API can 200-no-op, so «обновлено» is
+                # only printed when the change is VISIBLE in live data.
+                item = {"taskId": tid, "title": new_title or shown_title,
+                        "expect": {"changes": changes}}
+                fresh = _open_by_id(fresh=True)
+                if fresh is None:
+                    line = f"✏️ «{shown_title}» отправлено, но {_UNVERIFIED_MSG}"
+                else:
+                    verdict = _verify_item("update", item, fresh,
+                                           _v2_project_names())
+                    if "✅" in verdict[:8]:
+                        line = f"✏️ «{shown_title}» обновлено (проверено)"
+                    else:
+                        line = (f"❌ «{shown_title}» — изменения НЕ видны в "
+                                f"живом состоянии: {verdict.lstrip('- ')}")
+                if not (t.get("title") or "").strip():
+                    line += " ⚠️ выполнено БЕЗ сверки названия (title не передан)"
+                if sub_fails:
+                    line += "\n  ⚠️ " + "; ".join(sub_fails)
+                results.append(line)
+                _single_updates.append(item)
             except Exception as e:
                 results.append(f"✗ «{shown_title}»: {e}")
         if _single_updates:
@@ -1398,15 +1511,18 @@ async def update_tasks(
         return err
     try:
         # Identity guard first: only edit ids that resolve to the RIGHT task.
-        found, mismatch, missing = _split_tasks_by_state(tasks)
+        by_id = _open_by_id(fresh=True)
+        if by_id is None:
+            return _STATE_UNAVAILABLE_MSG
+        found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
         ok_ids = {f["taskId"] for f in found}
+        label_of = {}
         changes = []
-        labels = []
         for t in tasks:
             tid = t.get("taskId") or t.get("task_id")
             if tid not in ok_ids:
                 continue
-            labels.append(t.get("title") or _lookup_task_title(tid))
+            label_of[tid] = t.get("title") or _lookup_task_title(tid)
             ch = {"taskId": tid}
             if t.get("new_title") is not None:
                 ch["title"] = t["new_title"]
@@ -1415,7 +1531,7 @@ async def update_tasks(
             if t.get("priority") is not None:
                 ch["priority"] = t["priority"]
             if t.get("tags") is not None:
-                ch["tags"] = t["tags"]
+                ch["tags"] = [x.lstrip("#").lower() for x in t["tags"]]
             if t.get("assignee") is not None:
                 ch["assignee"] = t["assignee"]
             for src, dst in (("due_date", "dueDate"), ("start_date", "startDate")):
@@ -1425,12 +1541,49 @@ async def update_tasks(
                     if all_day:
                         ch["isAllDay"] = True
             changes.append(ch)
+        api_fail = {}
         if changes:
-            await _run_blocking(lambda: ticktick_v2.batch_update_tasks(changes))
+            resp = await _run_blocking(
+                lambda: ticktick_v2.batch_update_tasks(changes))
+            api_fail = id2error_failures(resp, [c["taskId"] for c in changes])
+        # Post-verify inline (like complete/move): fresh re-read + field diff —
+        # «Обновлено N» must describe live state, not the request.
+        items = [{"taskId": ch["taskId"],
+                  "title": ch.get("title") or label_of.get(ch["taskId"], ""),
+                  "expect": {"changes": {k: v for k, v in ch.items()
+                                         if k != "taskId"}}}
+                 for ch in changes]
+        updated, not_applied = [], []
+        unverified = False
+        if changes:
+            fresh = _open_by_id(fresh=True)
+            if fresh is None:
+                unverified = True
+            else:
+                names = _v2_project_names()
+                for it in items:
+                    if it["taskId"] in api_fail:
+                        not_applied.append(
+                            f"«{label_of.get(it['taskId'], it['title'])}» — "
+                            f"TickTick отклонил: {api_fail[it['taskId']]}")
+                        continue
+                    verdict = _verify_item("update", it, fresh, names)
+                    if "✅" in verdict[:8]:
+                        updated.append(label_of.get(it["taskId"], it["title"]))
+                    else:
+                        not_applied.append(verdict.lstrip("- "))
         lines = []
-        if labels:
-            lines.append(f"✏️ Обновлено {len(labels)}: "
-                         + ", ".join(f"«{lbl}»" for lbl in labels))
+        if updated:
+            lines.append(f"✏️ Обновлено {len(updated)} (проверено): "
+                         + ", ".join(f"«{lbl}»" for lbl in updated))
+        if unverified:
+            lines.append(f"✏️ Отправлено {len(changes)}, но {_UNVERIFIED_MSG}")
+        if not_applied:
+            lines.append(f"❌ НЕ применилось {len(not_applied)}:\n  - "
+                         + "\n  - ".join(not_applied))
+        note = _unarmed_note(found)
+        if note:
+            lines.append(note)
         if mismatch:
             lines.append(_mismatch_report(mismatch, "обновил"))
         if missing:
@@ -1438,11 +1591,7 @@ async def update_tasks(
                          "(неверный id/завершены): "
                          + ", ".join(f"«{m['title']}»" for m in missing))
         if changes:
-            rid = _op_journal("update", [
-                {"taskId": ch["taskId"],
-                 "title": ch.get("title") or "",
-                 "expect": {"changes": {k: v for k, v in ch.items() if k != "taskId"}}}
-                for ch in changes], summary)
+            rid = _op_journal("update", items, summary)
             lines.append(_report_line(rid))
         return "\n".join(lines) if lines else "Ничего не обновлено."
     except Exception as e:
@@ -1482,19 +1631,37 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
             # Verify against live state: batch_complete silently skips ids that
             # aren't open, so reporting by request count would over-claim. Ids
             # whose title/project disagree with the caller are refused (guard).
-            found, mismatch, missing = _split_tasks_by_state(tasks)
+            by_id = _open_by_id(fresh=True)
+            if by_id is None:
+                return _STATE_UNAVAILABLE_MSG
+            found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
             done, failed = [], []
+            api_fail = {}
+            unverified = False
             if found:
-                await _run_blocking(lambda: ticktick_v2.batch_complete_tasks(
+                resp = await _run_blocking(lambda: ticktick_v2.batch_complete_tasks(
                     [f["taskId"] for f in found]))
-                await _run_blocking(lambda: ticktick_v2.invalidate_cache())
-                still_open = _open_by_id()  # a completed task leaves the open pool
-                done = [f["title"] for f in found if f["taskId"] not in still_open]
-                failed = [f["title"] for f in found if f["taskId"] in still_open]
+                api_fail = id2error_failures(resp, [f["taskId"] for f in found])
+                still_open = _open_by_id(fresh=True)  # completed ⇒ leaves the open pool
+                if still_open is None:
+                    unverified = True
+                else:
+                    done = [f["title"] for f in found
+                            if f["taskId"] not in still_open
+                            and f["taskId"] not in api_fail]
+                    failed = [f["title"] for f in found
+                              if f["taskId"] in still_open
+                              or f["taskId"] in api_fail]
             lines = []
             if done:
                 lines.append(f"✓ Завершено {len(done)}: "
                              + ", ".join(f"«{t}»" for t in done))
+            if unverified:
+                lines.append(f"Отправлено на завершение {len(found)}, но "
+                             f"{_UNVERIFIED_MSG}")
+            note = _unarmed_note(found)
+            if note:
+                lines.append(note)
             if mismatch:
                 lines.append(_mismatch_report(mismatch, "завершил"))
             if missing:
@@ -1503,8 +1670,11 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
                     "(возможно уже завершены/неверный id): "
                     + ", ".join(f"«{t['title']}»" for t in missing))
             if failed:
-                lines.append(f"❌ НЕ завершены {len(failed)} (всё ещё открыты): "
-                             + ", ".join(f"«{t}»" for t in failed))
+                details = [f"«{t}»" for t in failed]
+                extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
+                lines.append(f"❌ НЕ завершены {len(failed)} (всё ещё открыты"
+                             + (f"; TickTick сообщил: {extra}" if extra else "")
+                             + "): " + ", ".join(details))
             if found:
                 rid = _op_journal("complete", [
                     {"taskId": f["taskId"], "title": f["title"]} for f in found], summary)
@@ -1522,15 +1692,41 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
                 if g.status == "mismatch":
                     results.append(f"🛑 НЕ завершил «{t.get('title')}» — {g.message}")
                     continue
+                if g.status == "unavailable":
+                    results.append(f"🛑 НЕ завершил «{title}» — {g.message}")
+                    continue
+                if g.status == "missing":
+                    # Not among open tasks: completing would either no-op
+                    # silently (stale projectId) or hit an already-closed task.
+                    results.append(f"↷ «{title}» — не среди открытых "
+                                   "(уже завершена/удалена/неверный id), "
+                                   "пропущено")
+                    continue
                 pid = g.project_id or _resolve_project_id(tid, pid)
                 pname = t.get("projectName") or _v2_project_names().get(pid, "")
                 res = await _run_blocking(lambda: ticktick.complete_task(pid, tid))
                 if 'error' in res:
                     results.append(f"✗ «{title}»: {res['error']}")
+                    continue
+                # Post-verify: the official API can silently no-op a complete
+                # with a mismatched projectId — «✓» only after the task is
+                # SEEN gone from the fresh open pool.
+                fresh = _open_by_id(fresh=True)
+                where = f" в «{pname}»" if pname else ""
+                if fresh is None:
+                    results.append(f"«{title}»{where} — отправлено, но "
+                                   f"{_UNVERIFIED_MSG}")
+                elif tid in fresh:
+                    results.append(f"❌ «{title}»{where} — complete НЕ сработал "
+                                   "(задача всё ещё среди открытых)")
+                    continue
                 else:
-                    where = f" в «{pname}»" if pname else ""
-                    results.append(f"✓ «{title}»{where}")
-                    _done_items.append({"taskId": tid, "title": title})
+                    line = f"✓ «{title}»{where}"
+                    if not (t.get("title") or "").strip():
+                        line += (" ⚠️ выполнено БЕЗ сверки названия "
+                                 "(title не передан)")
+                    results.append(line)
+                _done_items.append({"taskId": tid, "title": title})
             if _done_items:
                 rid = _op_journal("complete", _done_items, summary)
                 results.append(_report_line(rid))
@@ -1584,6 +1780,8 @@ async def delete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
         # deleting the wrong task by a stale id), and separate ids that aren't
         # among open tasks (already gone, or completed).
         by_id = _open_by_id(fresh=True)
+        if by_id is None:
+            return _STATE_UNAVAILABLE_MSG
         found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
         # Journal full snapshots BEFORE deleting (same guarantee as the manifest
         # path) — operation_report("direct-…") then works for point deletes too.
@@ -1600,33 +1798,48 @@ async def delete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
                                 if (by_id.get(e["taskId"]) or {}).get(k) is not None},
                              "taskId": e["taskId"]} for e in found],
             })
-        # Attempt to delete found (corrected pids) + missing (caller's pid — may
-        # be a completed task, still deletable). Mismatches are NEVER touched.
-        attempt = found + missing
-        items = [{"taskId": e["taskId"], "projectId": e["projectId"]} for e in attempt]
-        await _run_blocking(lambda: ticktick_v2.batch_delete_tasks(items))
+        # Delete ONLY verified ('found') ids. 'missing' ids are NOT attempted:
+        # their live title could not be checked (the guard sees only open
+        # tasks), so a stale id could erase a real COMPLETED task with no
+        # snapshot — exactly the wrong-target class the guard exists to stop.
+        api_fail = {}
+        if found:
+            items = [{"taskId": e["taskId"], "projectId": e["projectId"]}
+                     for e in found]
+            resp = await _run_blocking(lambda: ticktick_v2.batch_delete_tasks(items))
+            api_fail = id2error_failures(resp, [e["taskId"] for e in found])
         # Post-verify against FRESH state: which open ones actually disappeared.
-        await _run_blocking(lambda: ticktick_v2.invalidate_cache())
-        still_open = _open_by_id()
-        deleted = [e["title"] for e in found if e["taskId"] not in still_open]
-        failed = [e["title"] for e in found if e["taskId"] in still_open]
-        unverified = [e["title"] for e in missing]  # attempted, not confirmable here
-
+        still_open = _open_by_id(fresh=True) if found else {}
         lines = []
+        if still_open is None:
+            lines.append(f"Отправлено на удаление {len(found)}, но "
+                         f"{_UNVERIFIED_MSG}")
+            deleted, failed = [], []
+        else:
+            deleted = [e["title"] for e in found
+                       if e["taskId"] not in still_open
+                       and e["taskId"] not in api_fail]
+            failed = [e["title"] for e in found
+                      if e["taskId"] in still_open or e["taskId"] in api_fail]
+
         if deleted:
             lines.append(f"🗑 Удалено {len(deleted)}: "
                          + ", ".join(f"«{t}»" for t in deleted))
         if mismatch:
             lines.append(_mismatch_report(mismatch, "удалил"))
-        if unverified:
+        if missing:
             lines.append(
-                f"↷ Отправлено на удаление, но НЕ подтверждено {len(unverified)} "
-                "(нет среди открытых — возможно уже удалены/завершены; проверьте): "
-                + ", ".join(f"«{t}»" for t in unverified))
+                f"↷ Не среди открытых {len(missing)} — пропущено (сверить "
+                "название нельзя, значит удалять нельзя). Если это завершённая "
+                "задача — используй plan_task_deletion: "
+                + ", ".join(f"«{m['title']}»" for m in missing))
         if failed:
+            extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
             lines.append(
                 f"❌ НЕ удалено {len(failed)} — задачи ВСЁ ЕЩЁ в TickTick "
-                "(delete не сработал): " + ", ".join(f"«{t}»" for t in failed))
+                "(delete не сработал"
+                + (f"; TickTick сообщил: {extra}" if extra else "")
+                + "): " + ", ".join(f"«{t}»" for t in failed))
         if journal and deleted:
             lines.append(f"🧾 Снапшот в журнале; независимая проверка: "
                          f"operation_report(record_id=\"{record_id}\").")
@@ -1736,6 +1949,8 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
     if not tasks:
         return "Пустой список — планировать нечего."
     by_id = _open_by_id(fresh=True)
+    if by_id is None:
+        return _STATE_UNAVAILABLE_MSG
     found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
     names = _v2_project_names()
     mid = uuid.uuid4().hex[:12]
@@ -1753,6 +1968,13 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
 
     want_subs = {(t.get("taskId") or t.get("task_id"))
                  for t in tasks if t.get("with_subtasks")}
+    # Children index for FULL subtree expansion (grandchildren included) —
+    # one-level expansion would delete parent+child and orphan the grandchild.
+    kids: Dict[str, List[Dict]] = {}
+    for sub in by_id.values():
+        p = sub.get("parentId")
+        if p:
+            kids.setdefault(p, []).append(sub)
     items, seen = [], set()
     for f in found:
         if f["taskId"] in seen:
@@ -1763,15 +1985,24 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
         it["title"] = it["title"] or f["title"]
         items.append(it)
         if f["taskId"] in want_subs:
-            # Server-side expansion: every OPEN subtask of this parent joins the
-            # manifest with its live title — nothing hand-typed by the caller.
-            for sub in by_id.values():
+            # Server-side expansion: the ENTIRE open subtree of this parent
+            # (BFS over parentId, any depth) joins the manifest with its live
+            # title — nothing hand-typed by the caller, no orphans left.
+            queue = list(kids.get(f["taskId"], []))
+            depth_of = {f["taskId"]: 0}
+            while queue:
+                sub = queue.pop(0)
                 sid = sub.get("id")
-                if sub.get("parentId") == f["taskId"] and sid not in seen:
-                    seen.add(sid)
-                    si = _mk_item(sid, sub.get("projectId") or f["projectId"], sub)
-                    si["title"] = "↳ " + (si["title"] or f"[task {str(sid)[:8]}…]")
-                    items.append(si)
+                if not sid or sid in seen:
+                    continue
+                seen.add(sid)
+                d = depth_of.get(sub.get("parentId"), 0) + 1
+                depth_of[sid] = d
+                si = _mk_item(sid, sub.get("projectId") or f["projectId"], sub)
+                si["title"] = si["title"] or f"[task {str(sid)[:8]}…]"
+                si["depth"] = d  # render-only; title stays clean for re-verify
+                items.append(si)
+                queue.extend(kids.get(sid, []))
     if len(items) > max_items:
         return (f"🛑 Отказ: после разворачивания подзадач в плане {len(items)} "
                 f"удалений — больше капа {max_items}. Разбей на части или "
@@ -1782,7 +2013,8 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
     lines = [f"### 📋 План удаления — {len(items)}",
              f"_Манифест `{mid}` · ничего ещё не удалено_", ""]
     for i, it in enumerate(items, 1):
-        lines.append(f"{i}. **«{it['title']}»** — {it['project']} (`{it['taskId']}`)")
+        mark = "↳ " * it.get("depth", 0)
+        lines.append(f"{i}. {mark}**«{it['title']}»** — {it['project']} (`{it['taskId']}`)")
     if mismatch:
         lines.append(_mismatch_report(mismatch, "включил в план"))
     if missing:
@@ -1823,8 +2055,11 @@ async def execute_task_deletion(manifest_id: str, confirm: str = "") -> str:
         return (f"🛑 Подтверждение не совпало: нужно confirm=\"{expected}\" "
                 f"(получено {confirm!r}). Ничего не удалено.")
     try:
-        m["consumed"] = True
         by_id = _open_by_id(fresh=True)
+        if by_id is None:
+            # Do NOT consume the manifest: nothing was verified or deleted.
+            return _STATE_UNAVAILABLE_MSG
+        m["consumed"] = True
         ready, drifted = [], []
         for it in m["items"]:
             live = by_id.get(it["taskId"])
@@ -1839,14 +2074,25 @@ async def execute_task_deletion(manifest_id: str, confirm: str = "") -> str:
             "manifest": manifest_id, "summary": m.get("summary"),
             "deleted": [{**r["snapshot"], "taskId": r["taskId"]} for r in ready],
         }) if ready else ""
+        api_fail = {}
         if ready:
-            await _run_blocking(lambda: ticktick_v2.batch_delete_tasks(
+            resp = await _run_blocking(lambda: ticktick_v2.batch_delete_tasks(
                 [{"taskId": r["taskId"], "projectId": r["projectId"]} for r in ready]))
-            await _run_blocking(lambda: ticktick_v2.invalidate_cache())
-        still = _open_by_id()
-        deleted = [r["title"] for r in ready if r["taskId"] not in still]
-        failed = [r["title"] for r in ready if r["taskId"] in still]
+            api_fail = id2error_failures(resp, [r["taskId"] for r in ready])
+        still = _open_by_id(fresh=True) if ready else {}
         lines = []
+        if still is None:
+            deleted, failed = [], []
+            lines.append(f"Отправлено на удаление {len(ready)}, но "
+                         f"{_UNVERIFIED_MSG}")
+        else:
+            deleted = [r["title"] for r in ready
+                       if r["taskId"] not in still and r["taskId"] not in api_fail]
+            failed = [r["title"] for r in ready
+                      if r["taskId"] in still or r["taskId"] in api_fail]
+        if api_fail:
+            lines.append("❌ TickTick отклонил " + str(len(api_fail)) + ": "
+                         + "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items()))
         if deleted:
             lines.append(f"🗑 Удалено {len(deleted)}/{len(m['items'])}: "
                          + ", ".join(f"«{t}»" for t in deleted))
@@ -1882,6 +2128,10 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
     if op == "delete":
         return (f"- ❌ **«{title}»** — ВСЁ ЕЩЁ существует (удаление не состоялось "
                 "или восстановлена)" if live else f"- ✅ **«{title}»** — удалена")
+    if op == "restore":
+        return (f"- ✅ **«{title}»** — снова среди открытых" if live else
+                f"- ❌ **«{title}»** — НЕ появилась среди открытых "
+                "(восстановление не подтвердилось)")
     if op in ("complete", "abandon"):
         verb = "закрыта" if op == "complete" else "отмечена «не буду делать»"
         return (f"- ❌ **«{title}»** — всё ещё среди открытых" if live
@@ -1921,6 +2171,12 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
     if op == "parent":
         want = exp.get("parentId")  # None = detached
         got = live.get("parentId")
+        # A parentId "applied" toward a parent that is NOT itself alive among
+        # open tasks is an orphaning, not a success — check the parent too.
+        if want and want not in live_map:
+            return (f"- ❌ **«{title}»** — родитель {str(want)[:8]}… НЕ среди "
+                    "открытых задач (вложение под несуществующего/закрытого "
+                    "родителя)")
         ok = (got == want) if want else not got
         return (f"- ✅ **«{title}»** — родитель применён" if ok else
                 f"- ❌ **«{title}»** — parentId={got!r}, ожидался {want!r}")
@@ -1992,6 +2248,11 @@ def _build_operation_report(record_id: str) -> str:
             return (f"🧾 В журнале нет записей по {record_id} — операция не "
                     "исполнялась или журнал был недоступен в момент записи.")
         live = _open_by_id(fresh=True)
+        if live is None:
+            return (f"### 🧾 Отчёт по `{record_id}` невозможен\n"
+                    "⚠️ Живое состояние TickTick недоступно — независимая "
+                    "проверка не выполнена, исход операции НЕ ПОДТВЕРЖДЁН. "
+                    "Повтори operation_report позже.")
         names = _v2_project_names()
         when = records[-1].get("ts", "?")
         try:
@@ -2780,22 +3041,45 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]],
     if err:
         return err
     try:
-        to_name = to_project_name or _v2_project_names().get(to_project_id, to_project_id)
-        found, mismatch, missing = _split_tasks_by_state(tasks)
+        # Destination guard: the id must resolve to a LIVE project, and when
+        # the caller also names it, the name must match — otherwise tasks land
+        # in «Архив» while the success line claims «Работа».
+        refuse = _guard_project(to_project_id, to_project_name or "",
+                                fresh=True, require_known=True)
+        if refuse:
+            return refuse
+        # Render the destination from the LIVE map — never echo the caller.
+        to_name = _v2_project_names().get(to_project_id, to_project_id)
+        by_id = _open_by_id(fresh=True)
+        if by_id is None:
+            return _STATE_UNAVAILABLE_MSG
+        found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
         moved, failed = [], []
+        unverified = False
+        api_fail = {}
         if found:
-            await _run_blocking(lambda: ticktick_v2.batch_move_tasks(
+            resp = await _run_blocking(lambda: ticktick_v2.batch_move_tasks(
                 [f["taskId"] for f in found], to_project_id))
-            await _run_blocking(lambda: ticktick_v2.invalidate_cache())
-            fresh = _open_by_id()  # verify the task actually landed in the target
-            for f in found:
-                cur = fresh.get(f["taskId"])
-                (moved if (cur and cur.get("projectId") == to_project_id)
-                 else failed).append(f["title"])
+            api_fail = id2error_failures(resp, [f["taskId"] for f in found])
+            fresh = _open_by_id(fresh=True)  # verify the tasks actually landed
+            if fresh is None:
+                unverified = True
+            else:
+                for f in found:
+                    cur = fresh.get(f["taskId"])
+                    ok = (cur and cur.get("projectId") == to_project_id
+                          and f["taskId"] not in api_fail)
+                    (moved if ok else failed).append(f["title"])
         lines = []
         if moved:
             lines.append(f"↪ Перемещено {len(moved)} → «{to_name}»: "
                          + ", ".join(f"«{t}»" for t in moved))
+        if unverified:
+            lines.append(f"Отправлено на перемещение {len(found)}, но "
+                         f"{_UNVERIFIED_MSG}")
+        note = _unarmed_note(found)
+        if note:
+            lines.append(note)
         if mismatch:
             lines.append(_mismatch_report(mismatch, "переместил"))
         if missing:
@@ -2804,8 +3088,10 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]],
                 "(неверный id/уже завершены): "
                 + ", ".join(f"«{t['title']}»" for t in missing))
         if failed:
-            lines.append(f"❌ НЕ перемещено {len(failed)} (остались на месте): "
-                         + ", ".join(f"«{t}»" for t in failed))
+            extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
+            lines.append(f"❌ НЕ перемещено {len(failed)} (остались на месте"
+                         + (f"; TickTick сообщил: {extra}" if extra else "")
+                         + "): " + ", ".join(f"«{t}»" for t in failed))
         if found:
             rid = _op_journal("move", [
                 {"taskId": f["taskId"], "title": f["title"],
