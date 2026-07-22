@@ -1,0 +1,49 @@
+# Auto-deploy to the Anessa Railway account on every push to main.
+#
+# Why a GitHub Action instead of Railway's own GitHub auto-deploy:
+# these services live on a DIFFERENT Railway account than the GitHub repo,
+# and the cross-account Railway↔GitHub webhook doesn't fire. This Action is
+# the repo's OWN CI (always reliable), and it uses `railway up` from the
+# freshly-checked-out commit — the only method that ships current code
+# (`railway redeploy` rebuilds the stale uploaded image).
+#
+# Setup (one-time, by the repo owner):
+#   1. In the Anessa Railway account create a token
+#      (Account → Tokens, OR the ticktick-mcp Project → Settings → Tokens).
+#   2. Add it to this repo's GitHub secrets as RAILWAY_TOKEN
+#      (Settings → Secrets and variables → Actions), or as an org-level secret
+#      shared with all 6 MCP repos.
+# Nothing else is needed — the next push (or a manual "Run workflow") deploys.
+
+name: Deploy to Railway (Anessa)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+  # Safety net: a daily redeploy in case a push ever slips through.
+  schedule:
+    - cron: "0 9 * * *"
+
+concurrency:
+  group: railway-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install Railway CLI
+        run: npm i -g @railway/cli
+      - name: Deploy current code with railway up
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: >-
+          railway up --ci
+          --project f9721307-6f8b-442c-839b-c479b765ee79
+          --environment production
+          --service ticktick-mcp
