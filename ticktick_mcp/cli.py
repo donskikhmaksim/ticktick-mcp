@@ -52,12 +52,11 @@ def main():
     skip_interactive_auth_prompt = False
     if args.command == "run" and not check_auth_setup():
         # streamable-http (Railway): keep the server up without a token so
-        # the built-in /setup/<MCP_SECRET> OAuth flow is reachable — a person
-        # authorizes their own TickTick account in the browser and the token
-        # gets picked up without ever touching this machine's env/TTY.
+        # /health stays reachable. Authorize with the local `auth` flow and set
+        # TICKTICK_ACCESS_TOKEN — the client is picked up on the next tool call.
         if transport == "streamable-http":
             print("No TICKTICK_ACCESS_TOKEN yet — starting anyway. "
-                  "Visit https://<your-domain>/setup/<MCP_SECRET> to authorize.",
+                  "Run `ticktick-mcp auth` locally and set TICKTICK_ACCESS_TOKEN.",
                   file=sys.stderr)
             skip_interactive_auth_prompt = True
         # stdio in a non-interactive environment (e.g. a script piping in):

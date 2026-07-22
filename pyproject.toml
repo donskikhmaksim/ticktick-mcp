@@ -30,8 +30,7 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "ruff",
-    "fastapi",  # oauth-proxy tests import its FastAPI app
-    "httpx",    # starlette TestClient + oauth-proxy
+    "httpx",    # starlette TestClient (tests/test_routes.py)
 ]
 
 [project.scripts]

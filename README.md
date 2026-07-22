@@ -49,8 +49,7 @@ Fills the gaps the official API lacks:
 | `TICKTICK_CLIENT_ID` / `TICKTICK_CLIENT_SECRET` | for auth flow | TickTick developer app creds |
 | `TICKTICK_V2_TOKEN` | optional | the `t` cookie — enables the v2 API |
 | `MCP_TRANSPORT` | for remote | `streamable-http` (default `stdio`) |
-| `MCP_SECRET` | strongly recommended | secret appended to URL path: `/mcp/<secret>`; also gates the self-service `/setup/<secret>` route |
-| `TICKTICK_OAUTH_PROXY_URL` | optional | URL of the shared OAuth proxy for the `/setup` flow (defaults to the hosted proxy) |
+| `MCP_SECRET` | strongly recommended | secret appended to URL path: `/mcp/<secret>` — lightweight auth for the public endpoint |
 | `USER_TIMEZONE` | optional | IANA timezone for due-date handling (e.g. `Europe/Moscow`); defaults to UTC |
 | `MCP_HOST` / `PORT` | auto on Railway | bind address / port |
 
@@ -93,81 +92,73 @@ MCP_TRANSPORT=streamable-http MCP_SECRET=dev123 MCP_PORT=8000 \
 
 Railway health-checks `/health` (configured in `railway.toml`).
 
-## Self-service OAuth (`/setup` + the oauth-proxy)
+## One-command self-deploy (`scripts/setup.sh`)
 
-Instead of running the local `auth` flow, an instance can obtain its own
-TickTick tokens through the browser with no CLI:
+`scripts/setup.sh` provisions your own instance end to end and is safe to
+re-run (project, service, and fork are reused, never duplicated):
 
-1. `scripts/setup.sh` provisions the instance and hands the owner a
-   `https://<your-app>.up.railway.app/setup/<MCP_SECRET>` link.
-2. `/setup/<MCP_SECRET>` redirects to the shared **oauth-proxy** (see
-   [`oauth-proxy/README.md`](oauth-proxy/README.md)), which owns the single
-   TickTick-registered `redirect_uri`.
-3. After TickTick consent, the proxy relays the tokens back (signed `state`,
-   POST body) to this instance's `/auth/accept`, which hot-swaps the in-memory
-   client — no redeploy.
+1. Forks `donskikhmaksim/ticktick-mcp` into **your** GitHub account (via `gh`,
+   with a browser-fork fallback) and enables Actions on the fork.
+2. Creates a Railway project + service and points it at **your fork** as the
+   deploy source (native GitHub deploy) — so every push to your fork's `main`
+   redeploys automatically. The bundled `.github/workflows/sync-upstream.yml`
+   fast-forwards your fork from upstream every 5 minutes, so bug fixes ship to
+   you without any manual step.
+3. Attaches a `/data` volume, sets your env vars, and authorizes **your**
+   TickTick with the **local `auth` flow** (browser OAuth on your own machine —
+   your `client_secret` never leaves it), storing the resulting token as a
+   Railway variable.
+
+```bash
+bash <(curl -fsSL https://github.com/donskikhmaksim/ticktick-mcp/raw/main/scripts/setup.sh) \
+  --client-id "<your-client-id>" \
+  --client-secret "<your-client-secret>" \
+  --timezone "Europe/Moscow"
+```
+
+Register your own TickTick developer app at
+[developer.ticktick.com](https://developer.ticktick.com) to get the
+`client-id` / `client-secret`. See [`ONBOARDING.md`](ONBOARDING.md) for the
+step-by-step walkthrough.
 
 ## Isolation & privacy
 
-**Every self-hosted instance is a fully separate tenant.** You deploy your own
-instance, generate your own random `MCP_SECRET` (which is the URL path only you
-know), and authorize *your* TickTick account. Tasks go only to your account, and
-your `https://<your-app>/mcp/<MCP_SECRET>` URL is the one you plug into
-tg-ai-assistant (or any MCP client). No one shares an instance, a secret, or a
-token with anyone else.
+**Every self-hosted instance is a fully separate, single-tenant deployment.**
+You fork the repo into your own GitHub, deploy your own Railway instance,
+generate your own random `MCP_SECRET` (the URL path only you know), and
+authorize *your* TickTick account with the local `auth` flow. Tasks go only to
+your account, your `https://<your-app>/mcp/<MCP_SECRET>` URL is the one you plug
+into tg-ai-assistant (or any MCP client), and your `client_secret` and access
+token never touch anyone else's infrastructure. No one shares an instance, a
+secret, or a token with anyone else.
 
-The one shared component in the default setup is the OAuth **proxy**. Depending
-on how much you want to depend on the maintainer's infrastructure, choose one of
-three auth paths, in order of privacy:
+### The auth path — local `auth` flow (the only one)
 
-1. **Fully isolated (recommended).** Register *your own* TickTick developer app
-   at [developer.ticktick.com](https://developer.ticktick.com), put
-   `TICKTICK_CLIENT_ID` / `TICKTICK_CLIENT_SECRET` in your `.env`, and authorize
-   with the **local flow**:
+Register *your own* TickTick developer app at
+[developer.ticktick.com](https://developer.ticktick.com), put
+`TICKTICK_CLIENT_ID` / `TICKTICK_CLIENT_SECRET` in your `.env`, and authorize
+locally:
 
-   ```bash
-   uv run -m ticktick_mcp.cli auth
-   ```
+```bash
+uv run -m ticktick_mcp.cli auth
+```
 
-   This opens a browser, exchanges the code with *your* client credentials
-   locally, and writes `TICKTICK_ACCESS_TOKEN` to your `.env`. It **never
-   touches the shared proxy** (or any maintainer infrastructure). Paste the
-   resulting token into your Railway `TICKTICK_ACCESS_TOKEN` variable. This is
-   the only path with zero dependency on the maintainer.
-
-2. **Self-hosted proxy.** If you want the browser-based `/setup` flow but still
-   full isolation, host `oauth-proxy/` yourself (see
-   [`oauth-proxy/README.md`](oauth-proxy/README.md)). Register your own TickTick
-   app with its redirect URI pointing at *your* proxy's `REDIRECT_URI`
-   (`https://<your-proxy>/callback`), then point your instance at it:
-
-   ```
-   TICKTICK_OAUTH_PROXY_URL=https://<your-proxy-domain>
-   ```
-
-   Now the code exchange runs on infrastructure you control.
-
-3. **Default shared proxy (convenient, acceptable).** If you leave
-   `TICKTICK_OAUTH_PROXY_URL` unset, `/setup` uses the maintainer-operated proxy
-   at `https://ticktick-oauth-proxy-production.up.railway.app`, which uses the
-   maintainer's TickTick dev-app `client_id`/`secret`. That proxy **momentarily
-   relays** your access token back to your instance and does **not** persist
-   tokens — but you are still depending on, and observable by, the maintainer's
-   infrastructure during the exchange. For full isolation prefer option 1 or 2.
-
-Set `TICKTICK_OAUTH_PROXY_URL` if you host your own proxy (option 2), or leave it
-unset to use the default shared proxy (option 3). Option 1 ignores the proxy
-entirely.
+This opens a browser, exchanges the code with *your* client credentials on your
+own machine, and writes `TICKTICK_ACCESS_TOKEN` (and `TICKTICK_REFRESH_TOKEN`)
+to your `.env`. Paste the access token into your Railway `TICKTICK_ACCESS_TOKEN`
+variable (or let `scripts/setup.sh` do all of this for you). There is no
+server-side browser OAuth and no shared proxy — nothing depends on the
+maintainer's infrastructure at runtime.
 
 ### Standing up your own instance — the sequence
 
-1. **Deploy your own instance** (Railway → Deploy from GitHub, per the section
-   above) — or run `scripts/setup.sh`, which does this for you.
+1. **Fork + deploy** — run `scripts/setup.sh` (recommended), or fork the repo
+   yourself and point Railway at your fork (Deploy from GitHub).
 2. **Generate your own `MCP_SECRET`** (`openssl rand -hex 24`) and set it in
    Railway. This becomes your private URL path.
-3. **Authorize YOUR TickTick** — either the local `auth` flow (option 1) or the
-   `/setup/<MCP_SECRET>` browser flow (option 2/3). Log in to *your own*
-   TickTick account when the consent screen appears.
+3. **Authorize YOUR TickTick** with the local `auth` flow. Log in to *your own*
+   TickTick account when the consent screen appears; set the resulting
+   `TICKTICK_ACCESS_TOKEN` in Railway.
 4. **Use YOUR resulting URL** — `https://<your-app>/mcp/<MCP_SECRET>` — as the
    connector URL in tg-ai-assistant (or the Claude app). That URL, with your
    secret and your token, is what keeps your data yours.
