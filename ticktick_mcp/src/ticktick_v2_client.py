@@ -50,6 +50,20 @@ class TickTickAuthError(RuntimeError):
     """Raised when the v2 session token is missing, invalid, or expired."""
 
 
+def id2error_failures(resp: Any, ids: List[str]) -> Dict[str, str]:
+    """Per-item failures from a v2 batch response.
+
+    TickTick's /batch/* endpoints return HTTP 200 with per-item rejections in
+    an `id2error` map — a call can "succeed" while individual items failed.
+    Returns {id: error} for the given ids (empty dict = no reported failures)."""
+    if not isinstance(resp, dict):
+        return {}
+    errs = resp.get("id2error") or {}
+    if not isinstance(errs, dict):
+        return {}
+    return {str(i): str(errs[i]) for i in ids if i in errs and errs[i]}
+
+
 def _build_x_device() -> str:
     """The x-device header the web client sends; v2 returns 500 without it."""
     return json.dumps({
@@ -148,10 +162,12 @@ class TickTickV2Client:
         if method != "GET":
             self._state_cache = None
         # Retry on 429/5xx with exponential backoff (1s, 2s) — TickTick
-        # rate-limits bursts; a short wait usually clears it.
+        # rate-limits bursts; a short wait usually clears it. 502/504 are
+        # transient proxy errors (Cloudflare) — retry those too, so a
+        # post-mutation verify read doesn't fail on a blip.
         resp = self.session.request(method, url, **kwargs)
         for attempt in range(2):
-            if resp.status_code not in (429, 500, 503):
+            if resp.status_code not in (429, 500, 502, 503, 504):
                 break
             time.sleep(2 ** attempt)
             resp = self.session.request(method, url, **kwargs)
@@ -325,9 +341,24 @@ class TickTickV2Client:
                 for tid in task_ids]
         return self._request("POST", "/batch/taskParent", json=body)
 
+    def set_task_parents(self, rows: List[Dict]) -> Dict:
+        """Raw batch/taskParent: rows of {"parentId","taskId","projectId"} —
+        lets the caller send each child's OWN live projectId."""
+        return self._request("POST", "/batch/taskParent", json=rows)
+
     # ---- batch -----------------------------------------------------------
+    # NOTE on merge-based updates: the v2 /batch/task endpoint takes FULL task
+    # objects, so every mutation here re-posts the whole task with one field
+    # changed. To keep the clobber window (a concurrent edit from the phone
+    # being overwritten by a stale copy) as small as possible, the base object
+    # is always fetched force-fresh immediately before the write. Minimal
+    # patches are NOT attempted — the API's behaviour for partial objects is
+    # undocumented and a silently-ignored partial body is worse than a small
+    # race window (cf. update_task_comment: "a partial body is silently
+    # ignored").
     def batch_complete_tasks(self, task_ids: List[str]) -> Dict:
         """Mark several open tasks complete in one call."""
+        self.get_state(force=True)  # fresh base: shrink the clobber window
         by_id = {t.get("id"): t for t in self.get_open_tasks()}
         updates = []
         for tid in task_ids:
@@ -354,7 +385,9 @@ class TickTickV2Client:
     def batch_update_tasks(self, changes: List[Dict]) -> Dict:
         """Apply field changes to several open tasks in one call. Each change is
         {"taskId": ..., <field>: <value>, ...}; the current task object is
-        fetched from the sync state and the given fields are merged onto it."""
+        fetched force-fresh from the sync state and the given fields are merged
+        onto it (see the merge-base note above batch_complete_tasks)."""
+        self.get_state(force=True)  # fresh base: shrink the clobber window
         by_id = {t.get("id"): t for t in self.get_open_tasks()}
         updates = []
         for ch in changes:
@@ -382,9 +415,12 @@ class TickTickV2Client:
 
     def create_project_group(self, name: str) -> str:
         gid = uuid.uuid4().hex[:24]
-        self._request("POST", "/batch/projectGroup",
-                      json={"add": [{"id": gid, "name": name, "listType": "group"}],
-                            "update": [], "delete": []})
+        resp = self._request("POST", "/batch/projectGroup",
+                             json={"add": [{"id": gid, "name": name, "listType": "group"}],
+                                   "update": [], "delete": []})
+        err = id2error_failures(resp, [gid]).get(gid)
+        if err:
+            raise RuntimeError(f"TickTick rejected the project group: {err}")
         return gid
 
     def delete_project_group(self, group_id: str) -> Dict:
@@ -392,14 +428,21 @@ class TickTickV2Client:
                              json={"add": [], "update": [], "delete": [group_id]})
 
     def move_project_to_group(self, project_id: str, group_id: str) -> Dict:
-        """group_id='NONE' ungroups the project."""
+        """group_id='NONE' ungroups the project. Sends the FULL live project
+        object (force-fresh) with only groupId changed, so no other field is
+        reverted to a stale value as a side effect of the move."""
+        self.get_state(force=True)
         proj = next((p for p in self.list_projects() if p.get("id") == project_id), None)
         if not proj:
             raise ValueError(f"Project {project_id} not found.")
-        return self._request("POST", "/batch/project",
-                             json={"add": [], "delete": [], "update": [
-                                 {"id": project_id, "name": proj.get("name"),
-                                  "groupId": group_id}]})
+        upd = dict(proj)
+        upd["groupId"] = group_id
+        resp = self._request("POST", "/batch/project",
+                             json={"add": [], "delete": [], "update": [upd]})
+        err = id2error_failures(resp, [project_id]).get(project_id)
+        if err:
+            raise RuntimeError(f"TickTick rejected the move: {err}")
+        return resp
 
     # ---- task comments ---------------------------------------------------
     def get_task_comments(self, project_id: str, task_id: str) -> List[Dict]:
@@ -551,6 +594,7 @@ class TickTickV2Client:
         return self._request("DELETE", "/tag", params={"name": name.lower()})
 
     def set_task_tags(self, task_id: str, tags: List[str]) -> Dict:
+        self.get_state(force=True)  # fresh base: shrink the clobber window
         task = next((t for t in self.get_open_tasks() if t.get("id") == task_id), None)
         if not task:
             raise ValueError(f"Open task {task_id} not found.")
@@ -607,6 +651,7 @@ class TickTickV2Client:
 
     def set_task_column(self, task_id: str, column_id: str) -> Dict:
         """Move a task to a kanban column/section (v2 `columnId`)."""
+        self.get_state(force=True)  # fresh base: shrink the clobber window
         task = next((t for t in self.get_open_tasks() if t.get("id") == task_id), None)
         if not task:
             raise ValueError(f"Open task {task_id} not found.")
@@ -618,6 +663,7 @@ class TickTickV2Client:
     # ---- won't-do / duplicate -------------------------------------------
     def abandon_task(self, task_id: str) -> Dict:
         """Mark a task 'Won't do' (v2 status -1)."""
+        self.get_state(force=True)  # fresh base: shrink the clobber window
         task = next((t for t in self.get_open_tasks() if t.get("id") == task_id), None)
         if not task:
             raise ValueError(f"Open task {task_id} not found.")
@@ -627,6 +673,10 @@ class TickTickV2Client:
                              json={"add": [], "update": [task], "delete": []})
 
     def duplicate_task(self, task_id: str) -> Dict:
+        """Create a copy of an open task. NOT carried over (v2 quirks): the
+        checklist items, the kanban column, and the parent link — callers must
+        say so honestly. Raises RuntimeError if TickTick rejects the create."""
+        self.get_state(force=True)  # fresh source: copy the CURRENT task
         src = next((t for t in self.get_open_tasks() if t.get("id") == task_id), None)
         if not src:
             raise ValueError(f"Open task {task_id} not found.")
@@ -637,7 +687,10 @@ class TickTickV2Client:
         copy["id"] = uuid.uuid4().hex[:24]
         copy["title"] = (src.get("title", "") + " (copy)")
         copy["status"] = 0
-        self.batch_create_tasks([copy])
+        resp = self.batch_create_tasks([copy])
+        err = id2error_failures(resp, [copy["id"]]).get(copy["id"])
+        if err:
+            raise RuntimeError(f"TickTick rejected the duplicate: {err}")
         return copy
 
     # ---- comments edit/delete -------------------------------------------
@@ -662,13 +715,21 @@ class TickTickV2Client:
 
     # ---- project archive -------------------------------------------------
     def archive_project(self, project_id: str, closed: bool = True) -> Dict:
+        """Archive/unarchive a project. The base object is fetched force-fresh
+        immediately before the write so a concurrent in-app rename/recolor
+        isn't reverted; a per-item rejection raises instead of passing silently."""
+        self.get_state(force=True)
         proj = next((p for p in self.list_projects() if p.get("id") == project_id), None)
         if not proj:
             raise ValueError(f"Project {project_id} not found.")
         upd = dict(proj)
         upd["closed"] = closed
-        return self._request("POST", "/batch/project",
+        resp = self._request("POST", "/batch/project",
                              json={"add": [], "delete": [], "update": [upd]})
+        err = id2error_failures(resp, [project_id]).get(project_id)
+        if err:
+            raise RuntimeError(f"TickTick rejected the archive change: {err}")
+        return resp
 
 
 # ---- filter rule evaluation (client-side, mirrors the TickTick web app) ----
