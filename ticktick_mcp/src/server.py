@@ -3250,11 +3250,49 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
         return err
     if status not in (0, 1, 2):
         return "Invalid status. Use 2 (done), 1 (failed), or 0 (not done)."
+    # Strict date validation: '2026-7-4' would silently become stamp 202674.
+    if date is not None:
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            return (f"🛑 Неверный формат даты {date!r} — нужно строго "
+                    "YYYY-MM-DD (например 2026-07-04). Ничего не записано.")
     try:
-        await _run_blocking(lambda: ticktick_v2.checkin_habit(habit_id, date=date, status=status, value=value))
+        # Identity guard: the id must exist among live habits AND resolve to
+        # the given name — a swapped pair would check in the WRONG habit while
+        # the reply names the right one.
+        habits = await _run_blocking(lambda: ticktick_v2.get_habits())
+        habit = next((h for h in habits if h.get("id") == habit_id), None)
+        if habit is None:
+            return (f"🛑 Привычка с id {str(habit_id)[:12]}… не найдена "
+                    "(get_habits). Ничего не записано.")
+        real_name = habit.get("name") or ""
+        if not _names_agree(habit_name, real_name):
+            return (f"🛑 НЕ отметил — habit_id указывает на «{real_name}», а НЕ "
+                    f"«{habit_name}» (защита от «не той привычки»). Ничего не записано.")
+        try:
+            goal = float(habit.get("goal") or 1.0)
+        except (TypeError, ValueError):
+            goal = 1.0
+        stamp = int((date or datetime.now().strftime("%Y-%m-%d")).replace("-", ""))
+        # Duplicate detection: an unconditional 'add' on retry would double
+        # the value for the same day.
+        existing = await _run_blocking(
+            lambda: ticktick_v2.get_habit_checkins([habit_id], stamp - 1))
+        dup = next((e for e in existing.get(habit_id, [])
+                    if e.get("checkinStamp") == stamp), None)
+        if dup is not None:
+            return (f"↷ У «{real_name}» УЖЕ есть чек-ин на эту дату "
+                    f"(status={dup.get('status')}, value={dup.get('value')}/"
+                    f"{dup.get('goal')}) — повторный add задвоил бы значение. "
+                    "Ничего не записано.")
+        await _run_blocking(lambda: ticktick_v2.checkin_habit(
+            habit_id, date=date, status=status, value=value, goal=goal))
         when = date or "today"
         labels = {2: "done", 1: "failed", 0: "not done"}
-        return f"Habit '{habit_name}' checked in for {when} as '{labels[status]}'."
+        val = value if value is not None else (goal if status == 2 else 0.0)
+        return (f"Habit '{real_name}' checked in for {when} as "
+                f"'{labels[status]}' (value {val}/{goal}).")
     except Exception as e:
         logger.error(f"Error in checkin_habit: {e}")
         return f"Error checking in habit: {str(e)}"
@@ -4074,15 +4112,55 @@ async def create_tag(name: str, color: str = None) -> str:
         return f"Error creating tag: {str(e)}"
 
 
+async def _live_tag_names(force: bool = True) -> List[str]:
+    """Lowercased names of live tags (optionally force-fresh)."""
+    if force:
+        await _run_blocking(lambda: ticktick_v2.get_state(force=True))
+    tags = await _run_blocking(lambda: ticktick_v2.get_tags())
+    return [(t.get("name") or "").lower() for t in tags]
+
+
 @mcp.tool()
-async def rename_tag(old_name: str, new_name: str) -> str:
-    """Rename a tag (requires v2 API)."""
+async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False) -> str:
+    """Rename a tag (requires v2 API).
+
+    If new_name already exists as a tag, TickTick MERGES the two tags — that is
+    irreversible, so the call is refused unless allow_merge=True is passed
+    after the user explicitly confirmed the merge.
+
+    Args:
+        old_name: current tag name
+        new_name: new tag name
+        allow_merge: pass True ONLY after the user confirmed merging into an
+            existing tag
+    """
     err = _ensure_ready()
     if err:
         return err
     try:
+        existing = await _live_tag_names()
+        if old_name.lower() not in existing:
+            near = ", ".join(n for n in existing if n[:3] == old_name.lower()[:3]) \
+                or "нет похожих"
+            return (f"🛑 НЕ переименовал — тега «{old_name}» не существует "
+                    f"(возможно опечатка; похожие: {near}). Ничего не тронул.")
+        if new_name.lower() in existing and not allow_merge:
+            return (f"🛑 Тег «{new_name}» уже существует — это будет СЛИЯНИЕ "
+                    f"тегов «{old_name}» и «{new_name}» (необратимо: какие "
+                    "задачи носили какой тег — потеряется). Если пользователь "
+                    "явно подтвердил слияние — повтори с allow_merge=true. "
+                    "Ничего не тронул.")
         await _run_blocking(lambda: ticktick_v2.rename_tag(old_name, new_name))
-        return f"Tag '{old_name}' renamed to '{new_name}'."
+        # Post-verify against a fresh tag list.
+        after = await _live_tag_names()
+        if old_name.lower() in after:
+            return (f"❌ Тег «{old_name}» ВСЁ ЕЩЁ существует — переименование "
+                    "не сработало.")
+        if new_name.lower() not in after:
+            return (f"❌ Тега «{new_name}» нет после переименования — исход "
+                    "не подтверждён, проверь вручную.")
+        merged = " (слито с существующим)" if allow_merge and new_name.lower() in existing else ""
+        return f"Tag '{old_name}' renamed to '{new_name}' (проверено){merged}."
     except Exception as e:
         logger.error(f"Error in rename_tag: {e}")
         return f"Error renaming tag: {str(e)}"
@@ -4095,8 +4173,20 @@ async def delete_tag(name: str) -> str:
     if err:
         return err
     try:
+        existing = await _live_tag_names()
+        if name.lower() not in existing:
+            near = ", ".join(n for n in existing if n[:3] == name.lower()[:3]) \
+                or "нет похожих"
+            return (f"🛑 НЕ удалил — тега «{name}» не существует (возможно "
+                    f"опечатка — Latin/Cyrillic? похожие: {near}). Ничего не тронул.")
+        # Blast radius: how many tasks are about to lose the tag.
+        carriers = await _run_blocking(lambda: ticktick_v2.get_tasks_by_tag(name))
         await _run_blocking(lambda: ticktick_v2.delete_tag(name))
-        return f"Tag '{name}' deleted."
+        after = await _live_tag_names()
+        if name.lower() in after:
+            return f"❌ Тег «{name}» ВСЁ ЕЩЁ существует — удаление не сработало."
+        return (f"Tag '{name}' deleted (проверено). Тег снят с "
+                f"{len(carriers)} открытых задач(и); сами задачи не тронуты.")
     except Exception as e:
         logger.error(f"Error in delete_tag: {e}")
         return f"Error deleting tag: {str(e)}"
