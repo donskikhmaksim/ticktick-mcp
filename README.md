@@ -206,6 +206,36 @@ Register your own TickTick developer app at
 `client-id` / `client-secret`. See [`ONBOARDING.md`](ONBOARDING.md) for the
 step-by-step walkthrough.
 
+## Migrating from upstream (pre-fork deployments)
+
+If you deployed this server before the fork-based auto-update mechanism existed
+(i.e. your Railway service points directly to `donskikhmaksim/ticktick-mcp` or
+you cloned it manually), you can migrate to the new fork-and-sync model in one
+step:
+
+```bash
+gh_user=$(gh api user --jq .login) && \
+gh repo fork donskikhmaksim/ticktick-mcp --clone=false && \
+gh api -X PUT "repos/$gh_user/ticktick-mcp/actions/permissions" -F enabled=true && \
+railway service source connect --repo "$gh_user/ticktick-mcp" --branch main --service ticktick-mcp
+```
+
+What it does:
+1. Forks the upstream repo into your GitHub account (idempotent — if already
+   forked, it's a no-op).
+2. Enables GitHub Actions on your fork (required for the `sync-upstream`
+   workflow).
+3. Repoints your Railway service to deploy from your fork instead of upstream.
+
+After this, the bundled [`sync-upstream`](.github/workflows/sync-upstream.yml)
+workflow will run every ~5 minutes to pull in new features and fixes, and each
+sync automatically triggers a redeploy. Your data, tokens, and configuration are
+never touched.
+
+Alternatively, do it manually: fork on GitHub.com, enable Actions in the fork's
+Actions tab, and in Railway → **Settings → Source** connect to your fork's
+`main` with Deploy on push enabled.
+
 ## Isolation & privacy
 
 **Every self-hosted instance is a fully separate, single-tenant deployment.**
