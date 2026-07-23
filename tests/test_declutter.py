@@ -52,10 +52,10 @@ def test_pick_primary_prefers_richer_task():
 
 # ---- analyze: duplicates + keep-both bias --------------------------------
 
-def test_exact_duplicate_becomes_delete_action():
+async def test_exact_duplicate_becomes_delete_action():
     tasks = [_mk("a", "Позвонить в банк", due="2026-08-01"),
              _mk("b", "Позвонить в банк")]
-    out = s._dc_analyze(tasks, NAMES, judge_fn=None, smart_fn=None,
+    out = await s._dc_analyze(tasks, NAMES, judge_fn=None, smart_fn=None,
                         today=TODAY, now=NOW, fuzzy=False)
     assert len(out["delete"]) == 1
     d = out["delete"][0]
@@ -65,16 +65,16 @@ def test_exact_duplicate_becomes_delete_action():
     assert "snapshot" in d and d["snapshot"]["title"] == "Позвонить в банк"
 
 
-def test_fuzzy_cluster_keeps_both_when_no_judge():
+async def test_fuzzy_cluster_keeps_both_when_no_judge():
     tasks = [_mk("a", "Оплатить аренду офиса"),
              _mk("b", "Оплатить аренду офиса срочно сегодня")]
-    out = s._dc_analyze(tasks, NAMES, judge_fn=None, smart_fn=None,
+    out = await s._dc_analyze(tasks, NAMES, judge_fn=None, smart_fn=None,
                         today=TODAY, now=NOW, fuzzy=True)
     assert out["delete"] == []
     assert len(out["flag_dupe"]) == 1
 
 
-def test_fuzzy_cluster_merges_only_when_judge_is_sure():
+async def test_fuzzy_cluster_merges_only_when_judge_is_sure():
     tasks = [_mk("a", "Оплатить аренду офиса"),
              _mk("b", "Оплатить аренду офиса срочно сегодня")]
 
@@ -84,30 +84,30 @@ def test_fuzzy_cluster_merges_only_when_judge_is_sure():
     def judge_sure(clusters):
         return [{"i": 0, "is_duplicate": True, "keep": 0, "reason": "одно и то же"}]
 
-    unsure = s._dc_analyze(tasks, NAMES, judge_fn=judge_unsure, smart_fn=None,
+    unsure = await s._dc_analyze(tasks, NAMES, judge_fn=judge_unsure, smart_fn=None,
                            today=TODAY, now=NOW, fuzzy=True)
     assert unsure["delete"] == [] and len(unsure["flag_dupe"]) == 1
 
-    sure = s._dc_analyze(tasks, NAMES, judge_fn=judge_sure, smart_fn=None,
+    sure = await s._dc_analyze(tasks, NAMES, judge_fn=judge_sure, smart_fn=None,
                          today=TODAY, now=NOW, fuzzy=True)
     assert len(sure["delete"]) == 1 and sure["delete"][0]["taskId"] == "b"
 
 
-def test_judge_exception_defaults_to_keep_both():
+async def test_judge_exception_defaults_to_keep_both():
     tasks = [_mk("a", "Договор с подрядчиком"),
              _mk("b", "Договор с подрядчиком новый вариант")]
 
     def boom(clusters):
         raise RuntimeError("shim down mid-call")
 
-    out = s._dc_analyze(tasks, NAMES, judge_fn=boom, smart_fn=None,
+    out = await s._dc_analyze(tasks, NAMES, judge_fn=boom, smart_fn=None,
                         today=TODAY, now=NOW, fuzzy=True)
     assert out["delete"] == [] and len(out["flag_dupe"]) == 1
 
 
 # ---- Finding #1: never delete a task with live children ------------------
 
-def test_duplicate_with_live_children_is_never_deleted():
+async def test_duplicate_with_live_children_is_never_deleted():
     """Reviewer's 'Ремонт машины' scenario: an exact duplicate pair where one
     member has live subtasks. Metadata scoring alone would pick the OTHER
     (richer) member to keep and delete the one with children — but that would
@@ -123,7 +123,7 @@ def test_duplicate_with_live_children_is_never_deleted():
     # pick "b" (richer) to keep and delete "a" — exactly the orphaning bug.
     assert s._dc_pick_primary([parent_with_kids, richer_bare_dup]) == 1
 
-    out = s._dc_analyze(tasks, NAMES, judge_fn=None, smart_fn=None,
+    out = await s._dc_analyze(tasks, NAMES, judge_fn=None, smart_fn=None,
                         today=TODAY, now=NOW, fuzzy=False)
     deleted_ids = {d["taskId"] for d in out["delete"]}
     assert "a" not in deleted_ids, "task with live children must never be deleted"
@@ -131,21 +131,21 @@ def test_duplicate_with_live_children_is_never_deleted():
     assert out["delete"][0]["keep_id"] == "a"
 
 
-def test_duplicate_pair_both_with_children_is_flagged():
+async def test_duplicate_pair_both_with_children_is_flagged():
     """If BOTH members of a duplicate pair have live children, there is no
     safe single keeper — route to flag_dupe instead of guessing."""
     a = _mk("a", "Проект X")
     b = _mk("b", "Проект X")
     kid_a = _mk("ka", "Шаг 1", parent="a")
     kid_b = _mk("kb", "Шаг 2", parent="b")
-    out = s._dc_analyze([a, b, kid_a, kid_b], NAMES, judge_fn=None, smart_fn=None,
+    out = await s._dc_analyze([a, b, kid_a, kid_b], NAMES, judge_fn=None, smart_fn=None,
                         today=TODAY, now=NOW, fuzzy=False)
     assert out["delete"] == []
     assert len(out["flag_dupe"]) == 1
     assert set(out["flag_dupe"][0]["ids"]) == {"a", "b"}
 
 
-def test_fuzzy_duplicate_with_children_keeps_child_owner_even_if_judge_picks_other():
+async def test_fuzzy_duplicate_with_children_keeps_child_owner_even_if_judge_picks_other():
     """Same guard, but on the fuzzy (judge-confirmed) path: even when the judge
     explicitly names the OTHER member as 'keep', the child-owning member must
     still survive."""
@@ -156,7 +156,7 @@ def test_fuzzy_duplicate_with_children_keeps_child_owner_even_if_judge_picks_oth
     def judge_keep_b(clusters):
         return [{"i": 0, "is_duplicate": True, "keep": 1, "reason": "судья выбрал b"}]
 
-    out = s._dc_analyze([parent_with_kids, bare_dup, kid], NAMES,
+    out = await s._dc_analyze([parent_with_kids, bare_dup, kid], NAMES,
                         judge_fn=judge_keep_b, smart_fn=None,
                         today=TODAY, now=NOW, fuzzy=True)
     deleted_ids = {d["taskId"] for d in out["delete"]}
@@ -167,7 +167,7 @@ def test_fuzzy_duplicate_with_children_keeps_child_owner_even_if_judge_picks_oth
 
 # ---- Finding #2: fuzzy hub-clusters (3+ members) never auto-delete --------
 
-def test_hub_cluster_of_three_with_dissimilar_members_is_flagged_not_deleted():
+async def test_hub_cluster_of_three_with_dissimilar_members_is_flagged_not_deleted():
     """Reviewer's hub-cluster scenario: the fuzzy pass is anchor/'star'
     clustering — each member is only checked against the ANCHOR, never against
     each other. Here B and C are each similar enough to anchor A to join its
@@ -191,14 +191,14 @@ def test_hub_cluster_of_three_with_dissimilar_members_is_flagged_not_deleted():
     def judge_all_dupe(clusters):
         return [{"i": 0, "is_duplicate": True, "keep": 0, "reason": "судья считает дублями"}]
 
-    out = s._dc_analyze(tasks, NAMES, judge_fn=judge_all_dupe, smart_fn=None,
+    out = await s._dc_analyze(tasks, NAMES, judge_fn=judge_all_dupe, smart_fn=None,
                         today=TODAY, now=NOW, fuzzy=True)
     assert out["delete"] == []
     assert len(out["flag_dupe"]) == 1
     assert set(out["flag_dupe"][0]["ids"]) == {"a", "b", "c"}
 
 
-def test_fuzzy_pair_of_two_still_auto_deletes_when_judge_confirms():
+async def test_fuzzy_pair_of_two_still_auto_deletes_when_judge_confirms():
     """The 3+ cap must not regress the ordinary 2-member fuzzy-duplicate path
     (already covered by test_fuzzy_cluster_merges_only_when_judge_is_sure, but
     re-asserted here right next to the cap test for contrast)."""
@@ -208,106 +208,106 @@ def test_fuzzy_pair_of_two_still_auto_deletes_when_judge_confirms():
     def judge_sure(clusters):
         return [{"i": 0, "is_duplicate": True, "keep": 0, "reason": "одно и то же"}]
 
-    out = s._dc_analyze(tasks, NAMES, judge_fn=judge_sure, smart_fn=None,
+    out = await s._dc_analyze(tasks, NAMES, judge_fn=judge_sure, smart_fn=None,
                         today=TODAY, now=NOW, fuzzy=True)
     assert len(out["delete"]) == 1 and out["delete"][0]["taskId"] == "b"
 
 
 # ---- obsolete: FLAG ONLY -------------------------------------------------
 
-def test_obsolete_is_flagged_never_deleted():
+async def test_obsolete_is_flagged_never_deleted():
     stale = _mk("a", "Старая задача", due="2026-01-01",
                 modified="2026-01-05T00:00:00.000+0000")
-    out = s._dc_analyze([stale], NAMES, today=TODAY, now=NOW, fuzzy=False)
+    out = await s._dc_analyze([stale], NAMES, today=TODAY, now=NOW, fuzzy=False)
     assert out["delete"] == [] and out["rename"] == []
     assert len(out["flag_obsolete"]) == 1
     assert out["flag_obsolete"][0]["taskId"] == "a"
 
 
-def test_recently_touched_overdue_is_not_obsolete():
+async def test_recently_touched_overdue_is_not_obsolete():
     fresh = _mk("a", "Недавно тронутая", due="2026-06-01",
                 modified="2026-07-21T00:00:00.000+0000")
-    out = s._dc_analyze([fresh], NAMES, today=TODAY, now=NOW, fuzzy=False)
+    out = await s._dc_analyze([fresh], NAMES, today=TODAY, now=NOW, fuzzy=False)
     assert out["flag_obsolete"] == []
 
 
-def test_task_without_due_is_not_obsolete():
-    out = s._dc_analyze([_mk("a", "Без срока")], NAMES, today=TODAY, now=NOW,
+async def test_task_without_due_is_not_obsolete():
+    out = await s._dc_analyze([_mk("a", "Без срока")], NAMES, today=TODAY, now=NOW,
                         fuzzy=False)
     assert out["flag_obsolete"] == []
 
 
 # ---- umbrella grouping ---------------------------------------------------
 
-def test_umbrella_group_detected():
+async def test_umbrella_group_detected():
     tasks = [_mk("h", "Ремонт квартиры"),
              _mk("c1", "Ремонт квартиры покраска стен"),
              _mk("c2", "Ремонт квартиры замена окон")]
-    out = s._dc_analyze(tasks, NAMES, today=TODAY, now=NOW, fuzzy=False)
+    out = await s._dc_analyze(tasks, NAMES, today=TODAY, now=NOW, fuzzy=False)
     assert len(out["group"]) == 1
     g = out["group"][0]
     assert g["parentId"] == "h"
     assert {c["taskId"] for c in g["children"]} == {"c1", "c2"}
 
 
-def test_no_group_across_projects():
+async def test_no_group_across_projects():
     tasks = [_mk("h", "Проект альфа", project="p1"),
              _mk("c1", "Проект альфа этап один", project="p2"),
              _mk("c2", "Проект альфа этап два", project="p2")]
-    out = s._dc_analyze(tasks, NAMES, today=TODAY, now=NOW, fuzzy=False)
+    out = await s._dc_analyze(tasks, NAMES, today=TODAY, now=NOW, fuzzy=False)
     # header in p1 has no same-project children; p2 has no header prefix task
     assert out["group"] == []
 
 
-def test_already_parented_task_not_regrouped():
+async def test_already_parented_task_not_regrouped():
     tasks = [_mk("h", "Ремонт квартиры"),
              _mk("c1", "Ремонт квартиры покраска", parent="something"),
              _mk("c2", "Ремонт квартиры окна", parent="something")]
-    out = s._dc_analyze(tasks, NAMES, today=TODAY, now=NOW, fuzzy=False)
+    out = await s._dc_analyze(tasks, NAMES, today=TODAY, now=NOW, fuzzy=False)
     assert out["group"] == []
 
 
 # ---- SMART rewrites ------------------------------------------------------
 
-def test_smart_rewrite_becomes_rename_action():
+async def test_smart_rewrite_becomes_rename_action():
     tasks = [_mk("a", "Банк")]
 
     def smart(titles):
         return [{"i": 0, "new_title": "Позвонить в банк по кредиту",
                  "reason": "конкретизировал"}]
 
-    out = s._dc_analyze(tasks, NAMES, smart_fn=smart, today=TODAY, now=NOW,
+    out = await s._dc_analyze(tasks, NAMES, smart_fn=smart, today=TODAY, now=NOW,
                         fuzzy=False)
     assert len(out["rename"]) == 1
     assert out["rename"][0]["new_title"] == "Позвонить в банк по кредиту"
 
 
-def test_nonsmart_without_shim_is_flagged_not_renamed():
-    out = s._dc_analyze([_mk("a", "Банк")], NAMES, smart_fn=None, today=TODAY,
+async def test_nonsmart_without_shim_is_flagged_not_renamed():
+    out = await s._dc_analyze([_mk("a", "Банк")], NAMES, smart_fn=None, today=TODAY,
                         now=NOW, fuzzy=False)
     assert out["rename"] == []
     assert len(out["flag_nonsmart"]) == 1
 
 
-def test_smart_empty_rewrite_keeps_title():
+async def test_smart_empty_rewrite_keeps_title():
     def smart(titles):
         return [{"i": 0, "new_title": "", "reason": "уже норм"}]
 
-    out = s._dc_analyze([_mk("a", "Банк")], NAMES, smart_fn=smart, today=TODAY,
+    out = await s._dc_analyze([_mk("a", "Банк")], NAMES, smart_fn=smart, today=TODAY,
                         now=NOW, fuzzy=False)
     assert out["rename"] == [] and len(out["flag_nonsmart"]) == 1
 
 
 # ---- an id claimed by one action is not reused by another ----------------
 
-def test_deleted_duplicate_not_also_grouped_or_renamed():
+async def test_deleted_duplicate_not_also_grouped_or_renamed():
     tasks = [_mk("a", "X"), _mk("b", "X")]  # exact dupes, both short titles
 
     def smart(titles):
         return [{"i": i, "new_title": f"Сделать {t}", "reason": "r"}
                 for i, t in enumerate(titles)]
 
-    out = s._dc_analyze(tasks, NAMES, smart_fn=smart, today=TODAY, now=NOW,
+    out = await s._dc_analyze(tasks, NAMES, smart_fn=smart, today=TODAY, now=NOW,
                         fuzzy=False)
     claimed = {d["taskId"] for d in out["delete"]}
     claimed |= {d["keep_id"] for d in out["delete"]}
@@ -435,3 +435,91 @@ async def test_execute_declutter_returns_graceful_error_on_internal_exception(mo
     # as long as the caller gets a readable error instead of an unhandled
     # exception with no response.
     assert s._MANIFESTS[mid]["consumed"] is True
+
+
+# ---- Timeout fix: input-size cap + concurrent shim dispatch ---------------
+
+async def test_plan_declutter_refuses_over_cap_before_clustering(monkeypatch):
+    """A scope resolving to more tasks than _DC_MAX_TASKS must be refused
+    BEFORE any O(n^2) clustering/grouping or shim call — that's the whole
+    point of the cap (those passes, plus the two shim prompts, are what blew
+    past the MCP client's 60s timeout on a real full-pile task list)."""
+    monkeypatch.setattr(s, "_ensure_ready", lambda: None)
+    n = s._DC_MAX_TASKS + 37
+    tasks_by_id = {f"t{i}": _mk(f"t{i}", f"Задача {i}") for i in range(n)}
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: tasks_by_id)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: dict(NAMES))
+
+    def boom(*a, **kw):
+        raise AssertionError("must not run above the input-size cap")
+
+    # Neither the O(n^2) passes nor a shim call may happen once refused.
+    monkeypatch.setattr(s, "_dc_cluster_duplicates", boom)
+    monkeypatch.setattr(s, "_dc_group_candidates", boom)
+    monkeypatch.setattr(s, "_dc_shim_available", lambda: True)
+    monkeypatch.setattr(s, "_dc_judge_fn", boom)
+    monkeypatch.setattr(s, "_dc_smart_fn", boom)
+
+    before_keys = set(s._MANIFESTS.keys())
+    result = await s.plan_declutter()
+    # Refusal is read-only: no NEW manifest created (existing ones may still
+    # get pruned as a normal side effect of _prune_manifests(), unrelated to
+    # this refusal path).
+    assert set(s._MANIFESTS.keys()) <= before_keys
+
+    assert "🛑" in result
+    assert str(n) in result  # actual count, so the caller knows how far over
+    assert str(s._DC_MAX_TASKS) in result
+    assert "scope" in result.lower()
+
+
+async def test_plan_declutter_within_cap_still_analyzes(monkeypatch):
+    """Sanity counterpart: at/under the cap, analysis proceeds as normal."""
+    monkeypatch.setattr(s, "_ensure_ready", lambda: None)
+    n = s._DC_MAX_TASKS  # exactly at the cap must NOT be refused
+    tasks_by_id = {f"t{i}": _mk(f"t{i}", f"Задача {i}") for i in range(n)}
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: tasks_by_id)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: dict(NAMES))
+    monkeypatch.setattr(s, "_dc_shim_available", lambda: False)
+
+    result = await s.plan_declutter()
+    assert "🛑 Отказ" not in result
+    assert "разбора помойки" in result
+    assert f"проверено задач: {n}" in result
+
+
+async def test_analyze_dispatches_judge_and_smart_concurrently():
+    """judge_fn and smart_fn are independent (different candidate sets,
+    different shim prompts) and must run CONCURRENTLY (asyncio.gather over
+    asyncio.to_thread), not back-to-back — sequential dispatch was half of
+    why plan_declutter could exceed the 60s MCP client timeout. Fake both
+    calls as blocking sleeps and assert wall time tracks max(), not sum()."""
+    SLEEP = 0.2
+
+    def slow_judge(clusters):
+        time.sleep(SLEEP)
+        return [{"i": 0, "is_duplicate": True, "keep": 0, "reason": "судья подтвердил"}]
+
+    def slow_smart(titles):
+        time.sleep(SLEEP)
+        return [{"i": i, "new_title": f"Сделать {t}", "reason": "r"}
+                for i, t in enumerate(titles)]
+
+    tasks = [_mk("a", "Оплатить аренду офиса"),
+             _mk("b", "Оплатить аренду офиса срочно сегодня"),
+             _mk("c", "Банк")]
+
+    start = time.monotonic()
+    out = await s._dc_analyze(tasks, NAMES, judge_fn=slow_judge, smart_fn=slow_smart,
+                              today=TODAY, now=NOW, fuzzy=True)
+    elapsed = time.monotonic() - start
+
+    # Sequential would cost >= 2*SLEEP; concurrent should track ~1*SLEEP.
+    assert elapsed < SLEEP * 1.7, (
+        f"judge_fn/smart_fn look like they ran sequentially (elapsed={elapsed:.3f}s, "
+        f"expected ~{SLEEP:.3f}s if truly concurrent)")
+
+    # Both calls' results actually made it into the output.
+    assert len(out["delete"]) == 1  # fuzzy pair merged per slow_judge's verdict
+    assert len(out["rename"]) == 1  # "Банк" -> SMART rewrite per slow_smart
+    assert out["rename"][0]["taskId"] == "c"
