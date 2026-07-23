@@ -41,6 +41,11 @@ def _wire(monkeypatch, fake, names):
     # the SAME dict object each time so a test can mutate it mid-flight to
     # simulate the project actually disappearing after delete_project() runs.
     monkeypatch.setattr(s, "_v2_project_names", lambda: names)
+    # Post-verify (delete_project's own + _verify_item's "delete_project"
+    # branch) uses the None-distinguishing variant instead — default it to
+    # the same live dict so existing tests are unaffected; tests exercising
+    # the fetch-failure path override this directly.
+    monkeypatch.setattr(s, "_v2_project_names_or_none", lambda: dict(names))
 
 
 # ---- identity guard: wrong name / unknown id → refuse, nothing touched ----
@@ -176,6 +181,45 @@ async def test_operation_report_flags_project_that_did_not_actually_disappear(
 
     result = await s.delete_project("Упрямый", "p1", confirm="DELETE 0")
     assert "ВСЁ ЕЩЁ существует" in result
+
+
+# ---- post-verify fetch failure → "unverified", never a false "deleted" ---
+
+async def test_postverify_fetch_failure_is_reported_as_unverified_not_deleted(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+    fake = FakeOfficial([])
+    _wire(monkeypatch, fake, {"p1": "Работа"})
+    # _v2_project_names_or_none() catches its own internal errors and
+    # returns None (never raises) — mock that graceful-failure contract.
+    monkeypatch.setattr(s, "_v2_project_names_or_none", lambda: None)
+
+    result = await s.delete_project("Работа", "p1", confirm="DELETE 0")
+    assert fake.deleted_ids == ["p1"]  # the TickTick call itself did succeed
+    assert "НЕ ПОДТВЕРЖДЁН" in result
+    assert "удалён вместе с" not in result
+    assert "ВСЁ ЕЩЁ существует" not in result
+
+
+async def test_operation_report_flags_unverified_delete_project_on_fetch_failure(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+    fake = FakeOfficial([])
+    _wire(monkeypatch, fake, {"p1": "Работа"})
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: {})
+
+    await s.delete_project("Работа", "p1", confirm="DELETE 0")
+    journal_path = tmp_path / "deletion_journal.jsonl"
+    rec1 = json.loads(journal_path.read_text(encoding="utf-8").splitlines()[0])
+    rid = rec1["manifest"]
+
+    # Now simulate operation_report being re-run later when the project-name
+    # fetch itself is failing — _verify_item's "delete_project" branch must
+    # say "unverified", not silently claim success.
+    monkeypatch.setattr(s, "_v2_project_names_or_none", lambda: None)
+    report = s._build_operation_report(rid)
+    assert "НЕ ПОДТВЕРЖДЁН" in report
+    assert "проект удалён" not in report
 
 
 # ---- fetch-contents failure → refuse, never delete blind ------------------

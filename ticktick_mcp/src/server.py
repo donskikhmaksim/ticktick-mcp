@@ -217,6 +217,32 @@ def format_task_line(task: Dict, project_name: str = None) -> str:
     return line + f"  (id:{task.get('id')} proj:{task.get('projectId')})"
 
 
+def _v2_project_names_or_none() -> Optional[Dict]:
+    """Like _v2_project_names(), but returns None — never {} — when every
+    fetch path raised. _v2_project_names()'s plain {} return conflates "no
+    projects" with "couldn't check"; callers that treat an empty result as
+    CONFIRMED ABSENCE (delete_project's post-verify, _verify_item's
+    "delete_project" branch) must not read a failed refetch as a successful
+    deletion. Use this instead of _v2_project_names() anywhere the caller's
+    next move depends on "did this really disappear" rather than just
+    wanting a human-readable name for display."""
+    if ticktick_v2:
+        try:
+            st = ticktick_v2.get_state()
+            names = {p["id"]: p.get("name") for p in (st.get("projectProfiles") or [])}
+            if st.get("inboxId"):
+                names[st["inboxId"]] = "Inbox"
+            return names
+        except Exception:
+            pass
+    if ticktick:
+        try:
+            return {p.get("id"): p.get("name") for p in (ticktick.get_projects() or [])}
+        except Exception:
+            pass
+    return None
+
+
 def _v2_project_names() -> Dict:
     """Map projectId -> name (incl. Inbox) from the cached v2 state,
     falling back to the official v1 API so results stay human-readable
@@ -2077,9 +2103,16 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         return (f"- ❌ **«{title}»** — всё ещё среди открытых" if live
                 else f"- ✅ **«{title}»** — {verb} (ушла из открытых)")
     if op == "delete_project":
-        # tid here is the PROJECT id, not a task id — check it against the
-        # live project-name map instead of the (task-only) live_map.
-        still = names.get(tid)
+        # tid here is the PROJECT id, not a task id. Re-fetch fresh via the
+        # None-distinguishing helper rather than trusting the `names` dict
+        # the caller already had — a stale/failed fetch must never read as
+        # "project confirmed deleted".
+        fresh_names = _v2_project_names_or_none()
+        if fresh_names is None:
+            return (f"- ⚠️ **«{title}»** — проект: проверка не удалась (не "
+                    "получилось перечитать список проектов), исход НЕ "
+                    "ПОДТВЕРЖДЁН")
+        still = fresh_names.get(tid)
         return (f"- ❌ **«{title}»** — проект ВСЁ ЕЩЁ существует (удаление не "
                 "подтвердилось)" if still else
                 f"- ✅ **«{title}»** — проект удалён")
@@ -3112,9 +3145,17 @@ async def delete_project(project_name: str, project_id: str, confirm: str = "") 
                 ticktick_v2.invalidate_cache()
             except Exception:
                 pass
-        still_there = _v2_project_names().get(project_id)
+        names_after = _v2_project_names_or_none()
         lines = []
-        if still_there:
+        if names_after is None:
+            # Fetch failed outright — a failed refetch must never read as a
+            # confirmed deletion (the TickTick call above may have genuinely
+            # succeeded; we just couldn't check).
+            lines.append(f"⚠️ Проект «{live_name}» отправлен на удаление, но "
+                         "проверить результат не удалось (не получилось "
+                         "перечитать список проектов) — исход НЕ ПОДТВЕРЖДЁН. "
+                         "Повтори operation_report позже.")
+        elif names_after.get(project_id):
             lines.append(f"❌ Проект «{live_name}» ВСЁ ЕЩЁ существует — "
                          "удаление не подтвердилось.")
         else:
