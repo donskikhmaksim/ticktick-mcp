@@ -46,6 +46,15 @@ READONLY = ToolAnnotations(readOnlyHint=True)
 # Create TickTick clients
 ticktick = None       # official Open API (OAuth)
 ticktick_v2 = None    # unofficial v2 API (email/password), optional
+# `ticktick` (v1) is documented/stable but single-item-only: no listing,
+# filtering, batch ops, get_changes, habits, trash, or project groups.
+# `ticktick_v2` is undocumented/reverse-engineered but is what actually
+# powers almost every listing/filtering/batch/dedup/audit tool below — several
+# tools gate readiness on `ticktick` yet run on `ticktick_v2` when it's
+# configured, falling back to `ticktick` only when it's not. See the README
+# section "Two TickTick APIs, and what breaks if the unofficial one goes
+# down" for the full capability split and what a v2 outage does and doesn't
+# take down.
 
 def initialize_client():
     global ticktick, ticktick_v2
