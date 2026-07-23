@@ -2250,6 +2250,28 @@ _DC_FUZZY_THRESHOLD = 0.6
 _DC_OBSOLETE_OVERDUE_DAYS = 30
 _DC_OBSOLETE_STALE_DAYS = 60
 
+# Hard cap on how many open tasks a single plan_declutter scope may resolve
+# to. _dc_cluster_duplicates and _dc_group_candidates are both O(n^2) over
+# this set, and (when the shim is available) the analysis also bundles ALL
+# fuzzy-duplicate clusters into one judge prompt and ALL vague-title
+# candidates into one SMART-rewrite prompt — bigger input means bigger
+# prompts on top of the quadratic clustering cost. The MCP client this tool
+# is called through has a 60s timeout; a real user's full open-task list has
+# been observed to blow past it. 200 is picked as a middle ground: at that
+# size the O(n^2) passes stay well under a second in pure Python, and the two
+# (now-parallel, individually timeout-capped — see _DC_SHIM_TIMEOUT) shim
+# prompts stay small enough to answer quickly, leaving real headroom under
+# the 60s ceiling. A single project or a day/week's worth of inbox triage
+# should resolve well under this; the whole-pile case (what the timeout was
+# actually hit on) is exactly what should be narrowed via `scope` instead.
+_DC_MAX_TASKS = 200
+# Per-call timeout for the two declutter shim calls (judge_fn/smart_fn only —
+# NOT _dc_shim_json's default, which other/future callers may still rely on
+# at 90s). The two calls now run concurrently, so wall-clock cost is
+# ~max(judge, smart) rather than their sum, but each individual call still
+# needs its own sane ceiling well under the 60s client timeout.
+_DC_SHIM_TIMEOUT = 25
+
 
 def _dc_tokens(title: str) -> set:
     """Normalised word-token set of a title (for Jaccard similarity)."""
@@ -2446,17 +2468,30 @@ def _dc_group_candidates(tasks: List[Dict], skip_ids: set) -> List[Dict]:
     return groups
 
 
-def _dc_analyze(tasks: List[Dict], names: Dict, judge_fn=None, smart_fn=None,
-                today=None, now: Optional[datetime] = None,
-                fuzzy: bool = True) -> Dict:
-    """Pure analysis core (no I/O): from a list of live open tasks build the
-    proposed declutter actions + flags. judge_fn/smart_fn are injected so the
-    logic is unit-testable with mocks; the real tool wires them to the shim.
+async def _dc_analyze(tasks: List[Dict], names: Dict, judge_fn=None, smart_fn=None,
+                      today=None, now: Optional[datetime] = None,
+                      fuzzy: bool = True) -> Dict:
+    """Analysis core (the only I/O is the two injected shim calls, dispatched
+    concurrently): from a list of live open tasks build the proposed
+    declutter actions + flags. judge_fn/smart_fn are injected so the logic is
+    unit-testable with mocks (plain sync callables are fine — they are run
+    via asyncio.to_thread); the real tool wires them to the shim.
 
     judge_fn(clusters) -> aligned list of {"is_duplicate": bool, "keep": int,
         "reason": str} (or [] / None to abstain → KEEP-BOTH).
     smart_fn(titles) -> aligned list of {"new_title": str, "reason": str}
         (empty new_title → leave as-is).
+
+    judge_fn and smart_fn look at independent slices of the task pile
+    (fuzzy-duplicate clusters vs. vague-title candidates) and are run
+    CONCURRENTLY via asyncio.gather/to_thread rather than sequentially, since
+    each is one (potentially slow) shim HTTP call and running them back to
+    back risked summing past the MCP client's own timeout. The smart_fn
+    candidate pool is gathered up front (before duplicate-resolution below
+    decides what gets consumed) precisely so its dispatch doesn't have to
+    wait on the judge's verdict; any candidate that duplicate/group
+    resolution later claims is simply dropped from the final rename/flag
+    output — see the id-keyed lookup in step 4.
 
     Returns dict with mutating action lists (delete/rename/group) and flag lists
     (flag_obsolete/flag_dupe/flag_nonsmart)."""
@@ -2474,20 +2509,45 @@ def _dc_analyze(tasks: List[Dict], names: Dict, judge_fn=None, smart_fn=None,
     # declutter's own duplicate-scoring must not bypass that protection.
     children_of = {t.get("parentId") for t in tasks if t.get("parentId")}
 
-    # ---- 1. Duplicate clusters -------------------------------------------
+    # ---- Prepare BOTH shim inputs up front, then dispatch concurrently ----
     clusters = _dc_cluster_duplicates(tasks, fuzzy=fuzzy)
     fuzzy_clusters = [c for c in clusters if not c["exact"]]
-    verdicts = {}
-    if fuzzy_clusters and judge_fn:
+    # Full non-SMART candidate pool, NOT yet excluding tasks that duplicate/
+    # group resolution below will consume (that isn't known until after the
+    # judge verdict is in) — see the docstring above for why.
+    full_nonsmart_cand = [t for t in tasks
+                          if _dc_is_nonsmart_candidate(t.get("title") or "")]
+
+    async def _run_judge() -> Dict[int, Dict]:
+        if not (fuzzy_clusters and judge_fn):
+            return {}
         try:
-            res = judge_fn([[t.get("title") or "" for t in c["tasks"]]
-                            for c in fuzzy_clusters]) or []
-            for i, v in enumerate(res):
-                if isinstance(v, dict):
-                    verdicts[i] = v
+            res = await asyncio.to_thread(
+                judge_fn, [[t.get("title") or "" for t in c["tasks"]]
+                          for c in fuzzy_clusters]) or []
+            return {i: v for i, v in enumerate(res) if isinstance(v, dict)}
         except Exception as e:
             logger.warning(f"declutter judge failed: {e}")
+            return {}
 
+    async def _run_smart() -> Dict[Any, Dict]:
+        if not (full_nonsmart_cand and smart_fn):
+            return {}
+        try:
+            res = await asyncio.to_thread(
+                smart_fn, [t.get("title") or "" for t in full_nonsmart_cand]) or []
+            by_id = {}
+            for i, v in enumerate(res):
+                if isinstance(v, dict) and i < len(full_nonsmart_cand):
+                    by_id[full_nonsmart_cand[i].get("id")] = v
+            return by_id
+        except Exception as e:
+            logger.warning(f"declutter smart rewrite failed: {e}")
+            return {}
+
+    verdicts, smart_by_id = await asyncio.gather(_run_judge(), _run_smart())
+
+    # ---- 1. Duplicate clusters -------------------------------------------
     fuzzy_idx = 0
     for c in clusters:
         ctasks = c["tasks"]
@@ -2587,19 +2647,15 @@ def _dc_analyze(tasks: List[Dict], names: Dict, judge_fn=None, smart_fn=None,
         })
 
     # ---- 4. Non-SMART titles --------------------------------------------
+    # smart_fn was already called (concurrently with judge_fn) above, against
+    # full_nonsmart_cand — the pre-consumption superset of this list. Re-apply
+    # the same "not consumed" filter now that consumed is final, and look each
+    # survivor's rewrite up by task id in smart_by_id (built from that earlier
+    # call) instead of re-invoking the shim.
     cand = [t for t in tasks if t.get("id") not in consumed
             and _dc_is_nonsmart_candidate(t.get("title") or "")]
-    rewrites = {}
-    if cand and smart_fn:
-        try:
-            res = smart_fn([t.get("title") or "" for t in cand]) or []
-            for i, v in enumerate(res):
-                if isinstance(v, dict):
-                    rewrites[i] = v
-        except Exception as e:
-            logger.warning(f"declutter smart rewrite failed: {e}")
-    for i, t in enumerate(cand):
-        v = rewrites.get(i)
+    for t in cand:
+        v = smart_by_id.get(t.get("id"))
         new_title = (v or {}).get("new_title") if v else None
         if new_title and _norm_name(new_title) and _norm_name(new_title) != _norm_name(t.get("title") or ""):
             consumed.add(t.get("id"))
@@ -2637,7 +2693,7 @@ def _dc_judge_fn(clusters: List[List[str]],
         '[{"i":0,"is_duplicate":true,"keep":1,"reason":"<кратко>"}]'
     )
     res = _dc_shim_json("Ты вычищаешь дубликаты в списке задач. Отвечай только JSON.",
-                        prompt, fail_tracker=fail_tracker)
+                        prompt, timeout=_DC_SHIM_TIMEOUT, fail_tracker=fail_tracker)
     if not isinstance(res, list):
         return []
     aligned = [{} for _ in clusters]
@@ -2664,7 +2720,7 @@ def _dc_smart_fn(titles: List[str], fail_tracker: Optional[list] = None) -> List
         '[{"i":0,"new_title":"<или пусто>","reason":"<кратко>"}]'
     )
     res = _dc_shim_json("Ты переформулируешь задачи в SMART-вид. Отвечай только JSON.",
-                        prompt, fail_tracker=fail_tracker)
+                        prompt, timeout=_DC_SHIM_TIMEOUT, fail_tracker=fail_tracker)
     if not isinstance(res, list):
         return []
     aligned = [{} for _ in titles]
@@ -2716,6 +2772,10 @@ async def plan_declutter(scope: str = "", dry_run: bool = True) -> str:
     explicit «да», then call execute_declutter(manifest_id, confirm="DECLUTTER
     <N>"). Nothing mutates until then. Manifests are one-shot, expire in 1 h.
 
+    Refuses cleanly (no analysis, no shim call) when the resolved scope has
+    more than a few hundred open tasks — narrow `scope` (project/tag/date)
+    instead of running this over the whole pile.
+
     Args:
         scope: optional narrowing — 'inbox', or a project-name substring
         dry_run: retained for symmetry; plan_declutter is always read-only
@@ -2732,6 +2792,18 @@ async def plan_declutter(scope: str = "", dry_run: bool = True) -> str:
     if not tasks:
         return ("Открытых задач в этой области нет — разбирать нечего."
                 + (f" (scope='{scope}')" if scope else ""))
+    # Refuse BEFORE any O(n^2) clustering/grouping or shim call when the
+    # resolved scope is too big — see _DC_MAX_TASKS for the sizing rationale.
+    # Read-only refusal: nothing above this point mutated anything, and
+    # nothing below runs, so there is no partial analysis/journal entry.
+    if len(tasks) > _DC_MAX_TASKS:
+        return (f"🛑 Отказ: в этой области {len(tasks)} открытых задач — "
+                f"больше капа {_DC_MAX_TASKS} (на {len(tasks) - _DC_MAX_TASKS} "
+                "больше). Разбор такого объёма упрётся в таймаут ещё до "
+                "готового плана. Сузь scope (по проекту/тегу/сроку) и "
+                "попробуй снова — например scope='inbox' или конкретный "
+                "проект."
+                + (f" (текущий scope='{scope}')" if scope else " (scope не задан — вся куча)"))
 
     shim = _dc_shim_available()
     # Track whether a shim call actually FAILED during this run (vs. simply
@@ -2743,7 +2815,7 @@ async def plan_declutter(scope: str = "", dry_run: bool = True) -> str:
         if shim else None
     smart_fn = (lambda titles: _dc_smart_fn(titles, fail_tracker=shim_fail_tracker)) \
         if shim else None
-    actions = _dc_analyze(
+    actions = await _dc_analyze(
         tasks, names,
         judge_fn=judge_fn,
         smart_fn=smart_fn,
