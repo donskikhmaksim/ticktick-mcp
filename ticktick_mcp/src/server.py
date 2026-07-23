@@ -9,7 +9,7 @@ import uuid
 import logging
 from datetime import date, datetime, timezone, timedelta
 from typing import Dict, List, Any, Literal, Optional
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -3048,11 +3048,41 @@ def _is_all_day_task(task: Dict[str, Any]) -> bool:
     return bool(due) and isinstance(due, str) and _DATE_ONLY.match(due.strip()) is not None
 
 
-def _all_day_date(value: str) -> Optional[date]:
-    """Take the bare calendar date from an all-day dueDate VERBATIM (dueDate[:10]),
-    with no timezone assumption and no conversion."""
+def _all_day_date(value: str, tz_name: Optional[str] = None) -> Optional[date]:
+    """Take the calendar date of an all-day dueDate.
+
+    dueDate[:10] verbatim is safe for a NEGATIVE-offset zone (e.g. the owner's
+    America/Los_Angeles) but not universally: a POSITIVE-offset zone (e.g.
+    Europe/Moscow, +03) can have its local-midnight all-day date stored as a
+    UTC instant on the PREVIOUS day (2026-07-22 Moscow -> dueDate
+    "2026-07-21T21:00:00.000+0000"), so [:10] alone reads one day EARLY. The
+    OpenAPI-documented shape (dueDate + an explicit `timeZone` field even on
+    an all-day task, see ticktick-openapi.md) shows this isn't a theoretical
+    concern: `dueDate[:10]` and a zone-aware read of the same value can
+    disagree.
+
+    So: if the task carries its own IANA `timeZone`, treat `value` as a UTC
+    instant and convert it into THAT zone (not `_USER_TZ` — each TickTick task
+    can carry its own zone) before reading the date off it. That handles both
+    offset signs correctly and matches the documented shape.
+
+    If `timeZone` is absent or not a recognized IANA name (some stored/echoed
+    all-day shapes omit it — this is the common case observed for the owner's
+    own tasks), fall back to the plain `dueDate[:10]` read. That fallback is
+    safe for the owner's case but is NOT proven safe for every possible
+    storage form on a positive-offset account; when in doubt prefer a task
+    that actually carries `timeZone`."""
     if not value or not isinstance(value, str):
         return None
+    if tz_name:
+        try:
+            tz = ZoneInfo(tz_name)
+        except (ZoneInfoNotFoundError, ValueError):
+            tz = None
+        if tz is not None:
+            dt = _parse_ticktick_datetime(value)
+            if dt is not None:
+                return dt.astimezone(tz).date()
     try:
         return date.fromisoformat(value.strip()[:10])
     except ValueError:
@@ -3091,13 +3121,18 @@ def _task_due_local_date(task: Dict[str, Any]):
     """Return the task's due date as a calendar date, or None if there's
     no/unparseable due date.
 
-    All-day / date-only deadlines are zone-independent calendar dates: take
-    dueDate[:10] verbatim, never assume UTC and never .astimezone() them (that
-    is the #36 off-by-one — a negative-offset zone would read the previous day).
-    Only genuinely timed deadlines are converted into the user's local zone."""
+    All-day / date-only deadlines are zone-independent calendar dates: by
+    default take dueDate[:10] verbatim, never assume UTC and never
+    .astimezone(_USER_TZ) them (that is the #36 off-by-one — a negative-offset
+    zone would read the previous day). If the task itself carries a
+    `timeZone` field, `_all_day_date` instead reads the date via THAT zone
+    (not `_USER_TZ`), which is required to get the right day for a
+    positive-offset self-hoster (e.g. Europe/Moscow, +03) whose all-day dates
+    can be stored as local-midnight-expressed-in-UTC. Only genuinely timed
+    deadlines are converted into the user's local zone."""
     due = task.get('dueDate')
     if _is_all_day_task(task):
-        return _all_day_date(due)
+        return _all_day_date(due, task.get('timeZone'))
     dt = _parse_ticktick_datetime(due)
     if dt is None:
         return None
@@ -3120,7 +3155,7 @@ def _is_task_overdue(task: Dict[str, Any]) -> bool:
     the user's local zone (its date is before today) — NOT a UTC-instant compare,
     which would read an all-day task due today as overdue for most of the day."""
     if _is_all_day_task(task):
-        d = _all_day_date(task.get('dueDate'))
+        d = _all_day_date(task.get('dueDate'), task.get('timeZone'))
         return d is not None and d < _today_local()
     dt = _parse_ticktick_datetime(task.get('dueDate'))
     if dt is None:
