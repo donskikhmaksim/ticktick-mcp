@@ -100,8 +100,8 @@ class TickTickClient:
         self.session = requests.Session()
         self.client_id = os.getenv("TICKTICK_CLIENT_ID")
         self.client_secret = os.getenv("TICKTICK_CLIENT_SECRET")
-        # Prefer tokens persisted to the volume (freshest after a refresh or a
-        # /setup that happened on a previous container), falling back to env.
+        # Prefer tokens persisted to the volume (freshest after a token refresh
+        # on a previous container), falling back to env.
         persisted = load_token_file()
         self.access_token = persisted.get("access_token") or os.getenv("TICKTICK_ACCESS_TOKEN")
         self.refresh_token = persisted.get("refresh_token") or os.getenv("TICKTICK_REFRESH_TOKEN")

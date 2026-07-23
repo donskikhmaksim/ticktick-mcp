@@ -4,7 +4,6 @@ venv
 __pycache__
 *.pyc
 .env
-oauth-proxy/
 scripts/
 *.md
 .github/
