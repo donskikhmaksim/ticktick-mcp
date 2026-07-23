@@ -41,6 +41,17 @@ Fills the gaps the official API lacks:
 > eventually expires; when it does the v2 tools return a "re-extract the cookie"
 > message and the official API keeps working.
 
+### Optional LLM judge (set `CLAUDE_CLI_URL`)
+Want smarter fuzzy-duplicate detection and SMART-rewrite suggestions in
+`plan_declutter`, plus project-destination suggestions in
+`plan_task_creation`? Deploy your own
+[`claude-p-shim`](https://github.com/donskikhmaksim/claude-p-shim) — a tiny
+Railway service (~5 min to set up) that runs on your own Claude Pro/Max
+subscription, no Anthropic API key needed — and set `CLAUDE_CLI_URL` /
+`CLAUDE_CLI_TOKEN` / `CLAUDE_CLI_MODEL` as Railway variables on this service.
+Without it, everything still works — declutter just falls back to
+exact-title matching, and destination suggestions are skipped.
+
 ## Environment variables
 
 | Variable | Required | Purpose |
@@ -48,6 +59,7 @@ Fills the gaps the official API lacks:
 | `TICKTICK_ACCESS_TOKEN` | ✅ | Open API OAuth token (from local `auth` flow) |
 | `TICKTICK_CLIENT_ID` / `TICKTICK_CLIENT_SECRET` | for auth flow | TickTick developer app creds |
 | `TICKTICK_V2_TOKEN` | optional | the `t` cookie — enables the v2 API |
+| `CLAUDE_CLI_URL` / `CLAUDE_CLI_TOKEN` / `CLAUDE_CLI_MODEL` | optional | LLM judge for declutter dedup/SMART-rewrite + destination suggestions — see above |
 | `MCP_TRANSPORT` | for remote | `streamable-http` (default `stdio`) |
 | `MCP_SECRET` | strongly recommended | secret appended to URL path: `/mcp/<secret>` — lightweight auth for the public endpoint |
 | `USER_TIMEZONE` | optional | IANA timezone for due-date handling (e.g. `Europe/Moscow`); defaults to UTC |
