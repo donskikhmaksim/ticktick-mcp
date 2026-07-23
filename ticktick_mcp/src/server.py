@@ -7,7 +7,7 @@ import time
 import unicodedata
 import uuid
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from typing import Dict, List, Any, Literal, Optional
 from zoneinfo import ZoneInfo
 
@@ -1400,7 +1400,13 @@ async def update_tasks(
                     changes["tags"] = [x.lstrip("#").lower() for x in t["tags"]]
                 for src, dst in (("due_date", "dueDate"), ("start_date", "startDate")):
                     if t.get(src):
-                        changes[dst] = _normalize_date(t[src])[0]
+                        val, all_day = _normalize_date(t[src])
+                        changes[dst] = val
+                        # Preserve the all-day flag on update — dropping it turned
+                        # an edited all-day date into a timed midnight task, which
+                        # a negative-offset account then rendered a day early (#36).
+                        if all_day:
+                            changes["isAllDay"] = True
                 # Post-verify: re-read fresh state and diff the requested
                 # fields — the official API can 200-no-op, so «обновлено» is
                 # only printed when the change is VISIBLE in live data.
@@ -2331,6 +2337,31 @@ async def delete_project(project_name: str, project_id: str) -> str:
 # isn't off-by-one. Matches USER_TIMEZONE used by the client's date handling.
 _USER_TZ = ZoneInfo(os.getenv("USER_TIMEZONE", "UTC"))
 
+# A bare calendar date (no clock time) — an all-day marker on either side.
+_DATE_ONLY = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+
+def _is_all_day_task(task: Dict[str, Any]) -> bool:
+    """An all-day / date-only deadline is a ZONE-INDEPENDENT calendar date, not
+    a timezone-bearing instant. Detect it from the explicit isAllDay flag or a
+    bare YYYY-MM-DD dueDate so its date is read verbatim, never .astimezone()'d
+    (which would push a negative-offset zone back to the previous day, #36)."""
+    if task.get("isAllDay"):
+        return True
+    due = task.get("dueDate")
+    return bool(due) and isinstance(due, str) and _DATE_ONLY.match(due.strip()) is not None
+
+
+def _all_day_date(value: str) -> Optional[date]:
+    """Take the bare calendar date from an all-day dueDate VERBATIM (dueDate[:10]),
+    with no timezone assumption and no conversion."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return date.fromisoformat(value.strip()[:10])
+    except ValueError:
+        return None
+
 
 def _parse_ticktick_datetime(value: str) -> Optional[datetime]:
     """Parse a TickTick date string robustly. TickTick usually emits
@@ -2361,9 +2392,17 @@ def _parse_ticktick_datetime(value: str) -> Optional[datetime]:
 
 
 def _task_due_local_date(task: Dict[str, Any]):
-    """Return the task's due date as a date in the user's local timezone, or
-    None if there's no/unparseable due date."""
-    dt = _parse_ticktick_datetime(task.get('dueDate'))
+    """Return the task's due date as a calendar date, or None if there's
+    no/unparseable due date.
+
+    All-day / date-only deadlines are zone-independent calendar dates: take
+    dueDate[:10] verbatim, never assume UTC and never .astimezone() them (that
+    is the #36 off-by-one — a negative-offset zone would read the previous day).
+    Only genuinely timed deadlines are converted into the user's local zone."""
+    due = task.get('dueDate')
+    if _is_all_day_task(task):
+        return _all_day_date(due)
+    dt = _parse_ticktick_datetime(due)
     if dt is None:
         return None
     return dt.astimezone(_USER_TZ).date()
@@ -2379,7 +2418,14 @@ def _is_task_due_today(task: Dict[str, Any]) -> bool:
     return d is not None and d == _today_local()
 
 def _is_task_overdue(task: Dict[str, Any]) -> bool:
-    """Check if a task is overdue."""
+    """Check if a task is overdue.
+
+    For an all-day / date-only deadline "overdue" is a calendar-date compare in
+    the user's local zone (its date is before today) — NOT a UTC-instant compare,
+    which would read an all-day task due today as overdue for most of the day."""
+    if _is_all_day_task(task):
+        d = _all_day_date(task.get('dueDate'))
+        return d is not None and d < _today_local()
     dt = _parse_ticktick_datetime(task.get('dueDate'))
     if dt is None:
         return False
