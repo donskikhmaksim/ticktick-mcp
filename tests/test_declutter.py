@@ -2,6 +2,7 @@
 keep-both safety bias, obsolete FLAG-only handling, umbrella grouping, SMART
 rewrites, and the confirm-token / manifest shaping. The shim and the live task
 list are mocked — no network, no TickTick."""
+import time
 from datetime import datetime, timezone
 
 import ticktick_mcp.src.server as s
@@ -102,6 +103,114 @@ def test_judge_exception_defaults_to_keep_both():
     out = s._dc_analyze(tasks, NAMES, judge_fn=boom, smart_fn=None,
                         today=TODAY, now=NOW, fuzzy=True)
     assert out["delete"] == [] and len(out["flag_dupe"]) == 1
+
+
+# ---- Finding #1: never delete a task with live children ------------------
+
+def test_duplicate_with_live_children_is_never_deleted():
+    """Reviewer's 'Ремонт машины' scenario: an exact duplicate pair where one
+    member has live subtasks. Metadata scoring alone would pick the OTHER
+    (richer) member to keep and delete the one with children — but that would
+    orphan the children (parentId pointing at a deleted task). The task with
+    children must always be forced onto the KEEP side."""
+    parent_with_kids = _mk("a", "Ремонт машины")
+    richer_bare_dup = _mk("b", "Ремонт машины", due="2026-08-01", priority=5,
+                         content="подробности здесь")
+    kid = _mk("k1", "Заменить масло", parent="a")
+    tasks = [parent_with_kids, richer_bare_dup, kid]
+
+    # Sanity check: without the children guard, metadata scoring alone would
+    # pick "b" (richer) to keep and delete "a" — exactly the orphaning bug.
+    assert s._dc_pick_primary([parent_with_kids, richer_bare_dup]) == 1
+
+    out = s._dc_analyze(tasks, NAMES, judge_fn=None, smart_fn=None,
+                        today=TODAY, now=NOW, fuzzy=False)
+    deleted_ids = {d["taskId"] for d in out["delete"]}
+    assert "a" not in deleted_ids, "task with live children must never be deleted"
+    assert "b" in deleted_ids
+    assert out["delete"][0]["keep_id"] == "a"
+
+
+def test_duplicate_pair_both_with_children_is_flagged():
+    """If BOTH members of a duplicate pair have live children, there is no
+    safe single keeper — route to flag_dupe instead of guessing."""
+    a = _mk("a", "Проект X")
+    b = _mk("b", "Проект X")
+    kid_a = _mk("ka", "Шаг 1", parent="a")
+    kid_b = _mk("kb", "Шаг 2", parent="b")
+    out = s._dc_analyze([a, b, kid_a, kid_b], NAMES, judge_fn=None, smart_fn=None,
+                        today=TODAY, now=NOW, fuzzy=False)
+    assert out["delete"] == []
+    assert len(out["flag_dupe"]) == 1
+    assert set(out["flag_dupe"][0]["ids"]) == {"a", "b"}
+
+
+def test_fuzzy_duplicate_with_children_keeps_child_owner_even_if_judge_picks_other():
+    """Same guard, but on the fuzzy (judge-confirmed) path: even when the judge
+    explicitly names the OTHER member as 'keep', the child-owning member must
+    still survive."""
+    parent_with_kids = _mk("a", "Оплатить аренду офиса")
+    bare_dup = _mk("b", "Оплатить аренду офиса срочно сегодня")
+    kid = _mk("k1", "Подписать договор", parent="a")
+
+    def judge_keep_b(clusters):
+        return [{"i": 0, "is_duplicate": True, "keep": 1, "reason": "судья выбрал b"}]
+
+    out = s._dc_analyze([parent_with_kids, bare_dup, kid], NAMES,
+                        judge_fn=judge_keep_b, smart_fn=None,
+                        today=TODAY, now=NOW, fuzzy=True)
+    deleted_ids = {d["taskId"] for d in out["delete"]}
+    assert "a" not in deleted_ids
+    assert "b" in deleted_ids
+    assert out["delete"][0]["keep_id"] == "a"
+
+
+# ---- Finding #2: fuzzy hub-clusters (3+ members) never auto-delete --------
+
+def test_hub_cluster_of_three_with_dissimilar_members_is_flagged_not_deleted():
+    """Reviewer's hub-cluster scenario: the fuzzy pass is anchor/'star'
+    clustering — each member is only checked against the ANCHOR, never against
+    each other. Here B and C are each similar enough to anchor A to join its
+    cluster, but B and C are NOT similar to each other — a 3-member 'hub'
+    cluster mixing what may be two unrelated tasks. Even if the judge returns
+    one is_duplicate=True verdict for the whole cluster, auto-delete must be
+    capped at 2 members: any 3+-member fuzzy cluster is routed to flag_dupe
+    instead."""
+    a = _mk("a", "Счет банк")
+    b = _mk("b", "Счет банк реквизиты")
+    c = _mk("c", "Счет банк договор")
+    tasks = [a, b, c]
+
+    # Confirm the premise: it really is one 3-member hub cluster, and B/C are
+    # not pairwise-similar to each other even though both cleared the anchor.
+    clusters = s._dc_cluster_duplicates(tasks, fuzzy=True)
+    assert len(clusters) == 1 and len(clusters[0]["tasks"]) == 3
+    jac_bc = s._dc_jaccard(s._dc_tokens(b["title"]), s._dc_tokens(c["title"]))
+    assert jac_bc < s._DC_FUZZY_THRESHOLD
+
+    def judge_all_dupe(clusters):
+        return [{"i": 0, "is_duplicate": True, "keep": 0, "reason": "судья считает дублями"}]
+
+    out = s._dc_analyze(tasks, NAMES, judge_fn=judge_all_dupe, smart_fn=None,
+                        today=TODAY, now=NOW, fuzzy=True)
+    assert out["delete"] == []
+    assert len(out["flag_dupe"]) == 1
+    assert set(out["flag_dupe"][0]["ids"]) == {"a", "b", "c"}
+
+
+def test_fuzzy_pair_of_two_still_auto_deletes_when_judge_confirms():
+    """The 3+ cap must not regress the ordinary 2-member fuzzy-duplicate path
+    (already covered by test_fuzzy_cluster_merges_only_when_judge_is_sure, but
+    re-asserted here right next to the cap test for contrast)."""
+    tasks = [_mk("a", "Оплатить аренду офиса"),
+             _mk("b", "Оплатить аренду офиса срочно сегодня")]
+
+    def judge_sure(clusters):
+        return [{"i": 0, "is_duplicate": True, "keep": 0, "reason": "одно и то же"}]
+
+    out = s._dc_analyze(tasks, NAMES, judge_fn=judge_sure, smart_fn=None,
+                        today=TODAY, now=NOW, fuzzy=True)
+    assert len(out["delete"]) == 1 and out["delete"][0]["taskId"] == "b"
 
 
 # ---- obsolete: FLAG ONLY -------------------------------------------------
@@ -224,3 +333,105 @@ def test_scope_filter_inbox_and_substring():
     assert {t["id"] for t in s._dc_scope_filter(tasks, NAMES, "inbox")} == {"a"}
     assert {t["id"] for t in s._dc_scope_filter(tasks, NAMES, "раб")} == {"b"}
     assert len(s._dc_scope_filter(tasks, NAMES, "")) == 3
+
+
+# ---- Finding #7: shim-call-failure tracking (vs. simply unconfigured) ----
+
+def test_shim_json_records_failure_on_non_ok_response(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CLI_URL", "http://shim.example")
+    monkeypatch.setenv("CLAUDE_CLI_TOKEN", "tok")
+    import requests
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"ok": False}
+
+    monkeypatch.setattr(requests, "post", lambda *a, **kw: _Resp())
+    tracker: list = []
+    res = s._dc_shim_json("sys", "prompt", fail_tracker=tracker)
+    assert res is None
+    assert tracker == [True]
+
+
+def test_shim_json_records_failure_on_exception(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CLI_URL", "http://shim.example")
+    monkeypatch.setenv("CLAUDE_CLI_TOKEN", "tok")
+    import requests
+
+    def boom(*a, **kw):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(requests, "post", boom)
+    tracker: list = []
+    res = s._dc_shim_json("sys", "prompt", fail_tracker=tracker)
+    assert res is None
+    assert tracker == [True]
+
+
+def test_shim_json_no_failure_recorded_on_success(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CLI_URL", "http://shim.example")
+    monkeypatch.setenv("CLAUDE_CLI_TOKEN", "tok")
+    import requests
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"ok": True, "result": "[1, 2, 3]"}
+
+    monkeypatch.setattr(requests, "post", lambda *a, **kw: _Resp())
+    tracker: list = []
+    res = s._dc_shim_json("sys", "prompt", fail_tracker=tracker)
+    assert res == [1, 2, 3]
+    assert tracker == []
+
+
+def test_shim_json_unconfigured_is_not_counted_as_a_failure(monkeypatch):
+    """Not having CLAUDE_CLI_URL set at all is a different situation from a
+    configured shim whose call failed — plan_declutter already has a separate
+    warning for 'not configured', so an unset shim must NOT populate the
+    fail_tracker."""
+    monkeypatch.delenv("CLAUDE_CLI_URL", raising=False)
+    tracker: list = []
+    res = s._dc_shim_json("sys", "prompt", fail_tracker=tracker)
+    assert res is None
+    assert tracker == []
+
+
+# ---- Finding #8: execute_declutter never raises with the manifest already
+# marked consumed — an internal glue-code exception must come back as a
+# graceful error string. -------------------------------------------------
+
+async def test_execute_declutter_returns_graceful_error_on_internal_exception(monkeypatch):
+    monkeypatch.setattr(s, "ticktick_v2", object())  # _ensure_ready() passes
+    mid = "test-declutter-mid"
+    s._MANIFESTS[mid] = {
+        "kind": "declutter",
+        "actions": {
+            "delete": [],
+            "rename": [{"taskId": "x", "projectId": "p1", "title": "t",
+                        "new_title": "t2"}],
+            "group": [],
+        },
+        "mutating_count": 1,
+        "created": time.monotonic(),
+        "summary": "test",
+        "consumed": False,
+    }
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("glue-code exploded")
+
+    monkeypatch.setattr(s, "update_tasks", boom)
+
+    result = await s.execute_declutter(mid, confirm="DECLUTTER 1")
+    assert "Error executing declutter manifest" in result
+    assert "glue-code exploded" in result
+    # The manifest was already marked consumed before the crash — that's fine,
+    # as long as the caller gets a readable error instead of an unhandled
+    # exception with no response.
+    assert s._MANIFESTS[mid]["consumed"] is True
