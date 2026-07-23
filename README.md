@@ -52,6 +52,79 @@ subscription, no Anthropic API key needed — and set `CLAUDE_CLI_URL` /
 Without it, everything still works — declutter just falls back to
 exact-title matching, and destination suggestions are skipped.
 
+## Two TickTick APIs, and what breaks if the unofficial one goes down
+
+This server talks to TickTick over two very different APIs. It's worth
+understanding the split before you depend on it for anything important.
+
+- **v1 — official Open API.** Documented, stable, OAuth-authenticated —
+  what `TICKTICK_ACCESS_TOKEN` unlocks. It's also very limited: the Open API
+  only exposes single-item operations — get/create/update/delete/complete
+  *one* task or project at a time, plus create-subtask. It has **no listing,
+  no filtering, no batch operations, no `get_changes`, no task history, no
+  habits, no trash/restore, and no project groups.**
+- **v2 — unofficial, reverse-engineered.** What `TICKTICK_V2_TOKEN` (the
+  browser session cookie) unlocks. It's the sync API TickTick's own web and
+  mobile clients use internally — undocumented, changed at TickTick's
+  convenience, with zero support contract or notice period. It also powers
+  almost everything people actually use this server for day to day: listing
+  every open task in one call (including the Inbox), filtering by due date /
+  priority / tag, searching, batch create/update/complete/delete, the
+  `plan_declutter`/`execute_declutter` dedup pass, `get_changes` (the audit
+  feed), habits, project groups, trash/restore, and comments.
+
+**The gate isn't always the engine.** A number of read tools —
+`get_all_tasks`, `search_tasks`, `get_tasks_due_today` and its siblings,
+`get_recurring_tasks`, `get_engaged_tasks`, `get_next_tasks` — check that the
+v1 client is configured before running (so there's a fallback path), but when
+`TICKTICK_V2_TOKEN` is set they actually read from the v2 sync state in one
+fast call and only fall back to slow per-project v1 iteration when v2 is
+unavailable. Same story for the write tools: `create_tasks`, `update_tasks`,
+and `complete_tasks` create/update/complete a lone task via v1, but tags,
+assignees, kanban columns, nested subtask trees, and any true batch (more
+than one task, no advanced fields) all go through v2 — with v1 as a slower,
+narrower fallback when v2 is off.
+
+| Capability | API | Notes |
+|---|---|---|
+| Get / create / update / delete / complete **one** task or project, by id | v1 | The only thing guaranteed to survive a v2 outage |
+| Create a subtask under an existing task | v1 | `create_subtask` |
+| List/browse projects and a single project's tasks | v1 | `get_projects`, `get_project`, `get_project_tasks`, `get_task` |
+| List/filter across **all** open tasks (priority, due today/tomorrow/in N days/this week, overdue, search, recurring, GTD engaged/next) | v2 preferred, v1 fallback | v1 fallback works but is slower (one request per project) and omits the Inbox |
+| Batch create / update / complete (>1 task, no advanced fields) | v2, v1 fallback | Without v2 these degrade to one-at-a-time v1 calls — no tags/assignee/columns |
+| Tags, assignees, kanban columns/sections, nested subtask trees, `move_task`, `set_task_parent`/`unset_task_parent` | v2 only | No official-API equivalent exists |
+| Completed-tasks list, Inbox read, project groups (folders) | v2 only | — |
+| Habits (`get_habits` / `checkin_habit` / `get_habit_checkins`) | v2 only | — |
+| Trash / restore | v2 only | — |
+| Task comments, `get_task_activity` (edit history), `get_changes` (the audit-log feed) | v2 only | — |
+| `plan_declutter` / `execute_declutter` (dedup, SMART rewrite) | v2 only | Reads the whole task pool via v2 sync state; nothing to fall back to |
+| Project members, `get_statistics` | v2 only | — |
+
+**If v2 breaks** — TickTick changes their web client and the sync API
+underneath it, with no notice and no changelog, since it was never a
+contract to begin with — everything in the "v2 only" rows above stops
+working, and the "v2 preferred" rows fall back to their slower, narrower v1
+path. What keeps working unconditionally is single-task/single-project CRUD
+by id (get/create/update/delete/complete) plus creating a subtask. In short:
+TickTick becomes usable only one task at a time, by id — everything that
+depends on *seeing* the whole task pool at once (which is most of what makes
+this server useful to an LLM) is gone until v2 comes back or TickTick ships
+an equivalent official endpoint. The server fails soft, not hard: v2 tools
+return a clear "not enabled / session expired" message instead of crashing,
+so a v2 outage degrades functionality rather than taking down the whole
+server.
+
+**Why there's no separate v1-only fallback server.** This was considered and
+rejected. A v1-only server could only offer bare single-task/single-project
+CRUD — no listing, no filtering, no batch, no `get_changes`-based audit
+logging, no habits, no dedup — which isn't enough surface area to run any of
+this project's actual daily-use workflows (declutter, batch task management,
+audit logging). Building one wouldn't buy real resilience; it would just be
+this same server with `TICKTICK_V2_TOKEN` unset, which you already get for
+free today by leaving that variable out. If v2 ever breaks for good, the fix
+is a client update here (or TickTick shipping a broader official API) — not
+maintaining a second codebase that covers a fraction of the functionality.
+
 ## Environment variables
 
 | Variable | Required | Purpose |
