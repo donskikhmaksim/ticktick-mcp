@@ -217,6 +217,32 @@ def format_task_line(task: Dict, project_name: str = None) -> str:
     return line + f"  (id:{task.get('id')} proj:{task.get('projectId')})"
 
 
+def _v2_project_names_or_none() -> Optional[Dict]:
+    """Like _v2_project_names(), but returns None — never {} — when every
+    fetch path raised. _v2_project_names()'s plain {} return conflates "no
+    projects" with "couldn't check"; callers that treat an empty result as
+    CONFIRMED ABSENCE (delete_project's post-verify, _verify_item's
+    "delete_project" branch) must not read a failed refetch as a successful
+    deletion. Use this instead of _v2_project_names() anywhere the caller's
+    next move depends on "did this really disappear" rather than just
+    wanting a human-readable name for display."""
+    if ticktick_v2:
+        try:
+            st = ticktick_v2.get_state()
+            names = {p["id"]: p.get("name") for p in (st.get("projectProfiles") or [])}
+            if st.get("inboxId"):
+                names[st["inboxId"]] = "Inbox"
+            return names
+        except Exception:
+            pass
+    if ticktick:
+        try:
+            return {p.get("id"): p.get("name") for p in (ticktick.get_projects() or [])}
+        except Exception:
+            pass
+    return None
+
+
 def _v2_project_names() -> Dict:
     """Map projectId -> name (incl. Inbox) from the cached v2 state,
     falling back to the official v1 API so results stay human-readable
@@ -2076,6 +2102,20 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         verb = "закрыта" if op == "complete" else "отмечена «не буду делать»"
         return (f"- ❌ **«{title}»** — всё ещё среди открытых" if live
                 else f"- ✅ **«{title}»** — {verb} (ушла из открытых)")
+    if op == "delete_project":
+        # tid here is the PROJECT id, not a task id. Re-fetch fresh via the
+        # None-distinguishing helper rather than trusting the `names` dict
+        # the caller already had — a stale/failed fetch must never read as
+        # "project confirmed deleted".
+        fresh_names = _v2_project_names_or_none()
+        if fresh_names is None:
+            return (f"- ⚠️ **«{title}»** — проект: проверка не удалась (не "
+                    "получилось перечитать список проектов), исход НЕ "
+                    "ПОДТВЕРЖДЁН")
+        still = fresh_names.get(tid)
+        return (f"- ❌ **«{title}»** — проект ВСЁ ЕЩЁ существует (удаление не "
+                "подтвердилось)" if still else
+                f"- ✅ **«{title}»** — проект удалён")
     if live is None:
         return f"- ❌ **«{title}»** — не найдена среди открытых (ожидалась живой)"
     if op == "create":
@@ -3003,14 +3043,30 @@ async def create_project(
         logger.error(f"Error in create_project: {e}")
         return f"Error creating project: {str(e)}"
 
+_PROJECT_DELETE_SAMPLE_CAP = 20  # preview lines shown before the confirm echo
+
+
 @mcp.tool()
-async def delete_project(project_name: str, project_id: str) -> str:
+async def delete_project(project_name: str, project_id: str, confirm: str = "") -> str:
     """
-    Delete a project permanently.
+    ⚠️ Delete a project permanently — TickTick's own cascade ALSO deletes every
+    task the project contains (uncapped blast radius: a project can hold any
+    number of tasks). Irreversible, so this uses the same count-then-confirm
+    pattern as delete_tasks/execute_task_deletion instead of a bare id check:
+
+    1st call (confirm omitted or wrong): deletes NOTHING. Returns the project's
+    CURRENT contained-task count plus a short sample of titles, and the exact
+    confirm string to echo back.
+    2nd call: pass confirm="DELETE <N>" with N = the count just shown. The
+    count is re-read fresh on EVERY call (nothing cached from the first call),
+    so a stale/guessed N — or the project having changed in between — is
+    refused rather than silently deleted against an outdated count.
 
     Args:
         project_name: Name of the project (shown first in confirmation dialog)
         project_id: ID of the project
+        confirm: literal "DELETE <N>", N = number of tasks currently in the
+            project per THIS tool's own preview. Omit on the first call.
     """
     err = _ensure_official()
     if err:
@@ -3022,12 +3078,91 @@ async def delete_project(project_name: str, project_id: str) -> str:
     if refuse:
         return refuse
     live_name = _v2_project_names().get(project_id, project_name)
+
+    # Blast-radius disclosure: read the project's CURRENT contents fresh on
+    # every call (no stored plan/manifest) — the compare below is always
+    # against what's live right now, so drift between preview and confirm
+    # naturally re-triggers a fresh preview instead of deleting stale counts.
+    try:
+        data = await _run_blocking(lambda: ticktick.get_project_with_data(project_id))
+    except Exception as e:
+        logger.error(f"Error in delete_project (fetching contents): {e}")
+        return (f"🛑 Не смог прочитать содержимое проекта «{live_name}» — отказ "
+                f"(не удаляю вслепую): {str(e)}")
+    if 'error' in data:
+        return (f"🛑 Не смог прочитать содержимое проекта «{live_name}» — отказ "
+                f"(не удаляю вслепую): {data['error']}")
+    tasks = data.get('tasks') or []
+    count = len(tasks)
+    expected = f"DELETE {count}"
+
+    if confirm.strip() != expected:
+        lines = [f"⚠️ Проект «{live_name}» содержит {count} задач(и) — при "
+                 "удалении проекта TickTick удалит их ВМЕСТЕ с ним, "
+                 "безвозвратно.", ""]
+        if tasks:
+            for t in tasks[:_PROJECT_DELETE_SAMPLE_CAP]:
+                lines.append(format_task_line(t))
+            if count > _PROJECT_DELETE_SAMPLE_CAP:
+                lines.append(f"... и ещё {count - _PROJECT_DELETE_SAMPLE_CAP}.")
+            lines.append("")
+        lines.append("Ничего не удалено. Чтобы подтвердить, вызови ещё раз с "
+                     f'confirm="{expected}".')
+        return "\n".join(lines)
+
+    # Confirmed — journal a pre-delete snapshot of the project AND every
+    # contained task BEFORE the actual delete call, same convention as
+    # delete_tasks/execute_task_deletion (snapshot first, mutate second).
+    record_id = "delete_project-" + uuid.uuid4().hex[:8]
+    snap_fields = ("title", "content", "desc", "dueDate", "startDate",
+                   "priority", "tags", "parentId", "isAllDay")
+    _journal_write({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "manifest": record_id, "op": "delete_project",
+        "summary": f"Удаление проекта «{live_name}» ({count} задач)",
+        "items": [{"taskId": project_id, "title": live_name}],
+    })
+    if tasks:
+        _journal_write({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "manifest": record_id,
+            "summary": f"Задачи проекта «{live_name}», удаляемые каскадом",
+            "deleted": [{**{k: t.get(k) for k in snap_fields
+                            if t.get(k) is not None},
+                        "taskId": t.get("id"), "title": t.get("title")}
+                       for t in tasks],
+        })
+
     try:
         result = await _run_blocking(lambda: ticktick.delete_project(project_id))
         if 'error' in result:
-            return f"Error deleting project: {result['error']}"
+            return (f"❌ TickTick отклонил удаление проекта «{live_name}»: "
+                    f"{result['error']}\n{_report_line(record_id)}")
 
-        return f"Project '{live_name}' deleted successfully."
+        # Post-verify against FRESH state: the project must no longer resolve.
+        if ticktick_v2:
+            try:
+                ticktick_v2.invalidate_cache()
+            except Exception:
+                pass
+        names_after = _v2_project_names_or_none()
+        lines = []
+        if names_after is None:
+            # Fetch failed outright — a failed refetch must never read as a
+            # confirmed deletion (the TickTick call above may have genuinely
+            # succeeded; we just couldn't check).
+            lines.append(f"⚠️ Проект «{live_name}» отправлен на удаление, но "
+                         "проверить результат не удалось (не получилось "
+                         "перечитать список проектов) — исход НЕ ПОДТВЕРЖДЁН. "
+                         "Повтори operation_report позже.")
+        elif names_after.get(project_id):
+            lines.append(f"❌ Проект «{live_name}» ВСЁ ЕЩЁ существует — "
+                         "удаление не подтвердилось.")
+        else:
+            lines.append(f"🗑 Проект «{live_name}» удалён вместе с {count} "
+                         "задачами.")
+        lines.append(_report_line(record_id))
+        return "\n".join(lines)
     except Exception as e:
         logger.error(f"Error in delete_project: {e}")
         return f"Error deleting project: {str(e)}"
