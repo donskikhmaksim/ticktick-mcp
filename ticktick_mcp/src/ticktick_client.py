@@ -6,12 +6,9 @@ import base64
 import threading
 import requests
 import logging
-from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from typing import Dict, List
-
-from zoneinfo import ZoneInfo
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -63,25 +60,21 @@ def save_token_file(tokens: Dict[str, str]) -> bool:
 
 _DATE_ONLY = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
-# User's local timezone for all-day date storage. Set USER_TIMEZONE env var
-# (e.g. "America/Los_Angeles") so midnight means local midnight, not UTC midnight.
-_USER_TZ = ZoneInfo(os.getenv("USER_TIMEZONE", "UTC"))
-
 
 def _normalize_date(value):
-    """If a date is given without a time (YYYY-MM-DD), it's an all-day date:
-    return (local-midnight-padded value, True). Otherwise return (value, False).
-    Midnight is in the user's local timezone (USER_TIMEZONE env var) so TickTick
-    stores the correct calendar date rather than off-by-one due to UTC conversion."""
+    """If a date is given without a time (YYYY-MM-DD), it's a ZONE-INDEPENDENT
+    all-day calendar date: return (value at UTC midnight, True). Otherwise return
+    (value, False).
+
+    We deliberately anchor the date at +0000 (UTC midnight), NOT the user's local
+    zone. A positive-offset local midnight (e.g. Europe/Moscow +03) serializes to
+    the PREVIOUS UTC day, whose date part TickTick then renders one calendar day
+    early (#36). UTC midnight keeps the date part verbatim regardless of the
+    account's offset sign, and the read side takes dueDate[:10] for all-day tasks,
+    so it round-trips to the same calendar date. Timed values pass through
+    untouched — they carry their own offset."""
     if value and _DATE_ONLY.match(value.strip()):
-        naive = datetime.fromisoformat(value.strip() + "T00:00:00")
-        local_midnight = naive.replace(tzinfo=_USER_TZ)
-        offset = local_midnight.utcoffset()
-        total_minutes = int(offset.total_seconds() / 60)
-        sign = '+' if total_minutes >= 0 else '-'
-        h, m = divmod(abs(total_minutes), 60)
-        tz_str = f"{sign}{h:02d}{m:02d}"
-        return value.strip() + f"T00:00:00{tz_str}", True
+        return value.strip() + "T00:00:00.000+0000", True
     return value, False
 
 class TickTickClient:
