@@ -2220,6 +2220,702 @@ def _build_operation_report(record_id: str) -> str:
         return f"Error building operation report: {str(e)}"
 
 
+# ---------------------------------------------------------------------------
+# Retroactive declutter ("разбор помойки") — plan → confirm → execute
+# ---------------------------------------------------------------------------
+# The ingest pipeline (tg-ai) dedupes NEW tasks at capture time. This works
+# RETROACTIVELY over the EXISTING pile of open tasks: it clusters near-duplicate
+# titles, flags long-overdue/stale candidates, spots umbrella groups, and
+# proposes SMART re-titles. It CREATES and CHANGES nothing — plan_declutter
+# builds a manifest, execute_declutter (after an explicit confirm token) routes
+# every mutation through the already-audited deletion / update / parent tools,
+# so each one is identity-guarded, journalled and post-verified. The same
+# safety philosophy as the ingest judge governs the analysis: uncertain merges
+# default to KEEP-BOTH, and obsolete tasks are only FLAGGED — never auto-deleted
+# or auto-completed.
+
+# Similarity threshold for fuzzy (token-Jaccard) duplicate candidates — only
+# reached when the CLAUDE_CLI judge is available to confirm each candidate.
+_DC_FUZZY_THRESHOLD = 0.6
+# Obsolete = overdue by at least this many days AND untouched at least this long.
+_DC_OBSOLETE_OVERDUE_DAYS = 30
+_DC_OBSOLETE_STALE_DAYS = 60
+
+
+def _dc_tokens(title: str) -> set:
+    """Normalised word-token set of a title (for Jaccard similarity)."""
+    return set(re.findall(r"\w+", _norm_name(title), flags=re.UNICODE))
+
+
+def _dc_jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _dc_shim_available() -> bool:
+    return bool(os.environ.get("CLAUDE_CLI_URL") and os.environ.get("CLAUDE_CLI_TOKEN"))
+
+
+def _dc_shim_json(system: str, prompt: str, timeout: int = 90,
+                  fail_tracker: Optional[list] = None):
+    """Call the CLAUDE_CLI shim and return the parsed JSON array/object, or None
+    on ANY failure (unset, unreachable, malformed). Same shim the bot and
+    _suggest_destinations use.
+
+    fail_tracker: optional mutable list — if the shim WAS configured (url set)
+    but the call itself failed (network error, non-ok response, unparsable
+    reply), True is appended so callers can distinguish "not configured" from
+    "configured but degraded during this run"."""
+    url = os.environ.get("CLAUDE_CLI_URL")
+    token = os.environ.get("CLAUDE_CLI_TOKEN")
+    if not url:
+        return None
+    import requests as _rq
+    try:
+        r = _rq.post(url, json={
+            "system": system,
+            "prompt": prompt,
+            "model": os.environ.get("CLAUDE_CLI_MODEL", "sonnet"),
+        }, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("ok"):
+            if fail_tracker is not None:
+                fail_tracker.append(True)
+            return None
+        text = data.get("result") or ""
+        a = min([i for i in (text.find("["), text.find("{")) if i != -1] or [-1])
+        b = max(text.rfind("]"), text.rfind("}"))
+        if a == -1 or b == -1:
+            if fail_tracker is not None:
+                fail_tracker.append(True)
+            return None
+        return json.loads(text[a:b + 1])
+    except Exception as e:
+        logger.warning(f"declutter shim call failed: {e}")
+        if fail_tracker is not None:
+            fail_tracker.append(True)
+        return None
+
+
+def _dc_cluster_duplicates(tasks: List[Dict], fuzzy: bool) -> List[Dict]:
+    """Cluster open tasks by title. Returns list of {"tasks": [...], "exact":
+    bool}. EXACT clusters share an identical normalised title (safe to act on
+    even without the LLM). When fuzzy=True, remaining tasks are additionally
+    grouped by token-Jaccard ≥ threshold into non-exact clusters (candidates
+    that REQUIRE the judge to confirm). Only clusters of size ≥ 2 are returned."""
+    # Exact normalised-title buckets first.
+    exact: Dict[str, List[Dict]] = {}
+    for t in tasks:
+        key = _norm_name(t.get("title") or "")
+        if key:
+            exact.setdefault(key, []).append(t)
+    clusters: List[Dict] = []
+    claimed = set()
+    for key, group in exact.items():
+        if len(group) >= 2:
+            clusters.append({"tasks": group, "exact": True})
+            for t in group:
+                claimed.add(t.get("id"))
+    if not fuzzy:
+        return clusters
+    # Fuzzy pass over the not-yet-claimed tasks: greedy single-link by Jaccard.
+    rest = [t for t in tasks if t.get("id") not in claimed and (t.get("title") or "").strip()]
+    toks = {t.get("id"): _dc_tokens(t.get("title") or "") for t in rest}
+    used = set()
+    for i, a in enumerate(rest):
+        if a.get("id") in used:
+            continue
+        group = [a]
+        used.add(a.get("id"))
+        for b in rest[i + 1:]:
+            if b.get("id") in used:
+                continue
+            if _dc_jaccard(toks[a.get("id")], toks[b.get("id")]) >= _DC_FUZZY_THRESHOLD:
+                group.append(b)
+                used.add(b.get("id"))
+        if len(group) >= 2:
+            clusters.append({"tasks": group, "exact": False})
+    return clusters
+
+
+def _dc_metadata_score(task: Dict) -> tuple:
+    """Richness score for choosing which duplicate to KEEP — the survivor should
+    carry the most information. Higher tuple sorts first."""
+    return (
+        1 if task.get("dueDate") else 0,
+        task.get("priority") or 0,
+        len(task.get("content") or task.get("desc") or ""),
+        len(task.get("tags") or []),
+        # Older task (earlier createdTime) breaks ties — keep the original.
+        -(_dc_created_sort_key(task)),
+    )
+
+
+def _dc_created_sort_key(task: Dict) -> float:
+    dt = _parse_ticktick_datetime(task.get("createdTime"))
+    return dt.timestamp() if dt else 0.0
+
+
+def _dc_pick_primary(cluster_tasks: List[Dict]) -> int:
+    """Index of the task to KEEP within a duplicate cluster (richest metadata)."""
+    best_i, best_score = 0, None
+    for i, t in enumerate(cluster_tasks):
+        score = _dc_metadata_score(t)
+        if best_score is None or score > best_score:
+            best_i, best_score = i, score
+    return best_i
+
+
+def _dc_task_age_days(task: Dict, now: datetime) -> Optional[int]:
+    """Days since the task was last modified (or created). None if unknown."""
+    dt = _parse_ticktick_datetime(task.get("modifiedTime") or task.get("createdTime"))
+    if dt is None:
+        return None
+    return (now - dt).days
+
+
+def _dc_is_obsolete(task: Dict, today, now: datetime) -> Optional[Dict]:
+    """A long-overdue AND untouched task → {overdue_days, age_days}. None when
+    it is not a stale-obsolete candidate. FLAG-only: never acted on."""
+    due = _task_due_local_date(task)
+    if due is None:
+        return None
+    overdue_days = (today - due).days
+    if overdue_days < _DC_OBSOLETE_OVERDUE_DAYS:
+        return None
+    age = _dc_task_age_days(task, now)
+    if age is not None and age < _DC_OBSOLETE_STALE_DAYS:
+        return None
+    return {"overdue_days": overdue_days, "age_days": age}
+
+
+def _dc_is_nonsmart_candidate(title: str) -> bool:
+    """Cheap prefilter for non-SMART titles: a very short / vague title (≤ 2
+    meaningful words). The LLM does the actual judging + reformulation; without
+    it these are surfaced as flags only."""
+    toks = _dc_tokens(title)
+    return 1 <= len(toks) <= 2
+
+
+def _dc_word_prefix(short_title: str, long_title: str) -> bool:
+    """True if short_title's tokens are a PROPER leading sub-sequence of
+    long_title's tokens — i.e. short is a natural umbrella/header for long."""
+    st = re.findall(r"\w+", _norm_name(short_title), flags=re.UNICODE)
+    lt = re.findall(r"\w+", _norm_name(long_title), flags=re.UNICODE)
+    return bool(st) and len(st) < len(lt) and lt[:len(st)] == st
+
+
+def _dc_group_candidates(tasks: List[Dict], skip_ids: set) -> List[Dict]:
+    """Umbrella groups: a task whose title is a word-prefix of ≥ 2 other open
+    tasks IN THE SAME PROJECT becomes the parent, those become children. Only
+    genuine headers qualify (no synthetic parents) — safe, reversible nesting.
+    Tasks already parented, or in skip_ids (e.g. slated for deletion), are
+    excluded."""
+    pool = [t for t in tasks
+            if t.get("id") not in skip_ids and not t.get("parentId")
+            and (t.get("title") or "").strip()]
+    by_project: Dict[str, List[Dict]] = {}
+    for t in pool:
+        by_project.setdefault(t.get("projectId") or "", []).append(t)
+    groups: List[Dict] = []
+    used = set()
+    for pid, plist in by_project.items():
+        # Longer titles first so a shorter header is tested against them.
+        for parent in sorted(plist, key=lambda t: len(_dc_tokens(t.get("title") or ""))):
+            if parent.get("id") in used:
+                continue
+            children = [c for c in plist
+                        if c.get("id") not in used and c.get("id") != parent.get("id")
+                        and _dc_word_prefix(parent.get("title") or "", c.get("title") or "")]
+            if len(children) >= 2:
+                used.add(parent.get("id"))
+                for c in children:
+                    used.add(c.get("id"))
+                groups.append({"parent": parent, "children": children})
+    return groups
+
+
+def _dc_analyze(tasks: List[Dict], names: Dict, judge_fn=None, smart_fn=None,
+                today=None, now: Optional[datetime] = None,
+                fuzzy: bool = True) -> Dict:
+    """Pure analysis core (no I/O): from a list of live open tasks build the
+    proposed declutter actions + flags. judge_fn/smart_fn are injected so the
+    logic is unit-testable with mocks; the real tool wires them to the shim.
+
+    judge_fn(clusters) -> aligned list of {"is_duplicate": bool, "keep": int,
+        "reason": str} (or [] / None to abstain → KEEP-BOTH).
+    smart_fn(titles) -> aligned list of {"new_title": str, "reason": str}
+        (empty new_title → leave as-is).
+
+    Returns dict with mutating action lists (delete/rename/group) and flag lists
+    (flag_obsolete/flag_dupe/flag_nonsmart)."""
+    today = today or _today_local()
+    now = now or datetime.now(timezone.utc)
+    out = {"delete": [], "rename": [], "group": [],
+           "flag_obsolete": [], "flag_dupe": [], "flag_nonsmart": []}
+    consumed = set()  # ids already claimed by a delete/rename/group action
+
+    # Ids that are the parentId of at least one task in THIS SAME open-task
+    # pass — i.e. tasks with live children. A task with live children must
+    # NEVER be the "redundant" (delete) side of a duplicate pair: deleting it
+    # would orphan its children (parentId pointing at a deleted task).
+    # plan_task_deletion already guards this with BFS subtree expansion;
+    # declutter's own duplicate-scoring must not bypass that protection.
+    children_of = {t.get("parentId") for t in tasks if t.get("parentId")}
+
+    # ---- 1. Duplicate clusters -------------------------------------------
+    clusters = _dc_cluster_duplicates(tasks, fuzzy=fuzzy)
+    fuzzy_clusters = [c for c in clusters if not c["exact"]]
+    verdicts = {}
+    if fuzzy_clusters and judge_fn:
+        try:
+            res = judge_fn([[t.get("title") or "" for t in c["tasks"]]
+                            for c in fuzzy_clusters]) or []
+            for i, v in enumerate(res):
+                if isinstance(v, dict):
+                    verdicts[i] = v
+        except Exception as e:
+            logger.warning(f"declutter judge failed: {e}")
+
+    fuzzy_idx = 0
+    for c in clusters:
+        ctasks = c["tasks"]
+        if c["exact"]:
+            confident, keep_i, reason = True, _dc_pick_primary(ctasks), "идентичные названия"
+        else:
+            v = verdicts.get(fuzzy_idx)
+            fuzzy_idx += 1
+            # Bias to KEEP-BOTH: only merge when the judge is explicitly sure.
+            if v and v.get("is_duplicate") is True:
+                keep_i = v.get("keep")
+                keep_i = keep_i if isinstance(keep_i, int) and 0 <= keep_i < len(ctasks) \
+                    else _dc_pick_primary(ctasks)
+                confident, reason = True, (v.get("reason") or "судья подтвердил дубликат")
+            else:
+                confident, keep_i, reason = False, None, (
+                    (v or {}).get("reason") or "похожи, но слияние не подтверждено")
+
+        # Finding #2: the fuzzy pass is anchor/"star" clustering — every member
+        # is only checked against the cluster's anchor, never against each
+        # other, so a 3+-member cluster can silently mix a genuine duplicate
+        # pair with a task that only shares anchor-similarity. The judge
+        # returns a single is_duplicate/keep verdict for the WHOLE cluster, so
+        # an all-or-nothing delete on 3+ members risks wiping a distinct task.
+        # Cap auto-delete at exactly 2 members; any bigger FUZZY cluster is
+        # routed to flag_dupe as a suggestion instead, regardless of verdict.
+        if confident and not c["exact"] and len(ctasks) >= 3:
+            confident, keep_i = False, None
+            reason = ("группа из 3+ похожих задач — попарное сходство между "
+                      "всеми не гарантировано, слияние не автоматическое, "
+                      "проверь сам")
+
+        # Finding #1: a task with live children must never be the deleted
+        # side. If exactly one cluster member has children, force it onto the
+        # KEEP side regardless of metadata scoring / judge choice. If 2+
+        # members have children, there is no safe single keeper — flag it.
+        if confident:
+            child_ids = [t.get("id") for t in ctasks if t.get("id") in children_of]
+            if len(child_ids) >= 2:
+                confident, keep_i = False, None
+                reason = ("у нескольких похожих задач есть живые подзадачи — "
+                          "не могу безопасно выбрать, кого оставить, реши сам")
+            elif len(child_ids) == 1:
+                forced_i = next(j for j, t in enumerate(ctasks)
+                                if t.get("id") == child_ids[0])
+                if forced_i != keep_i:
+                    keep_i = forced_i
+                    reason = reason + " (оставил — у задачи есть подзадачи)"
+
+        if confident:
+            keeper = ctasks[keep_i]
+            consumed.add(keeper.get("id"))
+            redundant = [t for j, t in enumerate(ctasks) if j != keep_i]
+            for r in redundant:
+                consumed.add(r.get("id"))
+                out["delete"].append({
+                    "taskId": r.get("id"), "projectId": r.get("projectId"),
+                    "title": r.get("title") or "", "snapshot": _snapshot_of(r),
+                    "keep_title": keeper.get("title") or "",
+                    "keep_id": keeper.get("id"),
+                    "project": names.get(r.get("projectId"), ""),
+                    "reason": reason,
+                })
+        else:
+            out["flag_dupe"].append({
+                "titles": [t.get("title") or "" for t in ctasks],
+                "ids": [t.get("id") for t in ctasks],
+                "reason": reason,
+            })
+
+    # ---- 2. Obsolete (FLAG ONLY — never mutated) -------------------------
+    for t in tasks:
+        info = _dc_is_obsolete(t, today, now)
+        if info:
+            out["flag_obsolete"].append({
+                "taskId": t.get("id"), "title": t.get("title") or "",
+                "project": names.get(t.get("projectId"), ""),
+                "due": str(t.get("dueDate"))[:10] if t.get("dueDate") else "",
+                "overdue_days": info["overdue_days"], "age_days": info["age_days"],
+            })
+
+    # ---- 3. Umbrella groups ---------------------------------------------
+    for g in _dc_group_candidates(tasks, skip_ids=consumed):
+        parent = g["parent"]
+        kids = [c for c in g["children"] if c.get("id") not in consumed]
+        if len(kids) < 2:
+            continue
+        consumed.add(parent.get("id"))
+        for c in kids:
+            consumed.add(c.get("id"))
+        out["group"].append({
+            "parentId": parent.get("id"), "parent_title": parent.get("title") or "",
+            "project_id": parent.get("projectId"),
+            "project": names.get(parent.get("projectId"), ""),
+            "children": [{"taskId": c.get("id"), "title": c.get("title") or "",
+                          "projectId": c.get("projectId")} for c in kids],
+        })
+
+    # ---- 4. Non-SMART titles --------------------------------------------
+    cand = [t for t in tasks if t.get("id") not in consumed
+            and _dc_is_nonsmart_candidate(t.get("title") or "")]
+    rewrites = {}
+    if cand and smart_fn:
+        try:
+            res = smart_fn([t.get("title") or "" for t in cand]) or []
+            for i, v in enumerate(res):
+                if isinstance(v, dict):
+                    rewrites[i] = v
+        except Exception as e:
+            logger.warning(f"declutter smart rewrite failed: {e}")
+    for i, t in enumerate(cand):
+        v = rewrites.get(i)
+        new_title = (v or {}).get("new_title") if v else None
+        if new_title and _norm_name(new_title) and _norm_name(new_title) != _norm_name(t.get("title") or ""):
+            consumed.add(t.get("id"))
+            out["rename"].append({
+                "taskId": t.get("id"), "projectId": t.get("projectId"),
+                "title": t.get("title") or "", "new_title": new_title.strip(),
+                "project": names.get(t.get("projectId"), ""),
+                "reason": (v or {}).get("reason") or "",
+            })
+        else:
+            out["flag_nonsmart"].append({
+                "taskId": t.get("id"), "title": t.get("title") or "",
+                "project": names.get(t.get("projectId"), ""),
+            })
+    return out
+
+
+def _dc_judge_fn(clusters: List[List[str]],
+                 fail_tracker: Optional[list] = None) -> List[Dict]:
+    """Wire the fuzzy-cluster judge to the shim. Bias: KEEP-BOTH unless sure."""
+    if not clusters:
+        return []
+    blocks = []
+    for i, titles in enumerate(clusters):
+        lst = "\n".join(f"   {j}. «{t}»" for j, t in enumerate(titles))
+        blocks.append(f"Кластер {i}:\n{lst}")
+    prompt = (
+        "Ниже кластеры ПОХОЖИХ задач владельца. Для КАЖДОГО реши: это один и тот "
+        "же пункт (дубликаты, можно слить), или разные дела? Правило безопасности: "
+        "если сомневаешься — is_duplicate=false (лучше оставить обе, чем потерять "
+        "задачу). Когда дубликаты — укажи keep = индекс той версии, которую оставить "
+        "(с датой/приоритетом/деталями).\n\n"
+        + "\n\n".join(blocks) +
+        '\n\nОтвет СТРОГО JSON-массивом по одному объекту на кластер:\n'
+        '[{"i":0,"is_duplicate":true,"keep":1,"reason":"<кратко>"}]'
+    )
+    res = _dc_shim_json("Ты вычищаешь дубликаты в списке задач. Отвечай только JSON.",
+                        prompt, fail_tracker=fail_tracker)
+    if not isinstance(res, list):
+        return []
+    aligned = [{} for _ in clusters]
+    for it in res:
+        if isinstance(it, dict):
+            idx = it.get("i")
+            if isinstance(idx, int) and 0 <= idx < len(clusters):
+                aligned[idx] = it
+    return aligned
+
+
+def _dc_smart_fn(titles: List[str], fail_tracker: Optional[list] = None) -> List[Dict]:
+    """Wire the SMART-rewrite proposer to the shim."""
+    if not titles:
+        return []
+    numbered = "\n".join(f"{i}. «{t}»" for i, t in enumerate(titles))
+    prompt = (
+        "Ниже короткие/расплывчатые названия задач. Для каждого предложи более "
+        "SMART-формулировку: конкретное действие + объект (что именно сделать и с "
+        "чем), тем же языком. Время/срок ДОБАВЛЯТЬ НЕ обязательно. Если название "
+        "уже нормальное — верни пустую строку в new_title.\n\n"
+        f"{numbered}\n\n"
+        'Ответ СТРОГО JSON-массивом:\n'
+        '[{"i":0,"new_title":"<или пусто>","reason":"<кратко>"}]'
+    )
+    res = _dc_shim_json("Ты переформулируешь задачи в SMART-вид. Отвечай только JSON.",
+                        prompt, fail_tracker=fail_tracker)
+    if not isinstance(res, list):
+        return []
+    aligned = [{} for _ in titles]
+    for it in res:
+        if isinstance(it, dict):
+            idx = it.get("i")
+            if isinstance(idx, int) and 0 <= idx < len(titles):
+                aligned[idx] = it
+    return aligned
+
+
+def _dc_scope_filter(tasks: List[Dict], names: Dict, scope: str) -> List[Dict]:
+    """Optional narrowing. scope='inbox' → Inbox only; otherwise a case-
+    insensitive substring match on the project name."""
+    s = (scope or "").strip().lower()
+    if not s:
+        return tasks
+    if s == "inbox":
+        return [t for t in tasks if names.get(t.get("projectId"), "").lower() == "inbox"]
+    return [t for t in tasks
+            if s in (names.get(t.get("projectId"), "") or "").lower()]
+
+
+def _dc_mutating_count(actions: Dict) -> int:
+    return (len(actions["delete"]) + len(actions["rename"])
+            + sum(len(g["children"]) for g in actions["group"]))
+
+
+@mcp.tool(annotations=READONLY)
+async def plan_declutter(scope: str = "", dry_run: bool = True) -> str:
+    """
+    Phase 1 of the retroactive declutter ("разбор помойки"): READ every open
+    task and propose how to tidy the EXISTING pile. Read-only — creates and
+    changes NOTHING. This is the retro counterpart to ingest-time dedup: it
+    works over what is ALREADY in TickTick.
+
+    Analyses for: (1) DUPLICATE clusters — near-identical tasks; the redundant
+    copies are proposed for deletion, the richest kept (uncertain merges default
+    to KEEP-BOTH and are only flagged); (2) OBSOLETE — long-overdue + untouched
+    tasks, FLAGGED for a human, never auto-completed/deleted; (3) GROUPABLE —
+    umbrella tasks whose title is a header of others (proposed nesting);
+    (4) non-SMART titles — a proposed clearer reformulation.
+
+    When the CLAUDE_CLI shim is set it judges fuzzy duplicate merges (bias
+    keep-both) and writes the SMART reformulations. When it is unset/unreachable
+    the analysis DEGRADES to rule-based exact-title duplicates only and says so.
+
+    IMPORTANT: reprint the returned manifest VERBATIM to the user, get an
+    explicit «да», then call execute_declutter(manifest_id, confirm="DECLUTTER
+    <N>"). Nothing mutates until then. Manifests are one-shot, expire in 1 h.
+
+    Args:
+        scope: optional narrowing — 'inbox', or a project-name substring
+        dry_run: retained for symmetry; plan_declutter is always read-only
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    _prune_manifests()
+    by_id = _open_by_id(fresh=True)
+    if by_id is None:
+        return _STATE_UNAVAILABLE_MSG
+    names = _v2_project_names()
+    tasks = _dc_scope_filter(list(by_id.values()), names, scope)
+    if not tasks:
+        return ("Открытых задач в этой области нет — разбирать нечего."
+                + (f" (scope='{scope}')" if scope else ""))
+
+    shim = _dc_shim_available()
+    # Track whether a shim call actually FAILED during this run (vs. simply
+    # being unconfigured) so the manifest can warn accurately — "shim
+    # unavailable" previously only reflected the env vars being unset, not a
+    # real degraded call (timeout/bad response/malformed JSON) mid-analysis.
+    shim_fail_tracker: list = []
+    judge_fn = (lambda clusters: _dc_judge_fn(clusters, fail_tracker=shim_fail_tracker)) \
+        if shim else None
+    smart_fn = (lambda titles: _dc_smart_fn(titles, fail_tracker=shim_fail_tracker)) \
+        if shim else None
+    actions = _dc_analyze(
+        tasks, names,
+        judge_fn=judge_fn,
+        smart_fn=smart_fn,
+        today=_today_local(), now=datetime.now(timezone.utc), fuzzy=shim)
+    shim_call_failed = bool(shim_fail_tracker)
+
+    n_mut = _dc_mutating_count(actions)
+    n_flags = (len(actions["flag_obsolete"]) + len(actions["flag_dupe"])
+               + len(actions["flag_nonsmart"]))
+
+    mid = uuid.uuid4().hex[:12]
+    _MANIFESTS[mid] = {"kind": "declutter", "actions": actions,
+                       "mutating_count": n_mut, "created": time.monotonic(),
+                       "summary": f"Разбор помойки ({n_mut} правок)",
+                       "consumed": False}
+
+    when = datetime.now(_USER_TZ).strftime("%d.%m.%Y %H:%M")
+    lines = [f"### 🧹 План разбора помойки — {when} ({_USER_TZ.key})",
+             f"_Манифест `{mid}` · проверено задач: {len(tasks)} · "
+             "ничего ещё не тронуто_"]
+    if not shim:
+        lines.append("⚠️ _CLAUDE_CLI shim недоступен → только точные дубликаты "
+                     "(по идентичному названию), без судьи слияний и без "
+                     "SMART-переформулировок._")
+    elif shim_call_failed:
+        lines.append("⚠️ _CLAUDE_CLI shim настроен, но хотя бы один вызов во "
+                     "время этого разбора не удался (сеть/таймаут/некорректный "
+                     "ответ) — часть спорных дублей/названий могла остаться "
+                     "без вердикта судьи и уйти в «на заметку»._")
+    lines.append("")
+
+    if actions["delete"]:
+        lines.append(f"#### 🗑 Дубликаты на удаление — {len(actions['delete'])}")
+        for it in actions["delete"]:
+            lines.append(
+                f"- **«{it['title']}»** — {it['project']} (`{it['taskId']}`) → "
+                f"удалить, оставить **«{it['keep_title']}»** _({it['reason']})_")
+        lines.append("")
+    if actions["rename"]:
+        lines.append(f"#### ✏️ SMART-переформулировки — {len(actions['rename'])}")
+        for it in actions["rename"]:
+            lines.append(
+                f"- «{it['title']}» → **«{it['new_title']}»** — {it['project']} "
+                f"(`{it['taskId']}`)"
+                + (f" _({it['reason']})_" if it['reason'] else ""))
+        lines.append("")
+    if actions["group"]:
+        total_kids = sum(len(g["children"]) for g in actions["group"])
+        lines.append(f"#### 🔗 Группировка (родитель+подзадачи) — "
+                     f"{len(actions['group'])} групп / {total_kids} задач")
+        for g in actions["group"]:
+            lines.append(f"- под **«{g['parent_title']}»** ({g['project']}, "
+                         f"`{g['parentId']}`):")
+            for c in g["children"]:
+                lines.append(f"    - «{c['title']}» (`{c['taskId']}`)")
+        lines.append("")
+
+    if n_flags:
+        lines.append("#### 🚩 Только на заметку (НЕ трогаю автоматически)")
+        if actions["flag_obsolete"]:
+            lines.append(f"- ⏳ Похоже на протухшие — просрочены и давно без "
+                         f"движения ({len(actions['flag_obsolete'])}): "
+                         "реши сам, добить или отпустить:")
+            for it in actions["flag_obsolete"]:
+                age = f"{it['age_days']}д без правок" if it['age_days'] is not None else "возраст неизв."
+                lines.append(f"    - «{it['title']}» — {it['project']} · срок "
+                             f"{it['due']} (просрочено {it['overdue_days']}д, {age})")
+        if actions["flag_dupe"]:
+            lines.append(f"- 🤔 Похожи, но слить не уверен — оставил обе "
+                         f"({len(actions['flag_dupe'])}):")
+            for it in actions["flag_dupe"]:
+                lines.append("    - " + " / ".join(f"«{t}»" for t in it["titles"])
+                             + f" _({it['reason']})_")
+        if actions["flag_nonsmart"]:
+            lines.append(f"- ✏️ Расплывчатые названия без готовой переформулировки "
+                         f"({len(actions['flag_nonsmart'])}): "
+                         + ", ".join(f"«{it['title']}»" for it in actions["flag_nonsmart"]))
+        lines.append("")
+
+    if n_mut == 0:
+        lines.append("**Правок для применения нет** — либо всё чисто, либо всё "
+                     "спорное ушло в «на заметку».")
+        return "\n".join(lines)
+
+    lines.append(f"**Итого к применению: {n_mut} правок** "
+                 f"(🗑 {len(actions['delete'])} · ✏️ {len(actions['rename'])} · "
+                 f"🔗 {sum(len(g['children']) for g in actions['group'])}). "
+                 "Протухшие и спорные НЕ входят.")
+    lines.append("")
+    lines.append(f"_После явного «да»: `execute_declutter(manifest_id=\"{mid}\", "
+                 f"confirm=\"DECLUTTER {n_mut}\")` · действует 1 час, одноразово. "
+                 "Каждая правка пройдёт через штатные удаление/обновление/вложение "
+                 "(guard + журнал + сверка)._")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def execute_declutter(manifest_id: str, confirm: str = "") -> str:
+    """
+    Phase 2 of the declutter: apply EXACTLY the mutating actions the manifest
+    proposed and the user approved. `confirm` must be the literal
+    "DECLUTTER <N>" with N = the manifest's mutating-action count.
+
+    Nothing here is a fresh decision — every action is routed through the
+    already-audited tools (execute_task_deletion / update_tasks /
+    set_task_parent), so each mutation is identity-guarded, journalled and
+    post-verified. Obsolete and uncertain-duplicate FLAGS are never touched.
+    One-shot. Afterwards the independent operation reports are appended.
+
+    Args:
+        manifest_id: id from plan_declutter
+        confirm: literal "DECLUTTER <N>"
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    _prune_manifests()
+    m = _MANIFESTS.get(manifest_id)
+    if not m or m.get("kind") != "declutter":
+        return (f"🛑 Манифест разбора {manifest_id} не найден/истёк/уже "
+                "исполнен. Сначала plan_declutter.")
+    n_mut = m.get("mutating_count", 0)
+    expected = f"DECLUTTER {n_mut}"
+    if confirm.strip() != expected:
+        return (f"🛑 Подтверждение не совпало: нужно confirm=\"{expected}\" "
+                f"(получено {confirm!r}). Ничего не тронул.")
+    m["consumed"] = True
+    try:
+        actions = m["actions"]
+        summary = m.get("summary") or "Разбор помойки"
+        out_blocks: List[str] = []
+        report_ids: set = set()
+
+        # ---- Deletions: reuse the audited deletion manifest engine --------
+        if actions["delete"]:
+            sub_mid = uuid.uuid4().hex[:12]
+            items = [{"taskId": it["taskId"], "projectId": it["projectId"],
+                      "title": it["title"], "project": it.get("project", ""),
+                      "snapshot": it["snapshot"]} for it in actions["delete"]]
+            _MANIFESTS[sub_mid] = {"kind": "delete", "items": items,
+                                   "created": time.monotonic(),
+                                   "summary": summary + " — дубликаты",
+                                   "consumed": False}
+            res = await execute_task_deletion(sub_mid, f"DELETE {len(items)}")
+            out_blocks.append("## 🗑 Удаление дубликатов\n" + res)
+            report_ids.add(sub_mid)
+
+        # ---- Renames: reuse update_tasks (guard + journal + post-verify) --
+        if actions["rename"]:
+            res = await update_tasks(
+                summary + " — SMART-переименования",
+                [{"taskId": it["taskId"], "projectId": it["projectId"],
+                  "title": it["title"], "new_title": it["new_title"]}
+                 for it in actions["rename"]])
+            out_blocks.append("## ✏️ Переименования\n" + res)
+
+        # ---- Groups: reuse set_task_parent (guard + journal + post-verify) -
+        for g in actions["group"]:
+            res = await set_task_parent(
+                summary + f" — под «{g['parent_title']}»",
+                [{"taskId": c["taskId"], "title": c["title"]} for c in g["children"]],
+                g["parentId"], g["project_id"], g["parent_title"])
+            out_blocks.append(f"## 🔗 Группировка под «{g['parent_title']}»\n" + res)
+
+        if not out_blocks:
+            return "Нечего применять — в манифесте не было правок."
+
+        combined = "\n\n".join(out_blocks)
+        # Consolidated independent check: pull every journalled record id the
+        # sub-tools referenced and append the server-built report for each.
+        for rid in re.findall(r'operation_report\(record_id="([\w-]+)"\)', combined):
+            report_ids.add(rid)
+        reports = [_build_operation_report(rid) for rid in report_ids]
+        if reports:
+            combined += "\n\n---\n### 🧾 Независимые отчёты\n\n" + "\n\n".join(reports)
+        return combined
+    except Exception as e:
+        logger.error(f"Error in execute_declutter: {e}")
+        return f"Error executing declutter manifest: {str(e)}"
+
+
 @mcp.tool()
 async def delete_task_with_subtasks(
     summary: str,
