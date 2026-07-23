@@ -12,9 +12,8 @@ RUN pip install --no-cache-dir -e .
 
 # NB: run as root. The durable token volume Railway mounts at /data is owned by
 # root, and a non-root process cannot write to it — which silently broke token
-# persistence (the /setup success page reported "volume unavailable"). For a
-# personal single-tenant instance running as root is acceptable; keeping the
-# token store writable matters more here.
+# persistence. For a personal single-tenant instance running as root is
+# acceptable; keeping the token store writable matters more here.
 
 # Railway provides PORT; the server binds 0.0.0.0:$PORT via env.
 ENV MCP_TRANSPORT=streamable-http \
