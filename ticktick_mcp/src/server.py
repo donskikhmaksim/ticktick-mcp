@@ -19,6 +19,7 @@ from starlette.responses import JSONResponse, Response
 
 from .ticktick_client import TickTickClient, _normalize_date
 from .ticktick_v2_client import TickTickV2Client, id2error_failures
+from . import declutter_sheet
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -2842,9 +2843,414 @@ def _dc_mutating_count(actions: Dict) -> int:
             + sum(len(g["children"]) for g in actions["group"]))
 
 
+# ---------------------------------------------------------------------------
+# Sheet-backed declutter manifest (persist="sheet") — see
+# docs/DESIGN_sheet_backed_declutter.md. All Google I/O lives in
+# declutter_sheet.py; everything here is pure/deterministic glue so it stays
+# unit-testable without network (§8.3/§8.4 of the design doc).
+# ---------------------------------------------------------------------------
+
+# Sheet row actions that actually mutate TickTick — flags never do (§3/§4.1).
+_DC_MUTATING_ROW_ACTIONS = ("delete", "rename", "group")
+
+
+def _dc_now_la_iso() -> str:
+    """Timestamp for the sheet's run_ts/applied_ts columns — America/Los_Angeles
+    (via the app-wide _USER_TZ, same convention already used for due dates and
+    the plan_declutter header), never UTC."""
+    return datetime.now(_USER_TZ).isoformat()
+
+
+def _dc_actions_to_rows(actions: Dict, manifest_id: str, run_ts: str,
+                        names: Optional[Dict] = None) -> List[Dict]:
+    """Pure: flatten a declutter `actions` dict (the output of _dc_analyze)
+    into the flat per-row shape of the `Declutter Log` sheet (§3 of the
+    design doc). No I/O — `row_id` is assigned later by
+    declutter_sheet.append_rows(). Mutating actions (delete/rename/
+    group-child) default decision="approved" (today's apply-everything-
+    proposed semantics, §3 "Дефолт decision"); flag_* rows default
+    decision="pending" and are NEVER auto-applied (§5.9/§9.4 — MVP: flags
+    stay informational)."""
+    names = names or {}
+
+    def row(task_id, title, project, action, proposed_value, reason,
+            cluster_id="", decision="approved", snapshot=None):
+        return {
+            "manifest_id": manifest_id, "run_ts": run_ts,
+            "task_id": task_id or "", "title": title or "",
+            "project": project or "", "column": "",
+            "cluster_id": cluster_id or "", "action": action,
+            "proposed_value": proposed_value or "", "reason": reason or "",
+            "decision": decision, "status": "planned",
+            "applied_ts": "", "error": "",
+            "snapshot_json": json.dumps(snapshot or {}, ensure_ascii=False, default=str),
+        }
+
+    rows: List[Dict] = []
+
+    for it in actions.get("delete", []):
+        keep_id = it.get("keep_id") or ""
+        rows.append(row(
+            it.get("taskId"), it.get("title"), it.get("project"),
+            "delete", f"keep→{keep_id}", it.get("reason"),
+            cluster_id=keep_id, decision="approved",
+            snapshot=it.get("snapshot")))
+
+    for it in actions.get("rename", []):
+        rows.append(row(
+            it.get("taskId"), it.get("title"), it.get("project"),
+            "rename", it.get("new_title"), it.get("reason"),
+            decision="approved"))
+
+    for g in actions.get("group", []):
+        pid = g.get("parentId") or ""
+        for c in g.get("children", []):
+            rows.append(row(
+                c.get("taskId"), c.get("title"),
+                names.get(c.get("projectId"), g.get("project")),
+                "group", f"parent→{pid}",
+                f"под «{g.get('parent_title', '')}»",
+                cluster_id=pid, decision="approved"))
+
+    for it in actions.get("flag_obsolete", []):
+        age = (f"{it.get('age_days')}д без правок"
+               if it.get("age_days") is not None else "возраст неизв.")
+        rows.append(row(
+            it.get("taskId"), it.get("title"), it.get("project"),
+            "flag_obsolete", "",
+            f"просрочено {it.get('overdue_days')}д, {age}",
+            decision="pending"))
+
+    for i, it in enumerate(actions.get("flag_dupe", [])):
+        cid = f"dupeflag-{i}"
+        ids = it.get("ids") or []
+        titles = it.get("titles") or []
+        for j, tid in enumerate(ids):
+            rows.append(row(
+                tid, titles[j] if j < len(titles) else "", "",
+                "flag_dupe", "", it.get("reason"),
+                cluster_id=cid, decision="pending"))
+
+    for it in actions.get("flag_nonsmart", []):
+        rows.append(row(
+            it.get("taskId"), it.get("title"), it.get("project"),
+            "flag_nonsmart", "", "", decision="pending"))
+
+    return rows
+
+
+def _dc_rows_to_exec(rows: List[Dict]) -> Dict:
+    """Pure: reconstruct the input for execute_task_deletion / update_tasks /
+    set_task_parent from an ALREADY-FILTERED list of sheet rows (the caller
+    picks `apply_rows` = decision=="approved" AND status in
+    ("planned","failed") AND action in _DC_MUTATING_ROW_ACTIONS). No I/O.
+
+    Enforces the keep∉deletes invariant (§5.9): a delete row's `cluster_id`
+    IS the id of the task being kept. If that id is itself among the
+    task_ids approved for deletion in this same batch, the row is refused
+    (moved to `refused`, not `delete`) — a human approved a self-contradicting
+    edit (probably by hand-editing `decision`), and applying it would delete
+    the very task the OTHER row promised to keep.
+
+    Returns {"delete": [...], "rename": [...], "group": [...],
+             "refused": [{"row_id", "task_id", "cluster_id", "reason"}]} —
+    `delete`/`rename` items carry a "projectId": "" placeholder (the sheet
+    does not store project ids, only display names — every downstream
+    sub-tool re-resolves the REAL projectId from live state via the identity
+    guard, so an empty placeholder here is never actually trusted)."""
+    delete_rows = [r for r in rows if r.get("action") == "delete"]
+    rename_rows = [r for r in rows if r.get("action") == "rename"]
+    group_rows = [r for r in rows if r.get("action") == "group"]
+
+    delete_task_ids = {r.get("task_id") for r in delete_rows}
+    refused: List[Dict] = []
+    delete: List[Dict] = []
+    for r in delete_rows:
+        keep_id = r.get("cluster_id") or ""
+        if keep_id and keep_id in delete_task_ids:
+            refused.append({
+                "row_id": r.get("row_id"), "task_id": r.get("task_id"),
+                "cluster_id": keep_id,
+                "reason": (f"задача-«оставить» ({str(keep_id)[:8]}…) сама "
+                           "числится на удаление в этом же прогоне — "
+                           "кластер отклонён, поправь decision вручную"),
+            })
+            continue
+        try:
+            snapshot = json.loads(r.get("snapshot_json") or "{}")
+        except (ValueError, TypeError):
+            snapshot = {}
+        delete.append({
+            "taskId": r.get("task_id"), "projectId": "",
+            "title": r.get("title") or "", "project": r.get("project") or "",
+            "snapshot": snapshot,
+        })
+
+    rename = [{"taskId": r.get("task_id"), "projectId": "",
+               "title": r.get("title") or "",
+               "new_title": r.get("proposed_value") or ""}
+              for r in rename_rows]
+
+    groups_by_parent: Dict[str, Dict] = {}
+    for r in group_rows:
+        pid = r.get("cluster_id") or ""
+        g = groups_by_parent.setdefault(pid, {
+            "parentId": pid, "parent_title": "", "project_id": "",
+            "children": [],
+        })
+        g["children"].append({"taskId": r.get("task_id"),
+                              "title": r.get("title") or ""})
+    group = [g for g in groups_by_parent.values() if g["children"]]
+
+    return {"delete": delete, "rename": rename, "group": group,
+            "refused": refused}
+
+
+async def _execute_declutter_from_sheet(manifest_id: str, confirm: str) -> str:
+    """Sheet-backed execute/resume engine — shared by execute_declutter (when
+    the RAM pointer says persist="sheet") and resume_declutter (RAM pointer
+    gone, e.g. after a Railway restart). Implements §4.2/§5/§6 of
+    docs/DESIGN_sheet_backed_declutter.md:
+
+    - freshly reads `decision` from the sheet every time (never trusts RAM —
+      a human may have edited the sheet after the plan was printed);
+    - `confirm` must equal "DECLUTTER <N>" with N = the FRESH approved+pending
+      row count, not whatever N was printed at plan time (§6.2 — the
+      approval-race guard);
+    - resolves a crashed `applying` lock by LIVE fact in TickTick (§5.4)
+      before deciding whether to retry it, rather than trusting the stale
+      flag;
+    - write-throughs status=done|failed per row, judged from a FRESH
+      post-apply read of live state (§5.6) rather than by parsing the
+      sub-tool's text output;
+    - never re-applies a `done` row (§5.2 — the core "don't delete twice"
+      guarantee)."""
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        rows = declutter_sheet.read_manifest_rows(manifest_id)
+    except declutter_sheet.DeclutterSheetError as e:
+        return f"🛑 Не могу прочитать таблицу разбора: {e}"
+    if not rows:
+        try:
+            url = declutter_sheet.sheet_url()
+        except declutter_sheet.DeclutterSheetError:
+            url = "(таблица не настроена)"
+        return (f"🛑 Манифест разбора {manifest_id} не найден в таблице "
+                f"({url}). Сначала plan_declutter(persist=\"sheet\").")
+
+    by_id = _open_by_id(fresh=True)
+
+    # ---- §5.4: resolve any crashed `applying` lock by LIVE fact FIRST -----
+    stuck = [r for r in rows if r.get("status") == "applying"
+             and r.get("action") in _DC_MUTATING_ROW_ACTIONS]
+    if stuck:
+        if by_id is None:
+            return _STATE_UNAVAILABLE_MSG
+        resolved_updates = []
+        for r in stuck:
+            tid = r.get("task_id")
+            if r.get("action") == "delete":
+                done = tid not in by_id
+            elif r.get("action") == "rename":
+                live = by_id.get(tid)
+                done = bool(live) and _names_agree(
+                    r.get("proposed_value") or "", live.get("title") or "")
+            else:  # group
+                live = by_id.get(tid)
+                done = bool(live) and live.get("parentId") == r.get("cluster_id")
+            if done:
+                r["status"] = "done"
+                resolved_updates.append({"row_id": r.get("row_id"),
+                                         "status": "done",
+                                         "applied_ts": _dc_now_la_iso()})
+            else:
+                r["status"] = "failed"
+                resolved_updates.append({
+                    "row_id": r.get("row_id"), "status": "failed",
+                    "error": "прерванное применение (лок завис) — переприменяю"})
+        try:
+            declutter_sheet.batch_update_rows(resolved_updates)
+        except declutter_sheet.DeclutterSheetError as e:
+            return f"🛑 Не могу разрешить зависший лок applying в таблице: {e}"
+
+    apply_rows = [r for r in rows if r.get("action") in _DC_MUTATING_ROW_ACTIONS
+                  and r.get("decision") == "approved"
+                  and r.get("status") in ("planned", "failed")]
+
+    n_approved = len(apply_rows)
+    expected = f"DECLUTTER {n_approved}"
+    if confirm.strip() != expected:
+        try:
+            url = declutter_sheet.sheet_url()
+        except declutter_sheet.DeclutterSheetError:
+            url = ""
+        return (f"🛑 Подтверждение не совпало: сейчас в таблице {n_approved} "
+                f"одобренных ещё-не-применённых правок — нужно "
+                f"confirm=\"{expected}\" (получено {confirm!r}). Возможно, "
+                "decision поменяли в таблице после того, как был напечатан "
+                f"план — перечитай текущее состояние{(' (' + url + ')') if url else ''} "
+                "и подтверди заново. Ничего не тронул.")
+
+    if not apply_rows:
+        return ("Нечего применять — в таблице нет одобренных ещё-не-"
+                f"применённых правок для манифеста {manifest_id}.")
+
+    exec_input = _dc_rows_to_exec(apply_rows)
+
+    # ---- lock BEFORE touching TickTick (§5.3) ------------------------------
+    lock_updates = [{"row_id": r.get("row_id"), "status": "applying"}
+                    for r in apply_rows]
+    try:
+        declutter_sheet.batch_update_rows(lock_updates)
+    except declutter_sheet.DeclutterSheetError as e:
+        return f"🛑 Не могу поставить лок applying в таблице: {e}"
+
+    summary = f"Разбор помойки (таблица) — манифест {manifest_id}"
+    out_blocks: List[str] = []
+    report_ids: set = set()
+    row_by_task_action: Dict[tuple, Dict] = {
+        (r.get("task_id"), r.get("action")): r for r in apply_rows}
+    status_updates: List[Dict] = []
+
+    try:
+        if exec_input["delete"]:
+            sub_mid = uuid.uuid4().hex[:12]
+            items = [{"taskId": it["taskId"], "projectId": it["projectId"],
+                      "title": it["title"], "project": it.get("project", ""),
+                      "snapshot": it["snapshot"]} for it in exec_input["delete"]]
+            _MANIFESTS[sub_mid] = {"kind": "delete", "items": items,
+                                   "created": time.monotonic(),
+                                   "summary": summary + " — дубликаты",
+                                   "consumed": False}
+            res = await execute_task_deletion(sub_mid, f"DELETE {len(items)}")
+            out_blocks.append("## 🗑 Удаление дубликатов\n" + res)
+            report_ids.add(sub_mid)
+
+        if exec_input["rename"]:
+            res = await update_tasks(
+                summary + " — SMART-переименования",
+                [{"taskId": it["taskId"], "projectId": it["projectId"],
+                  "title": it["title"], "new_title": it["new_title"]}
+                 for it in exec_input["rename"]])
+            out_blocks.append("## ✏️ Переименования\n" + res)
+
+        for g in exec_input["group"]:
+            res = await set_task_parent(
+                summary + " — группировка",
+                [{"taskId": c["taskId"], "title": c["title"]}
+                 for c in g["children"]],
+                g["parentId"], g["project_id"] or "", g.get("parent_title") or "")
+            out_blocks.append(f"## 🔗 Группировка под `{g['parentId']}`\n" + res)
+
+        # ---- §5.6: per-row write-through, judged from FRESH live state ----
+        fresh = _open_by_id(fresh=True)
+        for it in exec_input["delete"]:
+            r = row_by_task_action.get((it["taskId"], "delete"))
+            if not r:
+                continue
+            if fresh is None:
+                status_updates.append({"row_id": r["row_id"], "status": "failed",
+                                       "error": _UNVERIFIED_MSG})
+                continue
+            ok = it["taskId"] not in fresh
+            status_updates.append({
+                "row_id": r["row_id"],
+                "status": "done" if ok else "failed",
+                "applied_ts": _dc_now_la_iso() if ok else "",
+                "error": "" if ok else "задача всё ещё в TickTick после удаления",
+            })
+        for it in exec_input["rename"]:
+            r = row_by_task_action.get((it["taskId"], "rename"))
+            if not r:
+                continue
+            if fresh is None:
+                status_updates.append({"row_id": r["row_id"], "status": "failed",
+                                       "error": _UNVERIFIED_MSG})
+                continue
+            live = fresh.get(it["taskId"])
+            ok = bool(live) and _names_agree(it["new_title"], live.get("title") or "")
+            status_updates.append({
+                "row_id": r["row_id"],
+                "status": "done" if ok else "failed",
+                "applied_ts": _dc_now_la_iso() if ok else "",
+                "error": "" if ok else "новое название не видно в живом состоянии",
+            })
+        for g in exec_input["group"]:
+            for c in g["children"]:
+                r = row_by_task_action.get((c["taskId"], "group"))
+                if not r:
+                    continue
+                if fresh is None:
+                    status_updates.append({"row_id": r["row_id"], "status": "failed",
+                                           "error": _UNVERIFIED_MSG})
+                    continue
+                live = fresh.get(c["taskId"])
+                ok = bool(live) and live.get("parentId") == g["parentId"]
+                status_updates.append({
+                    "row_id": r["row_id"],
+                    "status": "done" if ok else "failed",
+                    "applied_ts": _dc_now_la_iso() if ok else "",
+                    "error": "" if ok else "parentId не применился",
+                })
+        # Rows refused by the keep∉deletes invariant (§5.9) never went into
+        # exec_input — they were locked `applying` above, so must be
+        # explicitly written back to `failed` here (not left stuck).
+        for ref in exec_input["refused"]:
+            status_updates.append({"row_id": ref["row_id"], "status": "failed",
+                                   "error": ref["reason"]})
+
+        try:
+            declutter_sheet.batch_update_rows(status_updates)
+        except declutter_sheet.DeclutterSheetError as e:
+            out_blocks.append(
+                f"⚠️ Правки применены, но не смог записать статусы обратно в "
+                f"таблицу: {e} — сверь фактический результат вручную "
+                "(operation_report ниже) и поправь `status` в таблице.")
+
+        if not out_blocks:
+            return "Нечего применять — в манифесте не было правок."
+
+        combined = "\n\n".join(out_blocks)
+        for rid in re.findall(r'operation_report\(record_id="([\w-]+)"\)', combined):
+            report_ids.add(rid)
+        reports = [_build_operation_report(rid) for rid in report_ids]
+        if reports:
+            combined += "\n\n---\n### 🧾 Независимые отчёты\n\n" + "\n\n".join(reports)
+        if exec_input["refused"]:
+            try:
+                url = declutter_sheet.sheet_url()
+            except declutter_sheet.DeclutterSheetError:
+                url = ""
+            combined += (
+                f"\n\n🛑 Отклонено по инварианту «оставить∉удаляемых»: "
+                f"{len(exec_input['refused'])} правк(а/и) — задача-«оставить» "
+                "сама была одобрена на удаление в этом же прогоне. Строки "
+                f"помечены failed{(', поправь decision: ' + url) if url else ''}.")
+        try:
+            combined += f"\n\n📄 Таблица: {declutter_sheet.sheet_url()}"
+        except declutter_sheet.DeclutterSheetError:
+            pass
+        return combined
+    except Exception as e:
+        logger.error(f"Error in _execute_declutter_from_sheet: {e}")
+        # Best-effort: release the applying lock back to failed so a retry is
+        # possible instead of a permanently stuck row (mirrors the RAM
+        # branch's "graceful error, manifest state already changed" contract
+        # — see test_execute_declutter_returns_graceful_error_on_internal_exception).
+        try:
+            declutter_sheet.batch_update_rows(
+                [{"row_id": r["row_id"], "status": "failed",
+                  "error": f"внутренняя ошибка: {e}"} for r in apply_rows])
+        except Exception:
+            pass
+        return f"Error executing declutter manifest (sheet): {str(e)}"
+
+
 @mcp.tool(annotations=READONLY)
 async def plan_declutter(scope: str = "", dry_run: bool = True,
-                         max_tasks: int = 0) -> str:
+                         max_tasks: int = 0, persist: str = "ram") -> str:
     """
     Phase 1 of the retroactive declutter ("разбор помойки"): READ every open
     task and propose how to tidy the EXISTING pile. Read-only — creates and
@@ -2870,6 +3276,17 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
     more than a few hundred open tasks — narrow `scope` (project/tag/date)
     instead of running this over the whole pile.
 
+    persist="sheet" (opt-in, default stays "ram" — RAM behaviour is UNCHANGED):
+    writes every proposed edit (and flag) as a row in the `Declutter Log`
+    Google Sheet (env DECLUTTER_SHEET_ID/GSHEETS_SA_JSON — see
+    docs/DESIGN_sheet_backed_declutter.md) instead of relying only on the
+    in-process RAM manifest. The sheet becomes the durable source of truth:
+    it survives a restart, a human can edit its `decision` column directly,
+    and resume_declutter/execute_declutter re-read it fresh rather than
+    trusting stale RAM. If the sheet is unreachable (missing creds/network)
+    plan_declutter REFUSES explicitly — no silent fallback to RAM, since the
+    entire point of persist="sheet" is a durable plan.
+
     Args:
         scope: optional narrowing — 'inbox', a project-name substring, or
             'Project/Column' to restrict to one kanban column of a project
@@ -2882,6 +3299,8 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
             want to declutter a bigger set and accept the extra time — the O(n^2)
             clustering and the bundled shim prompts grow with the set, and the
             MCP client's ~60s timeout still applies, so keep it sane.
+        persist: "ram" (default, unchanged behaviour) or "sheet" (durable —
+            see above).
     """
     err = _ensure_ready()
     if err:
@@ -2937,10 +3356,39 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
                + len(actions["flag_nonsmart"]))
 
     mid = uuid.uuid4().hex[:12]
-    _MANIFESTS[mid] = {"kind": "declutter", "actions": actions,
-                       "mutating_count": n_mut, "created": time.monotonic(),
-                       "summary": f"Разбор помойки ({n_mut} правок)",
-                       "consumed": False}
+    sheet_note = ""
+    if persist == "sheet":
+        # Durable-plan invariant (design doc §9.3, Maksim's decision): if the
+        # sheet is unreachable, REFUSE explicitly — no silent fallback to a
+        # RAM manifest the human never sees and that dies on restart.
+        run_ts = _dc_now_la_iso()
+        rows = _dc_actions_to_rows(actions, mid, run_ts, names)
+        try:
+            declutter_sheet.ensure_header()
+            declutter_sheet.append_rows(rows)
+            url = declutter_sheet.sheet_url()
+        except declutter_sheet.DeclutterSheetError as e:
+            return (f"🛑 Отказ: не могу сохранить план durable в Google Sheet "
+                    f"(persist=\"sheet\") — {e} Ничего не записано в TickTick "
+                    "и ничего не записано в таблицу — план НЕ построен. "
+                    "Проверь DECLUTTER_SHEET_ID/GSHEETS_SA_JSON и доступ к "
+                    "сети, либо вызови без persist (RAM-режим, как раньше).")
+        _MANIFESTS[mid] = {"kind": "declutter", "actions": actions,
+                           "persist": "sheet", "spreadsheet_url": url,
+                           "mutating_count": n_mut, "created": time.monotonic(),
+                           "summary": f"Разбор помойки ({n_mut} правок)",
+                           "consumed": False}
+        sheet_note = (
+            f"\n📄 _План записан durable в таблицу: {url} — можешь править "
+            "колонку `decision` (approved/rejected) прямо там, либо "
+            "`set_declutter_decision`. Затем `execute_declutter(...)` "
+            "применит одобренное; после рестарта — "
+            f"`resume_declutter(manifest_id=\"{mid}\", confirm=...)`._")
+    else:
+        _MANIFESTS[mid] = {"kind": "declutter", "actions": actions,
+                           "mutating_count": n_mut, "created": time.monotonic(),
+                           "summary": f"Разбор помойки ({n_mut} правок)",
+                           "consumed": False}
 
     when = datetime.now(_USER_TZ).strftime("%d.%m.%Y %H:%M")
     lines = [f"### 🧹 План разбора помойки — {when} ({_USER_TZ.key})",
@@ -3008,7 +3456,7 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
     if n_mut == 0:
         lines.append("**Правок для применения нет** — либо всё чисто, либо всё "
                      "спорное ушло в «на заметку».")
-        return "\n".join(lines)
+        return "\n".join(lines) + sheet_note
 
     lines.append(f"**Итого к применению: {n_mut} правок** "
                  f"(🗑 {len(actions['delete'])} · ✏️ {len(actions['rename'])} · "
@@ -3019,7 +3467,7 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
                  f"confirm=\"DECLUTTER {n_mut}\")` · действует 1 час, одноразово. "
                  "Каждая правка пройдёт через штатные удаление/обновление/вложение "
                  "(guard + журнал + сверка)._")
-    return "\n".join(lines)
+    return "\n".join(lines) + sheet_note
 
 
 @mcp.tool()
@@ -3035,6 +3483,15 @@ async def execute_declutter(manifest_id: str, confirm: str = "") -> str:
     post-verified. Obsolete and uncertain-duplicate FLAGS are never touched.
     One-shot. Afterwards the independent operation reports are appended.
 
+    For a manifest planned with persist="sheet": this dispatches into the
+    sheet-backed engine instead — `decision`/`status` are freshly re-read from
+    the `Declutter Log` sheet (never trusted from RAM), `confirm` must match
+    the CURRENT approved-and-pending row count (not the plan-time N — see
+    docs/DESIGN_sheet_backed_declutter.md §6), and per-row results are written
+    back to the sheet. If the RAM pointer from plan_declutter is gone (e.g. a
+    restart) but the manifest_id still has rows in the sheet, use
+    resume_declutter instead — same engine, explicit entry point.
+
     Args:
         manifest_id: id from plan_declutter
         confirm: literal "DECLUTTER <N>"
@@ -3044,7 +3501,19 @@ async def execute_declutter(manifest_id: str, confirm: str = "") -> str:
         return err
     _prune_manifests()
     m = _MANIFESTS.get(manifest_id)
+    if m and m.get("kind") == "declutter" and m.get("persist") == "sheet":
+        return await _execute_declutter_from_sheet(manifest_id, confirm)
     if not m or m.get("kind") != "declutter":
+        # RAM pointer missing/expired — it may still be a sheet-backed
+        # manifest from an earlier process (Railway restart killed RAM but
+        # the sheet is durable). Only probe the sheet when it's actually
+        # configured, so a genuinely bad/expired id keeps today's exact text.
+        if declutter_sheet.sheet_configured():
+            try:
+                if declutter_sheet.read_manifest_rows(manifest_id):
+                    return await _execute_declutter_from_sheet(manifest_id, confirm)
+            except declutter_sheet.DeclutterSheetError:
+                pass
         return (f"🛑 Манифест разбора {manifest_id} не найден/истёк/уже "
                 "исполнен. Сначала plan_declutter.")
     n_mut = m.get("mutating_count", 0)
@@ -3105,6 +3574,96 @@ async def execute_declutter(manifest_id: str, confirm: str = "") -> str:
     except Exception as e:
         logger.error(f"Error in execute_declutter: {e}")
         return f"Error executing declutter manifest: {str(e)}"
+
+
+@mcp.tool()
+async def resume_declutter(manifest_id: str, confirm: str = "") -> str:
+    """
+    Resume a sheet-backed declutter manifest (plan_declutter(persist="sheet"))
+    after a restart, timeout, or partial application — when the in-process RAM
+    pointer plan_declutter left behind is gone. The Google Sheet IS the durable
+    state; RAM was only ever a same-process cache (see
+    docs/DESIGN_sheet_backed_declutter.md).
+
+    Reconstructs the remaining work straight from the `Declutter Log` rows for
+    this manifest_id: applies rows with decision="approved" AND status in
+    (planned, failed) — a row already `done` is NEVER re-applied (so this is
+    safe to call again after a partial run — it won't delete anything twice),
+    and a row left `applying` by a crashed run is resolved against LIVE
+    TickTick state first (task already gone → done; title already matches →
+    done; otherwise → retried) rather than trusted at face value.
+
+    `confirm` must be the literal "DECLUTTER <N>" where N is the count of
+    approved+pending rows FRESHLY read from the sheet right now — not
+    whatever N a previous message printed. If `decision` was edited in the
+    sheet (or via set_declutter_decision) since then, re-read the sheet and
+    confirm with the CURRENT number.
+
+    Args:
+        manifest_id: id from the ORIGINAL plan_declutter(persist="sheet") call
+        confirm: literal "DECLUTTER <N>" with N = current approved+pending row count
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    if not declutter_sheet.sheet_configured():
+        return ("🛑 Sheet-режим declutter не настроен (нужны env "
+                "DECLUTTER_SHEET_ID и GSHEETS_SA_JSON) — resume_declutter "
+                "работает только для планов, сохранённых с persist=\"sheet\".")
+    return await _execute_declutter_from_sheet(manifest_id, confirm)
+
+
+@mcp.tool()
+async def set_declutter_decision(manifest_id: str, row_ids: List[int],
+                                 decision: str) -> str:
+    """
+    Set the `decision` column (approved/rejected) for specific rows of a
+    sheet-backed declutter manifest (plan_declutter(persist="sheet")) — the
+    deterministic chat-approval path from docs/DESIGN_sheet_backed_declutter.md
+    §6(b): instead of the human editing the Google Sheet by hand, Claude
+    proposes/relays a decision here and the CODE writes it, so the row's
+    task_id/decision never has to round-trip through the model's own context.
+
+    Does NOT touch TickTick and does NOT change `status` — purely an
+    approval-bookkeeping write to column L. execute_declutter/resume_declutter
+    read the freshly-written `decision` afterwards, as always.
+
+    Args:
+        manifest_id: id from plan_declutter(persist="sheet")
+        row_ids: sheet row_id values (column A, printed in the plan / visible
+            in the sheet) to update — NOT task ids
+        decision: "approved" or "rejected"
+    """
+    if decision not in ("approved", "rejected"):
+        return "🛑 decision должен быть \"approved\" или \"rejected\" — получено " \
+               f"{decision!r}. Ничего не тронул."
+    if not row_ids:
+        return "🛑 Не передано ни одного row_id."
+    if not declutter_sheet.sheet_configured():
+        return ("🛑 Sheet-режим declutter не настроен (нужны env "
+                "DECLUTTER_SHEET_ID и GSHEETS_SA_JSON).")
+    try:
+        rows = declutter_sheet.read_manifest_rows(manifest_id)
+    except declutter_sheet.DeclutterSheetError as e:
+        return f"🛑 Не могу прочитать таблицу разбора: {e}"
+    if not rows:
+        return f"🛑 Манифест разбора {manifest_id} не найден в таблице."
+    valid_ids = {int(r["row_id"]) for r in rows
+                if str(r.get("row_id") or "").strip().isdigit()}
+    apply_ids = [rid for rid in row_ids if rid in valid_ids]
+    unknown = [rid for rid in row_ids if rid not in valid_ids]
+    if not apply_ids:
+        return (f"🛑 Ни один row_id не найден в манифесте {manifest_id}: "
+                f"{row_ids}. Ничего не тронул.")
+    try:
+        declutter_sheet.batch_update_rows(
+            [{"row_id": rid, "decision": decision} for rid in apply_ids])
+    except declutter_sheet.DeclutterSheetError as e:
+        return f"🛑 Не удалось записать decision в таблицу: {e}"
+    msg = f"✅ decision=\"{decision}\" проставлен для {len(apply_ids)} строк: {apply_ids}"
+    if unknown:
+        msg += f"\n⚠️ Не найдены в манифесте {manifest_id} (пропущены): {unknown}"
+    return msg
 
 
 @mcp.tool()

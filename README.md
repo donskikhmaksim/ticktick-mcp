@@ -52,6 +52,32 @@ subscription, no Anthropic API key needed — and set `CLAUDE_CLI_URL` /
 Without it, everything still works — declutter just falls back to
 exact-title matching, and destination suggestions are skipped.
 
+### Optional sheet-backed declutter manifest (set `DECLUTTER_SHEET_ID`)
+By default `plan_declutter` keeps its manifest only in the server's RAM — it
+survives a redeploy/restart for exactly nothing; the plan is gone the moment
+the process recycles. `plan_declutter(persist="sheet")` instead writes every
+proposed edit as a row in a `Declutter Log` Google Sheet, which becomes the
+durable source of truth: it survives a restart, you can edit the `decision`
+column (`approved`/`rejected`) directly in the sheet, and `resume_declutter`
+picks up exactly where a crashed/partial run left off — see
+[`docs/DESIGN_sheet_backed_declutter.md`](docs/DESIGN_sheet_backed_declutter.md)
+for the full design.
+
+To enable it:
+1. Create a Google Cloud service account, generate a JSON key for it, and
+   enable the Sheets API for that project.
+2. Create (or pick) a spreadsheet and share it with the service account's
+   `client_email` as **Editor**.
+3. Set `DECLUTTER_SHEET_ID` (the spreadsheet id from its URL) and
+   `GSHEETS_SA_JSON` (the key JSON — either the raw JSON string, or a path to
+   the key file) as env vars.
+
+Leave both unset to skip this entirely — `plan_declutter`'s default
+`persist="ram"` behaves exactly as before, byte-for-byte. If `persist="sheet"`
+is requested but the sheet is unreachable (missing creds, no network),
+`plan_declutter` REFUSES explicitly rather than silently falling back to RAM
+— durability is the entire point of that mode.
+
 ## Two TickTick APIs, and what breaks if the unofficial one goes down
 
 This server talks to TickTick over two very different APIs. It's worth
@@ -133,6 +159,7 @@ maintaining a second codebase that covers a fraction of the functionality.
 | `TICKTICK_CLIENT_ID` / `TICKTICK_CLIENT_SECRET` | for auth flow | TickTick developer app creds |
 | `TICKTICK_V2_TOKEN` | optional | the `t` cookie — enables the v2 API |
 | `CLAUDE_CLI_URL` / `CLAUDE_CLI_TOKEN` / `CLAUDE_CLI_MODEL` | optional | LLM judge for declutter dedup/SMART-rewrite + destination suggestions — see above |
+| `DECLUTTER_SHEET_ID` / `GSHEETS_SA_JSON` | optional | sheet-backed declutter manifest (`plan_declutter(persist="sheet")`) — see below |
 | `MCP_TRANSPORT` | for remote | `streamable-http` (default `stdio`) |
 | `MCP_SECRET` | strongly recommended | secret appended to URL path: `/mcp/<secret>` — lightweight auth for the public endpoint |
 | `USER_TIMEZONE` | optional | IANA timezone for due-date handling (e.g. `Europe/Moscow`); defaults to UTC |
