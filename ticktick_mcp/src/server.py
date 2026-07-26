@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hmac
 import json
 import os
@@ -5516,6 +5517,153 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
     except Exception as e:
         logger.error(f"Error in attach_file_to_task: {e}")
         return f"Error attaching file: {str(e)}"
+
+
+# Base64-encoded response payloads are ~4/3 the raw byte size, plus the MCP
+# transport itself has overhead — cap well under upload's 20 MB so a giant
+# attachment doesn't blow up the tool response instead of failing cleanly.
+DOWNLOAD_ATTACHMENT_MAX_BYTES = 15 * 1024 * 1024  # 15 MB
+
+
+def _merged_task_attachments(task_id: str) -> List[Dict]:
+    """Attachment refs for a task from BOTH sources, de-duplicated by id:
+    the structured `attachments` array (has fileName; id/size are not
+    guaranteed present on every account) and the ids/fileNames embedded as
+    ![file](id/name) tokens in the task's content/desc (always has an id).
+    Merging lets download/list work even when one source is incomplete."""
+    struct = ticktick_v2.get_task_attachments(task_id)
+    content_refs = ticktick_v2.get_content_attachment_refs(task_id)
+    by_name = {r.get("fileName"): r for r in content_refs if r.get("fileName")}
+    merged = []
+    seen_ids = set()
+    for a in struct:
+        name = a.get("fileName") or a.get("name")
+        att_id = a.get("id") or a.get("attachmentId") or a.get("fileId") \
+            or (by_name.get(name) or {}).get("id")
+        row = dict(a)
+        if att_id:
+            row["id"] = att_id
+            seen_ids.add(att_id)
+        merged.append(row)
+    # Any content-parsed ref not already covered by the structured array
+    # (e.g. attachments array was empty/unavailable for this account).
+    for r in content_refs:
+        if r.get("id") and r["id"] not in seen_ids:
+            merged.append(dict(r))
+            seen_ids.add(r["id"])
+    return merged
+
+
+@mcp.tool(annotations=READONLY)
+async def list_task_attachments(task_id: str, project_id: str = None) -> str:
+    """
+    List a task's file attachments (requires v2 API): filename, id (needed by
+    download_task_attachment), and size when known. Combines the structured
+    attachment metadata with ids/filenames parsed out of the task's own
+    content (TickTick embeds them there as ![file](id/name) tokens), since
+    not every account's attachment entries carry an id field directly.
+
+    Args:
+        task_id: ID of the task
+        project_id: ID of the task's project (optional; auto-resolved)
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        atts = await _run_blocking(lambda: _merged_task_attachments(task_id))
+        if not atts:
+            return f"No attachments on task {task_id}."
+        out = f"Attachments on task {task_id} ({len(atts)}):\n"
+        for i, a in enumerate(atts, 1):
+            name = a.get("fileName") or a.get("name") or "(unnamed)"
+            att_id = a.get("id") or "?"
+            size = a.get("fileSize") or a.get("size")
+            size_str = f", {size // 1024} KB" if isinstance(size, (int, float)) else ""
+            out += f"  {i}. {name}  (id:{att_id}{size_str})\n"
+        return out
+    except Exception as e:
+        logger.error(f"Error in list_task_attachments: {e}")
+        return f"Error listing attachments: {str(e)}"
+
+
+@mcp.tool()
+async def download_task_attachment(task_id: str, project_id: str = None,
+                                   attachment_id: str = None,
+                                   filename: str = None,
+                                   index: int = None) -> str:
+    """
+    Download a file attachment from a task (requires v2 API) and return its
+    content as base64, so it can be re-saved elsewhere (e.g. uploaded to
+    Google Drive). Identify the attachment by ONE of: attachment_id (from
+    list_task_attachments), filename (exact match), or index (1-based, as
+    shown by list_task_attachments). Refuses files over 15 MB (base64 bloats
+    the response) — download those to disk another way instead.
+
+    Endpoint: GET /api/v1/attachment/{projectId}/{taskId}/{attachmentId}
+    (mirrors the working upload path minus '/upload'; confirmed by probing —
+    this exact shape 401s, i.e. the route exists, while /api/v2/... and
+    other shapes 404).
+
+    Args:
+        task_id: ID of the task
+        project_id: ID of the task's project (optional; auto-resolved)
+        attachment_id: Attachment id (optional; see list_task_attachments)
+        filename: Exact attachment filename (optional, alternative to id)
+        index: 1-based position in list_task_attachments' output (optional)
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    if not attachment_id and not filename and not index:
+        return "Provide one of attachment_id, filename, or index (see list_task_attachments)."
+    try:
+        pid = project_id or _resolve_project_id(task_id, project_id)
+        if not pid:
+            return f"Could not resolve project_id for task {task_id}; pass it explicitly."
+        atts = await _run_blocking(lambda: _merged_task_attachments(task_id))
+        if not atts:
+            return f"No attachments found on task {task_id}."
+
+        target = None
+        if attachment_id:
+            target = next((a for a in atts if a.get("id") == attachment_id), None)
+            if not target:
+                target = {"id": attachment_id}  # caller may have it from elsewhere
+        elif filename:
+            target = next((a for a in atts
+                          if (a.get("fileName") or a.get("name")) == filename), None)
+            if not target:
+                return (f"No attachment named '{filename}' on this task. "
+                        "Run list_task_attachments to see exact names.")
+        elif index:
+            if index < 1 or index > len(atts):
+                return f"index {index} out of range (task has {len(atts)} attachments)."
+            target = atts[index - 1]
+
+        att_id = target.get("id")
+        if not att_id:
+            return ("Could not determine this attachment's id (neither the "
+                    "attachments metadata nor the content markdown had one) — "
+                    "try list_task_attachments and pass attachment_id explicitly.")
+        want_name = filename or target.get("fileName") or target.get("name")
+
+        name, data, mime = await _run_blocking(lambda: ticktick_v2.download_attachment(
+            pid, task_id, att_id, filename=want_name))
+
+        if len(data) > DOWNLOAD_ATTACHMENT_MAX_BYTES:
+            return (f"'{name}' is {len(data) // (1024*1024)} MB — over the "
+                    f"{DOWNLOAD_ATTACHMENT_MAX_BYTES // (1024*1024)} MB base64-response "
+                    "limit. Not downloaded.")
+
+        b64 = base64.b64encode(data).decode("ascii")
+        return (f"filename: {name}\n"
+                f"mime: {mime}\n"
+                f"size_bytes: {len(data)}\n"
+                f"content_base64: {b64}")
+    except Exception as e:
+        logger.error(f"Error in download_task_attachment: {e}")
+        return f"Error downloading attachment: {str(e)}"
 
 
 # ---------------------------------------------------------------------------

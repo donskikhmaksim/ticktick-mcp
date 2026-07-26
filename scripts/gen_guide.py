@@ -79,6 +79,8 @@ META: dict[str, tuple[str, str]] = {
     "set_task_parent": (THEME_TASKS, "Вложить задачи внутрь другой задачи (сделать их подзадачами)."),
     "unset_task_parent": (THEME_TASKS, "Вынуть подзадачу наружу, сделав её обычной задачей."),
     "attach_file_to_task": (THEME_TASKS, "Прикрепить файл к задаче (по ссылке или содержимому)."),
+    "list_task_attachments": (THEME_TASKS, "Список вложений задачи: имя файла, id, размер."),
+    "download_task_attachment": (THEME_TASKS, "Скачать вложение задачи (содержимое в base64)."),
     "plan_task_creation": (THEME_TASKS, "Шаг 1 безопасного создания: показать, что именно будет создано, до подтверждения."),
     "execute_task_creation": (THEME_TASKS, "Шаг 2 безопасного создания: создать ровно то, что было показано в плане."),
     "plan_task_deletion": (THEME_TASKS, "Шаг 1 безопасного удаления: показать, что именно удалится, до подтверждения."),

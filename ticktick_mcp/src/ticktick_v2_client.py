@@ -22,7 +22,9 @@ import json
 import base64
 import logging
 import mimetypes
+import re
 import time
+import urllib.parse
 import uuid
 import requests
 from datetime import datetime
@@ -509,6 +511,80 @@ class TickTickV2Client:
         return self._request("POST", "/trash/restore", json=body)
 
     # ---- attachments -----------------------------------------------------
+    def get_task_attachments(self, task_id: str) -> List[Dict]:
+        """Raw attachment metadata dicts for an OPEN task, straight from the
+        /batch/check/0 sync feed (whatever keys TickTick sends — not all
+        accounts/attachments carry the same fields, so callers should not
+        assume e.g. 'fileSize' or 'fileUrl' are always present)."""
+        task = next((t for t in self.get_open_tasks() if t.get("id") == task_id), None)
+        if not task:
+            raise ValueError(f"Open task {task_id} not found.")
+        return task.get("attachments") or []
+
+    def get_content_attachment_refs(self, task_id: str) -> List[Dict]:
+        """Fallback/cross-check source: TickTick embeds inline attachment
+        refs directly in a task's content/desc as markdown-ish tokens:
+            ![file](<24-hex attachmentId>/<url-encoded fileName>)
+        Parsed straight from the task text — useful when the structured
+        `attachments` array is missing an id field for this account/attachment
+        (observed in practice: the sync feed's attachments entries can carry
+        fileName without an id), or as a second opinion to cross-check it."""
+        task = next((t for t in self.get_open_tasks() if t.get("id") == task_id), None)
+        if not task:
+            raise ValueError(f"Open task {task_id} not found.")
+        text = (task.get("content") or "") + "\n" + (task.get("desc") or "")
+        refs = []
+        for m in re.finditer(r"!\[file\]\(([0-9a-fA-F]{24})/([^)]+)\)", text):
+            att_id, enc_name = m.group(1), m.group(2)
+            try:
+                name = urllib.parse.unquote(enc_name)
+            except Exception:
+                name = enc_name
+            refs.append({"id": att_id, "fileName": name})
+        return refs
+
+    def download_attachment(self, project_id: str, task_id: str,
+                            attachment_id: str, filename: str = None
+                            ) -> "tuple[str, bytes, str]":
+        """Download a file attachment's bytes. Endpoint mirrors the (known
+        working) upload path minus the '/upload' segment — confirmed by
+        probing: this exact 3-segment v1 shape returns 401 (route exists,
+        needs auth) while the v2 equivalent and other shapes 404:
+            GET /api/v1/attachment/{projectId}/{taskId}/{attachmentId}
+        Returns (filename, content_bytes, mime_type)."""
+        url = f"{ATTACHMENT_BASE}/attachment/{project_id}/{task_id}/{attachment_id}"
+        resp = self.session.get(url, timeout=60)
+        if resp.status_code in (401, 403):
+            raise TickTickAuthError(
+                "TickTick v2 session token is invalid or expired. Re-extract "
+                "the `t` cookie and update TICKTICK_V2_TOKEN.")
+        if resp.status_code == 404:
+            raise ValueError(
+                f"Attachment {attachment_id} not found on task {task_id} "
+                "(wrong id, or the file was removed).")
+        resp.raise_for_status()
+        data = resp.content
+        if len(data) > ATTACHMENT_MAX_BYTES:
+            raise ValueError(
+                f"File is {len(data) // (1024*1024)} MB; refusing to load "
+                f"more than {ATTACHMENT_MAX_BYTES // (1024*1024)} MB into memory.")
+
+        resolved_name = filename
+        if not resolved_name:
+            cd = resp.headers.get("Content-Disposition", "")
+            m = re.search(r"filename\*=UTF-8''([^;]+)", cd) or re.search(r'filename="?([^";]+)"?', cd)
+            if m:
+                try:
+                    resolved_name = urllib.parse.unquote(m.group(1))
+                except Exception:
+                    resolved_name = m.group(1)
+        resolved_name = resolved_name or f"attachment_{attachment_id}"
+
+        mime = resp.headers.get("Content-Type")
+        if not mime or mime == "application/octet-stream":
+            mime = mimetypes.guess_type(resolved_name)[0] or mime or "application/octet-stream"
+        return resolved_name, data, mime
+
     def upload_attachment(self, project_id: str, task_id: str, *,
                           url: str = None, content_base64: str = None,
                           filename: str = None) -> Dict:

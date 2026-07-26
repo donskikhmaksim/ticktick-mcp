@@ -68,7 +68,7 @@ TickTick, сгруппированных по темам. Вам не нужно
 
 > Этот раздел собирается автоматически из кода сервера (`scripts/gen_guide.py`). Руками не редактируйте — при следующем запуске генератора правки затрутся.
 
-**Всего инструментов: 70.**
+**Всего инструментов: 76.**
 
 ### Задачи (создать, изменить, выполнить, удалить)
 
@@ -86,6 +86,8 @@ TickTick, сгруппированных по темам. Вам не нужно
 | `set_task_parent` | Вложить задачи внутрь другой задачи (сделать их подзадачами). |
 | `unset_task_parent` | Вынуть подзадачу наружу, сделав её обычной задачей. |
 | `attach_file_to_task` | Прикрепить файл к задаче (по ссылке или содержимому). |
+| `list_task_attachments` | Список вложений задачи: имя файла, id, размер. |
+| `download_task_attachment` | Скачать вложение задачи (содержимое в base64). |
 | `plan_task_creation` | Шаг 1 безопасного создания: показать, что именно будет создано, до подтверждения. |
 | `execute_task_creation` | Шаг 2 безопасного создания: создать ровно то, что было показано в плане. |
 | `plan_task_deletion` | Шаг 1 безопасного удаления: показать, что именно удалится, до подтверждения. |
@@ -174,5 +176,14 @@ TickTick, сгруппированных по темам. Вам не нужно
 | `get_trash` | Показать содержимое корзины (недавно удалённое). |
 | `restore_tasks` | Вернуть задачи из корзины. |
 | `operation_report` | Отчёт-проверка после массовой операции: что реально произошло. |
+
+### Новое / без описания (обновите scripts/gen_guide.py)
+
+| Инструмент | Что делает |
+| --- | --- |
+| `execute_declutter` | Phase 2 of the declutter: apply EXACTLY the mutating actions the manifest |
+| `plan_declutter` | Phase 1 of the retroactive declutter ("разбор помойки"): READ every open |
+| `resume_declutter` | Resume a sheet-backed declutter manifest (plan_declutter(persist="sheet")) |
+| `set_declutter_decision` | Set the `decision` column (approved/rejected) for specific rows of a |
 
 <!-- TOOLS:AUTO-END -->
