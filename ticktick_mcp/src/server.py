@@ -2772,16 +2772,69 @@ def _dc_smart_fn(titles: List[str], fail_tracker: Optional[list] = None) -> List
     return aligned
 
 
-def _dc_scope_filter(tasks: List[Dict], names: Dict, scope: str) -> List[Dict]:
-    """Optional narrowing. scope='inbox' → Inbox only; otherwise a case-
-    insensitive substring match on the project name."""
-    s = (scope or "").strip().lower()
+def _dc_scope_filter(tasks: List[Dict], names: Dict, scope: str,
+                     col_names: Optional[Dict] = None) -> List[Dict]:
+    """Optional narrowing. Forms of `scope`:
+      'inbox'          → Inbox only
+      'Project'        → case-insensitive substring match on the project name
+      'Project/Column' → project-name substring AND kanban-column-name substring
+                         (col_names: {columnId: column_name} for the matched
+                         project(s), built by the caller via
+                         _dc_column_names_for_scope). Narrowing a big project to
+                         one column is the intended way to stay under
+                         _DC_MAX_TASKS.
+    An empty column part after '/' keeps every column (same as project-only)."""
+    s = (scope or "").strip()
     if not s:
         return tasks
+    # Column-qualified scope: "<project>/<column>". Split on the FIRST '/'.
+    if "/" in s:
+        proj_part, col_part = s.split("/", 1)
+        proj = proj_part.strip().lower()
+        col = col_part.strip().lower()
+        cn = col_names or {}
+        out = []
+        for t in tasks:
+            pname = (names.get(t.get("projectId"), "") or "").lower()
+            if proj and proj not in pname:
+                continue
+            if col:
+                cname = (cn.get(t.get("columnId"), "") or "").lower()
+                if col not in cname:
+                    continue
+            out.append(t)
+        return out
+    s = s.lower()
     if s == "inbox":
         return [t for t in tasks if names.get(t.get("projectId"), "").lower() == "inbox"]
     return [t for t in tasks
             if s in (names.get(t.get("projectId"), "") or "").lower()]
+
+
+async def _dc_column_names_for_scope(scope: str, names: Dict) -> Dict:
+    """For a 'Project/Column' scope, build {columnId: column_name} across the
+    projects whose name matches the project part, so _dc_scope_filter can match
+    the requested column by name. Returns {} for non-column scopes, when the v2
+    client is unavailable, or on any per-project failure (the column part then
+    simply matches nothing, and plan_declutter reports 'nothing in this area')."""
+    s = (scope or "").strip()
+    if "/" not in s or not ticktick_v2:
+        return {}
+    proj_part = s.split("/", 1)[0].strip().lower()
+    if not proj_part:
+        return {}
+    pids = [pid for pid, nm in names.items() if proj_part in (nm or "").lower()]
+    out: Dict = {}
+    for pid in pids:
+        try:
+            cols = await _run_blocking(lambda p=pid: ticktick_v2.get_project_columns(p))
+            for c in cols or []:
+                cid = c.get("id")
+                if cid:
+                    out[cid] = c.get("name") or c.get("title") or ""
+        except Exception as e:
+            logger.warning(f"declutter column scope: columns for {pid} failed: {e}")
+    return out
 
 
 def _dc_mutating_count(actions: Dict) -> int:
@@ -2790,7 +2843,8 @@ def _dc_mutating_count(actions: Dict) -> int:
 
 
 @mcp.tool(annotations=READONLY)
-async def plan_declutter(scope: str = "", dry_run: bool = True) -> str:
+async def plan_declutter(scope: str = "", dry_run: bool = True,
+                         max_tasks: int = 0) -> str:
     """
     Phase 1 of the retroactive declutter ("разбор помойки"): READ every open
     task and propose how to tidy the EXISTING pile. Read-only — creates and
@@ -2817,8 +2871,17 @@ async def plan_declutter(scope: str = "", dry_run: bool = True) -> str:
     instead of running this over the whole pile.
 
     Args:
-        scope: optional narrowing — 'inbox', or a project-name substring
+        scope: optional narrowing — 'inbox', a project-name substring, or
+            'Project/Column' to restrict to one kanban column of a project
+            (e.g. 'Fix&Roll/TG Inbox'). Use list_project_columns to see a
+            project's column names. Narrowing a big project to one column is
+            the intended way to fit under the size cap.
         dry_run: retained for symmetry; plan_declutter is always read-only
+        max_tasks: override the default size cap (_DC_MAX_TASKS = 200) for THIS
+            call only. 0/unset keeps the default. Raise it when you deliberately
+            want to declutter a bigger set and accept the extra time — the O(n^2)
+            clustering and the bundled shim prompts grow with the set, and the
+            MCP client's ~60s timeout still applies, so keep it sane.
     """
     err = _ensure_ready()
     if err:
@@ -2828,7 +2891,8 @@ async def plan_declutter(scope: str = "", dry_run: bool = True) -> str:
     if by_id is None:
         return _STATE_UNAVAILABLE_MSG
     names = _v2_project_names()
-    tasks = _dc_scope_filter(list(by_id.values()), names, scope)
+    col_names = await _dc_column_names_for_scope(scope, names)
+    tasks = _dc_scope_filter(list(by_id.values()), names, scope, col_names)
     if not tasks:
         return ("Открытых задач в этой области нет — разбирать нечего."
                 + (f" (scope='{scope}')" if scope else ""))
@@ -2836,13 +2900,19 @@ async def plan_declutter(scope: str = "", dry_run: bool = True) -> str:
     # resolved scope is too big — see _DC_MAX_TASKS for the sizing rationale.
     # Read-only refusal: nothing above this point mutated anything, and
     # nothing below runs, so there is no partial analysis/journal entry.
-    if len(tasks) > _DC_MAX_TASKS:
+    cap = max_tasks if isinstance(max_tasks, int) and max_tasks > 0 else _DC_MAX_TASKS
+    if len(tasks) > cap:
+        raise_hint = (
+            "" if (isinstance(max_tasks, int) and max_tasks > 0)
+            else f" Либо, если уверен в объёме, подними лимит: max_tasks={len(tasks)}.")
         return (f"🛑 Отказ: в этой области {len(tasks)} открытых задач — "
-                f"больше капа {_DC_MAX_TASKS} (на {len(tasks) - _DC_MAX_TASKS} "
+                f"больше капа {cap} (на {len(tasks) - cap} "
                 "больше). Разбор такого объёма упрётся в таймаут ещё до "
-                "готового плана. Сузь scope (по проекту/тегу/сроку) и "
-                "попробуй снова — например scope='inbox' или конкретный "
-                "проект."
+                "готового плана. Сузь scope и попробуй снова — например "
+                "scope='inbox', конкретный проект, или ОДНУ колонку большого "
+                "проекта: scope='Проект/Колонка' (например 'Fix&Roll/TG Inbox'; "
+                "названия колонок — list_project_columns)."
+                + raise_hint
                 + (f" (текущий scope='{scope}')" if scope else " (scope не задан — вся куча)"))
 
     shim = _dc_shim_available()
