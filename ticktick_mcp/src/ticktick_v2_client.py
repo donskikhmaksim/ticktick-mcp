@@ -451,17 +451,80 @@ class TickTickV2Client:
         data = self._request("GET", f"/project/{project_id}/task/{task_id}/comments")
         return data if isinstance(data, list) else []
 
-    def get_task_activity(self, project_id: str, task_id: str) -> List[Dict]:
-        """Fetch the edit-history / activity log for a task."""
-        data = self._request("GET", f"/project/{project_id}/task/{task_id}/activities")
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            # some endpoints wrap in {"items": [...]} or {"activities": [...]}
-            for key in ("items", "activities", "data"):
-                if isinstance(data.get(key), list):
-                    return data[key]
-        return []
+    def get_task_activity(self, project_id: str = None, task_id: str = None,
+                          *, skip: int = None, last_id: str = None,
+                          max_pages: int = 20) -> List[Dict]:
+        """Fetch the edit-history / activity log for a task.
+
+        Endpoint confirmed via a live DevTools capture of TickTick's own
+        "Task Activities" panel (2026-07, HTTP 200):
+            GET /api/v1/task/activity/{taskId}
+        Note: v1 (not v2), singular "activity" (not "activities"), and no
+        projectId in the path at all. `project_id` is kept as the first
+        positional arg for backward compatibility with existing callers but
+        is unused in the URL.
+
+        Pages via the same path plus query params `skip` (count of records
+        already fetched) and `lastId` (id of the last activity record
+        already fetched). By default this walks every page (bounded by
+        max_pages) and returns the concatenated list; pass skip/last_id
+        yourself to fetch a single page instead.
+        """
+        if not task_id:
+            raise ValueError("task_id is required.")
+        url = f"{ATTACHMENT_BASE}/task/activity/{task_id}"
+
+        def _fetch_page(skip_val: Optional[int], last_id_val: Optional[str]) -> List[Dict]:
+            params: Dict[str, Any] = {}
+            if skip_val:
+                params["skip"] = skip_val
+            if last_id_val:
+                params["lastId"] = last_id_val
+            resp = self.session.get(url, params=params or None, timeout=REQUEST_TIMEOUT)
+            if resp.status_code in (401, 403):
+                raise TickTickAuthError(
+                    "TickTick v2 session token is invalid or expired. Re-extract "
+                    "the `t` cookie and update TICKTICK_V2_TOKEN.")
+            if resp.status_code == 404:
+                return []
+            resp.raise_for_status()
+            if resp.status_code == 204 or not resp.text:
+                return []
+            try:
+                data = resp.json()
+            except ValueError:
+                raise TickTickAuthError(
+                    "TickTick v2 returned a non-JSON response (likely an HTML "
+                    "login/interstitial page). Re-extract the `t` cookie and "
+                    "update TICKTICK_V2_TOKEN.")
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                # some payload shapes wrap the list in {"items": [...]} etc.
+                for key in ("items", "activities", "data"):
+                    if isinstance(data.get(key), list):
+                        return data[key]
+            return []
+
+        # Single explicit page requested — caller drives its own pagination.
+        if skip is not None or last_id is not None:
+            return _fetch_page(skip, last_id)
+
+        # Otherwise walk every page until one comes back empty or repeats.
+        events: List[Dict] = []
+        cur_skip = 0
+        cur_last_id: Optional[str] = None
+        for _ in range(max(1, max_pages)):
+            page = _fetch_page(cur_skip, cur_last_id)
+            if not page:
+                break
+            events.extend(page)
+            cur_skip += len(page)
+            new_last_id = page[-1].get("id") if isinstance(page[-1], dict) else None
+            if not new_last_id or new_last_id == cur_last_id:
+                break
+            cur_last_id = new_last_id
+        return events
 
     def add_task_comment(self, project_id: str, task_id: str, text: str) -> Dict:
         body = {"id": uuid.uuid4().hex[:24], "title": text,

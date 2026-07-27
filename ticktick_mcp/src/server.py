@@ -6297,6 +6297,39 @@ async def get_task_info(task_id: str) -> str:
         return f"Error fetching task info: {str(e)}"
 
 
+def _task_activity_fallback(task_id: str) -> Optional[str]:
+    """Best-effort substitute for get_task_activity, used only when the real
+    /task/activity/{taskId} endpoint genuinely returns nothing (empty list
+    or 404) for this specific task — e.g. it has no logged activity. Not a
+    real edit log: no per-field diffs, no actor attribution beyond the
+    creator. Reuses the create/modify/complete stamps TickTick already
+    returns on the task object itself (same fields get_task_info shows under
+    "Activity"). Returns None if the task can't be found at all (open or
+    trashed)."""
+    if not ticktick_v2:
+        return None
+    try:
+        state = ticktick_v2.get_state()
+        owner = (state.get("inboxId") or "").replace("inbox", "")
+        tasks = state.get("syncTaskBean", {}).get("update", []) or []
+        t = next((x for x in tasks if x.get("id") == task_id), None)
+        if not t:
+            trashed = ticktick_v2.get_trash(limit=500)
+            t = next((x for x in trashed if x.get("id") == task_id), None)
+        if not t:
+            return None
+        creator = str(t.get("creator", ""))
+        who = "you" if creator == owner else (f"user {creator}" if creator else "?")
+        lines = [f"  created: {t.get('createdTime', '?')}  by {who}"]
+        if t.get("modifiedTime"):
+            lines.append(f"  last modified: {t['modifiedTime']}")
+        if t.get("completedTime"):
+            lines.append(f"  completed: {t['completedTime']}")
+        return "\n".join(lines)
+    except Exception:
+        return None
+
+
 @mcp.tool(annotations=READONLY)
 async def get_task_activity(task_id: str, project_id: str) -> str:
     """
@@ -6304,9 +6337,19 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
     Shows who changed what and when: title edits, due-date changes, moves,
     content updates, parent changes, etc.
 
+    Backed by TickTick's "Task Activities" panel endpoint (task detail →
+    "..." → Task Activities), confirmed via live capture:
+        GET /api/v1/task/activity/{taskId}
+    (v1, singular "activity", no projectId in the path). Automatically walks
+    all pages. If this specific task genuinely has no logged activity (empty
+    result or 404), falls back to the created/modified/completed stamps
+    already present on the task record (a much smaller "mini-history", no
+    per-field diffs or non-owner actor names).
+
     Args:
         task_id: ID of the task
-        project_id: ID of the project the task belongs to
+        project_id: ID of the project the task belongs to (kept for backward
+            compatibility; no longer needed by the underlying endpoint)
     """
     err = _ensure_ready()
     if err:
@@ -6314,9 +6357,11 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
     try:
         events = await _run_blocking(lambda: ticktick_v2.get_task_activity(project_id, task_id))
         if not events:
-            return ("No activity found for this task. "
-                    "The endpoint may not be available — try providing the exact URL "
-                    "from the browser Network tab (F12) when viewing task activity.")
+            base = "No activity found for this task (empty result from TickTick)."
+            fallback = await _run_blocking(lambda: _task_activity_fallback(task_id))
+            if fallback:
+                base += "\n\nWhat we do know from the task itself:\n" + fallback
+            return base
 
         ACTION_LABELS = {
             "T_TITLE":   "renamed",
@@ -6360,7 +6405,13 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
         return out
     except Exception as e:
         logger.error(f"Error in get_task_activity: {e}")
-        return f"Error fetching task activity: {str(e)}"
+        msg = f"Error fetching task activity: {str(e)}"
+        if "404" in str(e):
+            fallback = await _run_blocking(lambda: _task_activity_fallback(task_id))
+            if fallback:
+                msg += ("\n\nThis task's activity endpoint 404d — falling back "
+                        "to what's on the task record itself:\n" + fallback)
+        return msg
 
 
 @mcp.tool(annotations=READONLY)
