@@ -270,18 +270,20 @@ async def test_execute_from_sheet_deletes_and_writes_done(monkeypatch, sheet_env
 
     calls = {"n": 0}
 
-    async def fake_execute_task_deletion(manifest_id, confirm):
+    async def fake_execute_task_deletion_impl(manifest_id, m=None):
         calls["n"] += 1
-        m = s._MANIFESTS.get(manifest_id)
+        m = m or s._MANIFESTS.get(manifest_id)
         for it in m["items"]:
             live.pop(it["taskId"], None)
         return "🗑 deleted (fake)"
-    monkeypatch.setattr(s, "execute_task_deletion", fake_execute_task_deletion)
+    monkeypatch.setattr(s, "_execute_task_deletion_impl", fake_execute_task_deletion_impl)
 
     mid = "mid-del"
     ids = _plant_delete_manifest(fs, mid)
 
-    await s._execute_declutter_from_sheet(mid, "DECLUTTER 1")
+    # Consent (docs/DESIGN_approval_gate.md) is now the CALLER's job — this
+    # low-level engine trusts it already happened and just does the work.
+    await s._execute_declutter_from_sheet(mid)
     assert calls["n"] == 1
     assert "d1" not in live
     row = fs.read_manifest_rows(mid)[0]
@@ -290,7 +292,7 @@ async def test_execute_from_sheet_deletes_and_writes_done(monkeypatch, sheet_env
     assert row["row_id"] == ids[0]
 
     # ---- idempotency: a second run must NOT re-delete ---------------------
-    result2 = await s._execute_declutter_from_sheet(mid, "DECLUTTER 0")
+    result2 = await s._execute_declutter_from_sheet(mid)
     assert calls["n"] == 1, "done rows must never be re-applied"
     assert "Нечего применять" in result2
     row2 = fs.read_manifest_rows(mid)[0]
@@ -307,16 +309,16 @@ async def test_stuck_applying_lock_resolved_by_live_delete_fact_not_retried(monk
 
     calls = {"n": 0}
 
-    async def fake_execute_task_deletion(manifest_id, confirm):
+    async def fake_execute_task_deletion_impl(manifest_id, m=None):
         calls["n"] += 1
         return "should not be called"
-    monkeypatch.setattr(s, "execute_task_deletion", fake_execute_task_deletion)
+    monkeypatch.setattr(s, "_execute_task_deletion_impl", fake_execute_task_deletion_impl)
 
     mid = "mid-stuck"
     ids = _plant_delete_manifest(fs, mid)
     fs.batch_update_rows([{"row_id": ids[0], "status": "applying"}])
 
-    await s._execute_declutter_from_sheet(mid, "DECLUTTER 0")
+    await s._execute_declutter_from_sheet(mid)
     assert calls["n"] == 0
     row = fs.read_manifest_rows(mid)[0]
     assert row["status"] == "done"
@@ -332,42 +334,46 @@ async def test_stuck_applying_lock_not_yet_applied_is_retried(monkeypatch, sheet
 
     calls = {"n": 0}
 
-    async def fake_execute_task_deletion(manifest_id, confirm):
+    async def fake_execute_task_deletion_impl(manifest_id, m=None):
         calls["n"] += 1
-        m = s._MANIFESTS.get(manifest_id)
+        m = m or s._MANIFESTS.get(manifest_id)
         for it in m["items"]:
             live.pop(it["taskId"], None)
         return "🗑 deleted (fake, retried)"
-    monkeypatch.setattr(s, "execute_task_deletion", fake_execute_task_deletion)
+    monkeypatch.setattr(s, "_execute_task_deletion_impl", fake_execute_task_deletion_impl)
 
     mid = "mid-retry"
     ids = _plant_delete_manifest(fs, mid)
     fs.batch_update_rows([{"row_id": ids[0], "status": "applying"}])
 
-    await s._execute_declutter_from_sheet(mid, "DECLUTTER 1")
+    await s._execute_declutter_from_sheet(mid)
     assert calls["n"] == 1
     assert "d1" not in live
     row = fs.read_manifest_rows(mid)[0]
     assert row["status"] == "done"
 
 
-async def test_confirm_mismatch_after_decision_changed_since_plan(monkeypatch, sheet_env):
-    """Human rejects the row in the sheet AFTER the plan printed N=1 —
-    execute must refuse the stale confirm token, touching nothing."""
+async def test_rejected_row_since_plan_is_never_applied(monkeypatch, sheet_env):
+    """Human rejects the row in the sheet AFTER the plan printed N=1 — the
+    confirm="DECLUTTER <N>" approval-race guard was replaced by the in-chat
+    consent gate (docs/DESIGN_approval_gate.md), but the underlying safety
+    property still holds: `apply_rows` is filtered fresh by decision=
+    "approved" every call, so a row that flipped to "rejected" since the plan
+    was printed is simply excluded — nothing gets touched for it, regardless
+    of what N a stale message said."""
     fs = sheet_env
     monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: {})
 
     async def must_not_run(*a, **kw):
-        raise AssertionError("must not apply anything on a confirm mismatch")
-    monkeypatch.setattr(s, "execute_task_deletion", must_not_run)
+        raise AssertionError("must not apply anything for a rejected row")
+    monkeypatch.setattr(s, "_execute_task_deletion_impl", must_not_run)
 
     mid = "mid-race"
     ids = _plant_delete_manifest(fs, mid)
     fs.batch_update_rows([{"row_id": ids[0], "decision": "rejected"}])
 
-    result = await s._execute_declutter_from_sheet(mid, "DECLUTTER 1")
-    assert "🛑" in result and "не совпало" in result
-    assert "DECLUTTER 0" in result
+    result = await s._execute_declutter_from_sheet(mid)
+    assert "Нечего применять" in result
     row = fs.read_manifest_rows(mid)[0]
     assert row["status"] == "planned"  # untouched
 
@@ -380,12 +386,12 @@ async def test_keep_id_conflict_refused_end_to_end_others_still_apply(monkeypatc
             "b": {"id": "b", "title": "B"}}
     monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: dict(live))
 
-    async def fake_execute_task_deletion(manifest_id, confirm):
-        m = s._MANIFESTS.get(manifest_id)
+    async def fake_execute_task_deletion_impl(manifest_id, m=None):
+        m = m or s._MANIFESTS.get(manifest_id)
         for it in m["items"]:
             live.pop(it["taskId"], None)
         return "🗑 deleted (fake)"
-    monkeypatch.setattr(s, "execute_task_deletion", fake_execute_task_deletion)
+    monkeypatch.setattr(s, "_execute_task_deletion_impl", fake_execute_task_deletion_impl)
 
     mid = "mid-conflict"
     rows = []
@@ -398,7 +404,7 @@ async def test_keep_id_conflict_refused_end_to_end_others_still_apply(monkeypatc
     fs.append_rows(rows)
 
     # 3 approved+pending rows at plan time.
-    await s._execute_declutter_from_sheet(mid, "DECLUTTER 3")
+    await s._execute_declutter_from_sheet(mid)
     assert "a" in live  # refused — its keep target was also slated for delete
     assert "b" not in live  # unrelated row still applied
     by_task = {r["task_id"]: r for r in fs.read_manifest_rows(mid)}
@@ -409,12 +415,22 @@ async def test_keep_id_conflict_refused_end_to_end_others_still_apply(monkeypatc
 async def test_resume_declutter_requires_sheet_configured(monkeypatch):
     monkeypatch.setattr(s, "_ensure_ready", lambda: None)
     monkeypatch.setattr(s.declutter_sheet, "sheet_configured", lambda: False)
-    result = await s.resume_declutter("some-mid", "DECLUTTER 0")
+    # "not configured" is checked BEFORE consent, so any user_reply (even a
+    # non-affirmative one) still reaches this message.
+    result = await s.resume_declutter("some-mid", "да")
     assert "не настроен" in result
 
 
+async def test_resume_declutter_without_consent_is_refused(monkeypatch, sheet_env):
+    result = await s.resume_declutter("no-such-manifest")
+    assert "🛑" in result
+    assert "user_reply" in result
+
+
 async def test_resume_declutter_unknown_manifest_is_friendly(monkeypatch, sheet_env):
-    result = await s.resume_declutter("no-such-manifest", "DECLUTTER 0")
+    # Consent granted (real user_reply) → reaches the sheet engine, which
+    # reports the manifest itself isn't there.
+    result = await s.resume_declutter("no-such-manifest", user_reply="да")
     assert "🛑" in result and "не найден" in result
 
 
@@ -423,11 +439,18 @@ async def test_set_declutter_decision_updates_and_reports_unknown(monkeypatch, s
     mid = "mid-dec"
     ids = _plant_delete_manifest(fs, mid)
 
+    # decision="rejected" is safe and NOT gated — no user_reply needed.
     ok = await s.set_declutter_decision(mid, [ids[0]], "rejected")
     assert "✅" in ok
     assert fs.read_manifest_rows(mid)[0]["decision"] == "rejected"
 
-    unknown = await s.set_declutter_decision(mid, [999999], "approved")
+    # decision="approved" without user_reply → refused, not a silent approval.
+    no_consent = await s.set_declutter_decision(mid, [ids[0]], "approved")
+    assert "🛑" in no_consent
+    assert fs.read_manifest_rows(mid)[0]["decision"] == "rejected"  # untouched
+
+    unknown = await s.set_declutter_decision(mid, [999999], "approved",
+                                             user_reply="да")
     assert "🛑" in unknown
 
     bad_value = await s.set_declutter_decision(mid, [ids[0]], "maybe")
@@ -442,20 +465,21 @@ async def test_execute_declutter_dispatches_ram_and_sheet_correctly(monkeypatch,
     live = {"d1": {"id": "d1", "title": "Dup", "projectId": "p1"}}
     monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: dict(live))
 
-    async def fake_execute_task_deletion(manifest_id, confirm):
-        m = s._MANIFESTS.get(manifest_id)
+    async def fake_execute_task_deletion_impl(manifest_id, m=None):
+        m = m or s._MANIFESTS.get(manifest_id)
         for it in m["items"]:
             live.pop(it["taskId"], None)
         return "🗑 deleted (fake)"
-    monkeypatch.setattr(s, "execute_task_deletion", fake_execute_task_deletion)
+    monkeypatch.setattr(s, "_execute_task_deletion_impl", fake_execute_task_deletion_impl)
 
     mid = "mid-dispatch"
     _plant_delete_manifest(fs, mid)
     s._MANIFESTS[mid] = {"kind": "declutter", "persist": "sheet",
                          "mutating_count": 1, "created": time.monotonic(),
+                         "plan_shown_at": time.monotonic(),
                          "summary": "x", "consumed": False,
                          "actions": {"delete": [], "rename": [], "group": []}}
 
-    await s.execute_declutter(mid, "DECLUTTER 1")
+    await s.execute_declutter(mid, user_reply="да")
     assert "d1" not in live
     assert fs.read_manifest_rows(mid)[0]["status"] == "done"

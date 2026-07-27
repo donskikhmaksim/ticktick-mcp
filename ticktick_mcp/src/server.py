@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import hmac
 import json
 import os
@@ -765,7 +766,7 @@ async def create_tasks(
 
     ⛔ INTERACTIVE ASSISTANTS: this tool will REFUSE your call. Use
     plan_task_creation (read-only) → reprint its echo VERBATIM → get the
-    user's explicit «да/ок» → execute_task_creation(manifest_id, confirm=...)
+    user's explicit «да/ок» → execute_task_creation(manifest_id, user_reply=...)
     → operation_report. Do NOT try to fill automation_key — you don't know it
     and guessing is a protocol violation.
 
@@ -774,7 +775,7 @@ async def create_tasks(
     bypasses the interactive plan/approve requirement.
 
     summary (FIRST arg): one-line human sentence IN THE USER'S LANGUAGE shown
-    at the TOP of the confirmation dialog, e.g.
+    at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g.
     «Создаю задачу „Позвонить маме" в „Личное", срок 2026-07-01, приоритет высокий»
     or «Создаю 3 задачи в „Работа"». Include date and priority when set.
 
@@ -833,7 +834,7 @@ async def create_tasks(
     if not (SECRET and automation_key and hmac.compare_digest(automation_key, SECRET)):
         return ("🛑 Прямое создание — только для автоматики. Интерактивный флоу: "
                 "plan_task_creation (покажи эхо пользователю дословно) → явное "
-                "«да» → execute_task_creation(manifest_id, confirm=\"CREATE N\") "
+                "«да» → execute_task_creation(manifest_id, user_reply=<реплика>) "
                 "→ operation_report. Ничего не создано.")
     return await _create_tasks_impl(summary, tasks)
 
@@ -1174,9 +1175,13 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     («2 — в Fix&Roll»); re-plan with explicit project_id for corrections.
 
     IMPORTANT: reprint the returned text VERBATIM and IN FULL to the user, ask
-    for explicit confirmation («ок?»), and only after their yes call
-    execute_task_creation(manifest_id, confirm="CREATE <N>"). Afterwards run
-    operation_report and reprint it — the flow is: спроси → сделай → докажи.
+    for explicit confirmation («ок?»), and only after their real reply call
+    execute_task_creation(manifest_id, user_reply=<their literal message>).
+    Afterwards run operation_report and reprint it — the flow is: спроси →
+    сделай → докажи. Creation is low-risk and reversible (🟢 — see
+    docs/DESIGN_write_tool_taxonomy.md), so execute_task_creation does not
+    hard-block on user_reply the way the deletion/declutter tools do; it's
+    still required in the signature for a uniform manifest format.
 
     Args:
         summary: one-line human sentence describing the batch
@@ -1235,9 +1240,10 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
             _norm_name(lt.get("title") or ""))
 
     mid = uuid.uuid4().hex[:12]
+    now = time.monotonic()
     _MANIFESTS[mid] = {"kind": "create", "raw": [t for t, _, _ in good],
-                       "created": time.monotonic(), "summary": summary,
-                       "consumed": False}
+                       "created": now, "plan_shown_at": now,
+                       "summary": summary, "consumed": False}
     lines = [f"### 📋 План создания — {len(good)}",
              f"_Манифест `{mid}` · ничего ещё не создано_", ""]
     for i, (t, pname, sug) in enumerate(good, 1):
@@ -1266,22 +1272,25 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
                      "(«2 — в Fix&Roll»), тогда план пересоберётся с явными "
                      "адресами._")
     lines.append("")
-    lines.append(f"_После явного «да»: `execute_task_creation(manifest_id=\"{mid}\", "
-                 f"confirm=\"CREATE {len(good)}\")` · действует 1 час, одноразово._")
+    lines.append("После явного «да» вызови "
+                 f"`execute_task_creation(manifest_id=\"{mid}\", "
+                 "user_reply=\"<дословная реплика пользователя>\")` · "
+                 "действует 1 час, одноразово.")
     return "\n".join(lines)
 
 
 @mcp.tool()
-async def execute_task_creation(manifest_id: str, confirm: str = "") -> str:
+async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
     """
     Phase 2: create exactly what plan_task_creation planned and the user
-    approved. `confirm` must be the literal "CREATE <N>" with N = item count.
-    Runs the normal creation engine (id echo, destination post-verify,
-    operation_report record). One-shot.
+    approved. Runs the normal creation engine (id echo, destination
+    post-verify, operation_report record). One-shot.
 
     Args:
         manifest_id: id from plan_task_creation
-        confirm: literal "CREATE <N>"
+        user_reply: the user's reply approving the plan (creation is 🟢 —
+            reversible/low-risk — so this is accepted for a uniform format
+            but NOT hard-enforced the way it is for deletion/declutter)
     """
     err = _ensure_official()
     if err:
@@ -1291,10 +1300,10 @@ async def execute_task_creation(manifest_id: str, confirm: str = "") -> str:
     if not m or m.get("kind") != "create":
         return (f"🛑 Манифест создания {manifest_id} не найден/истёк/уже "
                 "исполнен. Сначала plan_task_creation.")
-    expected = f"CREATE {len(m['raw'])}"
-    if confirm.strip() != expected:
-        return (f"🛑 Подтверждение не совпало: нужно confirm=\"{expected}\" "
-                f"(получено {confirm!r}). Ничего не создано.")
+    cr = _require_consent(action="create", tier=0, manifest=m,
+                          user_reply=user_reply)
+    if not cr.ok:
+        return cr.reason
     m["consumed"] = True
     result = await _create_tasks_impl(m.get("summary") or "Создание по манифесту",
                                       m["raw"])
@@ -1320,7 +1329,7 @@ async def update_tasks(
     run operation_report(record_id) and reprint it verbatim.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog, e.g. «Меняю задачу „Оплатить аренду":
+    at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Меняю задачу „Оплатить аренду":
     срок 2026-07-01, приоритет высокий» or «Меняю срок у 3 задач на 2026-07-05».
     Mention only what actually changes.
 
@@ -1576,7 +1585,7 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
     user just named them). Afterwards run operation_report and reprint it.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog, e.g. «Завершаю задачу „Купить молоко"
+    at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Завершаю задачу „Купить молоко"
     в проекте „Покупки"» or «Завершаю 4 задачи».
 
     Put the human title inside each task object so the dialog shows what's
@@ -1704,31 +1713,65 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
         return f"Error completing tasks: {str(e)}"
 
 @mcp.tool()
-async def delete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
+async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = None,
+                       manifest_id: str = "", user_reply: str = "") -> str:
     """
-    ⚠️ Delete one or more tasks permanently in one call.
+    ⚠️ Delete one or more tasks permanently. Gated (🔴 — even a SINGLE
+    deletion): this is now a two-call plan → user says yes → execute flow,
+    same shape as plan_task_deletion/execute_task_deletion.
 
-    summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog. Destructive — START WITH ⚠️, e.g.
+    Call #1 (manifest_id omitted): resolves `tasks` against live state and
+    returns a one-shot manifest — nothing is deleted yet. Show that manifest
+    to the user VERBATIM and wait for their real reply.
+
+    Call #2 (after the user actually replied): repeat the call with
+    manifest_id=<id from call #1> and user_reply=<the user's literal last
+    message> — `tasks` is ignored (the manifest's own stored items are used,
+    so the set can't be swapped between the two calls). Do NOT make call #2
+    in the same turn as call #1.
+
+    summary (FIRST arg): one-line human sentence in the user's language,
+    Destructive — START WITH ⚠️, e.g.
     «⚠️ Удаляю задачу „Купить молоко" из „Покупки"» or
     «⚠️ Удаляю 5 задач из „Inbox"».
 
-    Put the human title and project name INSIDE each task object so the dialog
-    shows what's being deleted:
+    Put the human title and project name INSIDE each task object (call #1)
+    so the manifest shows what's being deleted:
     [{"title": "Buy milk", "projectName": "Groceries", "taskId": "abc",
       "projectId": "xyz"}]
 
+    BULK (more than DIRECT_DELETE_CAP tasks) is refused here outright — use
+    plan_task_deletion → execute_task_deletion instead.
+
     Args:
-        summary: Human-readable confirmation line starting with ⚠️ (see above)
+        summary: Human-readable line starting with ⚠️ (see above)
         tasks: List of {"title","projectName","taskId","projectId"} objects
+            — required on call #1, ignored on call #2
+        manifest_id: from call #1's response — pass on call #2 to actually delete
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
     err = _ensure_ready()
     if err:
         return err
+    _prune_manifests()
+
+    if manifest_id:
+        m = _MANIFESTS.get(manifest_id)
+        if not m or m.get("kind") != "delete":
+            return (f"🛑 Манифест удаления {manifest_id} не найден/истёк/уже "
+                    "исполнен. Начни заново: delete_tasks(summary, tasks).")
+        cr = _require_consent(action="delete", tier=2, manifest=m,
+                              user_reply=user_reply,
+                              object_ids=[it["taskId"] for it in m["items"]])
+        if not cr.ok:
+            return cr.reason
+        return await _execute_task_deletion_impl(manifest_id, m)
+
     if not tasks:
         return "Нечего удалять: список пуст."
     # SINGLE task → direct delete allowed, but only fully armed: the title is
-    # REQUIRED (identity guard always on), the snapshot is journaled, and
+    # REQUIRED (identity guard always on), the manifest is one-shot and needs
+    # explicit user consent, the snapshot is journaled once executed, and
     # operation_report works for it. BULK (>cap) → two-phase manifest only
     # (plan → text approval → execute → independent report).
     direct_cap = int(os.environ.get("DIRECT_DELETE_CAP", "1"))
@@ -1751,67 +1794,50 @@ async def delete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
         if by_id is None:
             return _STATE_UNAVAILABLE_MSG
         found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
-        # Journal full snapshots BEFORE deleting (same guarantee as the manifest
-        # path) — operation_report("direct-…") then works for point deletes too.
-        record_id = "direct-" + uuid.uuid4().hex[:8]
-        journal = ""
-        if found:
-            journal = _journal_write({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "manifest": record_id, "summary": summary,
-                "deleted": [{**{k: (by_id.get(e["taskId"]) or {}).get(k)
-                                for k in ("title", "content", "desc", "dueDate",
-                                          "startDate", "priority", "tags",
-                                          "projectId", "parentId", "isAllDay")
-                                if (by_id.get(e["taskId"]) or {}).get(k) is not None},
-                             "taskId": e["taskId"]} for e in found],
-            })
-        # Delete ONLY verified ('found') ids. 'missing' ids are NOT attempted:
-        # their live title could not be checked (the guard sees only open
-        # tasks), so a stale id could erase a real COMPLETED task with no
-        # snapshot — exactly the wrong-target class the guard exists to stop.
-        api_fail = {}
-        if found:
-            items = [{"taskId": e["taskId"], "projectId": e["projectId"]}
-                     for e in found]
-            resp = await _run_blocking(lambda: ticktick_v2.batch_delete_tasks(items))
-            api_fail = id2error_failures(resp, [e["taskId"] for e in found])
-        # Post-verify against FRESH state: which open ones actually disappeared.
-        still_open = _open_by_id(fresh=True) if found else {}
         lines = []
-        if still_open is None:
-            lines.append(f"Отправлено на удаление {len(found)}, но "
-                         f"{_UNVERIFIED_MSG}")
-            deleted, failed = [], []
-        else:
-            deleted = [e["title"] for e in found
-                       if e["taskId"] not in still_open
-                       and e["taskId"] not in api_fail]
-            failed = [e["title"] for e in found
-                      if e["taskId"] in still_open or e["taskId"] in api_fail]
-
-        if deleted:
-            lines.append(f"🗑 Удалено {len(deleted)}: "
-                         + ", ".join(f"«{t}»" for t in deleted))
         if mismatch:
-            lines.append(_mismatch_report(mismatch, "удалил"))
+            lines.append(_mismatch_report(mismatch, "буду удалять"))
         if missing:
             lines.append(
                 f"↷ Не среди открытых {len(missing)} — пропущено (сверить "
                 "название нельзя, значит удалять нельзя). Если это завершённая "
                 "задача — используй plan_task_deletion: "
                 + ", ".join(f"«{m['title']}»" for m in missing))
-        if failed:
-            extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
-            lines.append(
-                f"❌ НЕ удалено {len(failed)} — задачи ВСЁ ЕЩЁ в TickTick "
-                "(delete не сработал"
-                + (f"; TickTick сообщил: {extra}" if extra else "")
-                + "): " + ", ".join(f"«{t}»" for t in failed))
-        if journal and deleted:
-            lines.append(f"🧾 Снапшот в журнале; независимая проверка: "
-                         f"operation_report(record_id=\"{record_id}\").")
-        return "\n".join(lines) if lines else "Ничего не удалено."
+        if not found:
+            lines.insert(0, "Нечего удалять — среди открытых задач не нашёл "
+                            "ни одной из указанных.")
+            return "\n".join(lines)
+
+        names = _v2_project_names()
+        items = []
+        for f in found:
+            live = by_id.get(f["taskId"]) or {}
+            items.append({
+                "taskId": f["taskId"], "projectId": f["projectId"],
+                "title": live.get("title") or f["title"],
+                "project": names.get(f["projectId"], ""),
+                "snapshot": _snapshot_of(live),
+            })
+        mid = uuid.uuid4().hex[:12]
+        now = time.monotonic()
+        obj_hash = _manifest_object_hash("delete", [it["taskId"] for it in items])
+        _MANIFESTS[mid] = {"kind": "delete", "items": items,
+                           "created": now, "plan_shown_at": now,
+                           "object_hash": obj_hash,
+                           "summary": summary, "consumed": False}
+        preview = [f"### 📋 Готов удалить — {len(items)}",
+                  f"_Манифест `{mid}` · ничего ещё не удалено_", ""]
+        for i, it in enumerate(items, 1):
+            preview.append(f"{i}. **«{it['title']}»** — {it['project']} (`{it['taskId']}`)")
+        preview.extend(lines)
+        preview.append("")
+        preview.append("Покажи это пользователю дословно и ДОЖДИСЬ его "
+                       "отдельного ответа (не отвечай за него). Когда он явно "
+                       "согласится, вызови "
+                       f"`delete_tasks(summary=\"{summary}\", manifest_id=\"{mid}\", "
+                       "user_reply=\"<дословная реплика пользователя>\")` — "
+                       "НЕ в этом же ходе. Манифест одноразовый, действует 1 час.")
+        return "\n".join(preview)
     except Exception as e:
         logger.error(f"Error in delete_tasks: {e}")
         return f"Error deleting tasks: {str(e)}"
@@ -1830,6 +1856,178 @@ async def delete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
 _MANIFESTS: Dict[str, Dict] = {}
 _MANIFEST_TTL = 3600.0  # seconds; a stale plan must be re-planned
 _JOURNAL_DIR = os.environ.get("TICKTICK_DATA_DIR", "/data")
+
+
+# ---------------------------------------------------------------------------
+# In-chat consent gate — docs/DESIGN_approval_gate.md (v2, "no buttons").
+# ---------------------------------------------------------------------------
+# elicitation isn't available on claude.ai (§1 of the design doc) and Maksim
+# rejected any out-of-band channel (Telegram nonce / button), so this is a
+# BEHAVIOURAL gate, not a cryptographic one (§2 proves a hard gate is
+# impossible under those constraints). The threat model it targets is a
+# HURRIED model self-confirming (`execute` right after `plan`, using a
+# password the server itself printed) — not an adversarial one fabricating
+# consent outright (§3). The fix: `plan_*` no longer prints a deterministic
+# password; `execute_*` instead requires `user_reply` — the user's VERBATIM
+# last chat message — and every mutating tool in tiers 🟡/🔴 funnels through
+# this single `_require_consent()` so the check can't be skipped by one tool
+# simply lacking the reminder text.
+
+# How long a caller must wait between a plan_* being shown and the matching
+# execute_*(user_reply=...) — anti-"duplet" heuristic (§4.3.4): catches a
+# model that calls plan+execute back-to-back in the same turn, without ever
+# handing control back to a human. Weak but free; env-tunable per tier.
+_MIN_CONSENT_GAP = float(os.environ.get("MIN_CONSENT_GAP", "2.0"))
+
+# Server-side yes/no vocabulary (§4.3.3). Deliberately NOT anything that
+# looks like the old deterministic password ("DELETE 5"), a tool name, or
+# JSON — those are what a self-confirming model would fabricate, not what a
+# human actually types.
+_CONSENT_AFFIRMATIVE_WORDS = {
+    "да", "ага", "угу", "ок", "окей", "окай", "подтверждаю", "подтверждено",
+    "удаляй", "удали", "давай", "го", "погнали", "делай", "применяй",
+    "применить", "применяем", "конечно", "точно",
+    "yes", "yep", "yeah", "sure", "confirm", "confirmed", "ok", "okay",
+    "approve", "approved", "go", "+", "+1",
+}
+_CONSENT_NEGATIVE_WORDS = {
+    "нет", "неа", "не", "стоп", "отмена", "отмени", "погоди", "подожди",
+    "отбой", "не надо", "cancel", "no", "nope", "stop", "wait", "don't",
+}
+# A reply that merely echoes the server's OWN manifest jargon back is not a
+# human "yes" — it's exactly what a model that fabricates consent would type
+# (the literal string it would otherwise have self-confirmed with).
+_CONSENT_ECHO_ARTIFACT_RE = re.compile(
+    r'^(delete|create|declutter)\s*\d+$|manifest_id|execute_\w+\s*\(|plan_\w+\s*\(|^\{.*\}$',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _normalize_consent_reply(reply: Optional[str]) -> str:
+    return re.sub(r'\s+', ' ', (reply or "").strip().strip('.!?,;:')).lower()
+
+
+def _consent_tokens(norm: str) -> List[str]:
+    # Strip PER-WORD punctuation too ("да," / "го!") — _normalize_consent_reply
+    # only trims the ends of the whole string, and a real chat reply like
+    # "да, удаляй" or "да, сливай" commonly punctuates mid-sentence.
+    return [t.strip('.,!?;:') for t in norm.split()]
+
+
+def _is_negative_reply(reply: Optional[str]) -> bool:
+    norm = _normalize_consent_reply(reply)
+    if not norm:
+        return False
+    tokens = _consent_tokens(norm)
+    return any(t in _CONSENT_NEGATIVE_WORDS for t in tokens[:4]) or norm in _CONSENT_NEGATIVE_WORDS
+
+
+def _is_affirmative_reply(reply: Optional[str]) -> bool:
+    """True only for a real human-shaped "yes" — see docs/DESIGN_approval_gate.md
+    §4.3.3. Fail-closed: empty, negative, or manifest-echo-shaped replies are
+    NEVER affirmative, even if they also happen to contain a "да" substring
+    inside a longer sentence that also negates."""
+    norm = _normalize_consent_reply(reply)
+    if not norm or _CONSENT_ECHO_ARTIFACT_RE.search(norm):
+        return False
+    if _is_negative_reply(reply):
+        return False
+    if norm in _CONSENT_AFFIRMATIVE_WORDS:
+        return True
+    tokens = _consent_tokens(norm)
+    return any(t in _CONSENT_AFFIRMATIVE_WORDS for t in tokens[:4])
+
+
+def _manifest_object_hash(action: str, ids: List[str]) -> str:
+    """Binds a manifest to the exact object ids it was planned over (§4.3.2)
+    — recomputed at consent-check time and compared to the value stored at
+    plan time, so a manifest whose stored items were somehow mutated between
+    plan and execute is caught rather than silently applied."""
+    payload = action + "|" + ",".join(sorted(str(i) for i in ids))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+class ConsentResult:
+    __slots__ = ("ok", "reason")
+
+    def __init__(self, ok: bool, reason: str = ""):
+        self.ok = ok
+        self.reason = reason
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+_NO_REPLY_INSTRUCTION = (
+    "🛑 Нужно подтверждение пользователя, а не самого себя: этот инструмент "
+    "физически необратим/массовый, поэтому вызывай его ТОЛЬКО после того, "
+    "как человек в чате явно ответил на показанный план. Передай "
+    "user_reply=<дословная последняя реплика пользователя> — не сочиняй её "
+    "и не вызывай execute в этом же ходе, где ты только что показал план: "
+    "дождись отдельного сообщения от человека. Ничего не сделано."
+)
+
+
+def _require_consent(
+    *, action: str, tier: int, manifest: Optional[Dict] = None,
+    user_reply: Optional[str] = None, automation_key: str = "",
+    object_ids: Optional[List[str]] = None, min_gap: Optional[float] = None,
+) -> ConsentResult:
+    """The single gate every mutating tool in tiers 🟡(1)/🔴(2) must pass
+    before touching live state or writing an "approved" decision — see
+    docs/DESIGN_approval_gate.md §4.3/§6.1. Tier 🟢(0) always passes (nothing
+    to gate). `manifest`, when given, is the ALREADY-looked-up plan_*
+    manifest for this call (kind/existence already checked by the caller) —
+    used here only for the one-shot/TTL/binding/timing checks. When None,
+    this is an inline (non-manifest) 🔴 check (e.g. rename_tag's merge
+    branch, or a sheet-backed declutter row) — the binding/timing checks are
+    skipped (there is no plan_shown_at to compare against) but the
+    affirmative-reply check still fully applies. Never mutates `manifest`
+    except to invalidate it on an explicit "no"."""
+    if SECRET and automation_key and hmac.compare_digest(automation_key, SECRET):
+        return ConsentResult(True, "automation_key")
+    if tier <= 0:
+        return ConsentResult(True, "tier0-no-gate")
+
+    if manifest is not None:
+        if manifest.get("consumed"):
+            return ConsentResult(False, "🛑 Манифест уже исполнен (one-shot) — "
+                                  "план протух. Вызови plan_* заново.")
+        created = manifest.get("created")
+        if created is not None and time.monotonic() - created > _MANIFEST_TTL:
+            manifest["consumed"] = True
+            return ConsentResult(False, "🛑 Манифест истёк (>1ч с момента "
+                                  "плана) — вызови plan_* заново.")
+        stored_hash = manifest.get("object_hash")
+        if stored_hash and object_ids is not None:
+            if _manifest_object_hash(action, object_ids) != stored_hash:
+                return ConsentResult(False, "🛑 Манифест не совпадает с текущим "
+                                      "набором объектов (изменился между "
+                                      "планом и подтверждением) — вызови "
+                                      "plan_* заново.")
+
+    if _is_negative_reply(user_reply):
+        if manifest is not None:
+            manifest["consumed"] = True
+        return ConsentResult(False, "🛑 Пользователь НЕ подтвердил (ответ похож "
+                              "на отказ/отмену) — ничего не сделано. План "
+                              "аннулирован, при необходимости перепланируй.")
+
+    if not _is_affirmative_reply(user_reply):
+        return ConsentResult(False, _NO_REPLY_INSTRUCTION)
+
+    gap = _MIN_CONSENT_GAP if min_gap is None else min_gap
+    if manifest is not None and gap > 0:
+        shown_at = manifest.get("plan_shown_at", manifest.get("created"))
+        if shown_at is not None and time.monotonic() - shown_at < gap:
+            return ConsentResult(False, "🛑 План и «да» пришли слишком быстро "
+                                  f"подряд (< {gap:.0f}с) — похоже на "
+                                  "самоподтверждение в один ход, без реального "
+                                  "ответа человека. Покажи план пользователю, "
+                                  "дождись ЕГО отдельного сообщения, потом "
+                                  "повтори execute с user_reply.")
+
+    return ConsentResult(True, "user_reply")
 
 
 def _journal_write(record: Dict) -> str:
@@ -1886,8 +2084,12 @@ def _prune_manifests() -> None:
 async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
                              max_items: int = 50) -> str:
     """
-    Phase 1 of SAFE deletion — THE way to delete tasks (direct delete_tasks is
-    disabled): build a deletion MANIFEST without deleting anything. Read-only —
+    Phase 1 of SAFE deletion — the two-phase (plan → user says yes →
+    execute) path, REQUIRED for bulk deletes and for parent+subtree deletes.
+    (A single task MAY still be removed directly via delete_tasks when its
+    title is supplied, up to DIRECT_DELETE_CAP=1 — that path is ALSO gated,
+    not disabled; anything larger than the cap is refused there and routed
+    here.) Builds a deletion MANIFEST without deleting anything. Read-only —
     safe to call without confirmation.
 
     Each requested {taskId, title?, projectId?, with_subtasks?} is resolved
@@ -1899,14 +2101,17 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
 
     IMPORTANT: reprint the returned manifest text VERBATIM and IN FULL in your
     own reply to the user (tool-result blocks may be collapsed in some UIs —
-    your message is always fully visible). Then, after the human approves, call
-    execute_task_deletion(manifest_id, confirm="DELETE <N>"), and afterwards
-    operation_report(record_id) for the independent outcome check.
+    your message is always fully visible), then STOP and wait for their real
+    reply — do NOT call execute in this same turn. Only once the human has
+    actually answered, call execute_task_deletion(manifest_id,
+    user_reply=<their literal last message, verbatim — do not paraphrase or
+    invent it>), and afterwards operation_report(record_id) for the
+    independent outcome check.
 
     Nothing is deleted by this tool. Manifests are one-shot and expire in 1 h.
 
     Args:
-        summary: one-line human sentence (confirmation dialog)
+        summary: one-line human sentence (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         tasks: List of {"taskId","title","projectId","with_subtasks"} — title recommended
         max_items: refuse to plan more than this many deletions (blast cap)
     """
@@ -1975,8 +2180,11 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
         return (f"🛑 Отказ: после разворачивания подзадач в плане {len(items)} "
                 f"удалений — больше капа {max_items}. Разбей на части или "
                 "подними max_items осознанно.")
+    now = time.monotonic()
+    obj_hash = _manifest_object_hash("delete", [it["taskId"] for it in items])
     _MANIFESTS[mid] = {"kind": "delete", "items": items,
-                       "created": time.monotonic(),
+                       "created": now, "plan_shown_at": now,
+                       "object_hash": obj_hash,
                        "summary": summary, "consumed": False}
     lines = [f"### 📋 План удаления — {len(items)}",
              f"_Манифест `{mid}` · ничего ещё не удалено_", ""]
@@ -1989,26 +2197,35 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
         lines.append(f"↷ Исключены (не среди открытых) {len(missing)}: "
                      + ", ".join(f"«{m['title']}»" for m in missing))
     lines.append("")
-    lines.append(f"_После явного «да»: `execute_task_deletion(manifest_id=\"{mid}\", "
-                 f"confirm=\"DELETE {len(items)}\")` · действует 1 час, одноразово._")
+    lines.append("Покажи этот план пользователю дословно и ДОЖДИСЬ его "
+                 "отдельного ответа (не отвечай за него). Когда он явно "
+                 "согласится, вызови "
+                 f"`execute_task_deletion(manifest_id=\"{mid}\", "
+                 "user_reply=\"<дословная реплика пользователя>\")` — НЕ в "
+                 "этом же ходе. Манифест одноразовый, действует 1 час.")
     return "\n".join(lines)
 
 
 @mcp.tool()
-async def execute_task_deletion(manifest_id: str, confirm: str = "") -> str:
+async def execute_task_deletion(manifest_id: str, user_reply: str = "") -> str:
     """
     Phase 2: execute a deletion manifest created by plan_task_deletion.
 
     Deletes EXACTLY the manifest's items — the caller cannot add or swap tasks
-    here. Safety on execution: `confirm` must be the literal string
-    "DELETE <N>" where N is the manifest's item count (forces the caller to
-    have read the plan); every item is re-verified against live state (renamed
-    since planning → skipped); full task snapshots are appended to the deletion
-    journal before the delete; the effect is post-verified against fresh state.
+    here. Gated (🔴 docs/DESIGN_approval_gate.md): `user_reply` must be the
+    user's VERBATIM last chat message, given ONLY after they actually saw the
+    plan and replied — do not paraphrase, summarize, or invent it, and do not
+    call this in the same turn where you printed the plan. The server checks
+    it's a genuine affirmative reply (not a negation, not empty, not you
+    echoing back manifest jargon), enforces a minimum gap since the plan was
+    shown, and consumes the manifest once. Every item is also re-verified
+    against live state (renamed since planning → skipped); full task
+    snapshots are appended to the deletion journal before the delete; the
+    effect is post-verified against fresh state.
 
     Args:
         manifest_id: id returned by plan_task_deletion
-        confirm: literal "DELETE <N>" with N = number of items in the manifest
+        user_reply: the user's literal last message approving the plan
     """
     err = _ensure_ready()
     if err:
@@ -2018,10 +2235,27 @@ async def execute_task_deletion(manifest_id: str, confirm: str = "") -> str:
     if not m or m.get("kind") != "delete":
         return (f"🛑 Манифест удаления {manifest_id} не найден/истёк/уже "
                 "исполнен. Сначала plan_task_deletion.")
-    expected = f"DELETE {len(m['items'])}"
-    if confirm.strip() != expected:
-        return (f"🛑 Подтверждение не совпало: нужно confirm=\"{expected}\" "
-                f"(получено {confirm!r}). Ничего не удалено.")
+    cr = _require_consent(action="delete", tier=2, manifest=m,
+                          user_reply=user_reply,
+                          object_ids=[it["taskId"] for it in m["items"]])
+    if not cr.ok:
+        return cr.reason
+    return await _execute_task_deletion_impl(manifest_id, m)
+
+
+async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None) -> str:
+    """Shared deletion engine: does the actual TickTick delete for a
+    plan_task_deletion manifest, once consent has already been granted (by
+    execute_task_deletion) or is inherited from an ALREADY-consented outer
+    action (execute_declutter/_execute_declutter_from_sheet build a fresh
+    sub-manifest and call straight in here — the human already said yes to
+    the outer declutter, so re-asking for this internal step would just be
+    the model self-confirming with extra steps)."""
+    if m is None:
+        m = _MANIFESTS.get(manifest_id)
+    if not m or m.get("kind") != "delete":
+        return (f"🛑 Манифест удаления {manifest_id} не найден/истёк/уже "
+                "исполнен. Сначала plan_task_deletion.")
     try:
         by_id = _open_by_id(fresh=True)
         if by_id is None:
@@ -3007,7 +3241,7 @@ def _dc_rows_to_exec(rows: List[Dict]) -> Dict:
             "refused": refused}
 
 
-async def _execute_declutter_from_sheet(manifest_id: str, confirm: str) -> str:
+async def _execute_declutter_from_sheet(manifest_id: str) -> str:
     """Sheet-backed execute/resume engine — shared by execute_declutter (when
     the RAM pointer says persist="sheet") and resume_declutter (RAM pointer
     gone, e.g. after a Railway restart). Implements §4.2/§5/§6 of
@@ -3015,9 +3249,10 @@ async def _execute_declutter_from_sheet(manifest_id: str, confirm: str) -> str:
 
     - freshly reads `decision` from the sheet every time (never trusts RAM —
       a human may have edited the sheet after the plan was printed);
-    - `confirm` must equal "DECLUTTER <N>" with N = the FRESH approved+pending
-      row count, not whatever N was printed at plan time (§6.2 — the
-      approval-race guard);
+    - CONSENT (docs/DESIGN_approval_gate.md) is the CALLER's job — both
+      execute_declutter and resume_declutter run _require_consent(...) with
+      the user's real user_reply BEFORE dispatching here; this function
+      trusts that a genuine "yes" already happened and just does the work;
     - resolves a crashed `applying` lock by LIVE fact in TickTick (§5.4)
       before deciding whether to retry it, rather than trusting the stale
       flag;
@@ -3025,7 +3260,10 @@ async def _execute_declutter_from_sheet(manifest_id: str, confirm: str) -> str:
       post-apply read of live state (§5.6) rather than by parsing the
       sub-tool's text output;
     - never re-applies a `done` row (§5.2 — the core "don't delete twice"
-      guarantee)."""
+      guarantee) — a row whose decision flipped to "rejected"/"pending"
+      since the plan was printed is likewise simply excluded from
+      `apply_rows` below, so nothing gets touched for it regardless of what
+      N a stale plan-time message said."""
     err = _ensure_ready()
     if err:
         return err
@@ -3080,20 +3318,6 @@ async def _execute_declutter_from_sheet(manifest_id: str, confirm: str) -> str:
                   and r.get("decision") == "approved"
                   and r.get("status") in ("planned", "failed")]
 
-    n_approved = len(apply_rows)
-    expected = f"DECLUTTER {n_approved}"
-    if confirm.strip() != expected:
-        try:
-            url = declutter_sheet.sheet_url()
-        except declutter_sheet.DeclutterSheetError:
-            url = ""
-        return (f"🛑 Подтверждение не совпало: сейчас в таблице {n_approved} "
-                f"одобренных ещё-не-применённых правок — нужно "
-                f"confirm=\"{expected}\" (получено {confirm!r}). Возможно, "
-                "decision поменяли в таблице после того, как был напечатан "
-                f"план — перечитай текущее состояние{(' (' + url + ')') if url else ''} "
-                "и подтверди заново. Ничего не тронул.")
-
     if not apply_rows:
         return ("Нечего применять — в таблице нет одобренных ещё-не-"
                 f"применённых правок для манифеста {manifest_id}.")
@@ -3125,7 +3349,7 @@ async def _execute_declutter_from_sheet(manifest_id: str, confirm: str) -> str:
                                    "created": time.monotonic(),
                                    "summary": summary + " — дубликаты",
                                    "consumed": False}
-            res = await execute_task_deletion(sub_mid, f"DELETE {len(items)}")
+            res = await _execute_task_deletion_impl(sub_mid)
             out_blocks.append("## 🗑 Удаление дубликатов\n" + res)
             report_ids.add(sub_mid)
 
@@ -3269,9 +3493,11 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
     keep-both) and writes the SMART reformulations. When it is unset/unreachable
     the analysis DEGRADES to rule-based exact-title duplicates only and says so.
 
-    IMPORTANT: reprint the returned manifest VERBATIM to the user, get an
-    explicit «да», then call execute_declutter(manifest_id, confirm="DECLUTTER
-    <N>"). Nothing mutates until then. Manifests are one-shot, expire in 1 h.
+    IMPORTANT: reprint the returned manifest VERBATIM to the user and STOP —
+    wait for their real reply, do not call execute in the same turn. Once
+    they actually answer, call execute_declutter(manifest_id,
+    user_reply=<their literal last message, verbatim>). Nothing mutates
+    until then. Manifests are one-shot, expire in 1 h.
 
     Refuses cleanly (no analysis, no shim call) when the resolved scope has
     more than a few hundred open tasks — narrow `scope` (project/tag/date)
@@ -3357,6 +3583,7 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
                + len(actions["flag_nonsmart"]))
 
     mid = uuid.uuid4().hex[:12]
+    now = time.monotonic()
     sheet_note = ""
     if persist == "sheet":
         # Durable-plan invariant (design doc §9.3, Maksim's decision): if the
@@ -3376,7 +3603,8 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
                     "сети, либо вызови без persist (RAM-режим, как раньше).")
         _MANIFESTS[mid] = {"kind": "declutter", "actions": actions,
                            "persist": "sheet", "spreadsheet_url": url,
-                           "mutating_count": n_mut, "created": time.monotonic(),
+                           "mutating_count": n_mut, "created": now,
+                           "plan_shown_at": now,
                            "summary": f"Разбор помойки ({n_mut} правок)",
                            "consumed": False}
         sheet_note = (
@@ -3384,10 +3612,11 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
             "колонку `decision` (approved/rejected) прямо там, либо "
             "`set_declutter_decision`. Затем `execute_declutter(...)` "
             "применит одобренное; после рестарта — "
-            f"`resume_declutter(manifest_id=\"{mid}\", confirm=...)`._")
+            f"`resume_declutter(manifest_id=\"{mid}\", user_reply=...)`._")
     else:
         _MANIFESTS[mid] = {"kind": "declutter", "actions": actions,
-                           "mutating_count": n_mut, "created": time.monotonic(),
+                           "mutating_count": n_mut, "created": now,
+                           "plan_shown_at": now,
                            "summary": f"Разбор помойки ({n_mut} правок)",
                            "consumed": False}
 
@@ -3464,38 +3693,43 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
                  f"🔗 {sum(len(g['children']) for g in actions['group'])}). "
                  "Протухшие и спорные НЕ входят.")
     lines.append("")
-    lines.append(f"_После явного «да»: `execute_declutter(manifest_id=\"{mid}\", "
-                 f"confirm=\"DECLUTTER {n_mut}\")` · действует 1 час, одноразово. "
-                 "Каждая правка пройдёт через штатные удаление/обновление/вложение "
-                 "(guard + журнал + сверка)._")
+    lines.append("Покажи этот план пользователю дословно и ДОЖДИСЬ его "
+                 "отдельного ответа. Когда он явно согласится, вызови "
+                 f"`execute_declutter(manifest_id=\"{mid}\", "
+                 "user_reply=\"<дословная реплика пользователя>\")` — НЕ в "
+                 "этом же ходе. Действует 1 час, одноразово. Каждая правка "
+                 "пройдёт через штатные удаление/обновление/вложение "
+                 "(guard + журнал + сверка).")
     return "\n".join(lines) + sheet_note
 
 
 @mcp.tool()
-async def execute_declutter(manifest_id: str, confirm: str = "") -> str:
+async def execute_declutter(manifest_id: str, user_reply: str = "") -> str:
     """
     Phase 2 of the declutter: apply EXACTLY the mutating actions the manifest
-    proposed and the user approved. `confirm` must be the literal
-    "DECLUTTER <N>" with N = the manifest's mutating-action count.
+    proposed and the user approved. Gated (🔴 docs/DESIGN_approval_gate.md):
+    `user_reply` must be the user's VERBATIM last chat message, given ONLY
+    after they actually saw the plan and replied — do not paraphrase or
+    invent it, and do not call this in the same turn where you printed the
+    plan.
 
     Nothing here is a fresh decision — every action is routed through the
-    already-audited tools (execute_task_deletion / update_tasks /
+    already-audited tools (the deletion engine / update_tasks /
     set_task_parent), so each mutation is identity-guarded, journalled and
     post-verified. Obsolete and uncertain-duplicate FLAGS are never touched.
     One-shot. Afterwards the independent operation reports are appended.
 
     For a manifest planned with persist="sheet": this dispatches into the
-    sheet-backed engine instead — `decision`/`status` are freshly re-read from
-    the `Declutter Log` sheet (never trusted from RAM), `confirm` must match
-    the CURRENT approved-and-pending row count (not the plan-time N — see
-    docs/DESIGN_sheet_backed_declutter.md §6), and per-row results are written
-    back to the sheet. If the RAM pointer from plan_declutter is gone (e.g. a
-    restart) but the manifest_id still has rows in the sheet, use
+    sheet-backed engine instead — `decision`/`status` are freshly re-read
+    from the `Declutter Log` sheet (never trusted from RAM — see
+    docs/DESIGN_sheet_backed_declutter.md §6), and per-row results are
+    written back to the sheet. If the RAM pointer from plan_declutter is gone
+    (e.g. a restart) but the manifest_id still has rows in the sheet, use
     resume_declutter instead — same engine, explicit entry point.
 
     Args:
         manifest_id: id from plan_declutter
-        confirm: literal "DECLUTTER <N>"
+        user_reply: the user's literal last message approving the plan
     """
     err = _ensure_ready()
     if err:
@@ -3503,7 +3737,11 @@ async def execute_declutter(manifest_id: str, confirm: str = "") -> str:
     _prune_manifests()
     m = _MANIFESTS.get(manifest_id)
     if m and m.get("kind") == "declutter" and m.get("persist") == "sheet":
-        return await _execute_declutter_from_sheet(manifest_id, confirm)
+        cr = _require_consent(action="declutter", tier=2, manifest=m,
+                              user_reply=user_reply)
+        if not cr.ok:
+            return cr.reason
+        return await _execute_declutter_from_sheet(manifest_id)
     if not m or m.get("kind") != "declutter":
         # RAM pointer missing/expired — it may still be a sheet-backed
         # manifest from an earlier process (Railway restart killed RAM but
@@ -3512,16 +3750,19 @@ async def execute_declutter(manifest_id: str, confirm: str = "") -> str:
         if declutter_sheet.sheet_configured():
             try:
                 if declutter_sheet.read_manifest_rows(manifest_id):
-                    return await _execute_declutter_from_sheet(manifest_id, confirm)
+                    cr = _require_consent(action="declutter", tier=2,
+                                          manifest=None, user_reply=user_reply)
+                    if not cr.ok:
+                        return cr.reason
+                    return await _execute_declutter_from_sheet(manifest_id)
             except declutter_sheet.DeclutterSheetError:
                 pass
         return (f"🛑 Манифест разбора {manifest_id} не найден/истёк/уже "
                 "исполнен. Сначала plan_declutter.")
-    n_mut = m.get("mutating_count", 0)
-    expected = f"DECLUTTER {n_mut}"
-    if confirm.strip() != expected:
-        return (f"🛑 Подтверждение не совпало: нужно confirm=\"{expected}\" "
-                f"(получено {confirm!r}). Ничего не тронул.")
+    cr = _require_consent(action="declutter", tier=2, manifest=m,
+                          user_reply=user_reply)
+    if not cr.ok:
+        return cr.reason
     m["consumed"] = True
     try:
         actions = m["actions"]
@@ -3539,7 +3780,7 @@ async def execute_declutter(manifest_id: str, confirm: str = "") -> str:
                                    "created": time.monotonic(),
                                    "summary": summary + " — дубликаты",
                                    "consumed": False}
-            res = await execute_task_deletion(sub_mid, f"DELETE {len(items)}")
+            res = await _execute_task_deletion_impl(sub_mid)
             out_blocks.append("## 🗑 Удаление дубликатов\n" + res)
             report_ids.add(sub_mid)
 
@@ -3578,7 +3819,7 @@ async def execute_declutter(manifest_id: str, confirm: str = "") -> str:
 
 
 @mcp.tool()
-async def resume_declutter(manifest_id: str, confirm: str = "") -> str:
+async def resume_declutter(manifest_id: str, user_reply: str = "") -> str:
     """
     Resume a sheet-backed declutter manifest (plan_declutter(persist="sheet"))
     after a restart, timeout, or partial application — when the in-process RAM
@@ -3594,15 +3835,17 @@ async def resume_declutter(manifest_id: str, confirm: str = "") -> str:
     TickTick state first (task already gone → done; title already matches →
     done; otherwise → retried) rather than trusted at face value.
 
-    `confirm` must be the literal "DECLUTTER <N>" where N is the count of
-    approved+pending rows FRESHLY read from the sheet right now — not
-    whatever N a previous message printed. If `decision` was edited in the
-    sheet (or via set_declutter_decision) since then, re-read the sheet and
-    confirm with the CURRENT number.
+    Gated (🔴 docs/DESIGN_approval_gate.md): the RAM manifest is gone by
+    definition here, so there is no plan_shown_at to time against — but
+    `user_reply` must still be the user's VERBATIM real reply confirming they
+    want the remaining approved rows applied NOW (not fabricated by you).
+    If `decision` was edited in the sheet (or via set_declutter_decision)
+    since the original plan, that's reflected automatically — this always
+    re-reads `decision`/`status` fresh from the sheet.
 
     Args:
         manifest_id: id from the ORIGINAL plan_declutter(persist="sheet") call
-        confirm: literal "DECLUTTER <N>" with N = current approved+pending row count
+        user_reply: the user's literal message confirming "yes, apply now"
     """
     err = _ensure_ready()
     if err:
@@ -3611,19 +3854,30 @@ async def resume_declutter(manifest_id: str, confirm: str = "") -> str:
         return ("🛑 Sheet-режим declutter не настроен (нужны env "
                 "DECLUTTER_SHEET_ID и GSHEETS_SA_JSON) — resume_declutter "
                 "работает только для планов, сохранённых с persist=\"sheet\".")
-    return await _execute_declutter_from_sheet(manifest_id, confirm)
+    cr = _require_consent(action="declutter", tier=2, manifest=None,
+                          user_reply=user_reply)
+    if not cr.ok:
+        return cr.reason
+    return await _execute_declutter_from_sheet(manifest_id)
 
 
 @mcp.tool()
 async def set_declutter_decision(manifest_id: str, row_ids: List[int],
-                                 decision: str) -> str:
+                                 decision: str, user_reply: str = "") -> str:
     """
     Set the `decision` column (approved/rejected) for specific rows of a
-    sheet-backed declutter manifest (plan_declutter(persist="sheet")) — the
-    deterministic chat-approval path from docs/DESIGN_sheet_backed_declutter.md
-    §6(b): instead of the human editing the Google Sheet by hand, Claude
+    sheet-backed declutter manifest (plan_declutter(persist="sheet")) —
+    instead of the human editing the Google Sheet by hand, Claude
     proposes/relays a decision here and the CODE writes it, so the row's
     task_id/decision never has to round-trip through the model's own context.
+
+    WARNING: writing decision="approved" is EQUIVALENT to authorizing
+    whatever execute_declutter/resume_declutter will do with those rows next
+    (delete/rename/group) — it is NOT a harmless bookkeeping note. Gated
+    (🔴 docs/DESIGN_approval_gate.md) for that reason: decision="approved"
+    REQUIRES user_reply = the user's VERBATIM message approving exactly these
+    rows — you may NOT set "approved" on your own judgement. decision=
+    "rejected" is safe (it only prevents action) and is NOT gated.
 
     Does NOT touch TickTick and does NOT change `status` — purely an
     approval-bookkeeping write to column L. execute_declutter/resume_declutter
@@ -3634,12 +3888,19 @@ async def set_declutter_decision(manifest_id: str, row_ids: List[int],
         row_ids: sheet row_id values (column A, printed in the plan / visible
             in the sheet) to update — NOT task ids
         decision: "approved" or "rejected"
+        user_reply: REQUIRED when decision="approved" — the user's literal
+            message approving these specific rows
     """
     if decision not in ("approved", "rejected"):
         return "🛑 decision должен быть \"approved\" или \"rejected\" — получено " \
                f"{decision!r}. Ничего не тронул."
     if not row_ids:
         return "🛑 Не передано ни одного row_id."
+    if decision == "approved":
+        cr = _require_consent(action="declutter_decision", tier=2,
+                              manifest=None, user_reply=user_reply)
+        if not cr.ok:
+            return cr.reason
     if not declutter_sheet.sheet_configured():
         return ("🛑 Sheet-режим declutter не настроен (нужны env "
                 "DECLUTTER_SHEET_ID и GSHEETS_SA_JSON).")
@@ -3676,22 +3937,21 @@ async def delete_task_with_subtasks(
     project_name: str = None,
 ) -> str:
     """
-    ⚠️ Delete a parent task AND all its subtasks in one go.
-
-    Finds every subtask whose parentId matches task_id, deletes them via
-    batch delete, then deletes the parent itself.
-
-    summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog. Destructive — START WITH ⚠️ and say
-    it takes the subtasks too, e.g. «⚠️ Удаляю задачу „Проект X" вместе с её
-    подзадачами из проекта „Работа"».
+    DEPRECATED / always refuses. Subtree deletion is NOT performed here —
+    this tool exists only to catch old callers and redirect them. It always
+    returns a refusal pointing to plan_task_deletion with {"taskId", "title",
+    "with_subtasks": true}, which expands the ENTIRE open subtree into a
+    manifest for approval (already gated 🔴 — plan_task_deletion →
+    execute_task_deletion(manifest_id, user_reply=...)). No argument below
+    has any effect; nothing is ever deleted by THIS tool, regardless of what
+    you pass.
 
     Args:
-        summary: Human-readable confirmation line starting with ⚠️ (see above)
-        task_id: ID of the parent task
-        project_id: ID of the project
-        task_title: Title of the parent task (optional, auto-looked-up)
-        project_name: Name of the list the task is in (for the dialog)
+        summary: unused — has no effect, kept for backward-compatible calls
+        task_id: unused — has no effect, kept for backward-compatible calls
+        project_id: unused — has no effect, kept for backward-compatible calls
+        task_title: unused — has no effect, kept for backward-compatible calls
+        project_name: unused — has no effect, kept for backward-compatible calls
     """
     err = _ensure_ready()
     if err:
@@ -3749,26 +4009,27 @@ _PROJECT_DELETE_SAMPLE_CAP = 20  # preview lines shown before the confirm echo
 
 
 @mcp.tool()
-async def delete_project(project_name: str, project_id: str, confirm: str = "") -> str:
+async def delete_project(project_name: str, project_id: str, user_reply: str = "") -> str:
     """
     ⚠️ Delete a project permanently — TickTick's own cascade ALSO deletes every
     task the project contains (uncapped blast radius: a project can hold any
-    number of tasks). Irreversible, so this uses the same count-then-confirm
-    pattern as delete_tasks/execute_task_deletion instead of a bare id check:
+    number of tasks). Irreversible → gated 🔴 (docs/DESIGN_approval_gate.md):
 
-    1st call (confirm omitted or wrong): deletes NOTHING. Returns the project's
-    CURRENT contained-task count plus a short sample of titles, and the exact
-    confirm string to echo back.
-    2nd call: pass confirm="DELETE <N>" with N = the count just shown. The
-    count is re-read fresh on EVERY call (nothing cached from the first call),
-    so a stale/guessed N — or the project having changed in between — is
-    refused rather than silently deleted against an outdated count.
+    1st call (user_reply omitted): deletes NOTHING. Returns the project's
+    CURRENT contained-task count plus a short sample of titles and asks you
+    to show that to the user and wait for their real reply.
+    2nd call: AFTER the user actually replied, call again with
+    user_reply=<their literal message>, verbatim — do not paraphrase or
+    invent it, and do not make this 2nd call in the same turn as the 1st.
+    The count is re-read fresh on EVERY call (nothing cached from the first
+    call), so the project having changed in between is naturally reflected
+    rather than deleting against a stale count.
 
     Args:
-        project_name: Name of the project (shown first in confirmation dialog)
+        project_name: Name of the project (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         project_id: ID of the project
-        confirm: literal "DELETE <N>", N = number of tasks currently in the
-            project per THIS tool's own preview. Omit on the first call.
+        user_reply: the user's literal reply approving the deletion — omit on
+            the 1st call
     """
     err = _ensure_official()
     if err:
@@ -3796,9 +4057,10 @@ async def delete_project(project_name: str, project_id: str, confirm: str = "") 
                 f"(не удаляю вслепую): {data['error']}")
     tasks = data.get('tasks') or []
     count = len(tasks)
-    expected = f"DELETE {count}"
 
-    if confirm.strip() != expected:
+    cr = _require_consent(action="delete_project", tier=2, manifest=None,
+                          user_reply=user_reply)
+    if not cr.ok:
         lines = [f"⚠️ Проект «{live_name}» содержит {count} задач(и) — при "
                  "удалении проекта TickTick удалит их ВМЕСТЕ с ним, "
                  "безвозвратно.", ""]
@@ -3808,8 +4070,17 @@ async def delete_project(project_name: str, project_id: str, confirm: str = "") 
             if count > _PROJECT_DELETE_SAMPLE_CAP:
                 lines.append(f"... и ещё {count - _PROJECT_DELETE_SAMPLE_CAP}.")
             lines.append("")
-        lines.append("Ничего не удалено. Чтобы подтвердить, вызови ещё раз с "
-                     f'confirm="{expected}".')
+        if _is_negative_reply(user_reply):
+            lines.append(cr.reason)
+        else:
+            lines.append(
+                "Ничего не удалено. Покажи это пользователю дословно и "
+                "ДОЖДИСЬ его отдельного ответа (не отвечай за него). Когда "
+                "он явно согласится, вызови "
+                f'delete_project(project_name="{live_name}", '
+                f'project_id="{project_id}", '
+                'user_reply="<дословная реплика пользователя>") — НЕ в этом '
+                'же ходе.')
         return "\n".join(lines)
 
     # Confirmed — journal a pre-delete snapshot of the project AND every
@@ -4371,7 +4642,7 @@ async def create_subtask(
     Create a subtask for a parent task within the same project.
 
     Args:
-        parent_task_title: Title of the parent task (shown first in confirmation dialog)
+        parent_task_title: Title of the parent task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         subtask_title: Title of the new subtask
         parent_task_id: ID of the parent task
         project_id: ID of the project (must be same for both parent and subtask)
@@ -4540,7 +4811,7 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]],
     run operation_report and reprint it verbatim.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog, e.g. «Перемещаю задачу „Купить молоко"
+    at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Перемещаю задачу „Купить молоко"
     из „Inbox" в „Покупки"» or «Перемещаю 3 задачи в „Покупки"».
 
     Put the human title inside each task object so the dialog shows what moves:
@@ -4664,7 +4935,7 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
     Record a habit check-in (requires v2 API).
 
     Args:
-        habit_name: Name of the habit (shown first in confirmation dialog — get from get_habits)
+        habit_name: Name of the habit (shown first in the summary you show the user, see get_habits) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         habit_id: ID of the habit
         date: Date to check in as YYYY-MM-DD (optional; defaults to today — pass a past date to backfill)
         status: 2 = done (default), 1 = failed, 0 = not done
@@ -4729,7 +5000,7 @@ async def get_habit_checkins(habit_name: str, habit_id: str, after_date: str) ->
     Get a habit's check-in history (requires v2 API).
 
     Args:
-        habit_name: Name of the habit (shown first in confirmation dialog — get from get_habits)
+        habit_name: Name of the habit (shown first in the summary you show the user, see get_habits) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         habit_id: ID of the habit
         after_date: Only return check-ins on/after this date, as YYYY-MM-DD
     """
@@ -4789,7 +5060,7 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]],
     All tasks and the parent must be in the same project.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog, e.g. «Делаю задачу „Шаг 1"
+    at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Делаю задачу „Шаг 1"
     подзадачей „Большой проект"» or «Делаю 3 задачи подзадачами „Большой проект"».
 
     Put the human title inside each task object so the dialog shows what's being
@@ -4902,7 +5173,7 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
     Detach a subtask from its parent, making it a top-level task (requires v2 API).
 
     Args:
-        task_title: Title of the subtask being detached (shown first in confirmation dialog)
+        task_title: Title of the subtask being detached (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         parent_task_title: Title of its current parent task
         task_id: ID of the subtask to detach
         parent_task_id: ID of its current parent
@@ -4960,7 +5231,7 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]]) -> str:
     Replace tags on one or more tasks in one call (requires v2 API).
 
     summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog, e.g. «Ставлю тег „работа" на задачу
+    at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Ставлю тег „работа" на задачу
     „Купить молоко"» or «Ставлю тег „работа" на 4 задачи».
 
     Each item carries the task's human title (for the dialog) and the full
@@ -5173,7 +5444,7 @@ async def delete_project_group(group_name: str, group_id: str) -> str:
     Delete a project group/folder (projects inside are kept, just ungrouped) (requires v2 API).
 
     Args:
-        group_name: Name of the group (shown first in confirmation dialog)
+        group_name: Name of the group (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         group_id: ID of the group
     """
     err = _ensure_ready()
@@ -5210,7 +5481,7 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
     Move a project into a group/folder (requires v2 API).
 
     Args:
-        project_name: Name of the project (shown first in confirmation dialog)
+        project_name: Name of the project (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         project_id: ID of the project to move
         group_id: ID of the destination group, or "NONE" to ungroup
     """
@@ -5264,7 +5535,7 @@ async def get_task_comments(task_title: str, project_id: str, task_id: str) -> s
     Get comments on a task (requires v2 API).
 
     Args:
-        task_title: Title of the task (shown first in confirmation dialog)
+        task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         project_id: ID of the project
         task_id: ID of the task
     """
@@ -5292,7 +5563,7 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
     Add a comment to a task (requires v2 API).
 
     Args:
-        task_title: Title of the task (shown first in confirmation dialog)
+        task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         text: Comment text
         project_id: ID of the project
         task_id: ID of the task
@@ -5376,7 +5647,7 @@ async def restore_tasks(summary: str, tasks: List[Dict[str, str]],
     Restore one or more tasks from the trash in one call (requires v2 API).
 
     summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog, e.g. «Восстанавливаю из корзины
+    at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Восстанавливаю из корзины
     задачу „Купить молоко"» or «Восстанавливаю из корзины 3 задачи».
 
     Args:
@@ -5468,7 +5739,7 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
     Google Drive or generated by Claude. Max 20 MB.
 
     Args:
-        task_title: Title of the task (shown first in confirmation dialog)
+        task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         task_id: ID of the task
         project_id: ID of the task's project (auto-corrected if stale)
         url: Public/direct URL to download the file from (optional)
@@ -5693,18 +5964,25 @@ async def _live_tag_names(force: bool = True) -> List[str]:
 
 
 @mcp.tool()
-async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False) -> str:
+async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
+                     user_reply: str = "") -> str:
     """Rename a tag (requires v2 API).
 
-    If new_name already exists as a tag, TickTick MERGES the two tags — that is
-    irreversible, so the call is refused unless allow_merge=True is passed
-    after the user explicitly confirmed the merge.
+    If new_name already exists as a tag, TickTick MERGES the two tags — that
+    is irreversible (which tasks carried which tag is lost), so this branch
+    is gated 🔴 (docs/DESIGN_approval_gate.md): it's refused unless BOTH
+    allow_merge=True AND user_reply=<the user's literal message actually
+    confirming the merge> are given. Setting allow_merge=True on your own
+    judgement, without user_reply, is NOT sufficient — don't fabricate the
+    reply.
 
     Args:
         old_name: current tag name
         new_name: new tag name
         allow_merge: pass True ONLY after the user confirmed merging into an
-            existing tag
+            existing tag (also requires user_reply — see above)
+        user_reply: REQUIRED when a merge would happen — the user's literal
+            message confirming it
     """
     err = _ensure_ready()
     if err:
@@ -5716,12 +5994,18 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False) ->
                 or "нет похожих"
             return (f"🛑 НЕ переименовал — тега «{old_name}» не существует "
                     f"(возможно опечатка; похожие: {near}). Ничего не тронул.")
-        if new_name.lower() in existing and not allow_merge:
-            return (f"🛑 Тег «{new_name}» уже существует — это будет СЛИЯНИЕ "
-                    f"тегов «{old_name}» и «{new_name}» (необратимо: какие "
-                    "задачи носили какой тег — потеряется). Если пользователь "
-                    "явно подтвердил слияние — повтори с allow_merge=true. "
-                    "Ничего не тронул.")
+        will_merge = new_name.lower() in existing
+        if will_merge:
+            cr = _require_consent(action="rename_tag_merge", tier=2,
+                                  manifest=None, user_reply=user_reply)
+            if not (allow_merge and cr.ok):
+                return (f"🛑 Тег «{new_name}» уже существует — это будет СЛИЯНИЕ "
+                        f"тегов «{old_name}» и «{new_name}» (необратимо: какие "
+                        "задачи носили какой тег — потеряется). Покажи это "
+                        "пользователю дословно и, ТОЛЬКО после его явного "
+                        "согласия, повтори с allow_merge=true и "
+                        "user_reply=<дословная реплика пользователя>. Ничего "
+                        "не тронул." + ("" if cr.ok else f" ({cr.reason})"))
         await _run_blocking(lambda: ticktick_v2.rename_tag(old_name, new_name))
         # Post-verify against a fresh tag list.
         after = await _live_tag_names()
@@ -5776,7 +6060,7 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None) -> st
     Mark a task as 'Won't do' (requires v2 API).
 
     summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog, e.g. «Отмечаю «не буду делать»
+    at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Отмечаю «не буду делать»
     задачу „Купить молоко"».
 
     Args:
@@ -5820,7 +6104,7 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None) -> 
     Duplicate a task within the same project (requires v2 API).
 
     summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the confirmation dialog, e.g. «Дублирую задачу „Купить молоко"».
+    at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Дублирую задачу „Купить молоко"».
 
     Args:
         summary: Human-readable confirmation line (see above)
@@ -5876,7 +6160,7 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
     Edit a task comment (requires v2 API).
 
     Args:
-        task_title: Title of the task (shown first in confirmation dialog)
+        task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         text: New comment text
         project_id: ID of the project
         task_id: ID of the task
@@ -5919,7 +6203,7 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str, co
     Delete a task comment (requires v2 API).
 
     Args:
-        task_title: Title of the task (shown first in confirmation dialog)
+        task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         project_id: ID of the project
         task_id: ID of the task
         comment_id: ID of the comment to delete
@@ -5965,7 +6249,7 @@ async def update_project(project_name: str, project_id: str, name: str = None,
     Update a project's name, color, or view mode (uses the official API).
 
     Args:
-        project_name: Current name of the project (shown first in confirmation dialog)
+        project_name: Current name of the project (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         project_id: ID of the project
         name: New name (optional)
         color: New color hex like '#F18181' (optional)
@@ -6005,7 +6289,7 @@ async def archive_project(project_name: str, project_id: str, archived: bool = T
     Archive (close) or unarchive a project (requires v2 API).
 
     Args:
-        project_name: Name of the project (shown first in confirmation dialog)
+        project_name: Name of the project (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         project_id: ID of the project
         archived: True to archive, False to restore it to active
     """

@@ -1,9 +1,12 @@
 """delete_project: the count-then-confirm guard added after the mutating-tool
 audit found this was the one destructive project tool without a blast-radius
 disclosure, a confirm cap, or a pre-delete journal snapshot. Mirrors
-delete_tasks/execute_task_deletion's own identity-guard + confirm + journal +
-post-verify conventions. No real network — the official client and the
-project-name resolver are faked."""
+delete_tasks/execute_task_deletion's own identity-guard + journal +
+post-verify conventions. Confirmation itself has since migrated from a
+self-echoed confirm="DELETE N" string to the in-chat consent gate
+(docs/DESIGN_approval_gate.md) — the 2nd call passes user_reply=<the user's
+real reply> instead, checked by _require_consent(). No real network — the
+official client and the project-name resolver are faked."""
 import json
 
 import ticktick_mcp.src.server as s
@@ -68,7 +71,7 @@ async def test_unknown_project_id_is_refused(monkeypatch):
     assert fake.deleted_ids == []
 
 
-# ---- 1st call (no/omitted confirm): disclose count + sample, delete nothing
+# ---- 1st call (no/omitted user_reply): disclose count + sample, delete nothing
 
 async def test_first_call_shows_count_and_sample_without_deleting(monkeypatch):
     tasks = [_mk_task(f"t{i}", f"Задача {i}") for i in range(3)]
@@ -78,7 +81,8 @@ async def test_first_call_shows_count_and_sample_without_deleting(monkeypatch):
     assert fake.deleted_ids == []
     assert "3 задач" in result
     assert "Задача 0" in result
-    assert 'confirm="DELETE 3"' in result
+    assert "user_reply" in result
+    assert "delete_project" in result
 
 
 async def test_sample_is_capped_with_a_remainder_note(monkeypatch):
@@ -92,15 +96,27 @@ async def test_sample_is_capped_with_a_remainder_note(monkeypatch):
     assert "и ещё 5" in result
 
 
-# ---- wrong/stale confirm count → refuse (re-shows the FRESH count) --------
+# ---- non-affirmative user_reply → refuse (re-shows the FRESH count) -------
 
-async def test_wrong_confirm_count_is_refused(monkeypatch):
+async def test_non_affirmative_reply_is_refused(monkeypatch):
+    """A user_reply that isn't a real "yes" (empty, a negation, or something
+    that looks like the model echoing its own manifest jargon back) must
+    never be treated as consent — fail closed, re-show the current count."""
     tasks = [_mk_task(f"t{i}", f"Задача {i}") for i in range(3)]
     fake = FakeOfficial(tasks)
     _wire(monkeypatch, fake, {"p1": "Работа"})
-    result = await s.delete_project("Работа", "p1", confirm="DELETE 2")
+    result = await s.delete_project("Работа", "p1", user_reply="DELETE 3")
     assert fake.deleted_ids == []
-    assert "3 задач" in result  # fresh recount shown, not the caller's guess
+    assert "3 задач" in result  # fresh recount shown regardless
+
+
+async def test_negative_reply_is_refused_with_explicit_cancellation(monkeypatch):
+    tasks = [_mk_task(f"t{i}", f"Задача {i}") for i in range(3)]
+    fake = FakeOfficial(tasks)
+    _wire(monkeypatch, fake, {"p1": "Работа"})
+    result = await s.delete_project("Работа", "p1", user_reply="нет, отмена")
+    assert fake.deleted_ids == []
+    assert "НЕ подтвердил" in result
 
 
 # ---- correct confirm → deletes, journals a pre-delete snapshot -----------
@@ -125,7 +141,7 @@ async def test_correct_confirm_deletes_and_journals(monkeypatch, tmp_path):
     # _open_by_id — fake it too so the report can see the cascade's effect.
     monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: dict(open_tasks))
 
-    result = await s.delete_project("Работа", "p1", confirm="DELETE 2")
+    result = await s.delete_project("Работа", "p1", user_reply="да")
     assert fake.deleted_ids == ["p1"]
     assert "удалён вместе с 2" in result
     assert "operation_report" in result
@@ -164,9 +180,10 @@ async def test_zero_task_project_still_requires_explicit_confirm(monkeypatch, tm
 
     preview = await s.delete_project("Пусто", "p1")
     assert fake.deleted_ids == []
-    assert 'confirm="DELETE 0"' in preview
+    assert "user_reply=" in preview
+    assert "0 задач" in preview
 
-    result = await s.delete_project("Пусто", "p1", confirm="DELETE 0")
+    result = await s.delete_project("Пусто", "p1", user_reply="да")
     assert fake.deleted_ids == ["p1"]
     assert "удалён вместе с 0" in result
 
@@ -179,7 +196,7 @@ async def test_operation_report_flags_project_that_did_not_actually_disappear(
     fake = FakeOfficial([])  # delete_project "succeeds" but leaves names as-is
     _wire(monkeypatch, fake, {"p1": "Упрямый"})
 
-    result = await s.delete_project("Упрямый", "p1", confirm="DELETE 0")
+    result = await s.delete_project("Упрямый", "p1", user_reply="да")
     assert "ВСЁ ЕЩЁ существует" in result
 
 
@@ -194,7 +211,7 @@ async def test_postverify_fetch_failure_is_reported_as_unverified_not_deleted(
     # returns None (never raises) — mock that graceful-failure contract.
     monkeypatch.setattr(s, "_v2_project_names_or_none", lambda: None)
 
-    result = await s.delete_project("Работа", "p1", confirm="DELETE 0")
+    result = await s.delete_project("Работа", "p1", user_reply="да")
     assert fake.deleted_ids == ["p1"]  # the TickTick call itself did succeed
     assert "НЕ ПОДТВЕРЖДЁН" in result
     assert "удалён вместе с" not in result
@@ -208,7 +225,7 @@ async def test_operation_report_flags_unverified_delete_project_on_fetch_failure
     _wire(monkeypatch, fake, {"p1": "Работа"})
     monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: {})
 
-    await s.delete_project("Работа", "p1", confirm="DELETE 0")
+    await s.delete_project("Работа", "p1", user_reply="да")
     journal_path = tmp_path / "deletion_journal.jsonl"
     rec1 = json.loads(journal_path.read_text(encoding="utf-8").splitlines()[0])
     rid = rec1["manifest"]
@@ -227,7 +244,7 @@ async def test_operation_report_flags_unverified_delete_project_on_fetch_failure
 async def test_contents_fetch_error_refuses_before_any_delete(monkeypatch):
     fake = FakeOfficial([], project_error="rate limited")
     _wire(monkeypatch, fake, {"p1": "Работа"})
-    result = await s.delete_project("Работа", "p1", confirm="DELETE 0")
+    result = await s.delete_project("Работа", "p1", user_reply="да")
     assert fake.deleted_ids == []
     assert "🛑" in result
     assert "rate limited" in result

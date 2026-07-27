@@ -428,7 +428,7 @@ async def test_execute_declutter_returns_graceful_error_on_internal_exception(mo
 
     monkeypatch.setattr(s, "update_tasks", boom)
 
-    result = await s.execute_declutter(mid, confirm="DECLUTTER 1")
+    result = await s.execute_declutter(mid, user_reply="да")
     assert "Error executing declutter manifest" in result
     assert "glue-code exploded" in result
     # The manifest was already marked consumed before the crash — that's fine,
