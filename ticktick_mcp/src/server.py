@@ -4846,7 +4846,9 @@ async def get_tasks_due_in_days(days: int) -> str:
 
 @mcp.tool(annotations=READONLY)
 async def get_tasks_due_this_week() -> str:
-    """Get all tasks from TickTick that are due within the next 7 days. Ignores closed projects."""
+    """Get all tasks from TickTick due from today through 7 days from now
+    (today and the following 7 calendar days, 8 days inclusive — not a strict
+    "next 7 days" window). Ignores closed projects."""
     err = _ensure_official()
     if err:
         return err
@@ -5896,10 +5898,13 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
 @mcp.tool(annotations=READONLY)
 async def get_task_comments(task_title: str, project_id: str, task_id: str) -> str:
     """
-    Get comments on a task (requires v2 API).
+    Get comments on a task (requires v2 API). Read-only — no confirmation
+    needed. task_title is used only to label the output; it is not verified
+    against the live task (unlike write tools, there is no identity guard here
+    since nothing is mutated).
 
     Args:
-        task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
+        task_title: Title of the task, for display in the output only
         project_id: ID of the project
         task_id: ID of the task
     """
@@ -5910,7 +5915,7 @@ async def get_task_comments(task_title: str, project_id: str, task_id: str) -> s
         comments = await _run_blocking(lambda: ticktick_v2.get_task_comments(project_id, task_id))
         if not comments:
             return f"No comments on task '{task_title}'."
-        out = f"Comments on '{task_title}' ({len(comments)}):\n"
+        out = f"Comments on '{task_title}' ({len(comments)}):\n\n"
         for c in comments:
             who = (c.get("userProfile") or {}).get("displayName") or c.get("userName", "?")
             # Include the comment id — delete_task_comment/update_task_comment need it.
@@ -6617,7 +6622,7 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None) -> st
         if task_id in fresh:
             return (f"❌ НЕ отмечено «{title}» — задача всё ещё среди открытых.\n"
                     + _report_line(rid))
-        return f"✗ Не буду делать: «{title}» (проверено)\n" + _report_line(rid)
+        return f"✅ Не буду делать: «{title}» (проверено)\n" + _report_line(rid)
     except Exception as e:
         logger.error(f"Error in abandon_task: {e}")
         return f"Error abandoning task: {str(e)}"
@@ -6664,7 +6669,7 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None) -> 
             verdict = ("❌ Копия НЕ подтвердилась — её нет среди открытых "
                        "задач, проверь вручную.")
         else:
-            verdict = (f"Дублировано (проверено): «{title}» → копия "
+            verdict = (f"✅ Дублировано (проверено): «{title}» → копия "
                        f"«{copy.get('title') or title}»")
         return (verdict + "\n⚠️ В копию НЕ переносятся: чек-лист (items), "
                 "kanban-раздел (column) и привязка к родителю.\n"
