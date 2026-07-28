@@ -4360,14 +4360,30 @@ async def create_project(
             color=color,
             view_mode=view_mode
         )
-        
+
         if 'error' in project:
-            return f"Error creating project: {project['error']}"
-        
-        return "Project created successfully:\n\n" + format_project(project)
+            return f"### ❌ Проект «{name}» НЕ создан\n\nTickTick отклонил: {project['error']}"
+        pid = project.get('id')
     except Exception as e:
         logger.error(f"Error in create_project: {e}")
-        return f"Error creating project: {str(e)}"
+        return f"### ❌ Проект «{name}» НЕ создан\n\nОшибка: {str(e)}"
+
+    # Post-verify: independent fresh re-read (separate GET, not the create
+    # response) so a false-positive "success" from the API doesn't slip through.
+    try:
+        fresh = await _run_blocking(ticktick.get_project, pid)
+        if isinstance(fresh, dict) and not fresh.get('error') and fresh.get('id') == pid:
+            return (f"### ✅ Создан проект «{fresh.get('name', name)}»\n\n"
+                    f"{format_project(fresh)}\n\n"
+                    f"🧾 Проверено: подтверждено отдельным живым чтением TickTick "
+                    f"(id: {pid}).")
+        return (f"### ⚠️ Проект «{name}» создан, но НЕ подтверждён\n\n"
+                f"{format_project(project)}\n\n"
+                f"⚠️ {_UNVERIFIED_MSG} (id: {pid})")
+    except Exception as e:
+        return (f"### ⚠️ Проект «{name}» создан, но НЕ подтверждён\n\n"
+                f"{format_project(project)}\n\n"
+                f"⚠️ {_UNVERIFIED_MSG} ({e})")
 
 _PROJECT_DELETE_SAMPLE_CAP = 20  # preview lines shown before the confirm echo
 
@@ -5989,8 +6005,11 @@ async def get_statistics() -> str:
 @mcp.tool(annotations=READONLY)
 async def get_trash(limit: int = 50) -> str:
     """
-    List recently deleted (trashed) tasks (requires v2 API). Use restore_task
-    to bring one back.
+    List recently deleted (trashed) tasks (requires v2 API). Each line carries
+    the task's id and original project — restore_tasks needs both: the id/title
+    pair to identify the task (title is checked against the live trash entry
+    before restoring), and to_project_id only if you want to override the
+    original list it restored to.
 
     Args:
         limit: Maximum number of trashed tasks to return (default 50, max 500)
