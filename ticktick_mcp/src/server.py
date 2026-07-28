@@ -4719,17 +4719,17 @@ async def get_all_tasks() -> str:
         if ticktick_v2:
             tasks = await _run_blocking(lambda: ticktick_v2.get_open_tasks())
             if not tasks:
-                return "Задач не найдено."
+                return "No tasks found."
             names = _v2_project_names()
             by_project: Dict[str, list] = {}
             for t in tasks:
                 pid = t.get("projectId", "")
                 by_project.setdefault(pid, []).append(t)
-            out = f"Все открытые задачи ({len(tasks)}):\n\n"
+            out = f"All open tasks ({len(tasks)}):\n\n"
             for pid, ptasks in by_project.items():
                 pname = names.get(pid, pid or "Inbox")
                 top = [t for t in ptasks if not t.get("parentId")]
-                out += f"── {pname} ({len(top)} задач) ──\n"
+                out += f"── {pname} ({len(top)} tasks) ──\n"
                 out += format_task_tree(top, 500)
                 out += "\n"
             return out
@@ -5064,7 +5064,7 @@ async def create_subtask(
                 verdict = ("⚠️ Задача создана, но НЕ привязана к родителю "
                            f"(parentId={live.get('parentId')!r}).")
             else:
-                verdict = (f"✓ Подзадача «{subtask_title}» создана под "
+                verdict = (f"✅ Подзадача «{subtask_title}» создана под "
                            f"«{g.title or parent_task_title}» (проверено).")
         return (verdict + "\n\n" + format_task(subtask) + "\n" + _report_line(rid))
     except Exception as e:
@@ -5118,7 +5118,7 @@ async def list_tags() -> str:
         if not tags:
             return "No tags found."
         lines = [f"- {t.get('label', t.get('name', '?'))}" for t in tags]
-        return f"Tags ({len(tags)}):\n" + "\n".join(lines)
+        return f"Tags ({len(tags)}):\n\n" + "\n".join(lines)
     except Exception as e:
         logger.error(f"Error in list_tags: {e}")
         return f"Error fetching tags: {str(e)}"
@@ -5763,7 +5763,7 @@ async def list_project_groups() -> str:
         groups = [g for g in groups if not g.get("deleted")]
         if not groups:
             return "No project groups found."
-        return f"Project groups ({len(groups)}):\n" + "\n".join(
+        return f"Project groups ({len(groups)}):\n\n" + "\n".join(
             f"- {g.get('name','?')}  (id: {g.get('id')})" for g in groups)
     except Exception as e:
         logger.error(f"Error in list_project_groups: {e}")
@@ -6468,7 +6468,13 @@ async def create_tag(name: str, color: str = None) -> str:
         return err
     try:
         await _run_blocking(lambda: ticktick_v2.create_tag(name, color))
-        return f"Tag '{name}' created."
+        # Lightweight inline check — create_tag doesn't write to the journal
+        # (tag creation isn't journaled), so this is the only proof available.
+        after = await _live_tag_names()
+        if name.lower() in after:
+            return f"✅ Тег «{name}» создан (проверено)."
+        return (f"⚠️ Тег «{name}» отправлен на создание, но не виден в "
+                "свежем списке тегов — проверь вручную.")
     except Exception as e:
         logger.error(f"Error in create_tag: {e}")
         return f"Error creating tag: {str(e)}"
@@ -6560,8 +6566,8 @@ async def delete_tag(name: str) -> str:
         after = await _live_tag_names()
         if name.lower() in after:
             return f"❌ Тег «{name}» ВСЁ ЕЩЁ существует — удаление не сработало."
-        return (f"Tag '{name}' deleted (проверено). Тег снят с "
-                f"{len(carriers)} открытых задач(и); сами задачи не тронуты.")
+        return (f"✅ Тег «{name}» удалён (проверено). Снят с "
+                f"**{len(carriers)}** открытых задач(и); сами задачи не тронуты.")
     except Exception as e:
         logger.error(f"Error in delete_tag: {e}")
         return f"Error deleting tag: {str(e)}"
@@ -6877,10 +6883,10 @@ async def search_all_tasks(
     search_comments — also search task COMMENTS (default False). SLOW: TickTick
       has no bulk comment API, so comments are fetched one task at a time. To
       bound the cost we only fetch comments for tasks with commentCount > 0 (when
-      that field is present) and stop after a fixed number of fetches, noting in
-      the output how many were scanned and whether the cap was hit. Comment hits
-      are reported in their own group. Turn this on only when you specifically
-      need to find a task by something written in its comments.
+      that field is present) and stop after 150 fetches (COMMENT_FETCH_CAP),
+      noting in the output how many were scanned and whether the cap was hit.
+      Comment hits are reported in their own group. Turn this on only when you
+      specifically need to find a task by something written in its comments.
 
     Args:
         query: Text to search for.
@@ -7082,9 +7088,9 @@ async def get_task_info(task_id: str) -> str:
         # Attachments
         attachments = t.get("attachments") or []
         if attachments:
-            out += f"\nВложения ({len(attachments)}):\n"
+            out += f"\nAttachments ({len(attachments)}):\n"
             for a in attachments:
-                name = a.get("fileName") or a.get("name") or "(без имени)"
+                name = a.get("fileName") or a.get("name") or "(unnamed)"
                 size = a.get("fileSize")
                 size_str = f"  {size // 1024} KB" if size else ""
                 url = a.get("fileUrl") or a.get("url") or ""
@@ -7093,7 +7099,7 @@ async def get_task_info(task_id: str) -> str:
                     out += f"\n     {url}"
                 out += "\n"
         if not items and not kids and not attachments:
-            out += "\n(нет чеклистов, подзадач и вложений)\n"
+            out += "\n(no checklist items, subtasks, or attachments)\n"
         return out
     except Exception as e:
         logger.error(f"Error in get_task_info: {e}")
