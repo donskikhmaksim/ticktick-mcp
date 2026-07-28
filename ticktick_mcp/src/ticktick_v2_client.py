@@ -66,6 +66,13 @@ def id2error_failures(resp: Any, ids: List[str]) -> Dict[str, str]:
     return {str(i): str(errs[i]) for i in ids if i in errs and errs[i]}
 
 
+def new_attachment_id() -> str:
+    """A fresh attachment id in TickTick's shape (24 hex chars). The CLIENT
+    mints it — the upload URL contains it, so it has to exist before the file
+    is sent (which is what makes a pre-signed upload link possible at all)."""
+    return uuid.uuid4().hex[:24]
+
+
 def _build_x_device() -> str:
     """The x-device header the web client sends; v2 returns 500 without it."""
     return json.dumps({
@@ -648,31 +655,47 @@ class TickTickV2Client:
             mime = mimetypes.guess_type(resolved_name)[0] or mime or "application/octet-stream"
         return resolved_name, data, mime
 
-    def upload_attachment(self, project_id: str, task_id: str, *,
-                          url: str = None, content_base64: str = None,
-                          filename: str = None) -> Dict:
-        """Upload a file attachment to a task. Source is either a URL (the
-        server downloads it) or base64 content. Endpoint:
-        POST /api/v1/attachment/upload/{projectId}/{taskId}/{attachmentId},
-        multipart with a single `file` field."""
-        if url:
-            r = requests.get(url, timeout=60)
-            r.raise_for_status()
-            data = r.content
-            if not filename:
-                filename = url.split("?")[0].rstrip("/").split("/")[-1] or "attachment"
-        elif content_base64:
-            data = base64.b64decode(content_base64)
-            filename = filename or "attachment"
-        else:
-            raise ValueError("Provide either url or content_base64.")
+    def open_attachment_stream(self, project_id: str, task_id: str,
+                               attachment_id: str) -> "requests.Response":
+        """Same endpoint as download_attachment, but STREAMING: returns the raw
+        (already status-checked) requests.Response with stream=True, so the
+        caller can relay the bytes onward without ever holding the whole file in
+        memory. Caller owns the response and MUST close() it.
+        No size cap here on purpose — nothing is buffered."""
+        url = f"{ATTACHMENT_BASE}/attachment/{project_id}/{task_id}/{attachment_id}"
+        resp = self.session.get(url, timeout=60, stream=True)
+        if resp.status_code in (401, 403):
+            resp.close()
+            raise TickTickAuthError(
+                "TickTick v2 session token is invalid or expired. Re-extract "
+                "the `t` cookie and update TICKTICK_V2_TOKEN.")
+        if resp.status_code == 404:
+            resp.close()
+            raise ValueError(
+                f"Attachment {attachment_id} not found on task {task_id} "
+                "(wrong id, or the file was removed).")
+        try:
+            resp.raise_for_status()
+        except Exception:
+            resp.close()
+            raise
+        return resp
 
+    def upload_attachment_bytes(self, project_id: str, task_id: str,
+                                attachment_id: str, data: bytes,
+                                filename: str = None) -> Dict:
+        """The raw upload request, with the attachmentId supplied by the caller
+        (24-hex; TickTick lets the client mint it). Used both by
+        upload_attachment below and by the relay endpoint, so the two can never
+        drift apart. Note what this deliberately does NOT do: it does not touch
+        the task's content/desc, i.e. no `![file](id/name)` marker is written —
+        TickTick's own upload apparently attaches the file without it, and this
+        mirrors that exactly."""
+        filename = filename or f"attachment_{attachment_id}"
         if len(data) > ATTACHMENT_MAX_BYTES:
             raise ValueError(
                 f"File is {len(data) // (1024*1024)} MB; TickTick caps attachments at 20 MB.")
-
         mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        attachment_id = uuid.uuid4().hex[:24]
         upload_url = (f"{ATTACHMENT_BASE}/attachment/upload/"
                       f"{project_id}/{task_id}/{attachment_id}")
         self._state_cache = None  # task now has an attachment
@@ -694,6 +717,28 @@ class TickTickV2Client:
             # Upload succeeded (2xx) but body wasn't JSON; don't crash the tool.
             logger.warning("Attachment upload returned a non-JSON body.")
             return {}
+
+    def upload_attachment(self, project_id: str, task_id: str, *,
+                          url: str = None, content_base64: str = None,
+                          filename: str = None) -> Dict:
+        """Upload a file attachment to a task. Source is either a URL (the
+        server downloads it) or base64 content. Endpoint:
+        POST /api/v1/attachment/upload/{projectId}/{taskId}/{attachmentId},
+        multipart with a single `file` field."""
+        if url:
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+            data = r.content
+            if not filename:
+                filename = url.split("?")[0].rstrip("/").split("/")[-1] or "attachment"
+        elif content_base64:
+            data = base64.b64decode(content_base64)
+            filename = filename or "attachment"
+        else:
+            raise ValueError("Provide either url or content_base64.")
+
+        return self.upload_attachment_bytes(
+            project_id, task_id, new_attachment_id(), data, filename=filename)
 
     # ---- smart-list (filter) execution -----------------------------------
     def run_filter(self, filter_id_or_name: str) -> List[Dict]:

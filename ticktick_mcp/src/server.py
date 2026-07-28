@@ -3,24 +3,29 @@ import base64
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
 import re
 import time
 import unicodedata
+import urllib.parse
 import uuid
 import logging
 from datetime import date, datetime, timezone, timedelta
-from typing import Dict, List, Any, Literal, Optional
+from typing import Dict, List, Any, Literal, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from dotenv import load_dotenv
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import (JSONResponse, PlainTextResponse, Response,
+                                 StreamingResponse)
 
 from .ticktick_client import TickTickClient, _normalize_date
-from .ticktick_v2_client import TickTickV2Client, id2error_failures
+from .ticktick_v2_client import (ATTACHMENT_MAX_BYTES, TickTickAuthError,
+                                 TickTickV2Client, id2error_failures,
+                                 new_attachment_id)
 from . import declutter_sheet
 
 # Set up logging
@@ -130,6 +135,227 @@ def initialize_client():
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request: Request) -> Response:
     return JSONResponse({"status": "ok", "ticktick_connected": ticktick is not None})
+
+
+# --- Attachment transfer links (/dl, /ul) -----------------------------------
+# Big files must not travel through the MCP response body (download_task_
+# attachment base64-encodes into the answer and caps at 15 MB). Instead a tool
+# hands out a short-lived URL on THIS server, and the bytes are streamed
+# straight between the client (phone/browser/script) and TickTick.
+#
+# The link is STATELESS: everything the endpoint needs (project/task/attachment
+# ids, filename, expiry) is inside a signed token. There is no database and
+# nothing on disk, so nothing to clean up and nothing to leak on restart. The
+# signing key is DERIVED from MCP_SECRET rather than being MCP_SECRET itself,
+# so a leaked download link can never be replayed as the MCP endpoint's secret.
+# The TickTick `t` cookie NEVER leaves this server: the endpoints relay bytes.
+
+ATTACHMENT_LINK_TTL_DEFAULT_MIN = 15
+ATTACHMENT_LINK_TTL_MAX_MIN = 120
+
+
+def _link_key() -> Optional[bytes]:
+    """Key used to sign attachment links: HMAC(MCP_SECRET, "attachment-link").
+    None when MCP_SECRET is unset — in that case links cannot be signed and
+    every /dl and /ul request is rejected (fail closed)."""
+    if not SECRET:
+        return None
+    return hmac.new(SECRET.encode("utf-8"), b"attachment-link",
+                    hashlib.sha256).digest()
+
+
+def _b64u_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64u_decode(text: str) -> bytes:
+    pad = "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode(text + pad)
+
+
+def _sign_attachment_token(kind: str, project_id: str, task_id: str,
+                           attachment_id: str, filename: str,
+                           ttl_minutes: int) -> Optional[str]:
+    """Build '<payload>.<signature>' for a /dl (kind='dl') or /ul (kind='ul')
+    link. Returns None when there is no MCP_SECRET to derive a key from."""
+    key = _link_key()
+    if not key:
+        return None
+    payload = {"k": kind, "p": project_id, "t": task_id, "a": attachment_id,
+               "n": filename or "", "e": int(time.time() + ttl_minutes * 60)}
+    body = _b64u_encode(json.dumps(payload, separators=(",", ":"),
+                                   sort_keys=True,
+                                   ensure_ascii=False).encode("utf-8"))
+    sig = hmac.new(key, body.encode("ascii"), hashlib.sha256).digest()
+    return f"{body}.{_b64u_encode(sig)}"
+
+
+def _verify_attachment_token(token: str, kind: str) -> Optional[Dict]:
+    """Decoded payload for a valid, unexpired token of the expected kind, else
+    None. Any failure (bad shape, wrong signature, wrong kind, expired) returns
+    None — the caller must answer identically for all of them so the endpoint
+    never becomes an oracle."""
+    key = _link_key()
+    if not key or not token or token.count(".") != 1:
+        return None
+    body, sig_b64 = token.split(".")
+    try:
+        sig = _b64u_decode(sig_b64)
+        expected = hmac.new(key, body.encode("ascii"), hashlib.sha256).digest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        payload = json.loads(_b64u_decode(body).decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get("k") != kind:
+        return None
+    exp = payload.get("e")
+    if not isinstance(exp, (int, float)) or time.time() > exp:
+        return None
+    if not (payload.get("p") and payload.get("t") and payload.get("a")):
+        return None
+    return payload
+
+
+def _public_base_url() -> Optional[str]:
+    """Base URL this server is reachable at from the outside, or None if it
+    cannot be known. PUBLIC_BASE_URL wins (set it when a custom domain or a
+    proxy is in front); otherwise Railway's injected RAILWAY_PUBLIC_DOMAIN."""
+    base = os.getenv("PUBLIC_BASE_URL", "").strip()
+    if not base:
+        domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+        if not domain:
+            return None
+        base = domain if domain.startswith("http") else f"https://{domain}"
+    return base.rstrip("/")
+
+
+_NO_PUBLIC_URL_MSG = (
+    "Не могу собрать ссылку: сервер не знает свой публичный адрес. "
+    "Задай переменную окружения PUBLIC_BASE_URL "
+    "(например https://ticktick-mcp.up.railway.app) — на Railway обычно хватает "
+    "уже готовой RAILWAY_PUBLIC_DOMAIN, но её здесь нет.")
+_NO_SECRET_MSG = (
+    "Не могу подписать ссылку: не задан MCP_SECRET, а ключ подписи выводится "
+    "из него. Без него временные ссылки отключены.")
+# Deliberately vague: an expired, forged, or malformed token all look the same
+# from outside — no hints about which part was wrong.
+_BAD_LINK_MSG = ("Ссылка недействительна или устарела. Попроси новую — "
+                 "они живут недолго.\n")
+
+
+def _content_disposition(filename: str) -> str:
+    """Content-Disposition value that survives non-ASCII names: a stripped
+    ASCII fallback for ancient clients plus RFC 5987 filename* with the real
+    (percent-encoded UTF-8) name, which every current browser prefers."""
+    name = (filename or "").replace("\r", " ").replace("\n", " ").strip() or "attachment"
+    ascii_name = name.encode("ascii", "ignore").decode("ascii")
+    ascii_name = ascii_name.replace('"', "").replace("\\", "").strip()
+    # A fully non-ASCII name ("Отчёт.pdf") leaves only the extension — keep the
+    # extension but give the fallback an actual stem.
+    stem, dot, ext = ascii_name.rpartition(".")
+    if not stem.strip():
+        ascii_name = f"attachment{dot}{ext}" if dot else "attachment"
+    quoted = urllib.parse.quote(name, safe="")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quoted}"
+
+
+def _stream_and_close(resp):
+    """Yield the relayed body in chunks and always release the upstream
+    connection, including when the client hangs up mid-download."""
+    try:
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            if chunk:
+                yield chunk
+    finally:
+        resp.close()
+
+
+@mcp.custom_route("/dl/{token}", methods=["GET"])
+async def attachment_download_link(request: Request) -> Response:
+    """Stream a TickTick attachment to whoever holds a valid, unexpired token.
+    Nothing is buffered: bytes go TickTick -> here -> client."""
+    payload = _verify_attachment_token(request.path_params.get("token", ""), "dl")
+    if not payload:
+        return PlainTextResponse(_BAD_LINK_MSG, status_code=404)
+    # _ensure_ready can lazily (re-)initialize the clients, which does network
+    # I/O — keep it off the event loop like every other blocking client call.
+    err = await _run_blocking(_ensure_ready)
+    if err:
+        return PlainTextResponse(f"{err}\n", status_code=503)
+    try:
+        upstream = await _run_blocking(
+            lambda: ticktick_v2.open_attachment_stream(
+                payload["p"], payload["t"], payload["a"]))
+    except TickTickAuthError as e:
+        logger.error(f"/dl auth error: {e}")
+        return PlainTextResponse("Сервер не может обратиться к TickTick "
+                                 "(сессия истекла).\n", status_code=502)
+    except ValueError:
+        # Attachment genuinely gone upstream — same 404 wording as a bad link.
+        return PlainTextResponse(_BAD_LINK_MSG, status_code=404)
+    except Exception as e:
+        logger.error(f"/dl upstream error: {e}")
+        return PlainTextResponse("Не удалось получить файл из TickTick.\n",
+                                 status_code=502)
+
+    name = payload.get("n") or f"attachment_{payload['a']}"
+    mime = upstream.headers.get("Content-Type")
+    if not mime or mime == "application/octet-stream":
+        mime = mimetypes.guess_type(name)[0] or mime or "application/octet-stream"
+    headers = {"Content-Disposition": _content_disposition(name),
+               "Cache-Control": "private, no-store"}
+    # Pass the length through only when the upstream body is NOT encoded:
+    # iter_content() transparently decompresses, so a gzip Content-Length would
+    # describe the compressed size and leave the client waiting for bytes that
+    # never come. Without the header the response is simply chunked.
+    length = upstream.headers.get("Content-Length")
+    if length and not upstream.headers.get("Content-Encoding"):
+        headers["Content-Length"] = length
+    return StreamingResponse(_stream_and_close(upstream), media_type=mime,
+                             headers=headers)
+
+
+@mcp.custom_route("/ul/{token}", methods=["PUT"])
+async def attachment_upload_link(request: Request) -> Response:
+    """Accept a raw request body and relay it into TickTick as the multipart
+    upload it expects. The 20 MB cap is TickTick's own; the body is read in
+    chunks so an oversized upload is rejected without swallowing it whole."""
+    payload = _verify_attachment_token(request.path_params.get("token", ""), "ul")
+    if not payload:
+        return PlainTextResponse(_BAD_LINK_MSG, status_code=404)
+    # _ensure_ready can lazily (re-)initialize the clients, which does network
+    # I/O — keep it off the event loop like every other blocking client call.
+    err = await _run_blocking(_ensure_ready)
+    if err:
+        return PlainTextResponse(f"{err}\n", status_code=503)
+
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf.extend(chunk)
+        if len(buf) > ATTACHMENT_MAX_BYTES:
+            return PlainTextResponse(
+                f"Файл больше {ATTACHMENT_MAX_BYTES // (1024*1024)} МБ — "
+                "TickTick столько не принимает.\n", status_code=413)
+    if not buf:
+        return PlainTextResponse("Пустое тело запроса — нечего загружать.\n",
+                                 status_code=400)
+
+    name = payload.get("n") or f"attachment_{payload['a']}"
+    try:
+        await _run_blocking(lambda: ticktick_v2.upload_attachment_bytes(
+            payload["p"], payload["t"], payload["a"], bytes(buf), filename=name))
+    except TickTickAuthError as e:
+        logger.error(f"/ul auth error: {e}")
+        return PlainTextResponse("Сервер не может обратиться к TickTick "
+                                 "(сессия истекла).\n", status_code=502)
+    except Exception as e:
+        logger.error(f"/ul upstream error: {e}")
+        return PlainTextResponse(f"TickTick не принял файл: {e}\n",
+                                 status_code=502)
+    return JSONResponse({"status": "ok", "fileName": name,
+                         "size_bytes": len(buf), "task_id": payload["t"],
+                         "attachment_id": payload["a"]})
 
 
 # Single source of truth for TickTick's priority levels (0/1/3/5).
@@ -5858,6 +6084,50 @@ async def list_task_attachments(task_id: str, project_id: str = None) -> str:
         return f"Error listing attachments: {str(e)}"
 
 
+async def _resolve_attachment_ref(task_id: str, project_id: str = None,
+                                  attachment_id: str = None,
+                                  filename: str = None, index: int = None
+                                  ) -> Tuple[Optional[Tuple[str, str, str]], Optional[str]]:
+    """Turn "which attachment?" (id / exact filename / 1-based index) into a
+    concrete (projectId, attachmentId, fileName) triple.
+    Returns (triple, None) on success or (None, message-for-the-user) — shared
+    by download_task_attachment and get_attachment_download_url so both accept
+    exactly the same ways of naming an attachment."""
+    if not attachment_id and not filename and not index:
+        return None, ("Provide one of attachment_id, filename, or index "
+                      "(see list_task_attachments).")
+    pid = project_id or _resolve_project_id(task_id, project_id)
+    if not pid:
+        return None, f"Could not resolve project_id for task {task_id}; pass it explicitly."
+    atts = await _run_blocking(lambda: _merged_task_attachments(task_id))
+    if not atts:
+        return None, f"No attachments found on task {task_id}."
+
+    target = None
+    if attachment_id:
+        target = next((a for a in atts if a.get("id") == attachment_id), None)
+        if not target:
+            target = {"id": attachment_id}  # caller may have it from elsewhere
+    elif filename:
+        target = next((a for a in atts
+                       if (a.get("fileName") or a.get("name")) == filename), None)
+        if not target:
+            return None, (f"No attachment named '{filename}' on this task. "
+                          "Run list_task_attachments to see exact names.")
+    elif index:
+        if index < 1 or index > len(atts):
+            return None, f"index {index} out of range (task has {len(atts)} attachments)."
+        target = atts[index - 1]
+
+    att_id = target.get("id")
+    if not att_id:
+        return None, ("Could not determine this attachment's id (neither the "
+                      "attachments metadata nor the content markdown had one) — "
+                      "try list_task_attachments and pass attachment_id explicitly.")
+    name = filename or target.get("fileName") or target.get("name") or f"attachment_{att_id}"
+    return (pid, att_id, name), None
+
+
 @mcp.tool()
 async def download_task_attachment(task_id: str, project_id: str = None,
                                    attachment_id: str = None,
@@ -5869,7 +6139,9 @@ async def download_task_attachment(task_id: str, project_id: str = None,
     Google Drive). Identify the attachment by ONE of: attachment_id (from
     list_task_attachments), filename (exact match), or index (1-based, as
     shown by list_task_attachments). Refuses files over 15 MB (base64 bloats
-    the response) — download those to disk another way instead.
+    the response) — for those (and whenever the user just wants the file on
+    their phone/computer) use get_attachment_download_url instead: it hands
+    back a short-lived link and the bytes never enter this conversation.
 
     Endpoint: GET /api/v1/attachment/{projectId}/{taskId}/{attachmentId}
     (mirrors the working upload path minus '/upload'; confirmed by probing —
@@ -5886,38 +6158,12 @@ async def download_task_attachment(task_id: str, project_id: str = None,
     err = _ensure_ready()
     if err:
         return err
-    if not attachment_id and not filename and not index:
-        return "Provide one of attachment_id, filename, or index (see list_task_attachments)."
     try:
-        pid = project_id or _resolve_project_id(task_id, project_id)
-        if not pid:
-            return f"Could not resolve project_id for task {task_id}; pass it explicitly."
-        atts = await _run_blocking(lambda: _merged_task_attachments(task_id))
-        if not atts:
-            return f"No attachments found on task {task_id}."
-
-        target = None
-        if attachment_id:
-            target = next((a for a in atts if a.get("id") == attachment_id), None)
-            if not target:
-                target = {"id": attachment_id}  # caller may have it from elsewhere
-        elif filename:
-            target = next((a for a in atts
-                          if (a.get("fileName") or a.get("name")) == filename), None)
-            if not target:
-                return (f"No attachment named '{filename}' on this task. "
-                        "Run list_task_attachments to see exact names.")
-        elif index:
-            if index < 1 or index > len(atts):
-                return f"index {index} out of range (task has {len(atts)} attachments)."
-            target = atts[index - 1]
-
-        att_id = target.get("id")
-        if not att_id:
-            return ("Could not determine this attachment's id (neither the "
-                    "attachments metadata nor the content markdown had one) — "
-                    "try list_task_attachments and pass attachment_id explicitly.")
-        want_name = filename or target.get("fileName") or target.get("name")
+        ref, ref_err = await _resolve_attachment_ref(
+            task_id, project_id, attachment_id, filename, index)
+        if ref_err:
+            return ref_err
+        pid, att_id, want_name = ref
 
         name, data, mime = await _run_blocking(lambda: ticktick_v2.download_attachment(
             pid, task_id, att_id, filename=want_name))
@@ -5935,6 +6181,141 @@ async def download_task_attachment(task_id: str, project_id: str = None,
     except Exception as e:
         logger.error(f"Error in download_task_attachment: {e}")
         return f"Error downloading attachment: {str(e)}"
+
+
+def _clamp_link_ttl(ttl_minutes: Optional[int]) -> int:
+    """Keep a requested link lifetime inside 1..ATTACHMENT_LINK_TTL_MAX_MIN."""
+    try:
+        ttl = int(ttl_minutes) if ttl_minutes else ATTACHMENT_LINK_TTL_DEFAULT_MIN
+    except (TypeError, ValueError):
+        ttl = ATTACHMENT_LINK_TTL_DEFAULT_MIN
+    return max(1, min(ttl, ATTACHMENT_LINK_TTL_MAX_MIN))
+
+
+@mcp.tool(annotations=READONLY)
+async def get_attachment_download_url(task_id: str, project_id: str = None,
+                                      attachment_id: str = None,
+                                      filename: str = None,
+                                      index: int = None,
+                                      ttl_minutes: int = 15) -> str:
+    """
+    Get a temporary direct download LINK for a task attachment (requires v2
+    API) instead of pulling the file through this conversation. Use this for
+    anything big, and whenever the user actually wants the file on their phone
+    or computer — download_task_attachment base64-encodes into the answer and
+    refuses over 15 MB, this has no such limit and costs no tokens.
+
+    The link points at this MCP server (not at TickTick — TickTick has no
+    public/pre-signed file URLs), which streams the bytes through; the TickTick
+    session cookie never leaves the server. It is signed and expires (15 min by
+    default, 120 max), and anyone holding it can fetch that one file until it
+    does — so treat it like a one-off secret and don't post it publicly.
+
+    Identify the attachment by ONE of: attachment_id (from
+    list_task_attachments), filename (exact match), or index (1-based).
+    Requires the server to know its own public address (PUBLIC_BASE_URL or
+    Railway's RAILWAY_PUBLIC_DOMAIN) and MCP_SECRET to be set.
+
+    Args:
+        task_id: ID of the task
+        project_id: ID of the task's project (optional; auto-resolved)
+        attachment_id: Attachment id (optional; see list_task_attachments)
+        filename: Exact attachment filename (optional, alternative to id)
+        index: 1-based position in list_task_attachments' output (optional)
+        ttl_minutes: How long the link stays valid, 1-120 (default 15)
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    base = _public_base_url()
+    if not base:
+        return _NO_PUBLIC_URL_MSG
+    if not SECRET:
+        return _NO_SECRET_MSG
+    try:
+        ref, ref_err = await _resolve_attachment_ref(
+            task_id, project_id, attachment_id, filename, index)
+        if ref_err:
+            return ref_err
+        pid, att_id, name = ref
+        ttl = _clamp_link_ttl(ttl_minutes)
+        token = _sign_attachment_token("dl", pid, task_id, att_id, name, ttl)
+        if not token:
+            return _NO_SECRET_MSG
+        return (f"Ссылка на скачивание «{name}» (действует {ttl} мин):\n"
+                f"{base}/dl/{token}\n\n"
+                "Открой её в браузере или на телефоне — файл скачается напрямую, "
+                "минуя этот чат. После истечения срока ссылка перестанет работать.")
+    except Exception as e:
+        logger.error(f"Error in get_attachment_download_url: {e}")
+        return f"Error building download link: {str(e)}"
+
+
+@mcp.tool()
+async def create_attachment_upload_url(task_id: str, project_id: str = None,
+                                       filename: str = None,
+                                       size_bytes: int = None,
+                                       ttl_minutes: int = 15) -> str:
+    """
+    Create a temporary upload LINK that puts a file onto a task (requires v2
+    API) without the file passing through this conversation. Counterpart of
+    get_attachment_download_url; use it when the file is large or simply not in
+    Claude's hands — e.g. it sits on the user's phone or on a server.
+
+    HONEST LIMITATION: an MCP client (Claude) cannot use this link itself — it
+    cannot make raw PUT requests. The link is for a HUMAN with a browser/phone
+    or for a script. When Claude already has the bytes, attach_file_to_task is
+    the right tool. What the holder does with the link:
+        curl -X PUT --upload-file ./myfile.pdf "<the link>"
+    The server relays the body into TickTick as the multipart upload it expects
+    and answers with JSON. Max 20 MB (TickTick's own cap).
+
+    Requires the server to know its own public address (PUBLIC_BASE_URL or
+    Railway's RAILWAY_PUBLIC_DOMAIN) and MCP_SECRET to be set.
+
+    Args:
+        task_id: ID of the task the file will be attached to
+        project_id: ID of the task's project (optional; auto-resolved)
+        filename: Name the file will get in TickTick (recommended — the
+            extension decides the stored content type)
+        size_bytes: Expected file size, if known (checked against the 20 MB cap
+            up front so the user isn't told "too big" only after uploading)
+        ttl_minutes: How long the link stays valid, 1-120 (default 15)
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    base = _public_base_url()
+    if not base:
+        return _NO_PUBLIC_URL_MSG
+    if not SECRET:
+        return _NO_SECRET_MSG
+    if size_bytes and size_bytes > ATTACHMENT_MAX_BYTES:
+        return (f"Файл {size_bytes // (1024*1024)} МБ — TickTick принимает "
+                f"максимум {ATTACHMENT_MAX_BYTES // (1024*1024)} МБ. Ссылку не делаю.")
+    try:
+        pid = project_id or _resolve_project_id(task_id, project_id)
+        if not pid:
+            return f"Could not resolve project_id for task {task_id}; pass it explicitly."
+        att_id = new_attachment_id()
+        name = filename or f"attachment_{att_id}"
+        ttl = _clamp_link_ttl(ttl_minutes)
+        token = _sign_attachment_token("ul", pid, task_id, att_id, name, ttl)
+        if not token:
+            return _NO_SECRET_MSG
+        url = f"{base}/ul/{token}"
+        return (f"Ссылка для загрузки «{name}» на задачу {task_id} "
+                f"(действует {ttl} мин, максимум "
+                f"{ATTACHMENT_MAX_BYTES // (1024*1024)} МБ):\n{url}\n\n"
+                "Загрузить может человек с телефона/компьютера или скрипт — "
+                "я сам по этой ссылке файл отправить не могу (обычный PUT-запрос "
+                "мне недоступен). Команда:\n"
+                f"  curl -X PUT --upload-file ПУТЬ_К_ФАЙЛУ \"{url}\"\n\n"
+                "Файл появится на задаче сразу после успешной загрузки; "
+                "проверить — list_task_attachments.")
+    except Exception as e:
+        logger.error(f"Error in create_attachment_upload_url: {e}")
+        return f"Error building upload link: {str(e)}"
 
 
 # ---------------------------------------------------------------------------

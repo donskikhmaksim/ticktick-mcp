@@ -161,7 +161,8 @@ maintaining a second codebase that covers a fraction of the functionality.
 | `CLAUDE_CLI_URL` / `CLAUDE_CLI_TOKEN` / `CLAUDE_CLI_MODEL` | optional | LLM judge for declutter dedup/SMART-rewrite + destination suggestions — see above |
 | `DECLUTTER_SHEET_ID` / `GSHEETS_SA_JSON` | optional | sheet-backed declutter manifest (`plan_declutter(persist="sheet")`) — see below |
 | `MCP_TRANSPORT` | for remote | `streamable-http` (default `stdio`) |
-| `MCP_SECRET` | strongly recommended | secret appended to URL path: `/mcp/<secret>` — lightweight auth for the public endpoint |
+| `MCP_SECRET` | strongly recommended | secret appended to URL path: `/mcp/<secret>` — lightweight auth for the public endpoint; also the root of the attachment-link signing key |
+| `PUBLIC_BASE_URL` | optional | public base URL of this server (e.g. `https://<app>.up.railway.app`), used to build attachment transfer links; falls back to Railway's `RAILWAY_PUBLIC_DOMAIN` |
 | `USER_TIMEZONE` | optional | IANA timezone for due-date handling (e.g. `Europe/Moscow`); defaults to UTC |
 | `MCP_HOST` / `PORT` | auto on Railway | bind address / port |
 
@@ -203,6 +204,16 @@ MCP_TRANSPORT=streamable-http MCP_SECRET=dev123 MCP_PORT=8000 \
 5. Your MCP URL is: `https://<your-app>.up.railway.app/mcp/<MCP_SECRET>`
 
 Railway health-checks `/health` (configured in `railway.toml`).
+
+Two more public routes exist for attachment transfer: `GET /dl/<token>` streams
+a file out of TickTick and `PUT /ul/<token>` relays one in. Both are useless
+without a valid short-lived token — it is signed with a key derived from
+`MCP_SECRET` (`HMAC(MCP_SECRET, "attachment-link")`, never the secret itself),
+carries the project/task/attachment ids plus an expiry, and is minted by the
+`get_attachment_download_url` / `create_attachment_upload_url` tools. Nothing is
+stored server-side, and the TickTick session cookie never leaves the server.
+On Railway `RAILWAY_PUBLIC_DOMAIN` is enough; behind a custom domain or proxy
+set `PUBLIC_BASE_URL`.
 
 ## One-command self-deploy (`scripts/setup.sh`)
 
