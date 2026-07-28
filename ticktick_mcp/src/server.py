@@ -698,6 +698,60 @@ def _split_tasks_by_state(
     return found, mismatch, missing
 
 
+def _sync_point_date(live: Optional[Dict], start_date, due_date) -> tuple:
+    """Bug fix for date updates turning into unintended ranges.
+
+    The official update endpoint writes startDate/dueDate INDEPENDENTLY — a
+    request that supplies only ONE of them leaves the OTHER holding its OLD
+    value untouched. If the task used to be a single fixed date (startDate ==
+    dueDate), changing just due_date therefore produces startDate=<old date>,
+    dueDate=<new date>, which TickTick renders as a multi-day RANGE
+    («с 23-го по <новое>») instead of the intended plain move to a new date.
+
+    Takes the RAW start_date/due_date strings as supplied by the caller
+    (either may be None/empty — not yet run through _normalize_date) and the
+    task's CURRENT live v2 state (or None if unknown/new task). Returns
+    (start_date, due_date, warn) — warn is a Russian status line to surface,
+    or None.
+
+    Rule:
+      - Caller supplies BOTH fields → explicit, deliberate choice (a real
+        range, or two identical dates) — passed through unchanged, no sync.
+      - Caller supplies exactly ONE field, and the task's live state is a
+        single point (startDate == dueDate, both set) → sync the untouched
+        field to the SAME new value, so the task stays single-date, just
+        moved. This is the default/expected behaviour and the case that was
+        reported as a bug.
+      - Caller supplies exactly ONE field, and the task was ALREADY a
+        deliberate-looking range (startDate != dueDate) → leave values as
+        given (don't clobber a real range the user may be intentionally
+        shifting one edge of) but return a warning so the span change isn't
+        silent.
+      - `live` is None (state unknown, or a brand-new task with no prior
+        dates) → nothing to sync against, pass through unchanged — matches
+        create_tasks, where a single supplied field with no prior state is
+        just "no date on the other side", not a range.
+    """
+    has_due = due_date not in (None, "")
+    has_start = start_date not in (None, "")
+    warn = None
+    if has_due != has_start and live:
+        live_start = live.get("startDate")
+        live_due = live.get("dueDate")
+        was_point = bool(live_start) and bool(live_due) and \
+            str(live_start)[:10] == str(live_due)[:10]
+        if was_point:
+            if has_due:
+                start_date = due_date
+            else:
+                due_date = start_date
+        elif live_start and live_due:
+            warn = (f"у задачи был диапазон {str(live_start)[:10]}–"
+                    f"{str(live_due)[:10]}, теперь изменился только один "
+                    "край — проверьте, что диапазон остался корректным")
+    return start_date, due_date, warn
+
+
 def _unarmed_note(found: List[Dict]) -> str:
     """Warning line when some items were mutated WITHOUT the id↔title check
     (the caller sent no title, so the guard had nothing to verify). Makes the
@@ -1597,6 +1651,10 @@ async def update_tasks(
     if len(tasks) == 1 or has_advanced:
         results = []
         _single_updates = []
+        # Fetched once and reused for both the identity guard and the
+        # point-date sync below (see _sync_point_date) — avoids re-fetching
+        # fresh v2 state per task in the loop.
+        _by_id = _open_by_id(fresh=True)
         for t in tasks:
             tid = t.get("taskId") or t.get("task_id")
             pid = t.get("projectId") or t.get("project_id") or ""
@@ -1607,7 +1665,7 @@ async def update_tasks(
                 results.append(f"✗ «{shown_title}»: неверный приоритет (допустимо 0/1/3/5)")
                 continue
             # Identity guard: refuse to edit a DIFFERENT task if the id is stale.
-            g = _guard_task(tid, t.get("title") or "", pid)
+            g = _guard_task(tid, t.get("title") or "", pid, by_id=_by_id)
             if g.status == "mismatch":
                 results.append(f"🛑 НЕ обновил «{t.get('title')}» — {g.message}")
                 continue
@@ -1619,6 +1677,12 @@ async def update_tasks(
                 # an update with a stale projectId — refuse instead of lying.
                 results.append(f"🛑 НЕ обновил «{shown_title}» — {g.message}")
                 continue
+            # Fix for the "changing one date turns the task into a range" bug:
+            # sync the untouched start/due field when the caller only supplied
+            # one of them and the task was previously a single fixed date.
+            live = (_by_id or {}).get(tid)
+            sync_start, sync_due, date_warn = _sync_point_date(
+                live, t.get("start_date"), t.get("due_date"))
             try:
                 pid = g.project_id or _resolve_project_id(tid, pid)
                 task = await _run_blocking(
@@ -1627,8 +1691,8 @@ async def update_tasks(
                     project_id=pid,
                     title=new_title,
                     content=t.get("content"),
-                    start_date=t.get("start_date"),
-                    due_date=t.get("due_date"),
+                    start_date=sync_start,
+                    due_date=sync_due,
                     priority=priority,
                     repeat_flag=t.get("repeat_flag"),
                     reminders=t.get("reminders"),
@@ -1670,9 +1734,10 @@ async def update_tasks(
                     changes["priority"] = priority
                 if t.get("tags") is not None:
                     changes["tags"] = [x.lstrip("#").lower() for x in t["tags"]]
-                for src, dst in (("due_date", "dueDate"), ("start_date", "startDate")):
-                    if t.get(src):
-                        val, all_day = _normalize_date(t[src])
+                for src, dst, val_raw in (("due_date", "dueDate", sync_due),
+                                           ("start_date", "startDate", sync_start)):
+                    if val_raw:
+                        val, all_day = _normalize_date(val_raw)
                         changes[dst] = val
                         # Preserve the all-day flag on update — dropping it turned
                         # an edited all-day date into a timed midnight task, which
@@ -1695,6 +1760,8 @@ async def update_tasks(
                     else:
                         line = (f"❌ «{shown_title}» — изменения НЕ видны в "
                                 f"живом состоянии: {verdict.lstrip('- ')}")
+                if date_warn:
+                    line += f"\n  ⚠️ {date_warn}"
                 if not (t.get("title") or "").strip():
                     line += " ⚠️ выполнено БЕЗ сверки названия (title не передан)"
                 if sub_fails:
@@ -1721,6 +1788,7 @@ async def update_tasks(
         ok_ids = {f["taskId"] for f in found}
         label_of = {}
         changes = []
+        date_warns = {}
         for t in tasks:
             tid = t.get("taskId") or t.get("task_id")
             if tid not in ok_ids:
@@ -1737,9 +1805,18 @@ async def update_tasks(
                 ch["tags"] = [x.lstrip("#").lower() for x in t["tags"]]
             if t.get("assignee") is not None:
                 ch["assignee"] = t["assignee"]
-            for src, dst in (("due_date", "dueDate"), ("start_date", "startDate")):
-                if t.get(src):
-                    val, all_day = _normalize_date(t[src])
+            # Same fix as the single-task path: sync the untouched date field
+            # when only one is supplied and the task was previously a single
+            # fixed date, so it doesn't silently turn into a range.
+            live = (by_id or {}).get(tid)
+            sync_start, sync_due, warn = _sync_point_date(
+                live, t.get("start_date"), t.get("due_date"))
+            if warn:
+                date_warns[tid] = warn
+            for src, dst, val_raw in (("due_date", "dueDate", sync_due),
+                                       ("start_date", "startDate", sync_start)):
+                if val_raw:
+                    val, all_day = _normalize_date(val_raw)
                     ch[dst] = val
                     if all_day:
                         ch["isAllDay"] = True
@@ -1779,6 +1856,9 @@ async def update_tasks(
         if updated:
             lines.append(f"✏️ Обновлено {len(updated)} (проверено): "
                          + ", ".join(f"«{lbl}»" for lbl in updated))
+        if date_warns:
+            for tid, w in date_warns.items():
+                lines.append(f"  ⚠️ «{label_of.get(tid, tid)}»: {w}")
         if unverified:
             lines.append(f"✏️ Отправлено {len(changes)}, но {_UNVERIFIED_MSG}")
         if not_applied:
@@ -2488,15 +2568,52 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
             # Do NOT consume the manifest: nothing was verified or deleted.
             return _STATE_UNAVAILABLE_MSG
         m["consumed"] = True
+        names = _v2_project_names()
         ready, drifted = [], []
         for it in m["items"]:
             live = by_id.get(it["taskId"])
-            if live and _names_agree(it["title"], live.get("title") or ""):
-                ready.append({"taskId": it["taskId"],
-                              "projectId": live.get("projectId") or it["projectId"],
-                              "title": it["title"], "snapshot": it["snapshot"]})
-            else:
-                drifted.append(it["title"])
+            planned_title = (it.get("title") or "").strip()
+            live_title = (live or {}).get("title") or ""
+            live_pid = (live or {}).get("projectId") or it.get("projectId") or ""
+            planned_pid = (it.get("projectId") or "").strip()
+            planned_proj = (it.get("project") or "").strip()
+            # FULL identity binding before an irreversible delete: the id must
+            # still resolve to a live task whose TITLE **and** PROJECT are the
+            # ones the human saw in the approved plan. Anything unverifiable
+            # (task gone, no title stored to check against) is fail-closed —
+            # skipped and reported, never "deleted just in case".
+            if not live:
+                drifted.append((it.get("title") or f"[task {str(it['taskId'])[:8]}…]",
+                                "нет среди открытых задач"))
+                continue
+            if not planned_title:
+                drifted.append((live_title or f"[task {str(it['taskId'])[:8]}…]",
+                                "в плане не было названия — сверить id↔задачу "
+                                "нечем"))
+                continue
+            if not _names_agree(planned_title, live_title):
+                drifted.append((planned_title,
+                                f"id теперь указывает на «{live_title}»"))
+                continue
+            # Project check: armed by id when the plan carried one, else by
+            # display name (sheet-backed rows store only the name). Both
+            # absent → nothing to compare, title check stands alone.
+            if planned_pid and live_pid and live_pid != planned_pid:
+                drifted.append((planned_title,
+                                "задача переехала в другой проект "
+                                f"(«{names.get(live_pid, live_pid)}» вместо "
+                                f"«{names.get(planned_pid, planned_pid)}»)"))
+                continue
+            if (not planned_pid) and planned_proj and \
+                    not _names_agree(planned_proj, names.get(live_pid, "")):
+                drifted.append((planned_title,
+                                "задача не в том проекте, что в плане "
+                                f"(«{names.get(live_pid, '')}» вместо "
+                                f"«{planned_proj}»)"))
+                continue
+            ready.append({"taskId": it["taskId"],
+                          "projectId": live_pid or it.get("projectId", ""),
+                          "title": planned_title, "snapshot": it["snapshot"]})
         journal = _journal_write({
             "ts": datetime.now(timezone.utc).isoformat(),
             "manifest": manifest_id, "summary": m.get("summary"),
@@ -2525,8 +2642,10 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
             lines.append(f"🗑 Удалено {len(deleted)}/{len(m['items'])}: "
                          + ", ".join(f"«{t}»" for t in deleted))
         if drifted:
-            lines.append(f"⏭ Пропущены {len(drifted)} (изменились после плана — "
-                         "перепланируй): " + ", ".join(f"«{t}»" for t in drifted))
+            lines.append(
+                f"⏭ Пропущены {len(drifted)} (не совпали с одобренным планом — "
+                "перепланируй): "
+                + ", ".join(f"«{t}» ({why})" for t, why in drifted))
         if failed:
             lines.append(f"❌ НЕ удалено {len(failed)} (всё ещё в TickTick): "
                          + ", ".join(f"«{t}»" for t in failed))
@@ -3304,6 +3423,19 @@ def _dc_mutating_count(actions: Dict) -> int:
             + sum(len(g["children"]) for g in actions["group"]))
 
 
+def _dc_object_ids(actions: Dict) -> List[str]:
+    """Every task id a declutter manifest would actually TOUCH — the binding
+    set for _manifest_object_hash (docs/DESIGN_approval_gate.md §4.3.2). The
+    delete manifests had this from day one; without it a declutter manifest
+    whose stored actions changed between plan and consent would be applied
+    silently. Flags are excluded: they mutate nothing."""
+    ids = [it["taskId"] for it in actions.get("delete", [])]
+    ids += [it["taskId"] for it in actions.get("rename", [])]
+    for g in actions.get("group", []):
+        ids += [c["taskId"] for c in g.get("children", [])]
+    return ids
+
+
 # ---------------------------------------------------------------------------
 # Sheet-backed declutter manifest (persist="sheet") — see
 # docs/DESIGN_sheet_backed_declutter.md. All Google I/O lives in
@@ -3831,6 +3963,8 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
                            "persist": "sheet", "spreadsheet_url": url,
                            "mutating_count": n_mut, "created": now,
                            "plan_shown_at": now,
+                           "object_hash": _manifest_object_hash(
+                               "declutter", _dc_object_ids(actions)),
                            "summary": f"Разбор помойки ({n_mut} правок)",
                            "consumed": False}
         sheet_note = (
@@ -3843,6 +3977,8 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
         _MANIFESTS[mid] = {"kind": "declutter", "actions": actions,
                            "mutating_count": n_mut, "created": now,
                            "plan_shown_at": now,
+                           "object_hash": _manifest_object_hash(
+                               "declutter", _dc_object_ids(actions)),
                            "summary": f"Разбор помойки ({n_mut} правок)",
                            "consumed": False}
 
@@ -3964,7 +4100,8 @@ async def execute_declutter(manifest_id: str, user_reply: str = "") -> str:
     m = _MANIFESTS.get(manifest_id)
     if m and m.get("kind") == "declutter" and m.get("persist") == "sheet":
         cr = _require_consent(action="declutter", tier=2, manifest=m,
-                              user_reply=user_reply)
+                              user_reply=user_reply,
+                              object_ids=_dc_object_ids(m.get("actions") or {}))
         if not cr.ok:
             return cr.reason
         return await _execute_declutter_from_sheet(manifest_id)
@@ -3986,7 +4123,8 @@ async def execute_declutter(manifest_id: str, user_reply: str = "") -> str:
         return (f"🛑 Манифест разбора {manifest_id} не найден/истёк/уже "
                 "исполнен. Сначала plan_declutter.")
     cr = _require_consent(action="declutter", tier=2, manifest=m,
-                          user_reply=user_reply)
+                          user_reply=user_reply,
+                          object_ids=_dc_object_ids(m.get("actions") or {}))
     if not cr.ok:
         return cr.reason
     m["consumed"] = True
