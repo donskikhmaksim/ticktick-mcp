@@ -7179,24 +7179,82 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
 # Tag write operations (v2)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-async def create_tag(name: str, color: str = None) -> str:
-    """Create a tag (requires v2 API). color is an optional hex like '#FF6161'."""
+@mcp.tool(annotations=WRITE)
+async def create_tag(name: str, color: str = None, manifest_id: str = "",
+                     user_reply: str = "", automation_key: str = "") -> str:
+    """Create a tag (requires v2 API). color is an optional hex like '#FF6161'.
+
+    Gated 🟡 (STANDARD.md §3.1, references/gate.md): 1st call (manifest_id
+    omitted) mutates NOTHING — returns a preview to show the user verbatim
+    and wait for their real reply. 2nd call, AFTER that reply, repeats with
+    manifest_id=<from the 1st call> and user_reply=<их дословная реплика>.
+
+    Args:
+        name: tag name to create
+        color: optional hex color like '#FF6161'
+        manifest_id: id returned by the 1st (planning) call — omit on the 1st call
+        user_reply: Скопируй сюда ДОСЛОВНО последнее сообщение пользователя, которым он подтвердил действие. Не сочиняй и не пересказывай своими словами. Если пользователь ещё не ответил — не вызывай этот инструмент.
+        automation_key: headless automation only (see _gate_single) — interactive
+            callers never fill this in; guessing it is a protocol violation
+    """
     err = _ensure_ready()
     if err:
         return err
     try:
+        existing = await _live_tag_names()
+    except Exception as e:
+        logger.error(f"Error in create_tag (pre-check): {e}")
+        return _refuse(f"Не удалось прочитать текущий список тегов ({e}).",
+                       "Повтори попытку позже.")
+    if name.lower() in existing:
+        return _tool_response("↷", f"Тег «{name}» уже существует — не создаю дубликат.")
+
+    go = _gate_single(
+        action="tag_create", tool_name="create_tag",
+        objects=[{"id": name.lower(), "name": name, "color": color}],
+        manifest_id=manifest_id, user_reply=user_reply, tier=1,
+        preview_lines=[f"1. Создать тег «{name}»" + (f" (цвет {color})" if color else "")],
+        automation_key=automation_key,
+    )
+    if not go.proceed:
+        return go.message
+
+    # Freshness re-check right before mutating — state may have drifted
+    # since the plan call (references/identity-postverify.md §4).
+    fresh_existing = await _live_tag_names()
+    if name.lower() in fresh_existing:
+        return _refuse(f"Тег «{name}» уже существует — появился с момента плана.",
+                       "Ничего не создаю (дубликат).")
+
+    actor = _resolve_automation_actor(automation_key) or "human"
+    try:
         await _run_blocking(lambda: ticktick_v2.create_tag(name, color))
-        # Lightweight inline check — create_tag doesn't write to the journal
-        # (tag creation isn't journaled), so this is the only proof available.
-        after = await _live_tag_names()
-        if name.lower() in after:
-            return f"✅ Тег «{name}» создан (проверено)."
-        return (f"⚠️ Тег «{name}» отправлен на создание, но не виден в "
-                "свежем списке тегов — проверь вручную.")
     except Exception as e:
         logger.error(f"Error in create_tag: {e}")
-        return f"Error creating tag: {str(e)}"
+        return _refuse(f"TickTick отклонил создание тега «{name}»: {e}.")
+
+    rid = _op_journal(
+        "tag_create", [{"taskId": name.lower(), "title": name,
+                        "snapshot": {"color": color}}],
+        f"Создание тега «{name}»", actor=actor,
+        object_hash=_manifest_object_hash("tag_create", [name.lower()]),
+        user_reply=user_reply or None,
+    )
+    proof = _report_line(rid)
+    after_tags = await _run_blocking(lambda: ticktick_v2.get_tags())
+    live_tag = next((t for t in after_tags if (t.get("name") or "").lower() == name.lower()), None)
+    if live_tag is None:
+        return _tool_response(
+            "⚠️", f"Тег «{name}» отправлен на создание, но не подтверждён",
+            warnings=["не виден в свежем списке тегов — проверь вручную"], proof=proof)
+    if color and (live_tag.get("color") or "").lower() != color.lower():
+        return _tool_response(
+            "❌", f"Тег «{name}» создан, но цвет не совпал",
+            bullets=[f"«{name}» — ожидался цвет {color}, живой {live_tag.get('color')}"],
+            proof=proof)
+    return _tool_response(
+        "✅", "Создан **1** тег",
+        bullets=[f"«{name}»" + (f" ({color})" if color else "")], proof=proof)
 
 
 async def _live_tag_names(force: bool = True) -> List[str]:
@@ -7207,9 +7265,10 @@ async def _live_tag_names(force: bool = True) -> List[str]:
     return [(t.get("name") or "").lower() for t in tags]
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
-                     user_reply: str = "") -> str:
+                     user_reply: str = "", manifest_id: str = "",
+                     automation_key: str = "") -> str:
     """Rename a tag (requires v2 API).
 
     If new_name already exists as a tag, TickTick MERGES the two tags — that
@@ -7220,26 +7279,47 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
     judgement, without user_reply, is NOT sufficient — don't fabricate the
     reply.
 
+    Otherwise (no merge — new_name doesn't exist yet), this is a plain
+    rename, gated 🟡 (STANDARD.md §3.1) the same "one tool, two calls" way
+    as create_tag: 1st call (manifest_id omitted) mutates NOTHING and
+    returns a preview; 2nd call, AFTER the user's real reply, repeats with
+    manifest_id=<from the 1st call> and user_reply=<их дословная реплика>.
+
     Args:
         old_name: current tag name
         new_name: new tag name
         allow_merge: pass True ONLY after the user confirmed merging into an
             existing tag (also requires user_reply — see above)
         user_reply: REQUIRED when a merge would happen — the user's literal
-            message confirming it
+            message confirming it; also doubles as the plain-rename gate's
+            confirmation (same requirement): скопируй сюда ДОСЛОВНО последнее
+            сообщение пользователя, которым он подтвердил действие, не
+            сочиняй и не пересказывай своими словами; если пользователь ещё
+            не ответил — не вызывай этот инструмент
+        manifest_id: id returned by the 1st (planning) call of a plain
+            (non-merge) rename — omit on the 1st call; unused on the merge path
+        automation_key: headless automation only (see _gate_single) — interactive
+            callers never fill this in
     """
     err = _ensure_ready()
     if err:
         return err
     try:
         existing = await _live_tag_names()
-        if old_name.lower() not in existing:
-            near = ", ".join(n for n in existing if n[:3] == old_name.lower()[:3]) \
-                or "нет похожих"
-            return (f"🛑 НЕ переименовал — тега «{old_name}» не существует "
-                    f"(возможно опечатка; похожие: {near}). Ничего не тронул.")
-        will_merge = new_name.lower() in existing
-        if will_merge:
+    except Exception as e:
+        logger.error(f"Error in rename_tag (pre-check): {e}")
+        return _refuse(f"Не удалось прочитать текущий список тегов ({e}).",
+                       "Повтори попытку позже.")
+    if old_name.lower() not in existing:
+        near = ", ".join(n for n in existing if n[:3] == old_name.lower()[:3]) \
+            or "нет похожих"
+        return (f"🛑 НЕ переименовал — тега «{old_name}» не существует "
+                f"(возможно опечатка; похожие: {near}). Ничего не тронул.")
+    will_merge = new_name.lower() in existing
+    if will_merge:
+        # UNCHANGED — this branch is already gated correctly
+        # (PLAN_retrofit.md 10.4 explicitly deferred; do not rewrite).
+        try:
             cr = _require_consent(action="rename_tag_merge", tier=2,
                                   manifest=None, user_reply=user_reply)
             if not (allow_merge and cr.ok):
@@ -7250,46 +7330,183 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
                         "согласия, повтори с allow_merge=true и "
                         "user_reply=<дословная реплика пользователя>. Ничего "
                         "не тронул." + ("" if cr.ok else f" ({cr.reason})"))
+            await _run_blocking(lambda: ticktick_v2.rename_tag(old_name, new_name))
+            # Post-verify against a fresh tag list.
+            after = await _live_tag_names()
+            if old_name.lower() in after:
+                return (f"❌ Тег «{old_name}» ВСЁ ЕЩЁ существует — переименование "
+                        "не сработало.")
+            if new_name.lower() not in after:
+                return (f"❌ Тега «{new_name}» нет после переименования — исход "
+                        "не подтверждён, проверь вручную.")
+            merged = " (слито с существующим)" if allow_merge and new_name.lower() in existing else ""
+            return f"Tag '{old_name}' renamed to '{new_name}' (проверено){merged}."
+        except Exception as e:
+            logger.error(f"Error in rename_tag: {e}")
+            return f"Error renaming tag: {str(e)}"
+
+    # Plain rename (no merge) — PLAN_retrofit.md 10.3: now gated the same
+    # way as create_tag, via _gate_single(tier=1).
+    go = _gate_single(
+        action="tag_rename", tool_name="rename_tag",
+        objects=[{"id": old_name.lower(), "name": old_name, "new_name": new_name}],
+        manifest_id=manifest_id, user_reply=user_reply, tier=1,
+        preview_lines=[f"1. Переименовать тег «{old_name}» → «{new_name}»"],
+        automation_key=automation_key,
+    )
+    if not go.proceed:
+        return go.message
+
+    # Freshness re-check right before mutating.
+    fresh_existing = await _live_tag_names()
+    if old_name.lower() not in fresh_existing:
+        return _refuse(f"Тега «{old_name}» больше не существует — состояние "
+                       "изменилось с момента плана.", "Начни заново.")
+    if new_name.lower() in fresh_existing:
+        return _refuse(f"Тег «{new_name}» появился с момента плана — теперь это "
+                       "было бы СЛИЯНИЕ, а не переименование.",
+                       "Повтори с allow_merge=true, если согласен на слияние.")
+
+    actor = _resolve_automation_actor(automation_key) or "human"
+    try:
         await _run_blocking(lambda: ticktick_v2.rename_tag(old_name, new_name))
-        # Post-verify against a fresh tag list.
-        after = await _live_tag_names()
-        if old_name.lower() in after:
-            return (f"❌ Тег «{old_name}» ВСЁ ЕЩЁ существует — переименование "
-                    "не сработало.")
-        if new_name.lower() not in after:
-            return (f"❌ Тега «{new_name}» нет после переименования — исход "
-                    "не подтверждён, проверь вручную.")
-        merged = " (слито с существующим)" if allow_merge and new_name.lower() in existing else ""
-        return f"Tag '{old_name}' renamed to '{new_name}' (проверено){merged}."
     except Exception as e:
         logger.error(f"Error in rename_tag: {e}")
-        return f"Error renaming tag: {str(e)}"
+        return _refuse(f"TickTick отклонил переименование «{old_name}» → "
+                       f"«{new_name}»: {e}.")
+
+    rid = _op_journal(
+        "tag_rename", [{"taskId": old_name.lower(), "title": old_name,
+                        "snapshot": {"new_name": new_name}}],
+        f"Переименование тега «{old_name}» → «{new_name}»", actor=actor,
+        object_hash=_manifest_object_hash("tag_rename", [old_name.lower()]),
+        user_reply=user_reply or None,
+    )
+    proof = _report_line(rid)
+    after = await _live_tag_names()
+    if old_name.lower() in after:
+        return _tool_response(
+            "❌", f"Тег «{old_name}» НЕ переименован",
+            bullets=[f"«{old_name}» всё ещё существует под старым именем"], proof=proof)
+    if new_name.lower() not in after:
+        return _tool_response(
+            "⚠️", f"Тег «{old_name}» переименован, но не подтверждён",
+            warnings=[f"«{new_name}» не виден в свежем списке тегов — проверь вручную"],
+            proof=proof)
+    return _tool_response(
+        "✅", "Переименован **1** тег",
+        bullets=[f"«{old_name}» → «{new_name}»"], proof=proof)
 
 
-@mcp.tool()
-async def delete_tag(name: str) -> str:
-    """Delete a tag (requires v2 API). Tasks keep existing; they just lose the tag."""
+@mcp.tool(annotations=DESTRUCTIVE)
+async def delete_tag(name: str, manifest_id: str = "", user_reply: str = "",
+                     automation_key: str = "") -> str:
+    """Delete a tag (requires v2 API). Tasks keep existing; they just lose the tag.
+
+    Irreversible (which tasks carried the tag is lost once deleted) → gated
+    🔴 (STANDARD.md §3.1, references/gate.md): 1st call (manifest_id omitted)
+    mutates NOTHING — returns a preview, including how many open tasks
+    currently carry the tag, to show the user verbatim. 2nd call, AFTER the
+    user's real reply, repeats with manifest_id=<from the 1st call> and
+    user_reply=<их дословная реплика>.
+
+    Args:
+        name: tag name to delete
+        manifest_id: id returned by the 1st (planning) call — omit on the 1st call
+        user_reply: Скопируй сюда ДОСЛОВНО последнее сообщение пользователя, которым он подтвердил действие. Не сочиняй и не пересказывай своими словами. Если пользователь ещё не ответил — не вызывай этот инструмент.
+        automation_key: headless automation only (see _gate_single) — interactive
+            callers never fill this in
+    """
     err = _ensure_ready()
     if err:
         return err
     try:
         existing = await _live_tag_names()
-        if name.lower() not in existing:
-            near = ", ".join(n for n in existing if n[:3] == name.lower()[:3]) \
-                or "нет похожих"
-            return (f"🛑 НЕ удалил — тега «{name}» не существует (возможно "
-                    f"опечатка — Latin/Cyrillic? похожие: {near}). Ничего не тронул.")
-        # Blast radius: how many tasks are about to lose the tag.
+    except Exception as e:
+        logger.error(f"Error in delete_tag (pre-check): {e}")
+        return _refuse(f"Не удалось прочитать текущий список тегов ({e}).",
+                       "Повтори попытку позже.")
+    if name.lower() not in existing:
+        near = ", ".join(n for n in existing if n[:3] == name.lower()[:3]) \
+            or "нет похожих"
+        return (f"🛑 НЕ удалил — тега «{name}» не существует (возможно "
+                f"опечатка — Latin/Cyrillic? похожие: {near}). Ничего не тронул.")
+
+    # Blast radius: how many tasks are about to lose the tag — shown in the
+    # plan preview on EVERY call, so drift between plan and confirm is
+    # naturally re-disclosed rather than confirming against a stale count.
+    try:
         carriers = await _run_blocking(lambda: ticktick_v2.get_tasks_by_tag(name))
+    except Exception as e:
+        logger.error(f"Error in delete_tag (carriers): {e}")
+        return _refuse(f"Не удалось прочитать список задач с тегом «{name}» "
+                       f"({e}) — не удаляю вслепую.")
+
+    preview = [(f"1. Удалить тег «{name}» — снимется с **{len(carriers)}** "
+                "открытых задач(и) (сами задачи не удаляются)")]
+    if carriers:
+        preview.append("")
+        preview.extend(f"   - «{c.get('title') or c.get('id')}»" for c in carriers[:20])
+        if len(carriers) > 20:
+            preview.append(f"   … и ещё {len(carriers) - 20}.")
+
+    go = _gate_single(
+        action="tag_delete", tool_name="delete_tag",
+        objects=[{"id": name.lower(), "name": name}],
+        manifest_id=manifest_id, user_reply=user_reply, tier=2,
+        preview_lines=preview, automation_key=automation_key,
+    )
+    if not go.proceed:
+        return go.message
+
+    # Freshness re-check right before mutating.
+    fresh_existing = await _live_tag_names()
+    if name.lower() not in fresh_existing:
+        return _refuse(f"Тега «{name}» больше не существует — состояние "
+                       "изменилось с момента плана.", "Начни заново.")
+    try:
+        fresh_carriers = await _run_blocking(lambda: ticktick_v2.get_tasks_by_tag(name))
+        tags_before = await _run_blocking(lambda: ticktick_v2.get_tags())
+    except Exception as e:
+        logger.error(f"Error in delete_tag (fresh pre-snapshot): {e}")
+        return _refuse(f"Не удалось перечитать состояние тега «{name}» перед "
+                       f"удалением ({e}) — не удаляю вслепую.")
+    tag_live = next((t for t in tags_before if (t.get("name") or "").lower() == name.lower()), None)
+
+    # Pre-snapshot (STANDARD.md §5.2, PLAN_retrofit.md 10.2) — the tag's OWN
+    # fields plus the FULL carrier list (id+title), not just a count, so a
+    # mistaken delete can be manually reconstructed from the journal.
+    carrier_snapshots = [
+        {"taskId": c.get("id"), "title": c.get("title")} for c in fresh_carriers
+    ]
+
+    actor = _resolve_automation_actor(automation_key) or "human"
+    try:
         await _run_blocking(lambda: ticktick_v2.delete_tag(name))
-        after = await _live_tag_names()
-        if name.lower() in after:
-            return f"❌ Тег «{name}» ВСЁ ЕЩЁ существует — удаление не сработало."
-        return (f"✅ Тег «{name}» удалён (проверено). Снят с "
-                f"**{len(carriers)}** открытых задач(и); сами задачи не тронуты.")
     except Exception as e:
         logger.error(f"Error in delete_tag: {e}")
-        return f"Error deleting tag: {str(e)}"
+        return _refuse(f"TickTick отклонил удаление тега «{name}»: {e}.")
+
+    rid = _op_journal(
+        "tag_delete",
+        [{"taskId": name.lower(), "title": name,
+          "snapshot": _snapshot_of(tag_live, kind="tag"),
+          "carrier_tasks": carrier_snapshots}],
+        f"Удаление тега «{name}» ({len(fresh_carriers)} задач(и))", actor=actor,
+        object_hash=_manifest_object_hash("tag_delete", [name.lower()]),
+        user_reply=user_reply or None,
+    )
+    proof = _report_line(rid)
+    after = await _live_tag_names()
+    if name.lower() in after:
+        return _tool_response(
+            "❌", f"Тег «{name}» НЕ удалён",
+            bullets=[f"«{name}» всё ещё существует"], proof=proof)
+    return _tool_response(
+        "✅", "Удалён **1** тег",
+        bullets=[(f"«{name}» — снят с **{len(fresh_carriers)}** открытых "
+                  "задач(и); сами задачи не тронуты")],
+        proof=proof)
 
 
 

@@ -400,14 +400,30 @@ class _FakeV2Tags:
             self._names.append(new_name.lower())
         return {}
 
+    def create_tag(self, name, color=None):
+        self._names.append(name.lower())
+        return {}
 
-async def test_rename_tag_plain_rename_needs_no_consent(monkeypatch):
+    def delete_tag(self, name):
+        self._names = [n for n in self._names if n != name.lower()]
+        return {}
+
+    def get_tasks_by_tag(self, tag_label):
+        return []
+
+
+async def test_rename_tag_plain_rename_now_requires_consent(monkeypatch):
+    """PLAN_retrofit.md 10.3 — the plain (non-merge) branch used to mutate
+    with no gate at all; it now goes through _gate_single(tier=1) exactly
+    like create_tag/delete_tag. Full two-call coverage lives in
+    test_slice10_tags.py; this test just confirms the old no-gate behaviour
+    is gone."""
     monkeypatch.setattr(s, "_ensure_ready", lambda: None)
     fake = _FakeV2Tags(["старый"])
     monkeypatch.setattr(s, "ticktick_v2", fake)
     result = await s.rename_tag("старый", "новый")
-    assert "renamed" in result
-    assert "новый" in fake._names
+    assert "📋" in result  # plan preview, nothing mutated yet
+    assert fake._names == ["старый"]
 
 
 async def test_rename_tag_merge_without_consent_is_refused(monkeypatch):
