@@ -1,9 +1,8 @@
-"""Slice 2 (read-only tools) audit: get_all_tasks was the sole English-vs-
-Russian outlier among get_projects / get_project / get_project_tasks /
-get_task / get_all_tasks / get_tasks_by_priority / get_tasks_due_today /
-get_overdue_tasks — every sibling (and the shared _get_project_tasks_by_filter
-helper they funnel through) renders in English, but get_all_tasks's v2 branch
-was hardcoded in Russian. Locks in the fix: English output, same content."""
+"""Slice 2 (read-only tools): get_all_tasks and its siblings under package 2
+of the STANDARD.md retrofit (docs/PLAN_retrofit.md §1 item 1 — confirmed
+decision to translate the whole read layer to Russian). Locks in the
+Russian wrapper text for get_all_tasks's v2 branch; task content itself
+(titles etc.) is untouched — only the wrapper text changed language."""
 import pytest
 
 import ticktick_mcp.src.server as s
@@ -31,7 +30,7 @@ def _fake_official_client(monkeypatch):
     monkeypatch.setattr(s, "ticktick", object())
 
 
-async def test_get_all_tasks_v2_branch_is_english_not_russian(monkeypatch):
+async def test_get_all_tasks_v2_branch_is_russian(monkeypatch):
     tasks = [
         {"id": "t1", "title": "Позвонить в банк", "projectId": "p1"},
         {"id": "t2", "title": "Купить билеты", "projectId": "p1"},
@@ -43,20 +42,19 @@ async def test_get_all_tasks_v2_branch_is_english_not_russian(monkeypatch):
 
     out = await s.get_all_tasks()
 
-    assert "All open tasks (2):" in out
-    assert "Работа (2 tasks)" in out
-    # regression guard: the old hardcoded Russian strings must be gone
-    assert "Задач не найдено" not in out
-    assert "Все открытые задачи" not in out
-    assert "задач) ──" not in out
+    assert "Все открытые задачи (2):" in out
+    assert "Работа (2 задач) ──" in out
+    # regression guard: the old hardcoded English strings must be gone
+    assert "All open tasks" not in out
+    assert "tasks) ──" not in out
     # task content itself is untouched (only the wrapper text was translated)
     assert "Позвонить в банк" in out
     assert "Купить билеты" in out
 
 
-async def test_get_all_tasks_v2_branch_empty_is_english(monkeypatch):
+async def test_get_all_tasks_v2_branch_empty_is_russian(monkeypatch):
     monkeypatch.setattr(s, "ticktick_v2", FakeV2([]))
 
     out = await s.get_all_tasks()
 
-    assert out == "No tasks found."
+    assert out == "Задачи не найдены."

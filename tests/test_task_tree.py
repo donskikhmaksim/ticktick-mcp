@@ -49,4 +49,4 @@ def test_cycle_does_not_hang():
 def test_limit_truncation_note():
     tasks = [_mk(f"t{i}") for i in range(250)]
     out = s.format_task_tree(tasks, limit=200)
-    assert "more" in out.lower()
+    assert "и ещё" in out
