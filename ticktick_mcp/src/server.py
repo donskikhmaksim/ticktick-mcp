@@ -6441,7 +6441,10 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
         return "\n".join(lines) if lines else "Ничего не восстановлено."
     except Exception as e:
         logger.error(f"Error in restore_tasks: {e}")
-        return f"Error restoring tasks: {str(e)}"@mcp.tool()
+        return f"Error restoring tasks: {str(e)}"
+
+
+@mcp.tool()
 async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
                               url: str = None,
                               content_base64: str = None, filename: str = None) -> str:
