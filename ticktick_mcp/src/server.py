@@ -44,12 +44,75 @@ PORT = int(os.getenv("PORT", os.getenv("MCP_PORT", "8000")))
 SECRET = os.getenv("MCP_SECRET", "").strip()
 STREAMABLE_PATH = f"/mcp/{SECRET}" if SECRET else "/mcp"
 
+# --- automation_key: headless-consumer bypass, SEPARATE from MCP_SECRET ----
+# MCP_SECRET (above) authenticates the /mcp URL path itself — anyone who
+# knows it can call ANY tool interactively. automation_key (PLAN_retrofit.md
+# ПАКЕТ 1, п.1.1 / STANDARD.md references/automation-secrets.md §8) is a
+# DIFFERENT secret: it lets a specific HEADLESS caller (a bot, an n8n flow —
+# nobody who could ever type "да" in chat) legally skip the interactive
+# consent gate on specific write calls. Reusing MCP_SECRET for both roles
+# (as create_tasks still does pre-migration — PLAN_retrofit.md ПАКЕТ 15,
+# п.15.4) means rotating the URL secret silently revokes every bot too, and
+# vice versa — the two must be independently rotatable.
+#
+# One key PER CONSUMER: TICKTICK_AUTOMATION_KEY_<name> (e.g.
+# TICKTICK_AUTOMATION_KEY_TGBOT), so a single compromised/retired consumer
+# can be revoked by clearing just its own env var. TICKTICK_AUTOMATION_KEY
+# (no suffix) is kept as the implicit "default" consumer for the
+# single-bot case.
+_AUTOMATION_KEY_PREFIX = "TICKTICK_AUTOMATION_KEY_"
+
+
+def _load_automation_keys() -> Dict[str, str]:
+    """Consumer name -> key, re-read from os.environ on every call (never
+    cached at import) so tests can monkeypatch the environment without
+    reloading the module. Blank values are ignored (an env var set to ""
+    must not count as a configured, always-matching key)."""
+    keys: Dict[str, str] = {}
+    default_key = os.getenv("TICKTICK_AUTOMATION_KEY", "").strip()
+    if default_key:
+        keys["default"] = default_key
+    for env_name, value in os.environ.items():
+        if env_name.startswith(_AUTOMATION_KEY_PREFIX) and value.strip():
+            keys[env_name[len(_AUTOMATION_KEY_PREFIX):].lower()] = value.strip()
+    return keys
+
+
+def _resolve_automation_actor(automation_key: str) -> Optional[str]:
+    """Constant-time-compares `automation_key` against every configured
+    TICKTICK_AUTOMATION_KEY[_<name>] (hmac.compare_digest — NEVER `==`, a
+    timing side-channel on a bearer secret is a real leak). Returns
+    "automation:<name>" for the FIRST consumer whose key matches, else None
+    — fail-closed: empty input, an unknown key, or zero configured keys all
+    return None, never a guess. The key itself NEVER appears in the return
+    value — and callers of this function must never place `automation_key`
+    itself into a tool response, exception message, or log line either
+    (references/automation-secrets.md §8: this is the single most dangerous
+    leak in the whole scheme — a key visible to the model in an interactive
+    chat IS a working gate bypass handed to that chat)."""
+    if not automation_key:
+        return None
+    for name, key in _load_automation_keys().items():
+        if key and hmac.compare_digest(automation_key, key):
+            return f"automation:{name}"
+    return None
+
+
 # Create FastMCP server
 mcp = FastMCP("ticktick", host=HOST, port=PORT, streamable_http_path=STREAMABLE_PATH)
 
 # Read-only tools carry this annotation so MCP clients (Claude) can skip the
 # confirmation dialog / offer "always allow" for them.
 READONLY = ToolAnnotations(readOnlyHint=True)
+# Write tools (mutating, reversible-ish — create/update/rename/…): NOT
+# read-only, NOT flagged destructive. idempotentHint is intentionally left
+# unset here (per-method truth, not a blanket claim) — set it at the call
+# site only where the underlying operation genuinely is idempotent
+# (PLAN_retrofit.md п.1.4).
+WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
+# Write tools whose failure mode is "data is gone/unrecoverable without a
+# journal snapshot" (delete, archive, irreversible merge, …).
+DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
 
 # Create TickTick clients
 ticktick = None       # official Open API (OAuth)
@@ -2404,10 +2467,27 @@ def _require_consent(
     return ConsentResult(True, "user_reply")
 
 
-def _journal_write(record: Dict) -> str:
+def _journal_write(record: Dict, *, actor: str = "human") -> str:
     """Append a JSON record to the mutation journal (best-effort). Returns the
     journal path or '' if unwritable. The journal holds FULL task snapshots so
-    anything mutated by mistake can be reconstructed by hand."""
+    anything mutated by mistake can be reconstructed by hand.
+
+    `actor` (STANDARD.md §11 / PLAN_retrofit.md п.1.2) — "human" or
+    "automation:<name>" (from `_resolve_automation_actor`). Every record gets
+    one: if `record` already carries an "actor" key (a caller that already
+    resolved it explicitly, as `_gate_single`/`_op_journal` do), that value
+    wins; otherwise this parameter's value is filled in. The keyword DEFAULT
+    is "human", NOT because a blind default is fine (STANDARD.md is explicit
+    that it isn't), but because ~20 write tools predating this package call
+    `_journal_write`/`_op_journal` directly with no `actor` at all and their
+    bodies are frozen for this package (PLAN_retrofit.md ПАКЕТ 1 owns only
+    infra, not tool bodies) — those calls are today interactively
+    human-only, so "human" is factually correct for them, not a guess. Every
+    NEW call path this package adds (`_gate_single`) resolves and passes
+    `actor` explicitly and NEVER relies on this default; packages 8-14 are
+    expected to do the same as they migrate each tool onto the gate."""
+    record = dict(record)
+    record.setdefault("actor", actor)
     try:
         os.makedirs(_JOURNAL_DIR, exist_ok=True)
         path = os.path.join(_JOURNAL_DIR, "deletion_journal.jsonl")
@@ -2419,24 +2499,81 @@ def _journal_write(record: Dict) -> str:
         return ""
 
 
-def _snapshot_of(live: Optional[Dict]) -> Dict:
-    """Compact snapshot of a live task for the journal."""
-    return {k: (live or {}).get(k) for k in
-            ("title", "content", "desc", "dueDate", "startDate", "priority",
-             "tags", "projectId", "parentId", "columnId", "isAllDay")
-            if (live or {}).get(k) is not None}
+# PLAN_retrofit.md п.1.8 — which live fields `_snapshot_of` keeps per object
+# kind. Deliberately NOT a blind full-object dump (Максим, задача #45): only
+# the fields a manual rollback / incident review actually needs.
+_SNAPSHOT_FIELDS_BY_KIND = {
+    "task": ("title", "content", "desc", "dueDate", "startDate", "priority",
+             "tags", "projectId", "parentId", "columnId", "isAllDay"),
+    "project_group": ("id", "name"),
+    "tag": ("name", "label", "color", "sortType"),
+    "comment": ("content", "text", "authorName", "author", "commentTime", "time"),
+}
 
 
-def _op_journal(op: str, items: List[Dict], summary: str = "") -> str:
+def _snapshot_of(live: Optional[Dict], kind: str = "task") -> Dict:
+    """Compact pre-mutation snapshot for the journal — STANDARD.md §5.2,
+    PLAN_retrofit.md п.1.8. `kind` selects the relevant field set (only the
+    fields that CHANGE or DISAPPEAR, never a blind full-object dump —
+    Максим, задача #45):
+
+      - "task" (default — unchanged from pre-package-1 behaviour): the
+        original task field set.
+      - "project_group": id + name. A deleted/moved group's own identity —
+        pair this with `member_projects` below for what it CONTAINED.
+      - "tag": name/label/color/sortType — a deleted tag's own identity.
+      - "comment": text/author/time — the only way to recover a deleted
+        comment's content; TickTick has no comment trash.
+
+    `member_projects` (project_group) and `carrier_tasks` (tag) are NOT part
+    of this per-object field set — a group/tag snapshot is about the
+    group/tag's OWN fields, and the list of projects/tasks that reference it
+    is a separate, usually much larger structure the caller assembles itself
+    (e.g. one `_snapshot_of(t, kind="task")` per carrier task) and stores
+    alongside this snapshot in its own journal record, so a big carrier list
+    doesn't get silently truncated by this helper's per-kind field set."""
+    live = live or {}
+    fields = _SNAPSHOT_FIELDS_BY_KIND.get(kind, _SNAPSHOT_FIELDS_BY_KIND["task"])
+    return {k: live.get(k) for k in fields if live.get(k) is not None}
+
+
+def _op_journal(op: str, items: List[Dict], summary: str = "", *,
+                actor: str = "human", object_hash: Optional[str] = None,
+                user_reply: Optional[str] = None,
+                gate_result: Optional[str] = None,
+                plan_ts: Optional[str] = None,
+                exec_ts: Optional[str] = None) -> str:
     """Record a mutation operation: op ∈ create/update/complete/delete/move/
-    tags/parent/abandon. Each item: {taskId, title, snapshot?, expect?}.
+    tags/parent/abandon/... Each item: {taskId, title, snapshot?, expect?}.
     Returns the record id ("<op>-<hex>") to hand to operation_report, or ''
-    when the journal is unavailable (report then impossible — say so)."""
+    when the journal is unavailable (report then impossible — say so).
+
+    Keyword-only fields added by PLAN_retrofit.md п.1.2/1.3 — `actor`
+    ("human" / "automation:<name>"), `object_hash` (the gate's binding
+    value), `user_reply` (verbatim), `gate_result` (the gate's verdict
+    string), `plan_ts`/`exec_ts` (ISO timestamps of plan-shown vs.
+    execution). All are optional and omitted from the record when not
+    given — existing call sites (pre-package-1 tool bodies, frozen for this
+    package) keep working unchanged and simply don't populate them yet;
+    every NEW gated call site (via `_gate_single`, and packages 8-14 as they
+    migrate) is expected to pass `actor` at minimum, and the rest whenever
+    the gate already computed them."""
     rid = f"{op}-{uuid.uuid4().hex[:8]}"
-    path = _journal_write({
+    record = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "record": rid, "op": op, "summary": summary, "items": items,
-    })
+    }
+    if object_hash is not None:
+        record["object_hash"] = object_hash
+    if user_reply is not None:
+        record["user_reply"] = user_reply
+    if gate_result is not None:
+        record["gate_result"] = gate_result
+    if plan_ts is not None:
+        record["plan_ts"] = plan_ts
+    if exec_ts is not None:
+        record["exec_ts"] = exec_ts
+    path = _journal_write(record, actor=actor)
     return rid if path else ""
 
 
@@ -2530,6 +2667,237 @@ def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
         "— НЕ в этом же ходе (сам список tasks можно повторить как есть, на "
         "2-м вызове он игнорируется — используются данные из манифеста). "
         "Манифест одноразовый, действует 1 час.")
+    return _GateOutcome(False, message="\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# PLAN_retrofit.md ПАКЕТ 1 — shared infra for packages 2-17 (п.1.5-1.9).
+# Nothing below this comment changes the behaviour of any existing
+# @mcp.tool() — these are new helpers that packages 2-14 will call FROM
+# their (frozen, package-owned) tool bodies as those get migrated.
+# ---------------------------------------------------------------------------
+
+# §7.2 STANDARD.md — frozen emoji legend for write-tool output. Any other
+# character (including the ASCII "✓"/"✗" still used by a few not-yet-migrated
+# tools, or unlegended emoji like 🗑/✏️/↪) is a format defect, not a style
+# choice — _tool_response refuses to emit it.
+_STATUS_LEGEND = {"✅", "⚠️", "❌", "🛑", "↷", "🧾"}
+
+
+def _tool_response(status: str, headline: str, bullets: Optional[List[str]] = None,
+                    warnings: Optional[List[str]] = None, proof: str = "") -> str:
+    """Единый хелпер сборки ответа write-инструмента — STANDARD.md §7.1
+    (references/output-format.md), PLAN_retrofit.md п.1.5. Собирает четыре
+    блока в фиксированном порядке:
+
+      ### <status> <headline>          (заголовок — ОДНА строка, самодостаточная)
+
+      <bullets, по одному на объект>    (объекты — названиями, не id)
+
+      <warnings, если есть>
+
+      <proof, если есть>                (пруф-блок post-verify, приклеенный сервером)
+
+    `status` ДОЛЖЕН быть одним из шести символов замороженной легенды §7.2
+    (✅ ⚠️ ❌ 🛑 ↷ 🧾) — попытка передать что-то ещё (ASCII "✓"/"✗", любой
+    другой emoji) вызывает ValueError на этапе разработки: разнобой в
+    статусах ловится тестом, а не ревью на глаз. `headline` ДОЛЖЕН включать
+    число там, где оно применимо ("Создано **3**", "Удалена **1**") — сам
+    хелпер этого не проверяет (нет способа отличить осмысленный текст без
+    числа от забытого), но вызывающий код обязан следовать §7.1 п.3.
+    `bullets`/`warnings` — списки строк; элемент, ещё не начинающийся с "-"
+    или "⚠️" соответственно, получает префикс автоматически, чтобы
+    вызывающему коду не нужно было дублировать разметку."""
+    if status not in _STATUS_LEGEND:
+        raise ValueError(
+            f"_tool_response: недопустимый статус {status!r} — разрешены "
+            f"ТОЛЬКО символы замороженной легенды {sorted(_STATUS_LEGEND)} "
+            "(STANDARD.md §7.2 / references/output-format.md)")
+    if not (headline or "").strip():
+        raise ValueError("_tool_response: headline обязателен и не может быть пустым")
+
+    lines = [f"### {status} {headline.strip()}", ""]
+    for b in (bullets or []):
+        b = str(b)
+        lines.append(b if b.lstrip().startswith(("-", "•")) else f"- {b}")
+    if warnings:
+        lines.append("")
+        for w in warnings:
+            w = str(w)
+            lines.append(w if w.lstrip().startswith("⚠️") else f"⚠️ {w}")
+    if proof:
+        lines.append("")
+        lines.append(proof)
+    return "\n".join(lines)
+
+
+# STANDARD.md §3.3 — докстринг-шаблон параметра `user_reply`, буквально по
+# тексту стандарта, чтобы 15 новых гейтов (пакеты 2-14, PLAN_retrofit.md
+# п.1.7) не переписывали формулировку каждый по-своему. Использование:
+# `user_reply: str = "") -> str:\n    """...\n\n    Args:\n        ...\n        user_reply: {USER_REPLY_DOCSTRING}\n    """`.
+USER_REPLY_DOCSTRING = (
+    "Скопируй сюда ДОСЛОВНО последнее сообщение пользователя, которым он "
+    "подтвердил действие. Не сочиняй и не пересказывай своими словами. Если "
+    "пользователь ещё не ответил — не вызывай этот инструмент."
+)
+
+
+def _refuse(reason: str, what_to_do: str = "") -> str:
+    """Единый текст отказа 🛑 — STANDARD.md §6/§7, PLAN_retrofit.md п.1.9.
+    Раньше каждый метод писал отказ по-своему; теперь любой отказ (гейт,
+    identity-guard, fail-closed) идёт через этот хелпер, чтобы формулировка
+    "ничего не изменено" не терялась/не перефразировалась по пути. `reason`
+    — что помешало (человеческим языком, не стектрейс), `what_to_do` — что
+    сделать дальше, чтобы продолжить (может быть пустым для терминальных
+    отказов, где продолжать нечем)."""
+    reason = (reason or "").strip()
+    what_to_do = (what_to_do or "").strip()
+    if not reason:
+        raise ValueError("_refuse: reason обязателен — отказ без причины "
+                          "непонятен человеку")
+    body = f"🛑 {reason} Ничего не изменено."
+    if what_to_do:
+        body += f" {what_to_do}"
+    return body
+
+
+def _gate_single(*, action: str, tool_name: str, objects: List[Dict],
+                 manifest_id: str, user_reply: str, tier: int,
+                 preview_lines: Optional[List[str]] = None,
+                 automation_key: str = "") -> _GateOutcome:
+    """Single-object analogue of `_gate_batch` (above) for the ~15 NON-batch
+    write tools that currently mutate with no gate at all — PLAN_retrofit.md
+    п.1.6, STANDARD.md §3.1 (references/gate.md). Packages 2-14 migrate one
+    tool at a time onto this; this package only builds it and tests it in
+    isolation — no existing @mcp.tool() body calls it yet.
+
+    Same "one tool, two calls" shape as `_gate_batch`/`delete_project`:
+
+    Call 1 (`manifest_id` omitted): stores `objects` VERBATIM in a one-shot
+    manifest bound to `action` + each object's id via `_manifest_object_hash`
+    (same binding primitive `_gate_batch`/`delete_tasks` use), and returns
+    `.proceed=False` with `.message` set to a ready preview (header +
+    `preview_lines`, or a generic per-object bullet list when the caller
+    doesn't supply its own) instructing the caller to show it to the user
+    and wait for a SEPARATE reply. **Nothing is mutated on this call.**
+
+    Call 2 (`manifest_id` + `user_reply`): runs every §3.3 check via the
+    shared `_require_consent` — manifest liveness (exists / not consumed /
+    not expired), `object_hash` binding against the manifest's STORED
+    objects (a caller trying to swap in a different object set on call 2 is
+    caught, not silently accepted), affirmative `user_reply`, one-shot
+    consumption, anti-duplet timing for tier 2. On success returns
+    `.proceed=True` with `.tasks` set to the manifest's STORED objects
+    (never the call-2 `objects` argument) — same no-swap guarantee as
+    `_gate_batch`.
+
+    `automation_key`: resolved via `_resolve_automation_actor` against the
+    NEW per-consumer `TICKTICK_AUTOMATION_KEY_<name>` keys from п.1.1 (NOT
+    the legacy `MCP_SECRET` `_require_consent` still checks for
+    `create_tasks` pre-migration). references/automation-secrets.md §8: a
+    valid key legitimately has no human to say "да" for, so it skips the
+    plan→execute dance ENTIRELY — a single call with a valid `automation_key`
+    and `objects` proceeds immediately, `manifest_id`/`user_reply` ignored.
+    identity-guard, post-verify, and the journal are NOT skipped — only the
+    interactive consent check is.
+
+    Every call — plan shown, refused, executed by a human, or executed by
+    automation — is journaled (`_journal_write`) with `actor` (resolved from
+    `automation_key`, else "human"), `object_hash`, `user_reply` verbatim,
+    the gate's verdict, and wall-clock timing — PLAN_retrofit.md п.1.2/1.3."""
+    _prune_manifests()
+
+    def _obj_id(o: Dict) -> str:
+        return str(o.get("id") or o.get("taskId") or o.get("task_id")
+                   or o.get("objectId") or o.get("project_id")
+                   or o.get("projectId") or "")
+
+    automation_actor = _resolve_automation_actor(automation_key)
+    if automation_actor is not None:
+        if not objects:
+            return _GateOutcome(False, message="Пустой список объектов — нечего делать.")
+        obj_hash = _manifest_object_hash(action, [_obj_id(o) for o in objects])
+        _journal_write({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": "gate_execute", "action": action, "tool": tool_name,
+            "manifest_id": manifest_id or "", "object_hash": obj_hash,
+            "objects": [{"id": _obj_id(o), "title": o.get("title") or o.get("name")}
+                        for o in objects],
+            "user_reply": user_reply or "", "gate_ok": True,
+            "gate_reason": "automation_key",
+        }, actor=automation_actor)
+        return _GateOutcome(True, tasks=objects, extra={})
+
+    actor = "human"
+    kind = f"single:{action}"
+
+    if manifest_id:
+        m = _MANIFESTS.get(manifest_id)
+        if not m or m.get("kind") != kind:
+            _journal_write({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "event": "gate_execute", "action": action, "tool": tool_name,
+                "manifest_id": manifest_id, "gate_ok": False,
+                "gate_reason": "unknown_or_expired_manifest",
+                "user_reply": user_reply or "",
+            }, actor=actor)
+            return _GateOutcome(False, message=(
+                f"🛑 Манифест {manifest_id} не найден/истёк/уже исполнен. "
+                f"Начни заново: {tool_name}(...) без manifest_id."))
+        stored = m.get("objects") or []
+        stored_ids = [_obj_id(o) for o in stored]
+        cr = _require_consent(action=action, tier=tier, manifest=m,
+                              user_reply=user_reply, automation_key=automation_key,
+                              object_ids=stored_ids)
+        _journal_write({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": "gate_execute", "action": action, "tool": tool_name,
+            "manifest_id": manifest_id, "object_hash": m.get("object_hash"),
+            "objects": [{"id": _obj_id(o), "title": o.get("title") or o.get("name")}
+                        for o in stored],
+            "user_reply": user_reply or "", "gate_ok": bool(cr.ok),
+            "gate_reason": cr.reason, "plan_shown_at": m.get("plan_shown_at"),
+        }, actor=actor)
+        if not cr.ok:
+            return _GateOutcome(False, message=cr.reason)
+        # One-shot (§3.3 п.4): unlike _gate_batch (whose tier-1 callers mark
+        # `consumed` themselves right before mutating), _gate_single owns the
+        # full lifecycle — mark it consumed HERE, before the caller has even
+        # started mutating, so a caller that crashes mid-mutation still can't
+        # be replayed with the same manifest_id.
+        m["consumed"] = True
+        return _GateOutcome(True, tasks=stored, extra=m.get("extra") or {})
+
+    if not objects:
+        return _GateOutcome(False, message="Пустой список объектов — нечего делать.")
+    mid = uuid.uuid4().hex[:12]
+    now = time.monotonic()
+    ids = [_obj_id(o) for o in objects]
+    obj_hash = _manifest_object_hash(action, ids)
+    _MANIFESTS[mid] = {"kind": kind, "objects": objects, "created": now,
+                       "plan_shown_at": now, "object_hash": obj_hash,
+                       "consumed": False, "extra": {}}
+    lines = [f"### 📋 {tool_name} — план", f"_Манифест `{mid}` · ничего ещё не "
+             "изменено_", ""]
+    if preview_lines:
+        lines.extend(preview_lines)
+    else:
+        for i, o in enumerate(objects, 1):
+            lines.append(f"{i}. **«{o.get('title') or o.get('name') or _obj_id(o)}»**")
+    lines.append("")
+    lines.append(
+        "Покажи это пользователю дословно и ДОЖДИСЬ его отдельного ответа "
+        "(не отвечай за него). Когда он явно согласится, вызови этот же "
+        f'инструмент снова с manifest_id="{mid}" и '
+        'user_reply="<дословная реплика пользователя>" — НЕ в этом же ходе. '
+        "Манифест одноразовый, действует 1 час.")
+    _journal_write({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": "gate_plan", "action": action, "tool": tool_name,
+        "manifest_id": mid, "object_hash": obj_hash,
+        "objects": [{"id": _obj_id(o), "title": o.get("title") or o.get("name")}
+                    for o in objects],
+    }, actor=actor)
     return _GateOutcome(False, message="\n".join(lines))
 
 
