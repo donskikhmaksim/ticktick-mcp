@@ -5528,47 +5528,75 @@ async def get_next_tasks() -> str:
         logger.error(f"Error in get_next_tasks: {e}")
         return f"Error retrieving next tasks: {str(e)}"
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 async def create_subtask(
     parent_task_title: str,
     subtask_title: str,
     parent_task_id: str,
     project_id: str,
     content: str = None,
-    priority: int = 0
+    priority: int = 0,
+    manifest_id: str = "",
+    user_reply: str = "",
+    automation_key: str = "",
 ) -> str:
-    """
-    Create a subtask for a parent task within the same project.
+    f"""
+    Create a subtask for a parent task within the same project. Gated 🟡
+    plan→execute (STANDARD.md §3.1, PLAN_retrofit.md ПАКЕТ 11): 1st call
+    (manifest_id omitted) creates NOTHING — returns a plan + manifest_id.
+    Show that to the user verbatim and wait for their own reply. 2nd call
+    (manifest_id + user_reply, the user's literal reply) actually creates
+    the subtask. Do not make the 2nd call in the same turn as the 1st.
 
     Args:
-        parent_task_title: Title of the parent task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
+        parent_task_title: Title of the parent task
         subtask_title: Title of the new subtask
         parent_task_id: ID of the parent task
         project_id: ID of the project (must be same for both parent and subtask)
         content: Optional content/description for the subtask
         priority: Priority level (0: None, 1: Low, 3: Medium, 5: High) (optional)
+        manifest_id: id from the 1st (plan) call — omit on the 1st call
+        user_reply: {USER_REPLY_DOCSTRING}
+        automation_key: for headless/automation callers only — bypasses the
+            interactive user_reply check when valid (identity-guard and
+            post-verify still run). Leave empty for normal chat use.
     """
     err = _ensure_official()
     if err:
         return err
-    
+
     # Validate priority
     if priority not in [0, 1, 3, 5]:
-        return "Invalid priority. Must be 0 (None), 1 (Low), 3 (Medium), or 5 (High)."
+        return _refuse("Некорректный priority (допустимо 0/1/3/5).")
 
     # Identity guard on the PARENT: a stale parent_task_id would attach the new
     # subtask under a different task (or a dead one) while reporting success.
+    # Re-run on EVERY call (plan and execute) against FRESH state — a
+    # planning-time cache is not good enough for identity-guard.
     g = _guard_task(parent_task_id, parent_task_title or "", project_id)
     if g.status == "unavailable":
         return g.message
     if g.status == "mismatch":
-        return (f"🛑 НЕ создал подзадачу — родитель по id это «{g.title}», а НЕ "
-                f"«{parent_task_title}». Ничего не тронул.")
+        return _refuse(f"НЕ создал подзадачу — родитель по id это «{g.title}», "
+                       f"а НЕ «{parent_task_title}».")
     if g.status == "missing":
-        return (f"🛑 НЕ создал подзадачу — родитель «{parent_task_title}» не "
-                "среди открытых задач (завершён/удалён/неверный id). Ничего не тронул.")
+        return _refuse(f"НЕ создал подзадачу — родитель «{parent_task_title}» "
+                       "не среди открытых задач (завершён/удалён/неверный id).")
     # The subtask must live in the parent's REAL project.
     project_id = g.project_id or project_id
+    parent_title = g.title or parent_task_title
+
+    gate = _gate_single(
+        action="create_subtask", tool_name="create_subtask",
+        objects=[{"id": parent_task_id, "title": subtask_title}],
+        manifest_id=manifest_id, user_reply=user_reply, tier=1,
+        automation_key=automation_key,
+        preview_lines=[f"1. Создать подзадачу **«{subtask_title}»** под "
+                       f"**«{parent_title}»**."])
+    if not gate.proceed:
+        return gate.message
+    actor = _resolve_automation_actor(automation_key) or "human"
+
     try:
         subtask = await _run_blocking(
             ticktick.create_subtask,
@@ -5580,31 +5608,34 @@ async def create_subtask(
         )
 
         if 'error' in subtask:
-            return f"Error creating subtask: {subtask['error']}"
+            return _refuse(f"TickTick отклонил создание: {subtask['error']}")
 
         # Post-verify: the created task must exist AND point at the parent.
         sid = subtask.get("id")
         rid = _op_journal("parent", [{"taskId": sid, "title": subtask_title,
                                       "expect": {"parentId": parent_task_id}}],
-                          f"Подзадача «{subtask_title}» под «{g.title or parent_task_title}»")
+                          f"Подзадача «{subtask_title}» под «{parent_title}»",
+                          actor=actor)
         fresh = _open_by_id(fresh=True)
         if fresh is None:
-            verdict = f"⚠️ Создание отправлено, но {_UNVERIFIED_MSG}"
+            status, headline = "⚠️", f"Создание подзадачи «{subtask_title}» отправлено, но не подтверждено"
+            warnings = [_UNVERIFIED_MSG]
         else:
             live = fresh.get(sid) or {}
             if not live:
-                verdict = ("❌ Создание НЕ подтвердилось — задачи нет среди "
-                           "открытых, проверь вручную.")
+                status, headline = "❌", f"Создание подзадачи «{subtask_title}» НЕ подтвердилось"
+                warnings = ["Задачи нет среди открытых, проверь вручную."]
             elif live.get("parentId") != parent_task_id:
-                verdict = ("⚠️ Задача создана, но НЕ привязана к родителю "
-                           f"(parentId={live.get('parentId')!r}).")
+                status, headline = "⚠️", f"Подзадача «{subtask_title}» создана, но НЕ привязана к родителю"
+                warnings = [f"parentId={live.get('parentId')!r}"]
             else:
-                verdict = (f"✅ Подзадача «{subtask_title}» создана под "
-                           f"«{g.title or parent_task_title}» (проверено).")
-        return (verdict + "\n\n" + format_task(subtask) + "\n" + _report_line(rid))
+                status, headline = "✅", "Создана **1** подзадача"
+                warnings = None
+        bullets = [f"«{subtask_title}» под «{parent_title}»", format_task(subtask)]
+        return _tool_response(status, headline, bullets, warnings, _report_line(rid))
     except Exception as e:
         logger.error(f"Error in create_subtask: {e}")
-        return f"Error creating subtask: {str(e)}"
+        return _refuse(f"Ошибка создания подзадачи: {str(e)}")
 
 # ---------------------------------------------------------------------------
 # v2 API tools (unofficial). Available when TICKTICK_V2_TOKEN (the `t` cookie
@@ -7298,99 +7329,155 @@ async def delete_tag(name: str) -> str:
 # Won't-do / duplicate (v2)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-async def abandon_task(summary: str, task_id: str, task_title: str = None) -> str:
-    """
-    Mark a task as 'Won't do' (requires v2 API).
-
-    summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Отмечаю «не буду делать»
-    задачу „Купить молоко"».
+@mcp.tool(annotations=WRITE)
+async def abandon_task(summary: str, task_id: str, task_title: str = None,
+                       project_name: str = "", manifest_id: str = "",
+                       user_reply: str = "", automation_key: str = "") -> str:
+    f"""
+    Mark a task as 'Won't do' (requires v2 API). Gated 🟡 plan→execute
+    (STANDARD.md §3.1, PLAN_retrofit.md ПАКЕТ 11): 1st call (manifest_id
+    omitted) marks NOTHING — returns a plan + manifest_id. Show that to the
+    user verbatim and wait for their own reply. 2nd call (manifest_id +
+    user_reply, the user's literal reply) actually marks it. Do not make the
+    2nd call in the same turn as the 1st.
 
     Args:
-        summary: Human-readable confirmation line (see above)
+        summary: Human-readable one-line description of the action (shown in
+            the plan), e.g. «Отмечаю «не буду делать» задачу „Купить молоко"»
         task_id: ID of the task
         task_title: Title of the task (optional but recommended)
+        project_name: Name of the project the task lives in (optional but
+            recommended — armed the container check of the identity-guard;
+            without it only id+title are verified)
+        manifest_id: id from the 1st (plan) call — omit on the 1st call
+        user_reply: {USER_REPLY_DOCSTRING}
+        automation_key: for headless/automation callers only — bypasses the
+            interactive user_reply check when valid (identity-guard and
+            post-verify still run). Leave empty for normal chat use.
     """
     err = _ensure_ready()
     if err:
         return err
     title = task_title or _lookup_task_title(task_id)
-    g = _guard_task(task_id, task_title or "")
+    # Re-run on EVERY call (plan and execute) against FRESH state — a
+    # planning-time cache is not good enough for identity-guard. Container
+    # (project) check is armed only when project_name is supplied.
+    g = _guard_task(task_id, task_title or "", "", project_name)
     if g.status == "unavailable":
         return g.message
     if g.status == "mismatch":
-        return (f"🛑 НЕ отметил — id это «{g.title}», а НЕ «{task_title}». "
-                "Ничего не тронул.")
+        return _refuse(f"НЕ отметил — {g.message}.")
     if g.status == "missing":
-        return (f"🛑 НЕ отметил — «{title}» не среди открытых задач "
-                "(завершена/удалена/неверный id). Ничего не тронул.")
+        return _refuse(f"НЕ отметил — «{title}» не среди открытых задач "
+                       "(завершена/удалена/неверный id).")
+
+    gate = _gate_single(
+        action="abandon_task", tool_name="abandon_task",
+        objects=[{"id": task_id, "title": title}],
+        manifest_id=manifest_id, user_reply=user_reply, tier=1,
+        automation_key=automation_key,
+        preview_lines=[f"1. Отметить «не буду делать»: **«{title}»**."])
+    if not gate.proceed:
+        return gate.message
+    actor = _resolve_automation_actor(automation_key) or "human"
+
     try:
         await _run_blocking(lambda: ticktick_v2.abandon_task(task_id))
-        rid = _op_journal("abandon", [{"taskId": task_id, "title": title}], summary)
+        rid = _op_journal("abandon", [{"taskId": task_id, "title": title}],
+                          summary, actor=actor)
         # Post-verify: an abandoned task leaves the open pool.
         fresh = _open_by_id(fresh=True)
         if fresh is None:
-            return (f"Отметка «не буду делать» для «{title}» отправлена, но "
-                    f"{_UNVERIFIED_MSG}\n" + _report_line(rid))
+            return _tool_response("⚠️", f"Отметка «не буду делать» для «{title}» отправлена, но не подтверждена",
+                                  warnings=[_UNVERIFIED_MSG], proof=_report_line(rid))
         if task_id in fresh:
-            return (f"❌ НЕ отмечено «{title}» — задача всё ещё среди открытых.\n"
-                    + _report_line(rid))
-        return f"✅ Не буду делать: «{title}» (проверено)\n" + _report_line(rid)
+            return _tool_response("❌", f"НЕ отмечено «{title}»",
+                                  warnings=["Задача всё ещё среди открытых."],
+                                  proof=_report_line(rid))
+        return _tool_response("✅", "Отмечена **1** задача как «не буду делать»",
+                              [f"«{title}»"], proof=_report_line(rid))
     except Exception as e:
         logger.error(f"Error in abandon_task: {e}")
-        return f"Error abandoning task: {str(e)}"
+        return _refuse(f"Ошибка отметки: {str(e)}")
 
 
-@mcp.tool()
-async def duplicate_task(summary: str, task_id: str, task_title: str = None) -> str:
-    """
-    Duplicate a task within the same project (requires v2 API).
-
-    summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Дублирую задачу „Купить молоко"».
+@mcp.tool(annotations=WRITE)
+async def duplicate_task(summary: str, task_id: str, task_title: str = None,
+                         project_name: str = "", manifest_id: str = "",
+                         user_reply: str = "", automation_key: str = "") -> str:
+    f"""
+    Duplicate a task within the same project (requires v2 API). Gated 🟡
+    plan→execute (STANDARD.md §3.1, PLAN_retrofit.md ПАКЕТ 11): 1st call
+    (manifest_id omitted) duplicates NOTHING — returns a plan + manifest_id.
+    Show that to the user verbatim and wait for their own reply. 2nd call
+    (manifest_id + user_reply, the user's literal reply) actually duplicates
+    it. Do not make the 2nd call in the same turn as the 1st.
 
     Args:
-        summary: Human-readable confirmation line (see above)
+        summary: Human-readable one-line description of the action (shown in
+            the plan), e.g. «Дублирую задачу „Купить молоко"»
         task_id: ID of the task
         task_title: Title of the task (optional but recommended for confirmation)
+        project_name: Name of the project the task lives in (optional but
+            recommended — arms the container check of the identity-guard;
+            without it only id+title are verified)
+        manifest_id: id from the 1st (plan) call — omit on the 1st call
+        user_reply: {USER_REPLY_DOCSTRING}
+        automation_key: for headless/automation callers only — bypasses the
+            interactive user_reply check when valid (identity-guard and
+            post-verify still run). Leave empty for normal chat use.
     """
     err = _ensure_ready()
     if err:
         return err
     title = task_title or _lookup_task_title(task_id)
-    g = _guard_task(task_id, task_title or "")
+    # Re-run on EVERY call (plan and execute) against FRESH state — a
+    # planning-time cache is not good enough for identity-guard. Container
+    # (project) check is armed only when project_name is supplied.
+    g = _guard_task(task_id, task_title or "", "", project_name)
     if g.status == "unavailable":
         return g.message
     if g.status == "mismatch":
-        return (f"🛑 НЕ дублировал — id это «{g.title}», а НЕ «{task_title}». "
-                "Ничего не тронул.")
+        return _refuse(f"НЕ дублировал — {g.message}.")
     if g.status == "missing":
-        return (f"🛑 НЕ дублировал — «{title}» не среди открытых задач "
-                "(завершена/удалена/неверный id). Ничего не тронул.")
+        return _refuse(f"НЕ дублировал — «{title}» не среди открытых задач "
+                       "(завершена/удалена/неверный id).")
+
+    gate = _gate_single(
+        action="duplicate_task", tool_name="duplicate_task",
+        objects=[{"id": task_id, "title": title}],
+        manifest_id=manifest_id, user_reply=user_reply, tier=1,
+        automation_key=automation_key,
+        preview_lines=[f"1. Дублировать: **«{title}»**."])
+    if not gate.proceed:
+        return gate.message
+    actor = _resolve_automation_actor(automation_key) or "human"
+
     try:
         copy = await _run_blocking(lambda: ticktick_v2.duplicate_task(task_id))
         cid = copy.get("id")
         rid = _op_journal("create", [
             {"taskId": cid, "title": copy.get("title") or title,
              "expect": {"projectId": copy.get("projectId")}}],
-            summary)
+            summary, actor=actor)
         # Post-verify: the copy must actually exist in fresh open state.
         fresh = _open_by_id(fresh=True)
+        caveat = ("В копию НЕ переносятся: чек-лист (items), kanban-раздел "
+                  "(column) и привязка к родителю.")
         if fresh is None:
-            verdict = f"Дублирование отправлено, но {_UNVERIFIED_MSG}"
-        elif cid not in fresh:
-            verdict = ("❌ Копия НЕ подтвердилась — её нет среди открытых "
-                       "задач, проверь вручную.")
-        else:
-            verdict = (f"✅ Дублировано (проверено): «{title}» → копия "
-                       f"«{copy.get('title') or title}»")
-        return (verdict + "\n⚠️ В копию НЕ переносятся: чек-лист (items), "
-                "kanban-раздел (column) и привязка к родителю.\n"
-                + _report_line(rid))
+            return _tool_response("⚠️", f"Дублирование «{title}» отправлено, но не подтверждено",
+                                  [caveat], warnings=[_UNVERIFIED_MSG], proof=_report_line(rid))
+        if cid not in fresh:
+            return _tool_response("❌", f"Копия «{title}» НЕ подтвердилась",
+                                  warnings=["Её нет среди открытых задач, проверь вручную."],
+                                  proof=_report_line(rid))
+        return _tool_response(
+            "✅", "Дублирована **1** задача",
+            [f"«{title}» → копия «{copy.get('title') or title}»", caveat],
+            proof=_report_line(rid))
     except Exception as e:
         logger.error(f"Error in duplicate_task: {e}")
-        return f"Error duplicating task: {str(e)}"
+        return _refuse(f"Ошибка дублирования: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
