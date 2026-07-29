@@ -473,9 +473,12 @@ class TickTickV2Client:
 
         Pages via the same path plus query params `skip` (count of records
         already fetched) and `lastId` (id of the last activity record
-        already fetched). By default this walks every page (bounded by
-        max_pages) and returns the concatenated list; pass skip/last_id
-        yourself to fetch a single page instead.
+        already fetched). By default this walks every page and returns the
+        concatenated list, but stops after `max_pages` (default 20) even if
+        the task's history is longer than that — the cutoff is silent, the
+        caller gets whatever fit in those 20 pages and no signal that older
+        entries exist beyond it. Pass skip/last_id yourself to fetch a single
+        page instead (and drive your own pagination past the default cap).
         """
         if not task_id:
             raise ValueError("task_id is required.")
