@@ -178,21 +178,56 @@ async def test_create_tasks_automation_key_still_bypasses(monkeypatch):
 
 
 # ===========================================================================
-# execute_task_creation — 🟢 tier: accepted but not hard-enforced
+# execute_task_creation — Slice 1 real gate: tier bumped 0 -> 1, now HARD
+# enforced (creation is still reversible, but the model can no longer
+# self-confirm by passing an empty/blank user_reply).
 # ===========================================================================
 
-async def test_execute_task_creation_does_not_require_user_reply(monkeypatch):
+async def test_execute_task_creation_empty_reply_is_refused_and_does_not_create(monkeypatch):
+    calls = []
+
+    async def fake_impl(summary, tasks):
+        calls.append((summary, tasks))
+        return "created ok"
+    monkeypatch.setattr(s, "_create_tasks_impl", fake_impl)
+    monkeypatch.setattr(s, "_ensure_official", lambda: None)
+
+    mid = "test-create-mid-empty"
+    s._MANIFESTS[mid] = {"kind": "create", "raw": [{"title": "X"}],
+                         "created": time.monotonic(),
+                         "plan_shown_at": time.monotonic() - 10,
+                         "summary": "test", "consumed": False}
+    result = await s.execute_task_creation(mid, user_reply="")
+    assert "🛑" in result
+    assert calls == []
+    assert s._MANIFESTS[mid]["consumed"] is False  # retryable
+
+
+async def test_execute_task_creation_negative_reply_is_refused(monkeypatch):
+    monkeypatch.setattr(s, "_ensure_official", lambda: None)
+
+    mid = "test-create-mid-no"
+    s._MANIFESTS[mid] = {"kind": "create", "raw": [{"title": "X"}],
+                         "created": time.monotonic(),
+                         "plan_shown_at": time.monotonic() - 10,
+                         "summary": "test", "consumed": False}
+    result = await s.execute_task_creation(mid, user_reply="нет, отмена")
+    assert "🛑" in result
+    assert s._MANIFESTS[mid]["consumed"] is True  # a "no" burns the plan
+
+
+async def test_execute_task_creation_with_genuine_yes_creates(monkeypatch):
     async def fake_impl(summary, tasks):
         return "created ok"
     monkeypatch.setattr(s, "_create_tasks_impl", fake_impl)
     monkeypatch.setattr(s, "_ensure_official", lambda: None)
 
-    mid = "test-create-mid"
+    mid = "test-create-mid-yes"
     s._MANIFESTS[mid] = {"kind": "create", "raw": [{"title": "X"}],
                          "created": time.monotonic(),
-                         "plan_shown_at": time.monotonic(),
+                         "plan_shown_at": time.monotonic() - 10,
                          "summary": "test", "consumed": False}
-    result = await s.execute_task_creation(mid, user_reply="")
+    result = await s.execute_task_creation(mid, user_reply="да, создавай")
     assert "created ok" in result
     assert s._MANIFESTS[mid]["consumed"] is True
 

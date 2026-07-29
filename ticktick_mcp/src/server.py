@@ -1564,13 +1564,15 @@ async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
     """
     Phase 2: create exactly what plan_task_creation planned and the user
     approved. Runs the normal creation engine (id echo, destination
-    post-verify, operation_report record). One-shot.
+    post-verify, operation_report record). One-shot. Gated 🟡
+    (docs/DESIGN_approval_gate.md): user_reply is HARD-enforced — an empty,
+    negative, or fabricated-looking reply is refused and nothing is created.
 
     Args:
         manifest_id: id from plan_task_creation
-        user_reply: the user's reply approving the plan (creation is 🟢 —
-            reversible/low-risk — so this is accepted for a uniform format
-            but NOT hard-enforced the way it is for deletion/declutter)
+        user_reply: the user's literal reply approving the plan — REQUIRED,
+            must be a genuine affirmative («да»/«ok»/…), verbatim, not
+            invented
     """
     err = _ensure_official()
     if err:
@@ -1580,7 +1582,7 @@ async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
     if not m or m.get("kind") != "create":
         return (f"🛑 Манифест создания {manifest_id} не найден/истёк/уже "
                 "исполнен. Сначала plan_task_creation.")
-    cr = _require_consent(action="create", tier=0, manifest=m,
+    cr = _require_consent(action="create", tier=1, manifest=m,
                           user_reply=user_reply)
     if not cr.ok:
         return cr.reason
@@ -1598,20 +1600,26 @@ async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
 @mcp.tool()
 async def update_tasks(
     summary: str,
-    tasks: List[Dict[str, Any]]
+    tasks: List[Dict[str, Any]] = None,
+    manifest_id: str = "",
+    user_reply: str = ""
 ) -> str:
     """
-    Update one or more tasks in TickTick.
+    Update one or more tasks in TickTick. Gated 🟡 (docs/DESIGN_approval_gate.md):
+    two calls, same tool name — nothing is changed on call #1.
 
-    PROTOCOL (interactive chats): before calling, tell the user in plain text
-    exactly what will change on which tasks and get their explicit «да/ок»
-    (skip only when the user just dictated this exact change). After the call,
-    run operation_report(record_id) and reprint it verbatim.
+    Call #1 (manifest_id omitted): builds a one-shot manifest from `tasks` and
+    returns a preview of exactly what would change — nothing is updated yet.
+    Call #2 (after the user actually replied): repeat the call with
+    manifest_id=<id from call #1> and user_reply=<the user's literal last
+    message> — `tasks` is ignored on this call (the manifest's own stored
+    items are used, so the set can't be swapped between the two calls). Do
+    NOT make call #2 in the same turn as call #1.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Меняю задачу „Оплатить аренду":
-    срок 2026-07-01, приоритет высокий» or «Меняю срок у 3 задач на 2026-07-05».
-    Mention only what actually changes.
+    at the TOP of the summary you show the user, e.g. «Меняю задачу
+    „Оплатить аренду": срок 2026-07-01, приоритет высокий» or «Меняю срок у
+    3 задач на 2026-07-05». Mention only what actually changes.
 
     Each item identifies a task and carries the fields to update. For a single
     task, use a one-element list. For multiple tasks, all items are processed in
@@ -1639,8 +1647,51 @@ async def update_tasks(
 
     Args:
         summary: Human-readable confirmation line (see above)
-        tasks: List of task change objects — one item for a single task
+        tasks: List of task change objects — required on call #1, ignored on call #2
+        manifest_id: from call #1's response — pass on call #2 to actually update
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
+    err = _ensure_official()
+    if err:
+        return err
+    outcome = _gate_batch("update", "update_tasks", tasks, summary,
+                          manifest_id, user_reply, _describe_update_item)
+    if not outcome.proceed:
+        return outcome.message
+    return await _update_tasks_impl(outcome.summary, outcome.tasks)
+
+
+def _describe_update_item(t: Dict[str, Any]) -> str:
+    title = t.get("title") or t.get("taskId") or t.get("task_id") or "?"
+    bits = []
+    if t.get("new_title"):
+        bits.append(f"название → «{t['new_title']}»")
+    if t.get("content") is not None:
+        bits.append("содержимое меняется")
+    if t.get("due_date"):
+        bits.append(f"срок → {t['due_date']}")
+    if t.get("start_date"):
+        bits.append(f"начало → {t['start_date']}")
+    if t.get("priority") is not None:
+        bits.append(f"приоритет → {PRIORITY_MAP.get(t.get('priority'), t.get('priority'))}")
+    if t.get("tags") is not None:
+        bits.append(f"теги → {', '.join(t['tags'])}")
+    if t.get("column_id"):
+        bits.append("колонка меняется")
+    if t.get("assignee") is not None:
+        bits.append("исполнитель меняется")
+    changes = "; ".join(bits) or "(поля изменений не распознаны)"
+    return f"**«{title}»** — {changes}"
+
+
+async def _update_tasks_impl(
+    summary: str,
+    tasks: List[Dict[str, Any]]
+) -> str:
+    """Pure mutation logic for update_tasks — no consent gate. Called by
+    the public gated update_tasks() below AND directly by
+    execute_declutter/resume_declutter (an already-approved declutter
+    manifest must not be asked to confirm twice)."""
     err = _ensure_official()
     if err:
         return err
@@ -1880,32 +1931,50 @@ async def update_tasks(
     except Exception as e:
         logger.error(f"Error in update_tasks: {e}")
         return f"Error updating tasks: {str(e)}"
-
 @mcp.tool()
-async def complete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
+async def complete_tasks(summary: str, tasks: List[Dict[str, str]] = None,
+                         manifest_id: str = "", user_reply: str = "") -> str:
     """
-    Mark one or more tasks as complete in one call.
+    Mark one or more tasks as complete in one call. Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    changed on call #1.
 
-    PROTOCOL (interactive chats): before calling, name the exact tasks you're
-    about to complete and get the user's explicit «да/ок» (skip only when the
-    user just named them). Afterwards run operation_report and reprint it.
+    Call #1 (manifest_id omitted): builds a one-shot manifest from `tasks`
+    and returns a preview of what would be completed — nothing is completed
+    yet. Call #2 (after the user actually replied): repeat the call with
+    manifest_id=<id from call #1> and user_reply=<the user's literal last
+    message> — `tasks` is ignored on this call (the manifest's own stored
+    items are used). Do NOT make call #2 in the same turn as call #1.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Завершаю задачу „Купить молоко"
-    в проекте „Покупки"» or «Завершаю 4 задачи».
+    at the TOP of the summary you show the user, e.g. «Завершаю задачу
+    „Купить молоко" в проекте „Покупки"» or «Завершаю 4 задачи».
 
     Put the human title inside each task object so the dialog shows what's
     being completed: [{"title": "Buy milk", "taskId": "abc", "projectId": "xyz"}].
     project_name is optional but nice to have for a single task.
 
-    For a single task: [{"title": "...", "taskId": "...", "projectId": "...",
-                         "projectName": "..."}]
-    For multiple: [{"title": "...", "taskId": "..."}, ...]
-
     Args:
         summary: Human-readable confirmation line (see above)
-        tasks: List of {"title","taskId","projectId"} objects — one item for single task
+        tasks: List of {"title","taskId","projectId"} objects — required on
+            call #1, ignored on call #2
+        manifest_id: from call #1's response — pass on call #2 to actually complete
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
+    err = _ensure_official()
+    if err:
+        return err
+    outcome = _gate_batch(
+        "complete", "complete_tasks", tasks, summary, manifest_id, user_reply,
+        lambda t: f"**«{t.get('title') or t.get('taskId')}»**")
+    if not outcome.proceed:
+        return outcome.message
+    return await _complete_tasks_impl(outcome.summary, outcome.tasks)
+
+
+async def _complete_tasks_impl(summary: str, tasks: List[Dict[str, str]]) -> str:
+    """Pure mutation logic for complete_tasks — no consent gate. Called
+    only by the public gated complete_tasks() below."""
     err = _ensure_official()
     if err:
         return err
@@ -2017,7 +2086,6 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]]) -> str:
     except Exception as e:
         logger.error(f"Error in complete_tasks: {e}")
         return f"Error completing tasks: {str(e)}"
-
 @mcp.tool()
 async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = None,
                        manifest_id: str = "", user_reply: str = "") -> str:
@@ -2384,6 +2452,85 @@ def _prune_manifests() -> None:
     for mid in [m for m, v in _MANIFESTS.items()
                 if now - v["created"] > _MANIFEST_TTL or v.get("consumed")]:
         _MANIFESTS.pop(mid, None)
+
+
+# ---------------------------------------------------------------------------
+# Shared tier-🟡 gate for the batch-mutation tools (update_tasks/
+# complete_tasks/move_tasks/set_task_parent/set_task_tags/restore_tasks) —
+# docs/DESIGN_approval_gate.md §4/§5. Same "one function, two calls" shape as
+# delete_tasks (above): call #1 (manifest_id omitted) stores the caller's
+# `tasks` VERBATIM in a one-shot manifest and returns a preview — nothing
+# runs. Call #2 (manifest_id + user_reply) is checked by
+# _require_consent(tier=1, ...) and, on success, hands back the manifest's
+# STORED tasks — never the `tasks` argument of call #2 — so the set can't be
+# swapped between plan and execute. This is the SAME public tool name in both
+# calls; no new tools are introduced.
+class _GateOutcome:
+    __slots__ = ("proceed", "tasks", "summary", "message", "extra")
+
+    def __init__(self, proceed: bool, tasks: Optional[List[Dict]] = None,
+                 summary: Optional[str] = None, message: Optional[str] = None,
+                 extra: Optional[Dict] = None):
+        self.proceed = proceed
+        self.tasks = tasks
+        self.summary = summary
+        self.message = message
+        self.extra = extra or {}
+
+
+def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
+                summary: str, manifest_id: str, user_reply: str,
+                describe_item, extra: Optional[Dict] = None) -> _GateOutcome:
+    """Runs the two-call consent gate. Returns a _GateOutcome: when
+    `.proceed` is True, the caller must actually run the mutation using
+    `.tasks`/`.summary`/`.extra`; when False, `.message` is the full response
+    to return as-is (nothing was touched). `extra` (call #1 only) is fixed
+    context beyond the per-task list (e.g. set_task_parent's target parent,
+    move_tasks's destination project) — stored verbatim in the manifest and
+    handed back unchanged on call #2, same one-shot/no-swap guarantee as
+    `tasks`."""
+    _prune_manifests()
+    if manifest_id:
+        m = _MANIFESTS.get(manifest_id)
+        if not m or m.get("kind") != kind:
+            return _GateOutcome(False, message=(
+                f"🛑 Манифест {manifest_id} не найден/истёк/уже исполнен. "
+                f"Начни заново: {tool_name}(summary, tasks, ...) без "
+                "manifest_id."))
+        stored = m.get("tasks") or []
+        ids = [str(t.get("taskId") or t.get("task_id") or "") for t in stored]
+        # tier-🟡 per docs/DESIGN_approval_gate.md §5: no anti-duplet gap —
+        # only 🔴 tools time-gate plan vs. execute.
+        cr = _require_consent(action=kind, tier=1, manifest=m,
+                              user_reply=user_reply, object_ids=ids, min_gap=0)
+        if not cr.ok:
+            return _GateOutcome(False, message=cr.reason)
+        return _GateOutcome(True, tasks=stored, summary=m.get("summary") or summary,
+                            extra=m.get("extra") or {})
+
+    if not tasks:
+        return _GateOutcome(False, message="Пустой список — нечего делать.")
+    mid = uuid.uuid4().hex[:12]
+    now = time.monotonic()
+    ids = [str(t.get("taskId") or t.get("task_id") or "") for t in tasks]
+    _MANIFESTS[mid] = {"kind": kind, "tasks": tasks, "summary": summary,
+                       "created": now, "plan_shown_at": now, "consumed": False,
+                       "object_hash": _manifest_object_hash(kind, ids),
+                       "extra": extra or {}}
+    lines = [f"### 📋 План — {summary}",
+             f"_Манифест `{mid}` · ничего ещё не изменено_", ""]
+    for i, t in enumerate(tasks, 1):
+        lines.append(f"{i}. {describe_item(t)}")
+    lines.append("")
+    lines.append(
+        "Покажи это пользователю дословно и ДОЖДИСЬ его отдельного ответа "
+        "(не отвечай за него). Когда он явно согласится, вызови этот же "
+        f'инструмент снова: {tool_name}(summary="{summary}", tasks=[...], '
+        f'manifest_id="{mid}", user_reply="<дословная реплика пользователя>") '
+        "— НЕ в этом же ходе (сам список tasks можно повторить как есть, на "
+        "2-м вызове он игнорируется — используются данные из манифеста). "
+        "Манифест одноразовый, действует 1 час.")
+    return _GateOutcome(False, message="\n".join(lines))
 
 
 @mcp.tool(annotations=READONLY)
@@ -3712,7 +3859,7 @@ async def _execute_declutter_from_sheet(manifest_id: str) -> str:
             report_ids.add(sub_mid)
 
         if exec_input["rename"]:
-            res = await update_tasks(
+            res = await _update_tasks_impl(
                 summary + " — SMART-переименования",
                 [{"taskId": it["taskId"], "projectId": it["projectId"],
                   "title": it["title"], "new_title": it["new_title"]}
@@ -3720,7 +3867,7 @@ async def _execute_declutter_from_sheet(manifest_id: str) -> str:
             out_blocks.append("## ✏️ Переименования\n" + res)
 
         for g in exec_input["group"]:
-            res = await set_task_parent(
+            res = await _set_task_parent_impl(
                 summary + " — группировка",
                 [{"taskId": c["taskId"], "title": c["title"]}
                  for c in g["children"]],
@@ -4150,7 +4297,7 @@ async def execute_declutter(manifest_id: str, user_reply: str = "") -> str:
 
         # ---- Renames: reuse update_tasks (guard + journal + post-verify) --
         if actions["rename"]:
-            res = await update_tasks(
+            res = await _update_tasks_impl(
                 summary + " — SMART-переименования",
                 [{"taskId": it["taskId"], "projectId": it["projectId"],
                   "title": it["title"], "new_title": it["new_title"]}
@@ -4159,7 +4306,7 @@ async def execute_declutter(manifest_id: str, user_reply: str = "") -> str:
 
         # ---- Groups: reuse set_task_parent (guard + journal + post-verify) -
         for g in actions["group"]:
-            res = await set_task_parent(
+            res = await _set_task_parent_impl(
                 summary + f" — под «{g['parent_title']}»",
                 [{"taskId": c["taskId"], "title": c["title"]} for c in g["children"]],
                 g["parentId"], g["project_id"], g["parent_title"])
@@ -4942,7 +5089,7 @@ async def get_recurring_tasks(search_term: str = "") -> str:
         else:
             projects = await _run_blocking(lambda: ticktick.get_projects())
             if 'error' in projects:
-                return f"Ошибка получения проектов: {projects['error']}"
+                return f"Error fetching projects: {projects['error']}"
             all_open = []
             for p in projects:
                 pid = p.get("id")
@@ -4954,15 +5101,17 @@ async def get_recurring_tasks(search_term: str = "") -> str:
             tasks = [t for t in tasks if _task_matches_search(t, search_term.strip())]
 
         if not tasks:
-            msg = f"Повторяющихся задач, подходящих под «{search_term}», не найдено." if search_term else "Повторяющихся задач не найдено."
+            msg = (f"No recurring tasks found matching '{search_term}'." if search_term
+                   else "No recurring tasks found.")
             return msg
 
-        label = f"Повторяющиеся задачи{f' по запросу «{search_term}»' if search_term else ''} ({len(tasks)}):"
+        label = (f"Recurring tasks matching '{search_term}' ({len(tasks)}):" if search_term
+                 else f"Recurring tasks ({len(tasks)}):")
         return label + "\n" + format_task_tree(tasks, 200)
 
     except Exception as e:
         logger.error(f"Error in get_recurring_tasks: {e}")
-        return f"Ошибка при получении повторяющихся задач: {str(e)}"
+        return f"Error retrieving recurring tasks: {str(e)}"
 
 # New MCP Tools for Getting things done framework (Priority / Due Dates)
 
@@ -5182,29 +5331,61 @@ async def get_inbox_tasks() -> str:
 
 
 @mcp.tool()
-async def move_tasks(summary: str, tasks: List[Dict[str, str]],
-                     to_project_id: str, to_project_name: str = None) -> str:
+async def move_tasks(summary: str, tasks: List[Dict[str, str]] = None,
+                     to_project_id: str = "", to_project_name: str = None,
+                     manifest_id: str = "", user_reply: str = "") -> str:
     """
-    Move one or more open tasks to a destination list in one call (requires v2 API).
-    All tasks go to the same destination.
+    Move one or more open tasks to a destination list in one call (requires
+    v2 API). All tasks go to the same destination. Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    changed on call #1.
 
-    PROTOCOL (interactive chats): before calling, name the tasks and the
-    destination in plain text and get the user's explicit «да/ок». Afterwards
-    run operation_report and reprint it verbatim.
+    Call #1 (manifest_id omitted): builds a one-shot manifest from `tasks` +
+    the destination and returns a preview — nothing is moved yet.
+    Call #2 (after the user actually replied): repeat the call with
+    manifest_id=<id from call #1> and user_reply=<the user's literal last
+    message> — `tasks`/`to_project_id`/`to_project_name` are all ignored on
+    this call (the manifest's own stored values are used). Do NOT make call
+    #2 in the same turn as call #1.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Перемещаю задачу „Купить молоко"
-    из „Inbox" в „Покупки"» or «Перемещаю 3 задачи в „Покупки"».
+    at the TOP of the summary you show the user, e.g. «Перемещаю задачу
+    „Купить молоко" из „Inbox" в „Покупки"» or «Перемещаю 3 задачи в
+    „Покупки"».
 
-    Put the human title inside each task object so the dialog shows what moves:
-    [{"title": "Buy milk", "taskId": "abc"}]
+    Put the human title inside each task object so the dialog shows what
+    moves: [{"title": "Buy milk", "taskId": "abc"}].
 
     Args:
         summary: Human-readable confirmation line (see above)
-        tasks: List of {"title": "...", "taskId": "..."} objects — one item for single task
-        to_project_id: Destination project/list ID for ALL tasks
+        tasks: List of {"title": "...", "taskId": "..."} objects — required
+            on call #1, ignored on call #2
+        to_project_id: Destination project/list ID for ALL tasks — required
+            on call #1, ignored on call #2
         to_project_name: Destination list name (shown in the dialog)
+        manifest_id: from call #1's response — pass on call #2 to actually move
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
+    err = _ensure_ready()
+    if err:
+        return err
+    outcome = _gate_batch(
+        "move", "move_tasks", tasks, summary, manifest_id, user_reply,
+        lambda t: f"**«{t.get('title') or t.get('taskId')}»** → {to_project_name or to_project_id}",
+        extra={"to_project_id": to_project_id, "to_project_name": to_project_name})
+    if not outcome.proceed:
+        return outcome.message
+    ex = outcome.extra
+    return await _move_tasks_impl(
+        outcome.summary, outcome.tasks,
+        ex.get("to_project_id") or to_project_id,
+        ex.get("to_project_name") if ex.get("to_project_name") is not None else to_project_name)
+
+
+async def _move_tasks_impl(summary: str, tasks: List[Dict[str, str]],
+                           to_project_id: str, to_project_name: str = None) -> str:
+    """Pure mutation logic for move_tasks — no consent gate. Called only
+    by the public gated move_tasks() below."""
     err = _ensure_ready()
     if err:
         return err
@@ -5271,8 +5452,6 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]],
         return f"Error moving tasks: {str(e)}"
 
 
-
-
 # ---------------------------------------------------------------------------
 # Habits (v2)
 # ---------------------------------------------------------------------------
@@ -5316,6 +5495,11 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
     """
     Record a habit check-in (requires v2 API).
 
+    После записи сервер сам перечитывает check-ins свежим запросом
+    (независимо от того, что было отправлено) и подтверждает в ответе, что
+    отметка реально видна в TickTick — а не просто "запрос ушёл". Возврати
+    результат пользователю ДОСЛОВНО, не пересказывай своими словами.
+
     Args:
         habit_name: Name of the habit (shown first in the summary you show the user, see get_habits) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         habit_id: ID of the habit
@@ -5326,12 +5510,18 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
     err = _ensure_ready()
     if err:
         return err
+    labels = {2: "выполнено", 1: "провалено", 0: "не выполнено"}
     if status not in (0, 1, 2):
-        return "Invalid status. Use 2 (done), 1 (failed), or 0 (not done)."
-    # Strict date validation: '2026-7-4' would silently become stamp 202674.
+        return "🛑 Неверный status. Используй 2 (done), 1 (failed) или 0 (not done). Ничего не записано."
+    # Strict date validation: '2026-7-4' would silently become stamp 202674
+    # downstream (int(date.replace("-", ""))). strptime alone does NOT catch
+    # this — it happily parses non-zero-padded '2026-7-4' — so the format is
+    # also round-tripped back through strftime to enforce YYYY-MM-DD exactly.
     if date is not None:
         try:
-            datetime.strptime(date, "%Y-%m-%d")
+            parsed = datetime.strptime(date, "%Y-%m-%d")
+            if parsed.strftime("%Y-%m-%d") != date:
+                raise ValueError("not zero-padded")
         except ValueError:
             return (f"🛑 Неверный формат даты {date!r} — нужно строго "
                     "YYYY-MM-DD (например 2026-07-04). Ничего не записано.")
@@ -5353,6 +5543,7 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
         except (TypeError, ValueError):
             goal = 1.0
         stamp = int((date or datetime.now().strftime("%Y-%m-%d")).replace("-", ""))
+        when_fmt = datetime.strptime(str(stamp), "%Y%m%d").strftime("%d.%m.%Y")
         # Duplicate detection: an unconditional 'add' on retry would double
         # the value for the same day.
         existing = await _run_blocking(
@@ -5360,17 +5551,54 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
         dup = next((e for e in existing.get(habit_id, [])
                     if e.get("checkinStamp") == stamp), None)
         if dup is not None:
-            return (f"↷ У «{real_name}» УЖЕ есть чек-ин на эту дату "
-                    f"(status={dup.get('status')}, value={dup.get('value')}/"
-                    f"{dup.get('goal')}) — повторный add задвоил бы значение. "
-                    "Ничего не записано.")
+            dup_label = labels.get(dup.get("status"), dup.get("status"))
+            return (f"### ↷ Чек-ин «{real_name}» не записан\n\n"
+                    f"- дата: {when_fmt}\n"
+                    f"- на эту дату чек-ин **уже есть** (статус {dup_label}, "
+                    f"{dup.get('value')}/{dup.get('goal')})\n"
+                    "- повторная запись задвоила бы значение — ничего не изменено")
         await _run_blocking(lambda: ticktick_v2.checkin_habit(
             habit_id, date=date, status=status, value=value, goal=goal))
-        when = date or "today"
-        labels = {2: "done", 1: "failed", 0: "not done"}
         val = value if value is not None else (goal if status == 2 else 0.0)
-        return (f"Habit '{real_name}' checked in for {when} as "
-                f"'{labels[status]}' (value {val}/{goal}).")
+
+        # Post-verify: habits are not journaled (no operation_report later),
+        # so this is the ONLY independent confirmation this tool ever gets —
+        # a fresh, separate read of live check-ins, not a replay of what we
+        # just sent. Reuses the same call shape as the dup-check above.
+        try:
+            fresh = await _run_blocking(
+                lambda: ticktick_v2.get_habit_checkins([habit_id], stamp - 1))
+            written = next((e for e in fresh.get(habit_id, [])
+                            if e.get("checkinStamp") == stamp), None)
+        except Exception as e:
+            return (f"### ⚠️ Чек-ин «{real_name}» отправлен, проверка не выполнена\n\n"
+                    f"- дата: {when_fmt}\n"
+                    f"- запрос на статус **{labels[status]}** ({val}/{goal}) отправлен\n"
+                    f"- ⚠️ независимое перечитывание (`get_habit_checkins`) упало с ошибкой: {e} — "
+                    "исход НЕ подтверждён")
+
+        if written is None:
+            return (f"### ⚠️ Чек-ин «{real_name}» отправлен, но НЕ подтверждён\n\n"
+                    f"- дата: {when_fmt}\n"
+                    f"- запрос на статус **{labels[status]}** ({val}/{goal}) отправлен\n"
+                    "- ❌ при независимом перечитывании (`get_habit_checkins`) записи на эту "
+                    "дату НЕ нашлось — исход не подтверждён, возможно нужно время на синхронизацию")
+
+        w_status = written.get("status")
+        w_value = written.get("value")
+        w_goal = written.get("goal")
+        ok = (w_status == status)
+        w_label = labels.get(w_status, w_status)
+        if ok:
+            return (f"### ✅ Чек-ин привычки «{real_name}»\n\n"
+                    f"- дата: {when_fmt}\n"
+                    f"- статус: **{w_label}**, значение {w_value}/{w_goal}\n"
+                    "- 🧾 подтверждено независимым чтением (`get_habit_checkins`) сразу после записи")
+        return (f"### ❌ Чек-ин «{real_name}» разошёлся с подтверждением\n\n"
+                f"- дата: {when_fmt}\n"
+                f"- запрошено: **{labels[status]}** ({val}/{goal})\n"
+                f"- при независимом перечитывании: **{w_label}** ({w_value}/{w_goal})\n"
+                "- ⚠️ запись есть, но не совпадает с тем, что отправляли — проверь вручную")
     except Exception as e:
         logger.error(f"Error in checkin_habit: {e}")
         return f"Error checking in habit: {str(e)}"
@@ -5434,27 +5662,70 @@ async def list_filters() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def set_task_parent(summary: str, tasks: List[Dict[str, str]],
-                          parent_task_id: str, project_id: str,
-                          parent_task_title: str = None) -> str:
+async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
+                          parent_task_id: str = "", project_id: str = "",
+                          parent_task_title: str = None,
+                          manifest_id: str = "", user_reply: str = "") -> str:
     """
     Nest one or more tasks under a parent in one call (requires v2 API).
-    All tasks and the parent must be in the same project.
+    All tasks and the parent must be in the same project. Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    changed on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest from `tasks` +
+    the target parent and returns a preview — nothing is nested yet.
+    Call #2 (after the user actually replied): repeat the call with
+    manifest_id=<id from call #1> and user_reply=<the user's literal last
+    message> — `tasks`/`parent_task_id`/`project_id`/`parent_task_title` are
+    all ignored on this call (the manifest's own stored values are used, so
+    nothing can be swapped between the two calls). Do NOT make call #2 in the
+    same turn as call #1.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Делаю задачу „Шаг 1"
-    подзадачей „Большой проект"» or «Делаю 3 задачи подзадачами „Большой проект"».
+    at the TOP of the summary you show the user, e.g. «Делаю задачу „Шаг 1"
+    подзадачей „Большой проект"» or «Делаю 3 задачи подзадачами „Большой
+    проект"».
 
-    Put the human title inside each task object so the dialog shows what's being
-    nested: [{"title": "Step 1", "taskId": "abc"}].
+    Put the human title inside each task object so the dialog shows what's
+    being nested: [{"title": "Step 1", "taskId": "abc"}].
 
     Args:
         summary: Human-readable confirmation line (see above)
-        tasks: List of {"title": "...", "taskId": "..."} objects — one item for single task
-        parent_task_id: ID of the parent task
-        project_id: ID of the project all tasks live in
+        tasks: List of {"title": "...", "taskId": "..."} objects — required
+            on call #1, ignored on call #2
+        parent_task_id: ID of the parent task — required on call #1, ignored
+            on call #2
+        project_id: ID of the project all tasks live in — required on call
+            #1, ignored on call #2
         parent_task_title: Title of the parent (shown in the dialog)
+        manifest_id: from call #1's response — pass on call #2 to actually nest
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
+    err = _ensure_ready()
+    if err:
+        return err
+    outcome = _gate_batch(
+        "parent", "set_task_parent", tasks, summary, manifest_id, user_reply,
+        lambda t: f"**«{t.get('title') or t.get('taskId')}»** → под «{parent_task_title or parent_task_id}»",
+        extra={"parent_task_id": parent_task_id, "project_id": project_id,
+               "parent_task_title": parent_task_title})
+    if not outcome.proceed:
+        return outcome.message
+    ex = outcome.extra
+    return await _set_task_parent_impl(
+        outcome.summary, outcome.tasks,
+        ex.get("parent_task_id") or parent_task_id,
+        ex.get("project_id") or project_id,
+        ex.get("parent_task_title") if ex.get("parent_task_title") is not None else parent_task_title)
+
+
+async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
+                                parent_task_id: str, project_id: str,
+                                parent_task_title: str = None) -> str:
+    """Pure mutation logic for set_task_parent — no consent gate. Called
+    by the public gated set_task_parent() below AND directly by
+    execute_declutter/resume_declutter (an already-approved declutter
+    manifest must not be asked to confirm twice)."""
     err = _ensure_ready()
     if err:
         return err
@@ -5548,7 +5819,6 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]],
         logger.error(f"Error in set_task_parent: {e}")
         return f"Error nesting tasks: {str(e)}"
 
-
 @mcp.tool()
 async def unset_task_parent(task_title: str, parent_task_title: str, task_id: str, parent_task_id: str, project_id: str) -> str:
     """
@@ -5608,13 +5878,23 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
 
 
 @mcp.tool()
-async def set_task_tags(summary: str, tasks: List[Dict[str, Any]]) -> str:
+async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
+                        manifest_id: str = "", user_reply: str = "") -> str:
     """
-    Replace tags on one or more tasks in one call (requires v2 API).
+    Replace tags on one or more tasks in one call (requires v2 API). Gated
+    🟡 (docs/DESIGN_approval_gate.md): two calls, same tool name —
+    nothing is changed on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest from `tasks`
+    and returns a preview of the new tags per task — nothing is changed yet.
+    Call #2 (after the user actually replied): repeat the call with
+    manifest_id=<id from call #1> and user_reply=<the user's literal last
+    message> — `tasks` is ignored on this call (the manifest's own stored
+    items are used). Do NOT make call #2 in the same turn as call #1.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Ставлю тег „работа" на задачу
-    „Купить молоко"» or «Ставлю тег „работа" на 4 задачи».
+    at the TOP of the summary you show the user, e.g. «Ставлю тег „работа" на
+    задачу „Купить молоко"» or «Ставлю тег „работа" на 4 задачи».
 
     Each item carries the task's human title (for the dialog) and the full
     list of tags it should have (replaces existing):
@@ -5622,8 +5902,25 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]]) -> str:
 
     Args:
         summary: Human-readable confirmation line (see above)
-        tasks: List of {"title","taskId","tags"} objects — one item for a single task
+        tasks: List of {"title","taskId","tags"} objects — required on call
+            #1, ignored on call #2
+        manifest_id: from call #1's response — pass on call #2 to actually retag
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
+    err = _ensure_ready()
+    if err:
+        return err
+    outcome = _gate_batch(
+        "tags", "set_task_tags", tasks, summary, manifest_id, user_reply,
+        lambda t: f"**«{t.get('title') or t.get('taskId')}»** → теги: {', '.join(t.get('tags') or []) or '(пусто)'}")
+    if not outcome.proceed:
+        return outcome.message
+    return await _set_task_tags_impl(outcome.summary, outcome.tasks)
+
+
+async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
+    """Pure mutation logic for set_task_tags — no consent gate. Called
+    only by the public gated set_task_tags() below."""
     err = _ensure_ready()
     if err:
         return err
@@ -5683,10 +5980,7 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]]) -> str:
         return "\n".join(lines) if lines else "Ничего не изменено."
     except Exception as e:
         logger.error(f"Error in set_task_tags: {e}")
-        return f"Error setting tags: {str(e)}"
-
-
-# ---------------------------------------------------------------------------
+        return f"Error setting tags: {str(e)}"# ---------------------------------------------------------------------------
 # Batch operations (v2)
 # ---------------------------------------------------------------------------
 
@@ -6029,22 +6323,55 @@ async def get_trash(limit: int = 50) -> str:
 
 
 @mcp.tool()
-async def restore_tasks(summary: str, tasks: List[Dict[str, str]],
-                        to_project_id: str = None) -> str:
+async def restore_tasks(summary: str, tasks: List[Dict[str, str]] = None,
+                        to_project_id: str = None,
+                        manifest_id: str = "", user_reply: str = "") -> str:
     """
     Restore one or more tasks from the trash in one call (requires v2 API).
+    Gated 🟡 (docs/DESIGN_approval_gate.md): two calls, same tool
+    name — nothing is changed on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest from `tasks`
+    and returns a preview of what would be restored — nothing is restored
+    yet. Call #2 (after the user actually replied): repeat the call with
+    manifest_id=<id from call #1> and user_reply=<the user's literal last
+    message> — `tasks`/`to_project_id` are ignored on this call (the
+    manifest's own stored values are used). Do NOT make call #2 in the same
+    turn as call #1.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
-    at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Восстанавливаю из корзины
-    задачу „Купить молоко"» or «Восстанавливаю из корзины 3 задачи».
+    at the TOP of the summary you show the user, e.g. «Восстанавливаю из
+    корзины задачу „Купить молоко"» or «Восстанавливаю из корзины 3 задачи».
 
     Args:
         summary: Human-readable confirmation line (see above)
-        tasks: List of {"taskId": "...", "title": "..."} objects — one item for
-            a single task, multiple for batch. Get IDs/titles from get_trash.
-        to_project_id: Optional destination list for all tasks; defaults to each
-            task's original list
+        tasks: List of {"taskId": "...", "title": "..."} objects — required
+            on call #1, ignored on call #2. Get IDs/titles from get_trash.
+        to_project_id: Optional destination list for all tasks; defaults to
+            each task's original list — required (if used) on call #1,
+            ignored on call #2
+        manifest_id: from call #1's response — pass on call #2 to actually restore
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
+    err = _ensure_ready()
+    if err:
+        return err
+    outcome = _gate_batch(
+        "restore", "restore_tasks", tasks, summary, manifest_id, user_reply,
+        lambda t: f"**«{t.get('title') or t.get('taskId')}»**",
+        extra={"to_project_id": to_project_id})
+    if not outcome.proceed:
+        return outcome.message
+    ex = outcome.extra
+    return await _restore_tasks_impl(
+        outcome.summary, outcome.tasks,
+        ex.get("to_project_id") if ex.get("to_project_id") is not None else to_project_id)
+
+
+async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
+                              to_project_id: str = None) -> str:
+    """Pure mutation logic for restore_tasks — no consent gate. Called
+    only by the public gated restore_tasks() below."""
     err = _ensure_ready()
     if err:
         return err
@@ -6114,10 +6441,7 @@ async def restore_tasks(summary: str, tasks: List[Dict[str, str]],
         return "\n".join(lines) if lines else "Ничего не восстановлено."
     except Exception as e:
         logger.error(f"Error in restore_tasks: {e}")
-        return f"Error restoring tasks: {str(e)}"
-
-
-@mcp.tool()
+        return f"Error restoring tasks: {str(e)}"@mcp.tool()
 async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
                               url: str = None,
                               content_base64: str = None, filename: str = None) -> str:
@@ -6825,11 +7149,42 @@ async def update_project(project_name: str, project_id: str, name: str = None,
         proj = await _run_blocking(lambda: ticktick.update_project(
             project_id, name=name, color=color, view_mode=view_mode))
         if 'error' in proj:
-            return f"Error updating project: {proj['error']}"
-        return "Project updated:\n\n" + format_project(proj)
+            return f"### ❌ Проект «{project_name}» НЕ обновлён\n\nTickTick отклонил: {proj['error']}"
     except Exception as e:
         logger.error(f"Error in update_project: {e}")
-        return f"Error updating project: {str(e)}"
+        return f"### ❌ Проект «{project_name}» НЕ обновлён\n\nОшибка: {str(e)}"
+
+    # Post-verify: independent fresh re-read, compare each field that was
+    # actually requested against what TickTick shows live — the write
+    # response alone is never trusted as proof.
+    try:
+        fresh = await _run_blocking(ticktick.get_project, project_id)
+        if not (isinstance(fresh, dict) and not fresh.get('error')):
+            return (f"### ⚠️ Проект «{project_name}» обновлён, но НЕ подтверждён\n\n"
+                    f"{format_project(proj)}\n\n"
+                    f"⚠️ {_UNVERIFIED_MSG}")
+        mismatches = []
+        if name is not None and fresh.get('name') != name:
+            mismatches.append(f"name: ожидалось «{name}», сейчас «{fresh.get('name')}»")
+        if color is not None and fresh.get('color') != color:
+            mismatches.append(f"color: ожидалось {color}, сейчас {fresh.get('color')}")
+        if view_mode is not None and fresh.get('viewMode') != view_mode:
+            mismatches.append(f"view_mode: ожидалось {view_mode}, сейчас {fresh.get('viewMode')}")
+        new_name = fresh.get('name', project_name)
+        if mismatches:
+            return (f"### ❌ Проект «{project_name}» обновлён частично — расхождение\n\n"
+                    f"{format_project(fresh)}\n\n"
+                    "🧾 Проверка: " + "; ".join(mismatches))
+        title = (f"«{project_name}» → «{new_name}»" if name is not None and new_name != project_name
+                 else f"«{new_name}»")
+        return (f"### ✅ Проект {title} обновлён (проверено)\n\n"
+                f"{format_project(fresh)}\n\n"
+                "🧾 Проверено: все изменённые поля подтверждены отдельным "
+                "живым чтением TickTick.")
+    except Exception as e:
+        return (f"### ⚠️ Проект «{project_name}» обновлён, но НЕ подтверждён\n\n"
+                f"{format_project(proj)}\n\n"
+                f"⚠️ {_UNVERIFIED_MSG} ({e})")
 
 
 @mcp.tool()
@@ -6857,15 +7212,33 @@ async def archive_project(project_name: str, project_id: str, archived: bool = T
         if refuse:
             return refuse
     live_name = _v2_project_names().get(project_id, project_name)
+    verb = 'заархивирован' if archived else 'разархивирован'
     try:
         await _run_blocking(lambda: ticktick_v2.archive_project(project_id, closed=archived))
-        return f"Project '{live_name}' {'archived' if archived else 'unarchived'}."
     except RuntimeError as e:
-        return (f"❌ Проект '{live_name}' НЕ "
-                f"{'заархивирован' if archived else 'разархивирован'} — {e}")
+        return f"### ❌ Проект «{live_name}» НЕ {verb}\n\nTickTick отклонил: {e}"
     except Exception as e:
         logger.error(f"Error in archive_project: {e}")
         return f"Error archiving project: {str(e)}"
+
+    # Post-verify: independent fresh re-read of the project's own `closed`
+    # flag (not the write response) — force the v2 cache first.
+    try:
+        await _run_blocking(lambda: ticktick_v2.get_state(force=True))
+        projs = await _run_blocking(ticktick_v2.list_projects)
+        proj = next((p for p in projs if p.get("id") == project_id), None)
+        if proj is None:
+            return (f"### ⚠️ Проект «{live_name}» {verb}, но НЕ подтверждён\n\n"
+                    f"Проекта нет в свежем списке — {_UNVERIFIED_MSG}")
+        got_closed = bool(proj.get("closed"))
+        if got_closed != archived:
+            return (f"### ❌ Проект «{live_name}» — расхождение после архивации\n\n"
+                    f"Ожидался closed={archived}, живое состояние closed={got_closed}.")
+        return (f"### ✅ Проект «{live_name}» {verb} (проверено)\n\n"
+                f"🧾 closed={got_closed} — подтверждено отдельным живым чтением TickTick.")
+    except Exception as e:
+        return (f"### ⚠️ Проект «{live_name}» {verb}, но НЕ подтверждён\n\n"
+                f"⚠️ {_UNVERIFIED_MSG} ({e})")
 
 
 # ---------------------------------------------------------------------------
@@ -7506,12 +7879,28 @@ async def create_project_column(project_id: str, name: str,
     live_pname = _v2_project_names().get(project_id, project_id)
     try:
         cid = await _run_blocking(lambda: ticktick_v2.create_column(project_id, name))
-        return f"Column «{name}» created in project «{live_pname}». (id: {cid})"
     except RuntimeError as e:
-        return f"❌ Раздел «{name}» НЕ создан — {e}"
+        return f"### ❌ Раздел «{name}» НЕ создан\n\nTickTick отклонил: {e}"
     except Exception as e:
         logger.error(f"Error in create_project_column: {e}")
         return f"Error creating column: {str(e)}"
+
+    # Post-verify: independent fresh re-read of the project's columns (via the
+    # official API, not the v2 write response) — the new column must be there.
+    try:
+        data = await _run_blocking(lambda: ticktick.get_project_with_data(project_id))
+        cols = (data.get("columns") or []) if isinstance(data, dict) and 'error' not in data else []
+        match = next((c for c in cols if c.get("id") == cid), None)
+        if match is None:
+            return (f"### ⚠️ Раздел «{name}» создан (id: {cid}), но НЕ подтверждён\n\n"
+                    f"Его нет в свежем списке колонок проекта «{live_pname}» — "
+                    f"{_UNVERIFIED_MSG}")
+        return (f"### ✅ Раздел «{match.get('name', name)}» создан в проекте «{live_pname}» "
+                f"(проверено)\n\n"
+                f"🧾 Подтверждено отдельным живым чтением TickTick (id: {cid}).")
+    except Exception as e:
+        return (f"### ⚠️ Раздел «{name}» создан (id: {cid}), но НЕ подтверждён\n\n"
+                f"⚠️ {_UNVERIFIED_MSG} ({e})")
 
 
 def main():

@@ -426,7 +426,7 @@ async def test_execute_declutter_returns_graceful_error_on_internal_exception(mo
     async def boom(*args, **kwargs):
         raise RuntimeError("glue-code exploded")
 
-    monkeypatch.setattr(s, "update_tasks", boom)
+    monkeypatch.setattr(s, "_update_tasks_impl", boom)
 
     result = await s.execute_declutter(mid, user_reply="да")
     assert "Error executing declutter manifest" in result

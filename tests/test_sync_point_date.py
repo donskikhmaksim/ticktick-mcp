@@ -149,7 +149,7 @@ async def test_single_path_syncs_start_date_when_only_due_given(monkeypatch):
                    "startDate": "2026-07-23T00:00:00.000+0000",
                    "dueDate": "2026-07-23T00:00:00.000+0000"}}
     fake = _wire_single(monkeypatch, live)
-    result = await s.update_tasks("тест", [
+    result = await s._update_tasks_impl("тест", [
         {"taskId": "t1", "projectId": "p1", "title": "Оплатить аренду",
          "due_date": "2026-07-30"}])
     assert len(fake.calls) == 1
@@ -165,7 +165,7 @@ async def test_single_path_leaves_explicit_range_alone(monkeypatch):
                    "startDate": "2026-07-23T00:00:00.000+0000",
                    "dueDate": "2026-07-23T00:00:00.000+0000"}}
     fake = _wire_single(monkeypatch, live)
-    result = await s.update_tasks("тест", [
+    result = await s._update_tasks_impl("тест", [
         {"taskId": "t1", "projectId": "p1", "title": "Отпуск",
          "start_date": "2026-08-01", "due_date": "2026-08-10"}])
     call = fake.calls[0]
@@ -177,7 +177,7 @@ async def test_single_path_leaves_explicit_range_alone(monkeypatch):
 async def test_single_path_no_prior_dates_no_sync(monkeypatch):
     live = {"t1": {"id": "t1", "title": "Новая задача", "projectId": "p1"}}
     fake = _wire_single(monkeypatch, live)
-    result = await s.update_tasks("тест", [
+    result = await s._update_tasks_impl("тест", [
         {"taskId": "t1", "projectId": "p1", "title": "Новая задача",
          "due_date": "2026-07-30"}])
     call = fake.calls[0]
@@ -229,7 +229,7 @@ async def test_batch_path_syncs_point_task_date(monkeypatch):
                "dueDate": "2026-07-24T00:00:00.000+0000"},
     }
     fake_v2 = _wire_batch(monkeypatch, live)
-    result = await s.update_tasks("тест", [
+    result = await s._update_tasks_impl("тест", [
         {"taskId": "t1", "projectId": "p1", "title": "A", "due_date": "2026-07-30"},
         {"taskId": "t2", "projectId": "p1", "title": "B", "priority": 3},
     ])
@@ -251,7 +251,7 @@ async def test_batch_path_warns_on_existing_range_one_side_changed(monkeypatch):
                "dueDate": "2026-07-24T00:00:00.000+0000"},
     }
     fake_v2 = _wire_batch(monkeypatch, live)
-    result = await s.update_tasks("тест", [
+    result = await s._update_tasks_impl("тест", [
         {"taskId": "t1", "projectId": "p1", "title": "Отпуск", "due_date": "2026-08-10"},
         {"taskId": "t2", "projectId": "p1", "title": "B", "priority": 3},
     ])
