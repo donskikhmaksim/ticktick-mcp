@@ -5100,13 +5100,14 @@ def _parse_ticktick_datetime(value: str) -> Optional[datetime]:
 
 
 def _task_due_local_date(task: Dict[str, Any]):
-    """Return the task's due date as a calendar date, or None if there's
-    no/unparseable due date.
+    """Возвращает дедлайн задачи как календарную дату (без времени) или None,
+    если срока нет / его не удалось разобрать.
 
-    All-day / date-only deadlines are zone-independent calendar dates: take
-    dueDate[:10] verbatim, never assume UTC and never .astimezone() them (that
-    is the #36 off-by-one — a negative-offset zone would read the previous day).
-    Only genuinely timed deadlines are converted into the user's local zone."""
+    Дедлайн «на весь день» (без конкретного времени) — это дата, независимая
+    от часового пояса: берём dueDate[:10] дословно, никогда не считаем его UTC
+    и никогда не делаем .astimezone() (это баг #36 — при отрицательном смещении
+    пояса дата съезжала на день назад). В локальный пояс пользователя
+    конвертируются только дедлайны с реальным временем."""
     due = task.get('dueDate')
     if _is_all_day_task(task):
         return _all_day_date(due)
@@ -5121,16 +5122,17 @@ def _today_local():
 
 
 def _is_task_due_today(task: Dict[str, Any]) -> bool:
-    """Check if a task is due today (in the user's local timezone)."""
+    """Проверяет, что срок задачи — сегодня (в локальном поясе пользователя)."""
     d = _task_due_local_date(task)
     return d is not None and d == _today_local()
 
 def _is_task_overdue(task: Dict[str, Any]) -> bool:
-    """Check if a task is overdue.
+    """Проверяет, что задача просрочена.
 
-    For an all-day / date-only deadline "overdue" is a calendar-date compare in
-    the user's local zone (its date is before today) — NOT a UTC-instant compare,
-    which would read an all-day task due today as overdue for most of the day."""
+    Для дедлайна «на весь день» «просрочено» — это сравнение календарных дат в
+    локальном поясе пользователя (дата раньше сегодняшней), а НЕ сравнение
+    UTC-момента: иначе задача со сроком «сегодня» весь день читалась бы как
+    просроченная."""
     if _is_all_day_task(task):
         d = _all_day_date(task.get('dueDate'))
         return d is not None and d < _today_local()
@@ -5140,7 +5142,8 @@ def _is_task_overdue(task: Dict[str, Any]) -> bool:
     return dt < datetime.now(timezone.utc)
 
 def _is_task_due_in_days(task: Dict[str, Any], days: int) -> bool:
-    """Check if a task is due in exactly X days (in the user's local timezone)."""
+    """Проверяет, что срок задачи наступает ровно через N дней (в локальном
+    поясе пользователя)."""
     d = _task_due_local_date(task)
     return d is not None and d == _today_local() + timedelta(days=days)
 
@@ -5167,68 +5170,96 @@ def _task_matches_search(task: Dict[str, Any], search_term: str) -> bool:
     
     return False
 
-def _get_project_tasks_by_filter(filter_func, filter_name: str) -> str:
+# Кап на число отрендеренных карточек задач в резервной (fallback, без v2)
+# ветке _get_project_tasks_by_filter — раньше строка собиралась без предела
+# по всем проектам и задачам (§10.1).
+_FILTER_FALLBACK_TASK_CAP = 200
+
+
+async def _get_project_tasks_by_filter(filter_func, filter_name: str) -> str:
     """
-    Helper function to filter tasks across all projects.
+    Хелпер: фильтрует задачи по всем проектам.
 
     Args:
-        filter_func: Function that takes a task and returns True if it matches the filter
-        filter_name: Name of the filter for output formatting
+        filter_func: функция, принимающая задачу и возвращающая True, если она
+            подходит под фильтр
+        filter_name: название фильтра для текста ответа
 
     Returns:
-        Formatted string of filtered tasks
+        Отформатированная строка с отфильтрованными задачами.
 
-    Fetches projects only on the official-API fallback path; when v2 is
-    available no per-project HTTP calls are made at all.
+    Список проектов запрашивается только на резервном пути (без v2 — по одному
+    HTTP-запросу на проект); когда v2 доступен, ни одного запроса на проект не
+    делается вовсе.
     """
-    # Prefer the v2 open-task pool: it includes the Inbox (which the official
-    # API leaves out of the project list) and is a single call instead of one
-    # request per project. Falls back to official iteration when v2 is off.
+    # Предпочитаем пул открытых задач v2: он включает Inbox (которого нет в
+    # списке проектов официального API) и это один запрос вместо запроса на
+    # каждый проект. При недоступности v2 — резервный обход через официальный API.
     if ticktick_v2:
         try:
-            state = ticktick_v2.get_state()
+            state = await _run_blocking(lambda: ticktick_v2.get_state())
             tasks = state.get("syncTaskBean", {}).get("update", []) or []
             matched = [t for t in tasks if filter_func(t)]
             if not matched:
-                return f"No tasks found that are '{filter_name}'."
-            out = f"Tasks that are '{filter_name}' ({len(matched)}):\n"
+                return f"Задачи со статусом «{filter_name}» не найдены."
+            out = f"Задачи со статусом «{filter_name}» ({len(matched)}):\n"
             return out + format_task_tree(matched)
         except Exception as e:
-            logger.warning(f"v2 task pool failed, falling back to official API: {e}")
+            logger.warning(f"Пул задач v2 недоступен, переключаюсь на официальный API: {e}")
 
-    # Official-API fallback: fetch the project list only now that we need it.
-    projects = ticktick.get_projects()
+    # Резервный путь (официальный API): список проектов запрашиваем только сейчас.
+    projects = await _run_blocking(lambda: ticktick.get_projects())
     if 'error' in projects:
-        return f"Error fetching projects: {projects['error']}"
+        return f"Ошибка получения списка проектов: {projects['error']}"
     if not projects:
-        return "No projects found."
+        return "Проекты не найдены."
 
-    result = f"Found {len(projects)} projects:\n\n"
+    result = f"Найдено проектов: {len(projects)}\n\n"
+
+    total_matched = 0
+    rendered = 0
+    truncated = False
 
     for i, project in enumerate(projects, 1):
         if project.get('closed'):
             continue
 
         project_id = project.get('id', 'No ID')
-        project_data = ticktick.get_project_with_data(project_id)
+        project_data = await _run_blocking(lambda pid=project_id: ticktick.get_project_with_data(pid))
         tasks = project_data.get('tasks', [])
-        
+
         if not tasks:
-            result += f"Project {i}:\n{format_project(project)}"
-            result += f"With 0 tasks that are to be '{filter_name}' in this project :\n\n\n"
+            if not truncated:
+                result += f"Проект {i}:\n{format_project(project)}"
+                result += f"Задач со статусом «{filter_name}» в этом проекте: 0\n\n\n"
             continue
-        
-        # Filter tasks using the provided function
+
+        # Фильтруем задачи переданной функцией
         filtered_tasks = [(t, task) for t, task in enumerate(tasks, 1) if filter_func(task)]
-        
-        result += f"Project {i}:\n{format_project(project)}"
-        result += f"With {len(filtered_tasks)} tasks that are to be '{filter_name}' in this project :\n"
-        
+        total_matched += len(filtered_tasks)
+
+        if truncated:
+            # Кап уже достигнут — досчитываем total_matched для честного «N из
+            # M», но больше не форматируем карточки задач.
+            continue
+
+        result += f"Проект {i}:\n{format_project(project)}"
+        result += f"Задач со статусом «{filter_name}» в этом проекте: {len(filtered_tasks)}\n"
+
         for t, task in filtered_tasks:
-            result += f"Task {t}:\n{format_task(task)}\n"
-        
+            if rendered >= _FILTER_FALLBACK_TASK_CAP:
+                truncated = True
+                break
+            result += f"Задача {t}:\n{format_task(task)}\n"
+            rendered += 1
+
         result += "\n\n"
-    
+
+    if truncated:
+        result += (f"⚠️ Показано {rendered} из {total_matched} задач "
+                    f"(достигнут предел {_FILTER_FALLBACK_TASK_CAP}). "
+                    "Уточните фильтр, чтобы увидеть остальные.\n")
+
     return result
 
 # New MCP Tools for Tasks
@@ -5266,7 +5297,7 @@ async def get_all_tasks() -> str:
             return out
 
         # Fallback: official API per project (projects fetched inside helper)
-        return _get_project_tasks_by_filter(lambda t: True, "included")
+        return await _get_project_tasks_by_filter(lambda t: True, "included")
 
     except Exception as e:
         logger.error(f"Error in get_all_tasks: {e}")
@@ -5275,66 +5306,74 @@ async def get_all_tasks() -> str:
 @mcp.tool(annotations=READONLY)
 async def get_tasks_by_priority(priority_id: int) -> str:
     """
-    Get all tasks from TickTick by priority. Ignores closed projects.
+    Возвращает задачи TickTick по приоритету. В резервном (fallback, без v2)
+    режиме закрытые проекты исключаются; в основном v2-режиме состав задач
+    зависит от того, что отдаёт TickTick (закрытые проекты явно не фильтруются).
 
     Args:
-        priority_id: Priority of tasks to retrieve {0: "None", 1: "Low", 3: "Medium", 5: "High"}
+        priority_id: приоритет задач {0: «нет», 1: «низкий», 3: «средний», 5: «высокий»}
     """
     err = _ensure_official()
     if err:
         return err
-    
+
     if priority_id not in PRIORITY_MAP:
-        return f"Invalid priority_id. Valid values: {list(PRIORITY_MAP.keys())}"
-    
+        return f"Недопустимый priority_id. Допустимые значения: {list(PRIORITY_MAP.keys())}"
+
     try:
         def priority_filter(task: Dict[str, Any]) -> bool:
             return task.get('priority', 0) == priority_id
 
         priority_name = f"{PRIORITY_MAP[priority_id]} ({priority_id})"
-        return _get_project_tasks_by_filter(priority_filter, f"priority '{priority_name}'")
+        return await _get_project_tasks_by_filter(priority_filter, f"приоритет «{priority_name}»")
 
     except Exception as e:
-        logger.error(f"Error in get_tasks_by_priority: {e}")
-        return f"Error retrieving tasks by priority: {str(e)}"
+        logger.error(f"Ошибка в get_tasks_by_priority: {e}")
+        return f"Ошибка получения задач по приоритету: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def get_tasks_due_today() -> str:
-    """Get all tasks from TickTick that are due today. Ignores closed projects."""
+    """Возвращает задачи TickTick со сроком сегодня. В резервном (fallback, без
+    v2) режиме закрытые проекты исключаются; в основном v2-режиме это зависит
+    от данных TickTick."""
     err = _ensure_official()
     if err:
         return err
-    
+
     try:
         def today_filter(task: Dict[str, Any]) -> bool:
             return _is_task_due_today(task)
 
-        return _get_project_tasks_by_filter(today_filter, "due today")
+        return await _get_project_tasks_by_filter(today_filter, "срок сегодня")
 
     except Exception as e:
-        logger.error(f"Error in get_tasks_due_today: {e}")
-        return f"Error retrieving tasks due today: {str(e)}"
+        logger.error(f"Ошибка в get_tasks_due_today: {e}")
+        return f"Ошибка получения задач со сроком сегодня: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def get_overdue_tasks() -> str:
-    """Get all overdue tasks from TickTick. Ignores closed projects."""
+    """Возвращает просроченные задачи TickTick. В резервном (fallback, без v2)
+    режиме закрытые проекты исключаются; в основном v2-режиме это зависит от
+    данных TickTick."""
     err = _ensure_official()
     if err:
         return err
-    
+
     try:
         def overdue_filter(task: Dict[str, Any]) -> bool:
             return _is_task_overdue(task)
 
-        return _get_project_tasks_by_filter(overdue_filter, "overdue")
+        return await _get_project_tasks_by_filter(overdue_filter, "просрочено")
 
     except Exception as e:
-        logger.error(f"Error in get_overdue_tasks: {e}")
-        return f"Error retrieving overdue tasks: {str(e)}"
+        logger.error(f"Ошибка в get_overdue_tasks: {e}")
+        return f"Ошибка получения просроченных задач: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def get_tasks_due_tomorrow() -> str:
-    """Get all tasks from TickTick that are due tomorrow. Ignores closed projects."""
+    """Возвращает задачи TickTick со сроком завтра. В резервном (fallback, без
+    v2) режиме закрытые проекты исключаются; в основном v2-режиме это зависит
+    от данных TickTick."""
     err = _ensure_official()
     if err:
         return err
@@ -5343,47 +5382,51 @@ async def get_tasks_due_tomorrow() -> str:
         def tomorrow_filter(task: Dict[str, Any]) -> bool:
             return _is_task_due_in_days(task, 1)
 
-        return _get_project_tasks_by_filter(tomorrow_filter, "due tomorrow")
+        return await _get_project_tasks_by_filter(tomorrow_filter, "срок завтра")
 
     except Exception as e:
-        logger.error(f"Error in get_tasks_due_tomorrow: {e}")
-        return f"Error retrieving tasks due tomorrow: {str(e)}"
-    
+        logger.error(f"Ошибка в get_tasks_due_tomorrow: {e}")
+        return f"Ошибка получения задач со сроком завтра: {str(e)}"
+
 @mcp.tool(annotations=READONLY)
 async def get_tasks_due_in_days(days: int) -> str:
     """
-    Get all tasks from TickTick that are due in exactly X days. Ignores closed projects.
-    
+    Возвращает задачи TickTick со сроком ровно через N дней. В резервном
+    (fallback, без v2) режиме закрытые проекты исключаются; в основном
+    v2-режиме это зависит от данных TickTick.
+
     Args:
-        days: Number of days from today (0 = today, 1 = tomorrow, etc.)
+        days: число дней от сегодня (0 = сегодня, 1 = завтра и т.д.)
     """
     err = _ensure_official()
     if err:
         return err
-    
+
     if days < 0:
-        return "Days must be a non-negative integer."
-    
+        return "Число дней должно быть неотрицательным."
+
     try:
         def days_filter(task: Dict[str, Any]) -> bool:
             return _is_task_due_in_days(task, days)
 
-        day_description = "today" if days == 0 else f"in {days} day{'s' if days != 1 else ''}"
-        return _get_project_tasks_by_filter(days_filter, f"due {day_description}")
+        day_description = "сегодня" if days == 0 else f"через {days} дн."
+        return await _get_project_tasks_by_filter(days_filter, f"срок {day_description}")
 
     except Exception as e:
-        logger.error(f"Error in get_tasks_due_in_days: {e}")
-        return f"Error retrieving tasks due in days: {str(e)}"
+        logger.error(f"Ошибка в get_tasks_due_in_days: {e}")
+        return f"Ошибка получения задач по сроку в днях: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def get_tasks_due_this_week() -> str:
-    """Get all tasks from TickTick due from today through 7 days from now
-    (today and the following 7 calendar days, 8 days inclusive — not a strict
-    "next 7 days" window). Ignores closed projects."""
+    """Возвращает задачи TickTick со сроком от сегодня и включительно ещё 7
+    календарных дней вперёд (сегодня + 7 дней = 8 дней включительно — это НЕ
+    строгое окно «следующие 7 дней»). В резервном (fallback, без v2) режиме
+    закрытые проекты исключаются; в основном v2-режиме это зависит от данных
+    TickTick."""
     err = _ensure_official()
     if err:
         return err
-    
+
     try:
         def week_filter(task: Dict[str, Any]) -> bool:
             d = _task_due_local_date(task)
@@ -5392,11 +5435,11 @@ async def get_tasks_due_this_week() -> str:
             today = _today_local()
             return today <= d <= today + timedelta(days=7)
 
-        return _get_project_tasks_by_filter(week_filter, "due this week")
+        return await _get_project_tasks_by_filter(week_filter, "срок на этой неделе")
 
     except Exception as e:
-        logger.error(f"Error in get_tasks_due_this_week: {e}")
-        return f"Error retrieving tasks due this week: {str(e)}"
+        logger.error(f"Ошибка в get_tasks_due_this_week: {e}")
+        return f"Ошибка получения задач на этой неделе: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def search_tasks(search_term: str) -> str:
@@ -5429,7 +5472,7 @@ async def search_tasks(search_term: str) -> str:
         def search_filter(task: Dict[str, Any]) -> bool:
             return _task_matches_search(task, search_term)
 
-        return _get_project_tasks_by_filter(search_filter, f"matching '{search_term}'")
+        return await _get_project_tasks_by_filter(search_filter, f"matching '{search_term}'")
 
     except Exception as e:
         logger.error(f"Error in search_tasks: {e}")
@@ -5486,13 +5529,15 @@ async def get_recurring_tasks(search_term: str = "") -> str:
 @mcp.tool(annotations=READONLY)
 async def get_engaged_tasks() -> str:
     """
-    Get all tasks from TickTick that are "Engaged".
-    This includes tasks marked as high priority (5), due today or overdue.
+    Возвращает задачи TickTick в статусе «В работе» (Engaged): высокий
+    приоритет (5), срок сегодня или просрочено. В резервном (fallback, без v2)
+    режиме закрытые проекты исключаются; в основном v2-режиме это зависит от
+    данных TickTick.
     """
     err = _ensure_official()
     if err:
         return err
-    
+
     try:
         def engaged_filter(task: Dict[str, Any]) -> bool:
             is_high_priority = task.get('priority', 0) == 5
@@ -5500,33 +5545,34 @@ async def get_engaged_tasks() -> str:
             is_today = _is_task_due_today(task)
             return is_high_priority or is_overdue or is_today
 
-        return _get_project_tasks_by_filter(engaged_filter, "engaged")
+        return await _get_project_tasks_by_filter(engaged_filter, "в работе")
 
     except Exception as e:
-        logger.error(f"Error in get_engaged_tasks: {e}")
-        return f"Error retrieving engaged tasks: {str(e)}"
+        logger.error(f"Ошибка в get_engaged_tasks: {e}")
+        return f"Ошибка получения задач «в работе»: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def get_next_tasks() -> str:
     """
-    Get all tasks from TickTick that are "Next".
-    This includes tasks marked as medium priority (3) or due tomorrow.
+    Возвращает задачи TickTick в статусе «Следующие» (Next): средний приоритет
+    (3) или срок завтра. В резервном (fallback, без v2) режиме закрытые
+    проекты исключаются; в основном v2-режиме это зависит от данных TickTick.
     """
     err = _ensure_official()
     if err:
         return err
-    
+
     try:
         def next_filter(task: Dict[str, Any]) -> bool:
             is_medium_priority = task.get('priority', 0) == 3
             is_due_tomorrow = _is_task_due_in_days(task, 1)
             return is_medium_priority or is_due_tomorrow
 
-        return _get_project_tasks_by_filter(next_filter, "next")
+        return await _get_project_tasks_by_filter(next_filter, "следующее")
 
     except Exception as e:
-        logger.error(f"Error in get_next_tasks: {e}")
-        return f"Error retrieving next tasks: {str(e)}"
+        logger.error(f"Ошибка в get_next_tasks: {e}")
+        return f"Ошибка получения задач «следующее»: {str(e)}"
 
 @mcp.tool()
 async def create_subtask(
