@@ -4846,28 +4846,61 @@ async def delete_task_with_subtasks(
             "operation_report подтвердит результат.")
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 async def create_project(
     name: str,
     color: str = "#F18181",
-    view_mode: str = "list"
+    view_mode: str = "list",
+    manifest_id: str = "",
+    user_reply: str = "",
+    automation_key: str = "",
 ) -> str:
     """
-    Create a new project in TickTick.
-    
+    Create a new project in TickTick. Gated 🟡 (STANDARD.md §3.1,
+    references/gate.md — PLAN_retrofit.md ПАКЕТ 12):
+
+    1st call (manifest_id/user_reply omitted): creates NOTHING — builds a
+    plan and returns it; show it to the user VERBATIM and wait for their
+    real reply (do not call again in the same turn).
+    2nd call: after the user replied, call again with the SAME manifest_id
+    and user_reply=<their literal last message>. name/color/view_mode are
+    taken from the 1st call's manifest (not re-read from this call), so
+    re-pass them as-is.
+
     Args:
         name: Project name
         color: Color code (hex format) (optional)
         view_mode: View mode - one of list, kanban, or timeline (optional)
+        manifest_id: id from the 1st call — omit on the 1st call
+        user_reply: Скопируй сюда ДОСЛОВНО последнее сообщение пользователя,
+            которым он подтвердил действие. Не сочиняй и не пересказывай
+            своими словами. Если пользователь ещё не ответил — не вызывай
+            этот инструмент.
+        automation_key: legal headless bypass for automated consumers (see
+            references/automation-secrets.md §8) — leave empty for a human
+            in chat
     """
     err = _ensure_official()
     if err:
         return err
-    
+
     # Validate view_mode
     if view_mode not in ["list", "kanban", "timeline"]:
-        return "Invalid view_mode. Must be one of: list, kanban, timeline."
-    
+        return _refuse("Некорректный view_mode — нужен list/kanban/timeline.")
+
+    outcome = _gate_single(
+        action="project_create", tool_name="create_project",
+        objects=[{"name": name, "color": color, "view_mode": view_mode}],
+        manifest_id=manifest_id, user_reply=user_reply, tier=1,
+        preview_lines=[f"Создать проект **«{name}»** (цвет {color}, вид "
+                       f"{view_mode})."],
+        automation_key=automation_key,
+    )
+    if not outcome.proceed:
+        return outcome.message
+    obj = outcome.tasks[0]
+    name, color, view_mode = obj["name"], obj["color"], obj["view_mode"]
+
     try:
         project = await _run_blocking(
             ticktick.create_project,
@@ -4877,28 +4910,32 @@ async def create_project(
         )
 
         if 'error' in project:
-            return f"### ❌ Проект «{name}» НЕ создан\n\nTickTick отклонил: {project['error']}"
+            return _tool_response("❌", f"Проект «{name}» НЕ создан",
+                                  warnings=[f"TickTick отклонил: {project['error']}"])
         pid = project.get('id')
     except Exception as e:
         logger.error(f"Error in create_project: {e}")
-        return f"### ❌ Проект «{name}» НЕ создан\n\nОшибка: {str(e)}"
+        return _tool_response("❌", f"Проект «{name}» НЕ создан", warnings=[str(e)])
 
     # Post-verify: independent fresh re-read (separate GET, not the create
     # response) so a false-positive "success" from the API doesn't slip through.
     try:
         fresh = await _run_blocking(ticktick.get_project, pid)
         if isinstance(fresh, dict) and not fresh.get('error') and fresh.get('id') == pid:
-            return (f"### ✅ Создан проект «{fresh.get('name', name)}»\n\n"
-                    f"{format_project(fresh)}\n\n"
-                    f"🧾 Проверено: подтверждено отдельным живым чтением TickTick "
-                    f"(id: {pid}).")
-        return (f"### ⚠️ Проект «{name}» создан, но НЕ подтверждён\n\n"
-                f"{format_project(project)}\n\n"
-                f"⚠️ {_UNVERIFIED_MSG} (id: {pid})")
+            return _tool_response(
+                "✅", f"Создан проект «{fresh.get('name', name)}»",
+                bullets=[format_project(fresh)],
+                proof=f"🧾 Проверено: подтверждено отдельным живым чтением "
+                      f"TickTick (id: {pid}).")
+        return _tool_response(
+            "⚠️", f"Проект «{name}» создан, но НЕ подтверждён",
+            bullets=[format_project(project)],
+            warnings=[f"{_UNVERIFIED_MSG} (id: {pid})"])
     except Exception as e:
-        return (f"### ⚠️ Проект «{name}» создан, но НЕ подтверждён\n\n"
-                f"{format_project(project)}\n\n"
-                f"⚠️ {_UNVERIFIED_MSG} ({e})")
+        return _tool_response(
+            "⚠️", f"Проект «{name}» создан, но НЕ подтверждён",
+            bullets=[format_project(project)],
+            warnings=[f"{_UNVERIFIED_MSG} ({e})"])
 
 _PROJECT_DELETE_SAMPLE_CAP = 20  # preview lines shown before the confirm echo
 
@@ -6458,76 +6495,207 @@ async def _live_groups(fresh: bool = True) -> List[Dict]:
     return [g for g in groups if not g.get("deleted")]
 
 
-@mcp.tool()
-async def create_project_group(name: str) -> str:
-    """Create a project group (folder) (requires v2 API)."""
+@mcp.tool(annotations=WRITE)
+async def create_project_group(name: str, manifest_id: str = "",
+                               user_reply: str = "",
+                               automation_key: str = "") -> str:
+    """
+    Create a project group (folder) (requires v2 API). Gated 🟡 (STANDARD.md
+    §3.1, references/gate.md — PLAN_retrofit.md ПАКЕТ 12).
+
+    1st call (manifest_id/user_reply omitted): creates NOTHING — builds a
+    plan and returns it; show it to the user VERBATIM and wait for their
+    real reply.
+    2nd call: after the user replied, call again with the SAME manifest_id
+    and user_reply=<their literal last message>.
+
+    Args:
+        name: Name of the new group
+        manifest_id: id from the 1st call — omit on the 1st call
+        user_reply: Скопируй сюда ДОСЛОВНО последнее сообщение пользователя,
+            которым он подтвердил действие. Не сочиняй и не пересказывай
+            своими словами. Если пользователь ещё не ответил — не вызывай
+            этот инструмент.
+        automation_key: legal headless bypass for automated consumers (see
+            references/automation-secrets.md §8) — leave empty for a human
+            in chat
+    """
     err = _ensure_ready()
     if err:
         return err
+
+    outcome = _gate_single(
+        action="group_create", tool_name="create_project_group",
+        objects=[{"name": name}],
+        manifest_id=manifest_id, user_reply=user_reply, tier=1,
+        preview_lines=[f"Создать группу проектов **«{name}»**."],
+        automation_key=automation_key,
+    )
+    if not outcome.proceed:
+        return outcome.message
+    name = outcome.tasks[0]["name"]
+
     try:
         gid = await _run_blocking(lambda: ticktick_v2.create_project_group(name))
     except RuntimeError as e:
-        return f"❌ Группа «{name}» НЕ создана — TickTick отклонил: {e}"
+        return _tool_response("❌", f"Группа «{name}» НЕ создана",
+                              warnings=[f"TickTick отклонил: {e}"])
     except Exception as e:
         logger.error(f"Error in create_project_group: {e}")
-        return f"Error creating project group: {str(e)}"
+        return _tool_response("❌", f"Группа «{name}» НЕ создана", warnings=[str(e)])
     # Post-verify: the new group must appear in the force-refreshed list.
     try:
         groups = await _live_groups()
         if not any(g.get("id") == gid for g in groups):
-            return (f"❌ Группа «{name}» НЕ подтвердилась — её нет в списке "
-                    "групп после создания, проверь вручную.")
+            return _tool_response(
+                "⚠️", f"Группа «{name}» НЕ подтвердилась",
+                warnings=["её нет в списке групп после создания — проверь вручную."])
     except Exception as e:
-        return f"Группа «{name}» отправлена (id: {gid}), но {_UNVERIFIED_MSG} ({e})"
-    return f"Группа проектов «{name}» создана (проверено). (id: {gid})"
+        return _tool_response(
+            "⚠️", f"Группа «{name}» отправлена (id: {gid}), но не подтверждена",
+            warnings=[f"{_UNVERIFIED_MSG} ({e})"])
+    return _tool_response(
+        "✅", f"Группа проектов «{name}» создана (проверено)",
+        proof=f"🧾 Подтверждено отдельным живым чтением TickTick (id: {gid}).")
 
 
-@mcp.tool()
-async def delete_project_group(group_name: str, group_id: str) -> str:
+@mcp.tool(annotations=DESTRUCTIVE)
+async def delete_project_group(group_name: str, group_id: str,
+                               manifest_id: str = "", user_reply: str = "",
+                               automation_key: str = "") -> str:
     """
-    Delete a project group/folder (projects inside are kept, just ungrouped) (requires v2 API).
+    Delete a project group/folder (projects inside are kept, just ungrouped)
+    (requires v2 API). Gated 🔴 (STANDARD.md §3.1, references/gate.md —
+    PLAN_retrofit.md ПАКЕТ 12).
+
+    1st call (manifest_id/user_reply omitted): deletes NOTHING — builds a
+    plan and returns it; show it to the user VERBATIM and wait for their
+    real reply.
+    2nd call: after the user replied, call again with the SAME manifest_id
+    and user_reply=<their literal last message>.
 
     Args:
         group_name: Name of the group (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         group_id: ID of the group
+        manifest_id: id from the 1st call — omit on the 1st call
+        user_reply: Скопируй сюда ДОСЛОВНО последнее сообщение пользователя,
+            которым он подтвердил действие. Не сочиняй и не пересказывай
+            своими словами. Если пользователь ещё не ответил — не вызывай
+            этот инструмент.
+        automation_key: legal headless bypass for automated consumers (see
+            references/automation-secrets.md §8) — leave empty for a human
+            in chat
     """
     err = _ensure_ready()
     if err:
         return err
+    # Identity guard (fresh, on EVERY call): the id must exist AND resolve to
+    # the name.
     try:
-        # Identity guard (fresh): the id must exist AND resolve to the name.
         groups = await _live_groups()
-        grp = next((g for g in groups if g.get("id") == group_id), None)
-        if grp is None:
-            return (f"🛑 НЕ удалил — группы с id {str(group_id)[:12]}… нет в "
-                    "живом списке групп (уже удалена/неверный id). Ничего не тронул.")
-        real = grp.get("name") or ""
-        if not _names_agree(group_name, real):
-            return (f"🛑 НЕ удалил — group_id указывает на «{real}», а НЕ "
-                    f"«{group_name}» (защита от «не той папки»). Ничего не тронул.")
-        resp = await _run_blocking(lambda: ticktick_v2.delete_project_group(group_id))
-        api_err = id2error_failures(resp, [group_id]).get(group_id)
-        if api_err:
-            return f"❌ Группа «{real}» НЕ удалена — TickTick отклонил: {api_err}"
-        # Post-verify: the group must be gone from the fresh list.
-        groups = await _live_groups()
-        if any(g.get("id") == group_id for g in groups):
-            return f"❌ Группа «{real}» ВСЁ ЕЩЁ в списке — удаление не сработало."
-        return f"Project group '{real}' deleted (проверено; проекты остались, просто без папки)."
     except Exception as e:
         logger.error(f"Error in delete_project_group: {e}")
         return f"Error deleting project group: {str(e)}"
+    grp = next((g for g in groups if g.get("id") == group_id), None)
+    if grp is None:
+        return _refuse(
+            f"НЕ удалил — группы с id {str(group_id)[:12]}… нет в живом "
+            "списке групп (уже удалена/неверный id).")
+    real = grp.get("name") or ""
+    if not _names_agree(group_name, real):
+        return _refuse(
+            f"НЕ удалил — group_id указывает на «{real}», а НЕ «{group_name}» "
+            "(защита от «не той папки»).")
+
+    outcome = _gate_single(
+        action="group_delete", tool_name="delete_project_group",
+        objects=[{"group_id": group_id, "group_name": real}],
+        manifest_id=manifest_id, user_reply=user_reply, tier=2,
+        preview_lines=[f"Удалить группу проектов **«{real}»** (проекты внутри "
+                       "останутся, просто без папки)."],
+        automation_key=automation_key,
+    )
+    if not outcome.proceed:
+        return outcome.message
+    obj = outcome.tasks[0]
+    group_id = obj["group_id"]
+    real = obj["group_name"]
+
+    # Pre-snapshot (STANDARD.md §5.2, PLAN_retrofit.md 12.2): the group's own
+    # identity plus which projects currently live in it — without this a
+    # manual rollback ("which projects were in the deleted folder?") after an
+    # incident is impossible; delete_project_group previously wrote no
+    # journal record at all.
+    try:
+        projs = await _run_blocking(lambda: ticktick_v2.list_projects())
+    except Exception:
+        projs = []
+    member_projects = [{"id": p.get("id"), "name": p.get("name")}
+                       for p in (projs or []) if p.get("groupId") == group_id]
+    record_id = "group_delete-" + uuid.uuid4().hex[:8]
+    _journal_write({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "manifest": record_id, "op": "group_delete",
+        "summary": f"Удаление группы проектов «{real}»",
+        "items": [{"taskId": group_id, "title": real,
+                  "snapshot": _snapshot_of(grp, kind="project_group"),
+                  "member_projects": member_projects}],
+    }, actor="human")
+
+    try:
+        resp = await _run_blocking(lambda: ticktick_v2.delete_project_group(group_id))
+        api_err = id2error_failures(resp, [group_id]).get(group_id)
+        if api_err:
+            return _tool_response(
+                "❌", f"Группа «{real}» НЕ удалена",
+                warnings=[f"TickTick отклонил: {api_err}"],
+                proof=_report_line(record_id))
+        # Post-verify: the group must be gone from the fresh list.
+        groups = await _live_groups()
+        if any(g.get("id") == group_id for g in groups):
+            return _tool_response(
+                "❌", f"Группа «{real}» ВСЁ ЕЩЁ в списке",
+                warnings=["удаление не сработало."],
+                proof=_report_line(record_id))
+        bullets = ([f"Проекты остались без папки: "
+                   + ", ".join(f"«{p['name']}»" for p in member_projects)]
+                  if member_projects else [])
+        return _tool_response(
+            "✅", f"Группа «{real}» удалена (проверено)",
+            bullets=bullets, proof=_report_line(record_id))
+    except Exception as e:
+        logger.error(f"Error in delete_project_group: {e}")
+        return _tool_response(
+            "⚠️", f"Группа «{real}» — исход НЕ подтверждён",
+            warnings=[str(e)], proof=_report_line(record_id))
 
 
-@mcp.tool()
-async def move_project_to_group(project_name: str, project_id: str, group_id: str) -> str:
+@mcp.tool(annotations=WRITE)
+async def move_project_to_group(project_name: str, project_id: str, group_id: str,
+                                manifest_id: str = "", user_reply: str = "",
+                                automation_key: str = "") -> str:
     """
-    Move a project into a group/folder (requires v2 API).
+    Move a project into a group/folder (requires v2 API). Gated 🔴
+    (STANDARD.md §3.1, references/gate.md — PLAN_retrofit.md ПАКЕТ 12).
+
+    1st call (manifest_id/user_reply omitted): moves NOTHING — builds a plan
+    and returns it; show it to the user VERBATIM and wait for their real
+    reply.
+    2nd call: after the user replied, call again with the SAME manifest_id
+    and user_reply=<their literal last message>.
 
     Args:
         project_name: Name of the project (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         project_id: ID of the project to move
         group_id: ID of the destination group, or "NONE" to ungroup
+        manifest_id: id from the 1st call — omit on the 1st call
+        user_reply: Скопируй сюда ДОСЛОВНО последнее сообщение пользователя,
+            которым он подтвердил действие. Не сочиняй и не пересказывай
+            своими словами. Если пользователь ещё не ответил — не вызывай
+            этот инструмент.
+        automation_key: legal headless bypass for automated consumers (see
+            references/automation-secrets.md §8) — leave empty for a human
+            in chat
     """
     err = _ensure_ready()
     if err:
@@ -6544,11 +6712,31 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
             groups = await _live_groups(fresh=False)
             grp = next((g for g in groups if g.get("id") == group_id), None)
             if grp is None:
-                return (f"🛑 НЕ переместил — группы с id {str(group_id)[:12]}… "
-                        "нет в живом списке групп (list_project_groups). "
-                        "Ничего не тронул.")
+                return _refuse(
+                    f"НЕ переместил — группы с id {str(group_id)[:12]}… нет "
+                    "в живом списке групп (list_project_groups).")
             dest_name = grp.get("name") or group_id
         live_pname = _v2_project_names().get(project_id, project_name)
+
+        outcome = _gate_single(
+            action="project_move_group", tool_name="move_project_to_group",
+            objects=[{"project_id": project_id, "project_name": live_pname,
+                     "group_id": group_id, "dest_name": dest_name}],
+            manifest_id=manifest_id, user_reply=user_reply, tier=2,
+            preview_lines=[
+                f"Переместить проект **«{live_pname}»** в "
+                + (f"папку **«{dest_name}»**." if group_id != "NONE"
+                   else "**без папки (ungrouped)**.")],
+            automation_key=automation_key,
+        )
+        if not outcome.proceed:
+            return outcome.message
+        obj = outcome.tasks[0]
+        project_id = obj["project_id"]
+        live_pname = obj["project_name"]
+        group_id = obj["group_id"]
+        dest_name = obj["dest_name"]
+
         await _run_blocking(lambda: ticktick_v2.move_project_to_group(project_id, group_id))
         # Post-verify: the project's live groupId must equal the target.
         await _run_blocking(lambda: ticktick_v2.get_state(force=True))
@@ -6558,12 +6746,15 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
         want = None if group_id == "NONE" else group_id
         dest = "без папки (ungrouped)" if group_id == "NONE" else f"папку «{dest_name}»"
         if proj is None:
-            return (f"Проект «{live_pname}» отправлен в {dest}, но "
-                    f"{_UNVERIFIED_MSG}")
+            return _tool_response(
+                "⚠️", f"Проект «{live_pname}» отправлен в {dest}, но НЕ подтверждён",
+                warnings=[_UNVERIFIED_MSG])
         if (got or None) != want:
-            return (f"❌ Проект «{live_pname}» НЕ переместился — живой groupId "
-                    f"{got!r}, ожидался {want!r}.")
-        return f"Проект «{live_pname}» перемещён в {dest} (проверено)."
+            return _tool_response(
+                "❌", f"Проект «{live_pname}» НЕ переместился",
+                proof=f"🧾 Живой groupId {got!r}, ожидался {want!r}.")
+        return _tool_response(
+            "✅", f"Проект «{live_pname}» перемещён в {dest} (проверено)")
     except Exception as e:
         logger.error(f"Error in move_project_to_group: {e}")
         return f"Error moving project: {str(e)}"
@@ -7486,11 +7677,21 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str, co
 # Project update / archive
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 async def update_project(project_name: str, project_id: str, name: str = None,
-                         color: str = None, view_mode: str = None) -> str:
+                         color: str = None, view_mode: str = None,
+                         manifest_id: str = "", user_reply: str = "",
+                         automation_key: str = "") -> str:
     """
     Update a project's name, color, or view mode (uses the official API).
+    Gated 🟡 (STANDARD.md §3.1, references/gate.md — PLAN_retrofit.md ПАКЕТ 12):
+
+    1st call (manifest_id/user_reply omitted): changes NOTHING — builds a
+    plan and returns it; show it to the user VERBATIM and wait for their
+    real reply.
+    2nd call: after the user replied, call again with the SAME manifest_id
+    and user_reply=<their literal last message>. The fields applied are the
+    ones from the 1st call's manifest, not re-read from this call.
 
     Args:
         project_name: Current name of the project (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
@@ -7498,32 +7699,64 @@ async def update_project(project_name: str, project_id: str, name: str = None,
         name: New name (optional)
         color: New color hex like '#F18181' (optional)
         view_mode: 'list', 'kanban', or 'timeline' (optional)
+        manifest_id: id from the 1st call — omit on the 1st call
+        user_reply: Скопируй сюда ДОСЛОВНО последнее сообщение пользователя,
+            которым он подтвердил действие. Не сочиняй и не пересказывай
+            своими словами. Если пользователь ещё не ответил — не вызывай
+            этот инструмент.
+        automation_key: legal headless bypass for automated consumers (see
+            references/automation-secrets.md §8) — leave empty for a human
+            in chat
     """
     err = _ensure_official()
     if err:
         return err
     if name is None and color is None and view_mode is None:
-        return ("🛑 Нечего менять — все поля (name/color/view_mode) пусты. "
-                "Ничего не тронул.")
+        return _refuse("Нечего менять — все поля (name/color/view_mode) пусты.")
     for label, val in (("name", name), ("color", color), ("view_mode", view_mode)):
         if val is not None and not str(val).strip():
-            return (f"🛑 Пустая строка в поле {label} — клиент молча выбросил бы "
-                    "её и изменение не применилось бы. Передай значение или "
-                    "убери поле. Ничего не тронул.")
+            return _refuse(
+                f"Пустая строка в поле {label} — клиент молча выбросил бы её "
+                "и изменение не применилось бы.",
+                "Передай значение или убери поле.")
     if view_mode is not None and view_mode not in ("list", "kanban", "timeline"):
-        return "Invalid view_mode. Must be one of: list, kanban, timeline."
+        return _refuse("Некорректный view_mode — нужен list/kanban/timeline.")
+    # Identity guard runs on EVERY call (plan and execute alike) so a stale
+    # id is caught before the plan is even shown, not only at execute time.
     refuse = _guard_project(project_id, project_name, fresh=True,
                             require_known=True)
     if refuse:
         return refuse
+
+    outcome = _gate_single(
+        action="project_update", tool_name="update_project",
+        objects=[{"project_id": project_id, "project_name": project_name,
+                 "name": name, "color": color, "view_mode": view_mode}],
+        manifest_id=manifest_id, user_reply=user_reply, tier=1,
+        preview_lines=[
+            f"Обновить проект **«{project_name}»** — "
+            + ", ".join(f"{k}: {v!r}" for k, v in
+                        (("name", name), ("color", color), ("view_mode", view_mode))
+                        if v is not None) + "."],
+        automation_key=automation_key,
+    )
+    if not outcome.proceed:
+        return outcome.message
+    obj = outcome.tasks[0]
+    project_id = obj["project_id"]
+    project_name = obj["project_name"]
+    name, color, view_mode = obj["name"], obj["color"], obj["view_mode"]
+
     try:
         proj = await _run_blocking(lambda: ticktick.update_project(
             project_id, name=name, color=color, view_mode=view_mode))
         if 'error' in proj:
-            return f"### ❌ Проект «{project_name}» НЕ обновлён\n\nTickTick отклонил: {proj['error']}"
+            return _tool_response("❌", f"Проект «{project_name}» НЕ обновлён",
+                                  warnings=[f"TickTick отклонил: {proj['error']}"])
     except Exception as e:
         logger.error(f"Error in update_project: {e}")
-        return f"### ❌ Проект «{project_name}» НЕ обновлён\n\nОшибка: {str(e)}"
+        return _tool_response("❌", f"Проект «{project_name}» НЕ обновлён",
+                              warnings=[str(e)])
 
     # Post-verify: independent fresh re-read, compare each field that was
     # actually requested against what TickTick shows live — the write
@@ -7531,9 +7764,9 @@ async def update_project(project_name: str, project_id: str, name: str = None,
     try:
         fresh = await _run_blocking(ticktick.get_project, project_id)
         if not (isinstance(fresh, dict) and not fresh.get('error')):
-            return (f"### ⚠️ Проект «{project_name}» обновлён, но НЕ подтверждён\n\n"
-                    f"{format_project(proj)}\n\n"
-                    f"⚠️ {_UNVERIFIED_MSG}")
+            return _tool_response(
+                "⚠️", f"Проект «{project_name}» обновлён, но НЕ подтверждён",
+                bullets=[format_project(proj)], warnings=[_UNVERIFIED_MSG])
         mismatches = []
         if name is not None and fresh.get('name') != name:
             mismatches.append(f"name: ожидалось «{name}», сейчас «{fresh.get('name')}»")
@@ -7543,30 +7776,51 @@ async def update_project(project_name: str, project_id: str, name: str = None,
             mismatches.append(f"view_mode: ожидалось {view_mode}, сейчас {fresh.get('viewMode')}")
         new_name = fresh.get('name', project_name)
         if mismatches:
-            return (f"### ❌ Проект «{project_name}» обновлён частично — расхождение\n\n"
-                    f"{format_project(fresh)}\n\n"
-                    "🧾 Проверка: " + "; ".join(mismatches))
+            return _tool_response(
+                "❌", f"Проект «{project_name}» обновлён частично — расхождение",
+                bullets=[format_project(fresh)],
+                proof="🧾 Проверка: " + "; ".join(mismatches))
         title = (f"«{project_name}» → «{new_name}»" if name is not None and new_name != project_name
                  else f"«{new_name}»")
-        return (f"### ✅ Проект {title} обновлён (проверено)\n\n"
-                f"{format_project(fresh)}\n\n"
-                "🧾 Проверено: все изменённые поля подтверждены отдельным "
-                "живым чтением TickTick.")
+        return _tool_response(
+            "✅", f"Проект {title} обновлён (проверено)",
+            bullets=[format_project(fresh)],
+            proof="🧾 Проверено: все изменённые поля подтверждены отдельным "
+                  "живым чтением TickTick.")
     except Exception as e:
-        return (f"### ⚠️ Проект «{project_name}» обновлён, но НЕ подтверждён\n\n"
-                f"{format_project(proj)}\n\n"
-                f"⚠️ {_UNVERIFIED_MSG} ({e})")
+        return _tool_response(
+            "⚠️", f"Проект «{project_name}» обновлён, но НЕ подтверждён",
+            bullets=[format_project(proj)],
+            warnings=[f"{_UNVERIFIED_MSG} ({e})"])
 
 
-@mcp.tool()
-async def archive_project(project_name: str, project_id: str, archived: bool = True) -> str:
+@mcp.tool(annotations=DESTRUCTIVE)
+async def archive_project(project_name: str, project_id: str, archived: bool = True,
+                          manifest_id: str = "", user_reply: str = "",
+                          automation_key: str = "") -> str:
     """
-    Archive (close) or unarchive a project (requires v2 API).
+    Archive (close) or unarchive a project (requires v2 API). Gated 🔴
+    (STANDARD.md §3.1, references/gate.md — PLAN_retrofit.md ПАКЕТ 12):
+    archiving pulls the project out of the sync pool.
+
+    1st call (manifest_id/user_reply omitted): changes NOTHING — builds a
+    plan and returns it; show it to the user VERBATIM and wait for their
+    real reply (do not call again in the same turn).
+    2nd call: after the user replied, call again with the SAME manifest_id
+    and user_reply=<their literal last message>.
 
     Args:
         project_name: Name of the project (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         project_id: ID of the project
         archived: True to archive, False to restore it to active
+        manifest_id: id from the 1st call — omit on the 1st call
+        user_reply: Скопируй сюда ДОСЛОВНО последнее сообщение пользователя,
+            которым он подтвердил действие. Не сочиняй и не пересказывай
+            своими словами. Если пользователь ещё не ответил — не вызывай
+            этот инструмент.
+        automation_key: legal headless bypass for automated consumers (see
+            references/automation-secrets.md §8) — leave empty for a human
+            in chat
     """
     err = _ensure_ready()
     if err:
@@ -7584,13 +7838,32 @@ async def archive_project(project_name: str, project_id: str, archived: bool = T
             return refuse
     live_name = _v2_project_names().get(project_id, project_name)
     verb = 'заархивирован' if archived else 'разархивирован'
+
+    outcome = _gate_single(
+        action="project_archive", tool_name="archive_project",
+        objects=[{"project_id": project_id, "project_name": live_name,
+                 "archived": archived}],
+        manifest_id=manifest_id, user_reply=user_reply, tier=2,
+        preview_lines=[f"{'Заархивировать' if archived else 'Разархивировать'} "
+                       f"проект **«{live_name}»**."],
+        automation_key=automation_key,
+    )
+    if not outcome.proceed:
+        return outcome.message
+    obj = outcome.tasks[0]
+    project_id = obj["project_id"]
+    live_name = obj["project_name"]
+    archived = obj["archived"]
+    verb = 'заархивирован' if archived else 'разархивирован'
+
     try:
         await _run_blocking(lambda: ticktick_v2.archive_project(project_id, closed=archived))
     except RuntimeError as e:
-        return f"### ❌ Проект «{live_name}» НЕ {verb}\n\nTickTick отклонил: {e}"
+        return _tool_response("❌", f"Проект «{live_name}» НЕ {verb}",
+                              warnings=[f"TickTick отклонил: {e}"])
     except Exception as e:
         logger.error(f"Error in archive_project: {e}")
-        return f"Error archiving project: {str(e)}"
+        return _tool_response("❌", f"Проект «{live_name}» НЕ {verb}", warnings=[str(e)])
 
     # Post-verify: independent fresh re-read of the project's own `closed`
     # flag (not the write response) — force the v2 cache first.
@@ -7599,17 +7872,23 @@ async def archive_project(project_name: str, project_id: str, archived: bool = T
         projs = await _run_blocking(ticktick_v2.list_projects)
         proj = next((p for p in projs if p.get("id") == project_id), None)
         if proj is None:
-            return (f"### ⚠️ Проект «{live_name}» {verb}, но НЕ подтверждён\n\n"
-                    f"Проекта нет в свежем списке — {_UNVERIFIED_MSG}")
+            return _tool_response(
+                "⚠️", f"Проект «{live_name}» {verb}, но НЕ подтверждён",
+                warnings=[f"Проекта нет в свежем списке — {_UNVERIFIED_MSG}"])
         got_closed = bool(proj.get("closed"))
         if got_closed != archived:
-            return (f"### ❌ Проект «{live_name}» — расхождение после архивации\n\n"
-                    f"Ожидался closed={archived}, живое состояние closed={got_closed}.")
-        return (f"### ✅ Проект «{live_name}» {verb} (проверено)\n\n"
-                f"🧾 closed={got_closed} — подтверждено отдельным живым чтением TickTick.")
+            return _tool_response(
+                "❌", f"Проект «{live_name}» — расхождение после архивации",
+                proof=f"🧾 Ожидался closed={archived}, живое состояние "
+                      f"closed={got_closed}.")
+        return _tool_response(
+            "✅", f"Проект «{live_name}» {verb} (проверено)",
+            proof=f"🧾 closed={got_closed} — подтверждено отдельным живым "
+                  f"чтением TickTick.")
     except Exception as e:
-        return (f"### ⚠️ Проект «{live_name}» {verb}, но НЕ подтверждён\n\n"
-                f"⚠️ {_UNVERIFIED_MSG} ({e})")
+        return _tool_response(
+            "⚠️", f"Проект «{live_name}» {verb}, но НЕ подтверждён",
+            warnings=[f"{_UNVERIFIED_MSG} ({e})"])
 
 
 # ---------------------------------------------------------------------------
@@ -8220,41 +8499,86 @@ async def list_project_columns(project_id: str) -> str:
         return f"Error fetching columns: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 async def create_project_column(project_id: str, name: str,
-                                project_name: str = "") -> str:
+                                project_name: str = "",
+                                manifest_id: str = "", user_reply: str = "",
+                                automation_key: str = "") -> str:
     """
     Create a kanban column/section inside a project (including the Inbox) and
     return its id (requires v2 API). Use the returned id as column_id in
-    create_task/update_task to route tasks into this section.
+    create_task/update_task to route tasks into this section. Gated 🟡
+    (STANDARD.md §3.1, references/gate.md — PLAN_retrofit.md ПАКЕТ 12).
 
     Sections only render in a project's kanban view; switch the project's view
     to kanban to see them.
 
+    1st call (manifest_id/user_reply omitted): creates NOTHING — builds a
+    plan and returns it; show it to the user VERBATIM and wait for their
+    real reply.
+    2nd call: after the user replied, call again with the SAME manifest_id
+    and user_reply=<their literal last message>.
+
     Args:
         project_id: ID of the project (or the Inbox id from get_projects)
         name: Name of the new column/section
-        project_name: Name of the project (recommended — arms the identity
-            guard so a stale/wrong project_id is refused instead of silently
-            creating the column elsewhere)
+        project_name: Name of the project — REQUIRED (not just "recommended"
+            any more, PLAN_retrofit.md п.12.3): the identity guard needs it to
+            actually refuse a stale/wrong project_id instead of silently
+            creating the column wherever the id happens to resolve. The
+            parameter itself stays optional for signature backward
+            compatibility (references/limits-audit.md §12) — an empty value
+            is refused at runtime instead, with this explanation.
+        manifest_id: id from the 1st call — omit on the 1st call
+        user_reply: Скопируй сюда ДОСЛОВНО последнее сообщение пользователя,
+            которым он подтвердил действие. Не сочиняй и не пересказывай
+            своими словами. Если пользователь ещё не ответил — не вызывай
+            этот инструмент.
+        automation_key: legal headless bypass for automated consumers (see
+            references/automation-secrets.md §8) — leave empty for a human
+            in chat
     """
     err = _ensure_ready()
     if err:
         return err
-    # Identity guard: the id must resolve to a live project (and to the given
-    # name when one is passed) — a wrong id would create the column elsewhere.
-    refuse = _guard_project(project_id, project_name or "", fresh=True,
+    if not (project_name or "").strip():
+        return _refuse(
+            "project_name обязателен — без названия identity-guard не может "
+            "проверить, что project_id указывает на тот проект, который "
+            "имелся в виду.",
+            "Передай project_name (см. get_projects) и повтори вызов.")
+    # Identity guard (fresh, on EVERY call): the id must resolve to a live
+    # project AND to the given name — a wrong id would create the column
+    # elsewhere.
+    refuse = _guard_project(project_id, project_name, fresh=True,
                             require_known=True)
     if refuse:
         return refuse
     live_pname = _v2_project_names().get(project_id, project_id)
+
+    outcome = _gate_single(
+        action="column_create", tool_name="create_project_column",
+        objects=[{"project_id": project_id, "name": name,
+                 "project_name": live_pname}],
+        manifest_id=manifest_id, user_reply=user_reply, tier=1,
+        preview_lines=[f"Создать раздел **«{name}»** в проекте **«{live_pname}»**."],
+        automation_key=automation_key,
+    )
+    if not outcome.proceed:
+        return outcome.message
+    obj = outcome.tasks[0]
+    project_id = obj["project_id"]
+    name = obj["name"]
+    live_pname = obj["project_name"]
+
     try:
         cid = await _run_blocking(lambda: ticktick_v2.create_column(project_id, name))
     except RuntimeError as e:
-        return f"### ❌ Раздел «{name}» НЕ создан\n\nTickTick отклонил: {e}"
+        return _tool_response("❌", f"Раздел «{name}» НЕ создан",
+                              warnings=[f"TickTick отклонил: {e}"])
     except Exception as e:
         logger.error(f"Error in create_project_column: {e}")
-        return f"Error creating column: {str(e)}"
+        return _tool_response("❌", f"Раздел «{name}» НЕ создан", warnings=[str(e)])
 
     # Post-verify: independent fresh re-read of the project's columns (via the
     # official API, not the v2 write response) — the new column must be there.
@@ -8263,15 +8587,18 @@ async def create_project_column(project_id: str, name: str,
         cols = (data.get("columns") or []) if isinstance(data, dict) and 'error' not in data else []
         match = next((c for c in cols if c.get("id") == cid), None)
         if match is None:
-            return (f"### ⚠️ Раздел «{name}» создан (id: {cid}), но НЕ подтверждён\n\n"
-                    f"Его нет в свежем списке колонок проекта «{live_pname}» — "
-                    f"{_UNVERIFIED_MSG}")
-        return (f"### ✅ Раздел «{match.get('name', name)}» создан в проекте «{live_pname}» "
-                f"(проверено)\n\n"
-                f"🧾 Подтверждено отдельным живым чтением TickTick (id: {cid}).")
+            return _tool_response(
+                "⚠️", f"Раздел «{name}» создан (id: {cid}), но НЕ подтверждён",
+                warnings=[f"Его нет в свежем списке колонок проекта "
+                          f"«{live_pname}» — {_UNVERIFIED_MSG}"])
+        return _tool_response(
+            "✅", f"Раздел «{match.get('name', name)}» создан в проекте "
+                 f"«{live_pname}» (проверено)",
+            proof=f"🧾 Подтверждено отдельным живым чтением TickTick (id: {cid}).")
     except Exception as e:
-        return (f"### ⚠️ Раздел «{name}» создан (id: {cid}), но НЕ подтверждён\n\n"
-                f"⚠️ {_UNVERIFIED_MSG} ({e})")
+        return _tool_response(
+            "⚠️", f"Раздел «{name}» создан (id: {cid}), но НЕ подтверждён",
+            warnings=[f"{_UNVERIFIED_MSG} ({e})"])
 
 
 def main():
