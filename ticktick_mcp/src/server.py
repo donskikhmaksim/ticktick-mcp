@@ -1779,7 +1779,7 @@ async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
     return result
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE)
 async def update_tasks(
     summary: str,
     tasks: List[Dict[str, Any]] = None,
@@ -1895,7 +1895,7 @@ async def _update_tasks_impl(
             new_title = t.get("new_title")
             priority = t.get("priority")
             if priority is not None and priority not in [0, 1, 3, 5]:
-                results.append(f"✗ «{shown_title}»: неверный приоритет (допустимо 0/1/3/5)")
+                results.append(f"❌ «{shown_title}»: неверный приоритет (допустимо 0/1/3/5)")
                 continue
             # Identity guard: refuse to edit a DIFFERENT task if the id is stale.
             g = _guard_task(tid, t.get("title") or "", pid, by_id=_by_id)
@@ -1914,6 +1914,11 @@ async def _update_tasks_impl(
             # sync the untouched start/due field when the caller only supplied
             # one of them and the task was previously a single fixed date.
             live = (_by_id or {}).get(tid)
+            # Pre-snapshot BEFORE overwriting — STANDARD.md §5.2, PLAN_retrofit.md
+            # п.14.1 (P0): update_tasks overwrites title/content/priority/dates/
+            # tags, and without a snapshot of the OLD values a manual rollback of
+            # a wrong update is physically impossible.
+            snapshot = _snapshot_of(live)
             sync_start, sync_due, date_warn = _sync_point_date(
                 live, t.get("start_date"), t.get("due_date"))
             try:
@@ -1931,7 +1936,7 @@ async def _update_tasks_impl(
                     reminders=t.get("reminders"),
                 )
                 if 'error' in task:
-                    results.append(f"✗ «{shown_title}»: {task['error']}")
+                    results.append(f"❌ «{shown_title}»: {task['error']}")
                     continue
                 # Sub-steps (tags/column/assignee) — failures go into the RESULT
                 # text, not only the log: «обновлено» must not hide a lost tag.
@@ -1981,15 +1986,15 @@ async def _update_tasks_impl(
                 # fields — the official API can 200-no-op, so «обновлено» is
                 # only printed when the change is VISIBLE in live data.
                 item = {"taskId": tid, "title": new_title or shown_title,
-                        "expect": {"changes": changes}}
+                        "expect": {"changes": changes}, "snapshot": snapshot}
                 fresh = _open_by_id(fresh=True)
                 if fresh is None:
-                    line = f"✏️ «{shown_title}» отправлено, но {_UNVERIFIED_MSG}"
+                    line = f"⚠️ «{shown_title}» отправлено, но {_UNVERIFIED_MSG}"
                 else:
                     verdict = _verify_item("update", item, fresh,
                                            _v2_project_names())
                     if "✅" in verdict[:8]:
-                        line = f"✏️ «{shown_title}» обновлено (проверено)"
+                        line = f"✅ «{shown_title}» обновлено (проверено)"
                     else:
                         line = (f"❌ «{shown_title}» — изменения НЕ видны в "
                                 f"живом состоянии: {verdict.lstrip('- ')}")
@@ -2002,11 +2007,17 @@ async def _update_tasks_impl(
                 results.append(line)
                 _single_updates.append(item)
             except Exception as e:
-                results.append(f"✗ «{shown_title}»: {e}")
+                results.append(f"❌ «{shown_title}»: {e}")
         if _single_updates:
             rid = _op_journal("update", _single_updates, summary)
-            results.append(_report_line(rid))
-        return "\n".join(results)
+        else:
+            rid = ""
+        status = _batch_status(results)
+        n_ok = sum(1 for l in results if l.lstrip().startswith("✅"))
+        headline = (f"Обновлено **{n_ok}** из {len(results)}" if len(results) != n_ok
+                    else f"Обновлено **{n_ok}**")
+        return _tool_response(status, headline, bullets=results,
+                              proof=_report_line(rid) if _single_updates else "")
 
     # Multiple tasks, no advanced fields — use v2 batch
     err = _ensure_ready()
@@ -2022,6 +2033,7 @@ async def _update_tasks_impl(
         label_of = {}
         changes = []
         date_warns = {}
+        snap_by_id = {}
         for t in tasks:
             tid = t.get("taskId") or t.get("task_id")
             if tid not in ok_ids:
@@ -2042,6 +2054,9 @@ async def _update_tasks_impl(
             # when only one is supplied and the task was previously a single
             # fixed date, so it doesn't silently turn into a range.
             live = (by_id or {}).get(tid)
+            # Pre-snapshot BEFORE overwriting (STANDARD.md §5.2, PLAN_retrofit.md
+            # п.14.1, P0) — same reasoning as the single-task path above.
+            snap_by_id[tid] = _snapshot_of(live)
             sync_start, sync_due, warn = _sync_point_date(
                 live, t.get("start_date"), t.get("due_date"))
             if warn:
@@ -2064,7 +2079,8 @@ async def _update_tasks_impl(
         items = [{"taskId": ch["taskId"],
                   "title": ch.get("title") or label_of.get(ch["taskId"], ""),
                   "expect": {"changes": {k: v for k, v in ch.items()
-                                         if k != "taskId"}}}
+                                         if k != "taskId"}},
+                  "snapshot": snap_by_id.get(ch["taskId"], {})}
                  for ch in changes]
         updated, not_applied = [], []
         unverified = False
@@ -2085,35 +2101,41 @@ async def _update_tasks_impl(
                         updated.append(label_of.get(it["taskId"], it["title"]))
                     else:
                         not_applied.append(verdict.lstrip("- "))
-        lines = []
+        bullets = []
         if updated:
-            lines.append(f"✏️ Обновлено {len(updated)} (проверено): "
-                         + ", ".join(f"«{lbl}»" for lbl in updated))
+            bullets.append(f"✅ Обновлено {len(updated)} (проверено): "
+                           + ", ".join(f"«{lbl}»" for lbl in updated))
         if date_warns:
             for tid, w in date_warns.items():
-                lines.append(f"  ⚠️ «{label_of.get(tid, tid)}»: {w}")
+                bullets.append(f"  ⚠️ «{label_of.get(tid, tid)}»: {w}")
         if unverified:
-            lines.append(f"✏️ Отправлено {len(changes)}, но {_UNVERIFIED_MSG}")
+            bullets.append(f"⚠️ Отправлено {len(changes)}, но {_UNVERIFIED_MSG}")
         if not_applied:
-            lines.append(f"❌ НЕ применилось {len(not_applied)}:\n  - "
-                         + "\n  - ".join(not_applied))
+            bullets.append(f"❌ НЕ применилось {len(not_applied)}:\n  - "
+                           + "\n  - ".join(not_applied))
         note = _unarmed_note(found)
         if note:
-            lines.append(note)
+            bullets.append(note)
         if mismatch:
-            lines.append(_mismatch_report(mismatch, "обновил"))
+            bullets.append(_mismatch_report(mismatch, "обновил"))
         if missing:
-            lines.append(f"↷ Не найдены среди открытых {len(missing)} "
-                         "(неверный id/завершены): "
-                         + ", ".join(f"«{m['title']}»" for m in missing))
+            bullets.append(f"↷ Не найдены среди открытых {len(missing)} "
+                           "(неверный id/завершены): "
+                           + ", ".join(f"«{m['title']}»" for m in missing))
+        rid = ""
         if changes:
             rid = _op_journal("update", items, summary)
-            lines.append(_report_line(rid))
-        return "\n".join(lines) if lines else "Ничего не обновлено."
+        if not bullets:
+            return _tool_response("↷", "Ничего не обновлено")
+        status = _batch_status(bullets)
+        headline = f"Обновлено **{len(updated)}**"
+        return _tool_response(status, headline, bullets=bullets,
+                              proof=_report_line(rid) if changes else "")
     except Exception as e:
         logger.error(f"Error in update_tasks: {e}")
-        return f"Error updating tasks: {str(e)}"
-@mcp.tool()
+        return _tool_response("❌", "Ошибка при обновлении задач",
+                              warnings=[str(e)])
+@mcp.tool(annotations=WRITE)
 async def complete_tasks(summary: str, tasks: List[Dict[str, str]] = None,
                          manifest_id: str = "", user_reply: str = "") -> str:
     """
@@ -2169,6 +2191,11 @@ async def _complete_tasks_impl(summary: str, tasks: List[Dict[str, str]]) -> str
             if by_id is None:
                 return _STATE_UNAVAILABLE_MSG
             found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
+            # Light pre-snapshot (PLAN_retrofit.md п.14.2, P1): previous status
+            # is a limited-value field, but a snapshot still makes rollback
+            # ("re-complete → re-open") mechanical instead of guesswork.
+            snap_by_id = {f["taskId"]: {"status": (by_id.get(f["taskId"]) or {}).get("status")}
+                         for f in found}
             done, failed = [], []
             api_fail = {}
             unverified = False
@@ -2186,34 +2213,39 @@ async def _complete_tasks_impl(summary: str, tasks: List[Dict[str, str]]) -> str
                     failed = [f["title"] for f in found
                               if f["taskId"] in still_open
                               or f["taskId"] in api_fail]
-            lines = []
+            bullets = []
             if done:
-                lines.append(f"✓ Завершено {len(done)}: "
-                             + ", ".join(f"«{t}»" for t in done))
+                bullets.append(f"✅ Завершено {len(done)}: "
+                               + ", ".join(f"«{t}»" for t in done))
             if unverified:
-                lines.append(f"Отправлено на завершение {len(found)}, но "
-                             f"{_UNVERIFIED_MSG}")
+                bullets.append(f"⚠️ Отправлено на завершение {len(found)}, но "
+                               f"{_UNVERIFIED_MSG}")
             note = _unarmed_note(found)
             if note:
-                lines.append(note)
+                bullets.append(note)
             if mismatch:
-                lines.append(_mismatch_report(mismatch, "завершил"))
+                bullets.append(_mismatch_report(mismatch, "завершил"))
             if missing:
-                lines.append(
+                bullets.append(
                     f"↷ Не найдены среди открытых {len(missing)} "
                     "(возможно уже завершены/неверный id): "
                     + ", ".join(f"«{t['title']}»" for t in missing))
             if failed:
                 details = [f"«{t}»" for t in failed]
                 extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
-                lines.append(f"❌ НЕ завершены {len(failed)} (всё ещё открыты"
-                             + (f"; TickTick сообщил: {extra}" if extra else "")
-                             + "): " + ", ".join(details))
+                bullets.append(f"❌ НЕ завершены {len(failed)} (всё ещё открыты"
+                               + (f"; TickTick сообщил: {extra}" if extra else "")
+                               + "): " + ", ".join(details))
+            rid = ""
             if found:
                 rid = _op_journal("complete", [
-                    {"taskId": f["taskId"], "title": f["title"]} for f in found], summary)
-                lines.append(_report_line(rid))
-            return "\n".join(lines) if lines else "Ничего не завершено."
+                    {"taskId": f["taskId"], "title": f["title"],
+                     "snapshot": snap_by_id.get(f["taskId"], {})} for f in found], summary)
+            if not bullets:
+                return _tool_response("↷", "Ничего не завершено")
+            return _tool_response(_batch_status(bullets), f"Завершено **{len(done)}**",
+                                  bullets=bullets,
+                                  proof=_report_line(rid) if found else "")
         else:
             results = []
             _done_items = []
@@ -2222,7 +2254,8 @@ async def _complete_tasks_impl(summary: str, tasks: List[Dict[str, str]]) -> str
                 pid = t.get("projectId") or t.get("project_id") or ""
                 title = t.get("title") or _lookup_task_title(tid)
                 # Identity guard for the single-completion path too.
-                g = _guard_task(tid, t.get("title") or "", pid)
+                _by_id = _open_by_id(fresh=True)
+                g = _guard_task(tid, t.get("title") or "", pid, by_id=_by_id)
                 if g.status == "mismatch":
                     results.append(f"🛑 НЕ завершил «{t.get('title')}» — {g.message}")
                     continue
@@ -2236,38 +2269,46 @@ async def _complete_tasks_impl(summary: str, tasks: List[Dict[str, str]]) -> str
                                    "(уже завершена/удалена/неверный id), "
                                    "пропущено")
                     continue
+                # Light pre-snapshot (PLAN_retrofit.md п.14.2, P1) — previous status.
+                snapshot = {"status": (_by_id.get(tid) or {}).get("status")}
                 pid = g.project_id or _resolve_project_id(tid, pid)
                 pname = t.get("projectName") or _v2_project_names().get(pid, "")
                 res = await _run_blocking(lambda: ticktick.complete_task(pid, tid))
                 if 'error' in res:
-                    results.append(f"✗ «{title}»: {res['error']}")
+                    results.append(f"❌ «{title}»: {res['error']}")
                     continue
                 # Post-verify: the official API can silently no-op a complete
-                # with a mismatched projectId — «✓» only after the task is
+                # with a mismatched projectId — «✅» only after the task is
                 # SEEN gone from the fresh open pool.
                 fresh = _open_by_id(fresh=True)
                 where = f" в «{pname}»" if pname else ""
                 if fresh is None:
-                    results.append(f"«{title}»{where} — отправлено, но "
+                    results.append(f"⚠️ «{title}»{where} — отправлено, но "
                                    f"{_UNVERIFIED_MSG}")
                 elif tid in fresh:
                     results.append(f"❌ «{title}»{where} — complete НЕ сработал "
                                    "(задача всё ещё среди открытых)")
                     continue
                 else:
-                    line = f"✓ «{title}»{where}"
+                    line = f"✅ «{title}»{where}"
                     if not (t.get("title") or "").strip():
                         line += (" ⚠️ выполнено БЕЗ сверки названия "
                                  "(title не передан)")
                     results.append(line)
-                _done_items.append({"taskId": tid, "title": title})
+                _done_items.append({"taskId": tid, "title": title, "snapshot": snapshot})
+            rid = ""
             if _done_items:
                 rid = _op_journal("complete", _done_items, summary)
-                results.append(_report_line(rid))
-            return "\n".join(results)
+            if not results:
+                return _tool_response("↷", "Ничего не завершено")
+            n_ok = sum(1 for l in results if l.lstrip().startswith("✅"))
+            return _tool_response(_batch_status(results), f"Завершено **{n_ok}**",
+                                  bullets=results,
+                                  proof=_report_line(rid) if _done_items else "")
     except Exception as e:
         logger.error(f"Error in complete_tasks: {e}")
-        return f"Error completing tasks: {str(e)}"
+        return _tool_response("❌", "Ошибка при завершении задач",
+                              warnings=[str(e)])
 @mcp.tool()
 async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = None,
                        manifest_id: str = "", user_reply: str = "") -> str:
@@ -2848,6 +2889,25 @@ def _tool_response(status: str, headline: str, bullets: Optional[List[str]] = No
         lines.append("")
         lines.append(proof)
     return "\n".join(lines)
+
+
+def _batch_status(lines: List[str]) -> str:
+    """Aggregate per-item status prefixes into ONE overall header status for
+    `_tool_response` — STANDARD.md §7.3: "частичный успех батча → ⚠️ в
+    заголовке, разбивка ✅/❌ по объектам в теле" (PLAN_retrofit.md п.14.5).
+    Lines that don't start with one of the legend chars (plain warnings,
+    footer notes) don't vote."""
+    seen = {c for c in ("✅", "⚠️", "❌", "🛑", "↷")
+            if any(l.lstrip().startswith(c) for l in lines)}
+    if not seen or seen == {"↷"}:
+        return "↷"
+    if seen == {"✅"}:
+        return "✅"
+    if seen <= {"🛑", "↷"}:
+        return "🛑"
+    if seen <= {"❌", "↷"}:
+        return "❌"
+    return "⚠️"
 
 
 # STANDARD.md §3.3 — докстринг-шаблон параметра `user_reply`, буквально по
@@ -5972,7 +6032,7 @@ async def get_inbox_tasks() -> str:
         return f"Ошибка получения задач из «Входящих»: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 async def move_tasks(summary: str, tasks: List[Dict[str, str]] = None,
                      to_project_id: str = "", to_project_name: str = None,
                      manifest_id: str = "", user_reply: str = "") -> str:
@@ -6045,6 +6105,12 @@ async def _move_tasks_impl(summary: str, tasks: List[Dict[str, str]],
         if by_id is None:
             return _STATE_UNAVAILABLE_MSG
         found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
+        # Light pre-snapshot (PLAN_retrofit.md п.14.2, P1): prior projectId
+        # (already resolved fresh by _split_tasks_by_state) + prior columnId,
+        # so a rollback ("move back") is mechanical.
+        snap_by_id = {f["taskId"]: {"projectId": f["projectId"],
+                                    "columnId": (by_id.get(f["taskId"]) or {}).get("columnId")}
+                     for f in found}
         moved, failed = [], []
         unverified = False
         api_fail = {}
@@ -6061,37 +6127,43 @@ async def _move_tasks_impl(summary: str, tasks: List[Dict[str, str]],
                     ok = (cur and cur.get("projectId") == to_project_id
                           and f["taskId"] not in api_fail)
                     (moved if ok else failed).append(f["title"])
-        lines = []
+        bullets = []
         if moved:
-            lines.append(f"↪ Перемещено {len(moved)} → «{to_name}»: "
-                         + ", ".join(f"«{t}»" for t in moved))
+            bullets.append(f"✅ Перемещено {len(moved)} → «{to_name}»: "
+                           + ", ".join(f"«{t}»" for t in moved))
         if unverified:
-            lines.append(f"Отправлено на перемещение {len(found)}, но "
-                         f"{_UNVERIFIED_MSG}")
+            bullets.append(f"⚠️ Отправлено на перемещение {len(found)}, но "
+                           f"{_UNVERIFIED_MSG}")
         note = _unarmed_note(found)
         if note:
-            lines.append(note)
+            bullets.append(note)
         if mismatch:
-            lines.append(_mismatch_report(mismatch, "переместил"))
+            bullets.append(_mismatch_report(mismatch, "переместил"))
         if missing:
-            lines.append(
+            bullets.append(
                 f"↷ Не найдены среди открытых {len(missing)} "
                 "(неверный id/уже завершены): "
                 + ", ".join(f"«{t['title']}»" for t in missing))
         if failed:
             extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
-            lines.append(f"❌ НЕ перемещено {len(failed)} (остались на месте"
-                         + (f"; TickTick сообщил: {extra}" if extra else "")
-                         + "): " + ", ".join(f"«{t}»" for t in failed))
+            bullets.append(f"❌ НЕ перемещено {len(failed)} (остались на месте"
+                           + (f"; TickTick сообщил: {extra}" if extra else "")
+                           + "): " + ", ".join(f"«{t}»" for t in failed))
+        rid = ""
         if found:
             rid = _op_journal("move", [
                 {"taskId": f["taskId"], "title": f["title"],
-                 "expect": {"projectId": to_project_id}} for f in found], summary)
-            lines.append(_report_line(rid))
-        return "\n".join(lines) if lines else "Ничего не перемещено."
+                 "expect": {"projectId": to_project_id},
+                 "snapshot": snap_by_id.get(f["taskId"], {})} for f in found], summary)
+        if not bullets:
+            return _tool_response("↷", "Ничего не перемещено")
+        return _tool_response(_batch_status(bullets), f"Перемещено **{len(moved)}**",
+                              bullets=bullets,
+                              proof=_report_line(rid) if found else "")
     except Exception as e:
         logger.error(f"Error in move_tasks: {e}")
-        return f"Error moving tasks: {str(e)}"
+        return _tool_response("❌", "Ошибка при перемещении задач",
+                              warnings=[str(e)])
 
 
 # ---------------------------------------------------------------------------
@@ -6313,7 +6385,7 @@ async def list_filters() -> str:
 # Subtasks (v2)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
                           parent_task_id: str = "", project_id: str = "",
                           parent_task_title: str = None,
@@ -6437,39 +6509,44 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
                     ok = (live.get("parentId") == parent_task_id
                           and f["taskId"] not in api_fail)
                     (nested if ok else failed).append(f["title"])
-        lines = []
+        bullets = []
         if nested:
-            lines.append(f"🔗 Вложено {len(nested)} под «{pname}»: "
-                         + ", ".join(f"«{t}»" for t in nested))
+            bullets.append(f"✅ Вложено {len(nested)} под «{pname}»: "
+                           + ", ".join(f"«{t}»" for t in nested))
         if unverified:
-            lines.append(f"Отправлено {len(ok_items)}, но {_UNVERIFIED_MSG}")
+            bullets.append(f"⚠️ Отправлено {len(ok_items)}, но {_UNVERIFIED_MSG}")
         if cycle_refused:
-            lines.append(f"🛑 НЕ вложено {len(cycle_refused)} — задача не может "
-                         "стать подзадачей самой себя или своего потомка "
-                         "(цикл): " + ", ".join(f"«{t}»" for t in cycle_refused))
+            bullets.append(f"🛑 НЕ вложено {len(cycle_refused)} — задача не может "
+                           "стать подзадачей самой себя или своего потомка "
+                           "(цикл): " + ", ".join(f"«{t}»" for t in cycle_refused))
         if cross_refused:
-            lines.append(f"🛑 НЕ вложено {len(cross_refused)} — задачи в ДРУГОМ "
-                         f"проекте, а родитель в «{_v2_project_names().get(parent_pid, parent_pid)}». "
-                         "Сначала перенеси move_tasks: " + ", ".join(cross_refused))
+            bullets.append(f"🛑 НЕ вложено {len(cross_refused)} — задачи в ДРУГОМ "
+                           f"проекте, а родитель в «{_v2_project_names().get(parent_pid, parent_pid)}». "
+                           "Сначала перенеси move_tasks: " + ", ".join(cross_refused))
         if failed:
             extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
-            lines.append(f"❌ НЕ вложено {len(failed)} (parentId не применился"
-                         + (f"; TickTick сообщил: {extra}" if extra else "")
-                         + "): " + ", ".join(f"«{t}»" for t in failed))
+            bullets.append(f"❌ НЕ вложено {len(failed)} (parentId не применился"
+                           + (f"; TickTick сообщил: {extra}" if extra else "")
+                           + "): " + ", ".join(f"«{t}»" for t in failed))
         if mismatch:
-            lines.append(_mismatch_report(mismatch, "вложил"))
+            bullets.append(_mismatch_report(mismatch, "вложил"))
         if missing:
-            lines.append(f"↷ Не найдены среди открытых {len(missing)}: "
-                         + ", ".join(f"«{m['title']}»" for m in missing))
+            bullets.append(f"↷ Не найдены среди открытых {len(missing)}: "
+                           + ", ".join(f"«{m['title']}»" for m in missing))
+        rid = ""
         if ok_items:
             rid = _op_journal("parent", [
                 {"taskId": f["taskId"], "title": f["title"],
                  "expect": {"parentId": parent_task_id}} for f in ok_items], summary)
-            lines.append(_report_line(rid))
-        return "\n".join(lines) if lines else "Ничего не вложено."
+        if not bullets:
+            return _tool_response("↷", "Ничего не вложено")
+        return _tool_response(_batch_status(bullets), f"Вложено **{len(nested)}**",
+                              bullets=bullets,
+                              proof=_report_line(rid) if ok_items else "")
     except Exception as e:
         logger.error(f"Error in set_task_parent: {e}")
-        return f"Error nesting tasks: {str(e)}"
+        return _tool_response("❌", "Ошибка при вложении задач",
+                              warnings=[str(e)])
 
 @mcp.tool()
 async def unset_task_parent(task_title: str, parent_task_title: str, task_id: str, parent_task_id: str, project_id: str) -> str:
@@ -6529,7 +6606,7 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
         return f"Error detaching subtask: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
                         manifest_id: str = "", user_reply: str = "") -> str:
     """
@@ -6607,32 +6684,40 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                     got = set((fresh.get(f["taskId"]) or {}).get("tags") or [])
                     ok_item = want == got and f["taskId"] not in api_fail
                     (applied if ok_item else failed).append(f["title"])
-        lines = []
+        bullets = []
         if applied:
-            lines.append(f"🏷 Теги обновлены у {len(applied)} (проверено): "
-                         + ", ".join(f"«{t}»" for t in applied))
+            bullets.append(f"✅ Теги обновлены у {len(applied)} (проверено): "
+                           + ", ".join(f"«{t}»" for t in applied))
         if unverified:
-            lines.append(f"Отправлено {len(changes)}, но {_UNVERIFIED_MSG}")
+            bullets.append(f"⚠️ Отправлено {len(changes)}, но {_UNVERIFIED_MSG}")
         if failed:
             extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
-            lines.append(f"❌ Теги НЕ применились у {len(failed)}"
-                         + (f" (TickTick сообщил: {extra})" if extra else "")
-                         + ": " + ", ".join(f"«{t}»" for t in failed))
+            bullets.append(f"❌ Теги НЕ применились у {len(failed)}"
+                           + (f" (TickTick сообщил: {extra})" if extra else "")
+                           + ": " + ", ".join(f"«{t}»" for t in failed))
         if mismatch:
-            lines.append(_mismatch_report(mismatch, "тегировал"))
+            bullets.append(_mismatch_report(mismatch, "тегировал"))
         if missing:
-            lines.append(f"↷ Не найдены среди открытых {len(missing)}: "
-                         + ", ".join(f"«{m['title']}»" for m in missing))
+            bullets.append(f"↷ Не найдены среди открытых {len(missing)}: "
+                           + ", ".join(f"«{m['title']}»" for m in missing))
+        rid = ""
         if changes:
             rid = _op_journal("tags", [
                 {"taskId": f["taskId"], "title": f["title"],
                  "expect": {"tags": tags_by_id.get(f["taskId"], [])}}
                 for f in found], summary)
-            lines.append(_report_line(rid))
-        return "\n".join(lines) if lines else "Ничего не изменено."
+        if not bullets:
+            return _tool_response("↷", "Ничего не изменено")
+        return _tool_response(_batch_status(bullets), f"Теги обновлены у **{len(applied)}**",
+                              bullets=bullets,
+                              proof=_report_line(rid) if changes else "")
     except Exception as e:
         logger.error(f"Error in set_task_tags: {e}")
-        return f"Error setting tags: {str(e)}"# ---------------------------------------------------------------------------
+        return _tool_response("❌", "Ошибка при обновлении тегов",
+                              warnings=[str(e)])
+
+
+# ---------------------------------------------------------------------------
 # Batch operations (v2)
 # ---------------------------------------------------------------------------
 
@@ -7200,7 +7285,7 @@ async def get_trash(limit: int = 50) -> str:
         return f"Ошибка получения корзины: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 async def restore_tasks(summary: str, tasks: List[Dict[str, str]] = None,
                         to_project_id: str = None,
                         manifest_id: str = "", user_reply: str = "") -> str:
@@ -7276,7 +7361,12 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
             if not _names_agree(exp, real):
                 mismatch.append(f"«{exp}» → в корзине по этому id «{real}»")
                 continue
-            ok_items.append({"taskId": tid, "title": exp or real})
+            # Snapshot of the trash record itself (PLAN_retrofit.md п.14.3, P2) —
+            # title/project as they were AT THE MOMENT of restore, for the audit
+            # trail (the trash entry disappears once restored).
+            ok_items.append({"taskId": tid, "title": exp or real,
+                             "snapshot": {"title": real,
+                                          "projectId": entry.get("projectId")}})
         if mismatch:
             return ("🛑 НЕ восстановил — id НЕ совпал с названием в корзине "
                     "(защита от «не той задачи»): " + "; ".join(mismatch)
@@ -7297,29 +7387,34 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
                 for i in ok_items:
                     ok = i["taskId"] in fresh and i["taskId"] not in api_fail
                     (restored if ok else failed).append(i["title"])
-        lines = []
+        bullets = []
         if restored:
-            lines.append(f"↩ Восстановлено из корзины {len(restored)} "
-                         "(проверено — снова среди открытых): "
-                         + ", ".join(f"«{t}»" for t in restored))
+            bullets.append(f"✅ Восстановлено из корзины {len(restored)} "
+                           "(проверено — снова среди открытых): "
+                           + ", ".join(f"«{t}»" for t in restored))
         if unverified:
-            lines.append(f"Восстановление {len(ok_items)} отправлено, но "
-                         f"{_UNVERIFIED_MSG}")
+            bullets.append(f"⚠️ Восстановление {len(ok_items)} отправлено, но "
+                           f"{_UNVERIFIED_MSG}")
         if failed:
             extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
-            lines.append(f"❌ НЕ восстановлено {len(failed)} (не появились среди "
-                         "открытых" + (f"; TickTick сообщил: {extra}" if extra else "")
-                         + "): " + ", ".join(f"«{t}»" for t in failed))
+            bullets.append(f"❌ НЕ восстановлено {len(failed)} (не появились среди "
+                           "открытых" + (f"; TickTick сообщил: {extra}" if extra else "")
+                           + "): " + ", ".join(f"«{t}»" for t in failed))
         if absent:
-            lines.append(f"↷ Не найдены в корзине {len(absent)}: "
-                         + ", ".join(f"«{t}»" for t in absent))
+            bullets.append(f"↷ Не найдены в корзине {len(absent)}: "
+                           + ", ".join(f"«{t}»" for t in absent))
+        rid = ""
         if ok_items:
             rid = _op_journal("restore", ok_items, summary)
-            lines.append(_report_line(rid))
-        return "\n".join(lines) if lines else "Ничего не восстановлено."
+        if not bullets:
+            return _tool_response("↷", "Ничего не восстановлено")
+        return _tool_response(_batch_status(bullets), f"Восстановлено **{len(restored)}**",
+                              bullets=bullets,
+                              proof=_report_line(rid) if ok_items else "")
     except Exception as e:
         logger.error(f"Error in restore_tasks: {e}")
-        return f"Error restoring tasks: {str(e)}"
+        return _tool_response("❌", "Ошибка при восстановлении задач",
+                              warnings=[str(e)])
 
 
 @mcp.tool()
