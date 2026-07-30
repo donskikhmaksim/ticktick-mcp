@@ -53,7 +53,7 @@ async def test_404_falls_back_to_task_stamps(monkeypatch):
     out = await s.get_task_activity(task_id="task1", project_id="proj1")
 
     assert "404" in out
-    assert "falling back" in out
+    assert "используем" in out
     assert "2026-07-01T10:00:00+0000" in out
     assert "2026-07-02T11:00:00+0000" in out
 
@@ -65,8 +65,8 @@ async def test_404_with_unknown_task_has_no_fallback_but_says_so(monkeypatch):
 
     out = await s.get_task_activity(task_id="ghost", project_id="proj1")
 
-    assert "Error fetching task activity" in out
-    assert "falling back" not in out
+    assert "Ошибка получения активности задачи" in out
+    assert "используем" not in out
 
 
 @pytest.mark.asyncio
@@ -78,8 +78,8 @@ async def test_empty_events_also_offers_fallback(monkeypatch):
 
     out = await s.get_task_activity(task_id="task1", project_id="proj1")
 
-    assert "No activity found" in out
-    assert "What we do know from the task itself" in out
+    assert "Активность по этой задаче не найдена" in out
+    assert "Что известно из самой задачи" in out
     assert "2026-07-01T10:00:00+0000" in out
 
 
@@ -92,6 +92,6 @@ async def test_successful_events_still_formatted_normally(monkeypatch):
 
     out = await s.get_task_activity(task_id="task1", project_id="proj1")
 
-    assert "renamed" in out
+    assert "переименовал" in out
     assert "New name" in out
     assert "404" not in out

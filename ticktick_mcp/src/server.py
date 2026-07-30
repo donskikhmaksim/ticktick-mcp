@@ -7044,18 +7044,18 @@ async def list_task_attachments(task_id: str, project_id: str = None) -> str:
     try:
         atts = await _run_blocking(lambda: _merged_task_attachments(task_id))
         if not atts:
-            return f"No attachments on task {task_id}."
-        out = f"Attachments on task {task_id} ({len(atts)}):\n"
+            return f"У задачи {task_id} нет вложений."
+        out = f"Вложения задачи {task_id} ({len(atts)}):\n"
         for i, a in enumerate(atts, 1):
-            name = a.get("fileName") or a.get("name") or "(unnamed)"
+            name = a.get("fileName") or a.get("name") or "(без имени)"
             att_id = a.get("id") or "?"
             size = a.get("fileSize") or a.get("size")
-            size_str = f", {size // 1024} KB" if isinstance(size, (int, float)) else ""
+            size_str = f", {size // 1024} КБ" if isinstance(size, (int, float)) else ""
             out += f"  {i}. {name}  (id:{att_id}{size_str})\n"
         return out
     except Exception as e:
         logger.error(f"Error in list_task_attachments: {e}")
-        return f"Error listing attachments: {str(e)}"
+        return f"Ошибка получения списка вложений: {str(e)}"
 
 
 async def _resolve_attachment_ref(task_id: str, project_id: str = None,
@@ -7857,40 +7857,44 @@ async def search_all_tasks(
                     comment_matches.append(t)
                     already.add(tid)
 
+        def _format_capped(tasks: List[Dict[str, Any]], cap: int = 100) -> str:
+            """Honest cap: render up to `cap` tasks, and say how many were left
+            out instead of silently dropping them (matches format_task_tree's
+            "... and N more" pattern used for open_matches above)."""
+            if not tasks:
+                return "(нет)\n"
+            text = "\n".join(format_task(t) for t in tasks[:cap]) + "\n"
+            if len(tasks) > cap:
+                text += f"… и ещё {len(tasks) - cap}.\n"
+            return text
+
         if not open_matches and not closed_matches and not comment_matches:
-            base = f"No tasks matched '{query}' (scope={scope}, match={match}, fields={fields}"
+            base = (f"Ничего не найдено по '{query}' "
+                    f"(scope={scope}, match={match}, fields={fields}")
             if search_comments:
-                base += f", comments: scanned {comment_fetches} task(s)"
+                base += f", комментарии: просмотрено {comment_fetches} задач(и)"
             return base + ")."
 
-        out = f"Matches for '{query}' (scope={scope}, match={match}, fields={fields}):\n\n"
+        out = f"Совпадения по '{query}' (scope={scope}, match={match}, fields={fields}):\n\n"
         if want_open:
-            out += f"── Open projects ({len(open_matches)}) ──\n"
-            out += format_task_tree(open_matches, 100) if open_matches else "(none)\n"
+            out += f"── Открытые проекты ({len(open_matches)}) ──\n"
+            out += format_task_tree(open_matches, 100) if open_matches else "(нет)\n"
             out += "\n"
         if want_closed:
-            out += f"── Closed / archived projects ({len(closed_matches)}) ──\n"
-            out += (
-                "\n".join(format_task(t) for t in closed_matches[:100])
-                if closed_matches
-                else "(none)\n"
-            )
+            out += f"── Закрытые / архивные проекты ({len(closed_matches)}) ──\n"
+            out += _format_capped(closed_matches, 100)
             out += "\n"
         if search_comments:
-            cap_note = " — CAP HIT, not all tasks scanned" if comment_capped else ""
+            cap_note = " — ДОСТИГНУТ ЛИМИТ, просмотрены не все задачи" if comment_capped else ""
             out += (
-                f"── Comment matches ({len(comment_matches)}; "
-                f"fetched comments for {comment_fetches} task(s){cap_note}) ──\n"
+                f"── Совпадения в комментариях ({len(comment_matches)}; "
+                f"комментарии загружены для {comment_fetches} задач(и){cap_note}) ──\n"
             )
-            out += (
-                "\n".join(format_task(t) for t in comment_matches[:100])
-                if comment_matches
-                else "(none)\n"
-            )
+            out += _format_capped(comment_matches, 100)
         return out
     except Exception as e:
         logger.error(f"Error in search_all_tasks: {e}")
-        return f"Error searching tasks: {str(e)}"
+        return f"Ошибка поиска задач: {str(e)}"
 
 
 @mcp.tool(annotations=READONLY)
@@ -7913,82 +7917,82 @@ async def get_task_info(task_id: str) -> str:
         tasks = state.get("syncTaskBean", {}).get("update", []) or []
         t = next((x for x in tasks if x.get("id") == task_id), None)
         if not t:
-            return (f"Task {task_id} not found among open tasks "
-                    "(it may be completed or in the trash).")
+            return (f"Задача {task_id} не найдена среди открытых "
+                    "(возможно, она завершена или в корзине).")
 
         pr = PRIORITY_MAP.get(t.get("priority", 0))
-        status = {0: "Active", 2: "Completed", -1: "Won't do"}.get(t.get("status", 0), t.get("status"))
+        status = {0: "Активна", 2: "Завершена", -1: "Не делать"}.get(t.get("status", 0), t.get("status"))
         creator = str(t.get("creator", ""))
-        who = "you" if creator == owner else f"user {creator}"
+        who = "ты" if creator == owner else f"пользователь {creator}"
 
-        out = f"Task: {t.get('title')}\n"
-        out += f"  id: {t.get('id')}  |  project: {names.get(t.get('projectId'), t.get('projectId'))}\n"
-        out += f"  status: {status}  |  priority: {pr}\n"
+        out = f"Задача: {t.get('title')}\n"
+        out += f"  id: {t.get('id')}  |  проект: {names.get(t.get('projectId'), t.get('projectId'))}\n"
+        out += f"  статус: {status}  |  приоритет: {pr}\n"
         if t.get("parentId"):
             all_tasks = state.get("syncTaskBean", {}).get("update", []) or []
             parent = next((x for x in all_tasks if x.get("id") == t["parentId"]), None)
             pname = parent.get("title") if parent else t["parentId"]
-            out += f"  parent: «{pname}»  (id:{t['parentId']})\n"
+            out += f"  родитель: «{pname}»  (id:{t['parentId']})\n"
         if t.get("startDate"):
             sd = t["startDate"][:10] if t.get("isAllDay") else t["startDate"]
-            out += f"  start: {sd}\n"
+            out += f"  начало: {sd}\n"
         if t.get("dueDate"):
             d = t["dueDate"][:10] if t.get("isAllDay") else t["dueDate"]
-            out += f"  due: {d}{'  (all-day)' if t.get('isAllDay') else ''}\n"
+            out += f"  срок: {d}{'  (весь день)' if t.get('isAllDay') else ''}\n"
         repeat = t.get("repeatFlag") or t.get("repeatRule")
         if repeat:
-            out += f"  repeat: {repeat}\n"
+            out += f"  повтор: {repeat}\n"
         reminders = t.get("reminders") or []
         if reminders:
-            out += f"  reminders: {', '.join(str(r) for r in reminders)}\n"
+            out += f"  напоминания: {', '.join(str(r) for r in reminders)}\n"
         if t.get("assignee"):
-            out += f"  assignee: {t['assignee']}\n"
+            out += f"  исполнитель: {t['assignee']}\n"
         if t.get("tags"):
-            out += f"  tags: {', '.join('#'+x for x in t['tags'])}\n"
+            out += f"  теги: {', '.join('#'+x for x in t['tags'])}\n"
         if t.get("columnId"):
             out += f"  columnId: {t['columnId']}\n"
         content = t.get("content") or t.get("desc") or ""
         if content:
-            out += f"  content: {content[:300]}\n"
+            out += f"  содержание: {content[:300]}\n"
         # Activity (no full edit-log endpoint exists; these are the task's stamps)
-        out += "\nActivity:\n"
-        out += f"  created: {t.get('createdTime', '?')} by {who}\n"
-        out += f"  last modified: {t.get('modifiedTime', '?')}\n"
+        out += "\nАктивность:\n"
+        out += f"  создана: {t.get('createdTime', '?')}  ({who})\n"
+        out += f"  изменена: {t.get('modifiedTime', '?')}\n"
         if t.get("completedTime"):
-            out += f"  completed: {t['completedTime']}\n"
+            out += f"  завершена: {t['completedTime']}\n"
         # Checklist items
         items = t.get("items") or []
         if items:
-            out += f"\nChecklist ({len(items)}):\n"
+            out += f"\nЧек-лист ({len(items)}):\n"
             for it in items:
                 mark = "x" if it.get("status") == 1 else " "
                 out += f"  [{mark}] {it.get('title')}\n"
         # Subtasks = child tasks (parentId points here)
         kids = [x for x in tasks if x.get("parentId") == task_id]
         if kids:
-            out += f"\nSubtasks ({len(kids)}):\n"
+            out += f"\nПодзадачи ({len(kids)}):\n"
             for k in kids:
                 km = "x" if k.get("status") in (2, -1) else " "
                 out += f"  [{km}] {k.get('title')}  (id:{k.get('id')})\n"
         # Attachments
         attachments = t.get("attachments") or []
         if attachments:
-            out += f"\nAttachments ({len(attachments)}):\n"
+            out += f"\nВложения ({len(attachments)}):\n"
             for a in attachments:
-                name = a.get("fileName") or a.get("name") or "(unnamed)"
+                name = a.get("fileName") or a.get("name") or "(без имени)"
                 size = a.get("fileSize")
-                size_str = f"  {size // 1024} KB" if size else ""
+                size_str = f"  {size // 1024} КБ" if size else ""
                 url = a.get("fileUrl") or a.get("url") or ""
                 out += f"  📎 {name}{size_str}"
                 if url:
                     out += f"\n     {url}"
                 out += "\n"
         if not items and not kids and not attachments:
-            out += "\n(no checklist items, subtasks, or attachments)\n"
+            out += "\n(нет чек-листа, подзадач и вложений)\n"
         return out
     except Exception as e:
         logger.error(f"Error in get_task_info: {e}")
-        return f"Error fetching task info: {str(e)}"
+        return f"Ошибка получения информации о задаче: {str(e)}"
 
 
 def _task_activity_fallback(task_id: str) -> Optional[str]:
@@ -8013,12 +8017,12 @@ def _task_activity_fallback(task_id: str) -> Optional[str]:
         if not t:
             return None
         creator = str(t.get("creator", ""))
-        who = "you" if creator == owner else (f"user {creator}" if creator else "?")
-        lines = [f"  created: {t.get('createdTime', '?')}  by {who}"]
+        who = "ты" if creator == owner else (f"пользователь {creator}" if creator else "?")
+        lines = [f"  создана: {t.get('createdTime', '?')}  ({who})"]
         if t.get("modifiedTime"):
-            lines.append(f"  last modified: {t['modifiedTime']}")
+            lines.append(f"  изменена: {t['modifiedTime']}")
         if t.get("completedTime"):
-            lines.append(f"  completed: {t['completedTime']}")
+            lines.append(f"  завершена: {t['completedTime']}")
         return "\n".join(lines)
     except Exception:
         return None
@@ -8034,11 +8038,16 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
     Backed by TickTick's "Task Activities" panel endpoint (task detail →
     "..." → Task Activities), confirmed via live capture:
         GET /api/v1/task/activity/{taskId}
-    (v1, singular "activity", no projectId in the path). Automatically walks
-    all pages. If this specific task genuinely has no logged activity (empty
-    result or 404), falls back to the created/modified/completed stamps
-    already present on the task record (a much smaller "mini-history", no
-    per-field diffs or non-owner actor names).
+    (v1, singular "activity", no projectId in the path). Walks pages
+    automatically, but only up to max_pages=20 (see
+    ticktick_v2_client.get_task_activity) — for a task with an exceptionally
+    long history, entries beyond that are not fetched and this is NOT called
+    out in the response (there is no reliable way to detect "stopped because
+    of the cap" vs "stopped because history genuinely ended" from here). If
+    this specific task genuinely has no logged activity (empty result or
+    404), falls back to the created/modified/completed stamps already present
+    on the task record (a much smaller "mini-history", no per-field diffs or
+    non-owner actor names).
 
     Args:
         task_id: ID of the task
@@ -8051,31 +8060,31 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
     try:
         events = await _run_blocking(lambda: ticktick_v2.get_task_activity(project_id, task_id))
         if not events:
-            base = "No activity found for this task (empty result from TickTick)."
+            base = "Активность по этой задаче не найдена (пустой ответ от TickTick)."
             fallback = await _run_blocking(lambda: _task_activity_fallback(task_id))
             if fallback:
-                base += "\n\nWhat we do know from the task itself:\n" + fallback
+                base += "\n\nЧто известно из самой задачи:\n" + fallback
             return base
 
         ACTION_LABELS = {
-            "T_TITLE":   "renamed",
-            "T_CONTENT": "edited description",
-            "T_DUE":     "changed due date",
-            "T_MOVE":    "moved to another list",
-            "T_PARENT":  "changed parent/subtask",
-            "T_CREATE":  "created",
-            "T_COMPLETE":"completed",
-            "T_DELETE":  "deleted",
-            "T_PRIORITY":"changed priority",
-            "T_TAG":     "changed tags",
+            "T_TITLE":   "переименовал(а)",
+            "T_CONTENT": "изменил(а) описание",
+            "T_DUE":     "изменил(а) срок",
+            "T_MOVE":    "перенёс(ла) в другой список",
+            "T_PARENT":  "изменил(а) родителя/подзадачу",
+            "T_CREATE":  "создал(а)",
+            "T_COMPLETE":"завершил(а)",
+            "T_DELETE":  "удалил(а)",
+            "T_PRIORITY":"изменил(а) приоритет",
+            "T_TAG":     "изменил(а) теги",
         }
 
-        out = f"Activity log ({len(events)} events):\n\n"
+        out = f"Журнал активности ({len(events)} событий):\n\n"
         for e in events:
             action = e.get("action", "?")
             when = (e.get("when") or "?")[:19].replace("T", " ")
             who = e.get("whoProfile", {})
-            actor = "you" if who.get("isMyself") else who.get("displayName") or "someone"
+            actor = "ты" if who.get("isMyself") else who.get("displayName") or "кто-то"
             channel = e.get("deviceChannel", "")
             label = ACTION_LABELS.get(action, action)
 
@@ -8083,11 +8092,11 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
             if action == "T_TITLE" and e.get("title"):
                 line += f' → "{e["title"]}"'
             elif action == "T_DUE":
-                before = (e.get("dueDateBefore") or "")[:10] or "none"
-                after = (e.get("dueDate") or "")[:10] or "none"
+                before = (e.get("dueDateBefore") or "")[:10] or "нет"
+                after = (e.get("dueDate") or "")[:10] or "нет"
                 line += f"  {before} → {after}"
                 if e.get("isAllDay"):
-                    line += " (all-day)"
+                    line += " (весь день)"
             elif action == "T_MOVE":
                 line += f"  {e.get('fromProjectId', '?')} → {e.get('toProjectId', '?')}"
             elif action == "T_CONTENT" and e.get("content"):
@@ -8099,13 +8108,17 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
         return out
     except Exception as e:
         logger.error(f"Error in get_task_activity: {e}")
-        msg = f"Error fetching task activity: {str(e)}"
+        msg = f"Ошибка получения активности задачи: {str(e)}"
         if "404" in str(e):
             fallback = await _run_blocking(lambda: _task_activity_fallback(task_id))
             if fallback:
-                msg += ("\n\nThis task's activity endpoint 404d — falling back "
-                        "to what's on the task record itself:\n" + fallback)
+                msg += ("\n\nЭндпойнт активности этой задачи вернул 404 — используем "
+                        "то, что есть в самой задаче:\n" + fallback)
         return msg
+
+
+_GET_CHANGES_EVENTS_CAP = 200  # final events shown in the feed
+_GET_CHANGES_OPEN_SCAN_CAP = 5000  # open tasks scanned for create/modify events
 
 
 @mcp.tool(annotations=READONLY)
@@ -8122,6 +8135,13 @@ async def get_changes(since: str, until: str = None,
 
     Dates are matched at day granularity in UTC; a task completed late at night
     local time may land on the next UTC day.
+
+    This is the widest read on the server by response volume, so it is capped
+    on both ends: at most the newest 200 events are rendered (older ones are
+    dropped with an honest "shown N of M" note), and at most the newest 5000
+    open tasks are scanned for create/modify events (an account with more open
+    tasks than that gets a matching warning — completed and trashed tasks are
+    unaffected, they're already server-side limited).
 
     Args:
         since: Start date YYYY-MM-DD (inclusive)
@@ -8160,6 +8180,20 @@ async def get_changes(since: str, until: str = None,
             completed = [t for t in completed if t.get("projectId") == project_id]
             trash = [t for t in trash if t.get("projectId") == project_id]
 
+        # get_open_tasks() has no server-side limit (unlike completed/trash
+        # above, which are already capped at the API level) — an account with
+        # a very large open-task pool would otherwise scan it unbounded. Bias
+        # the cap toward the most recently touched tasks, since those are the
+        # ones most likely to actually fall in the requested date range.
+        open_scan_total = len(open_tasks)
+        open_capped = open_scan_total > _GET_CHANGES_OPEN_SCAN_CAP
+        if open_capped:
+            open_tasks = sorted(
+                open_tasks,
+                key=lambda t: max(t.get("createdTime") or "", t.get("modifiedTime") or ""),
+                reverse=True,
+            )[:_GET_CHANGES_OPEN_SCAN_CAP]
+
         events = []  # (timestamp, icon, line)
 
         for t in open_tasks:
@@ -8185,13 +8219,32 @@ async def get_changes(since: str, until: str = None,
                     f'{when(dt)}  Удалено (в корзине): «{t.get("title","?")}» из «{pname(t.get("projectId"))}»'))
 
         if not events:
-            return f"С {since} по {until} изменений не найдено."
+            base = f"С {since} по {until} изменений не найдено."
+            if open_capped:
+                base += (f"\n\n⚠️ Открытых задач больше лимита сканирования "
+                         f"({_GET_CHANGES_OPEN_SCAN_CAP}) — просканированы "
+                         f"{_GET_CHANGES_OPEN_SCAN_CAP} последних по времени изменения "
+                         f"из {open_scan_total}; создания/правки более старых задач "
+                         "могли быть пропущены.")
+            return base
 
         events.sort(key=lambda e: e[0] or "", reverse=True)
-        header = f"Изменения с {since} по {until} ({len(events)}):\n\n"
-        body = "\n".join(f"{icon} {line}" for _, icon, line in events)
+        total_events = len(events)
+        events_capped = total_events > _GET_CHANGES_EVENTS_CAP
+        shown_events = events[:_GET_CHANGES_EVENTS_CAP]
+
+        count_note = (f"показано {len(shown_events)} из {total_events}, самые свежие"
+                      if events_capped else f"{total_events}")
+        header = f"Изменения с {since} по {until} ({count_note}):\n\n"
+        body = "\n".join(f"{icon} {line}" for _, icon, line in shown_events)
         note = ("\n\nℹ️ Для точной истории конкретной задачи (кто/куда перенёс, "
                 "что переименовал) используй get_task_activity.")
+        if open_capped:
+            note += (f"\n\n⚠️ Открытых задач больше лимита сканирования "
+                     f"({_GET_CHANGES_OPEN_SCAN_CAP}) — просканированы "
+                     f"{_GET_CHANGES_OPEN_SCAN_CAP} последних по времени изменения из "
+                     f"{open_scan_total}; создания/правки более старых задач могли быть "
+                     "пропущены.")
         return header + body + note
     except Exception as e:
         logger.error(f"Error in get_changes: {e}")
