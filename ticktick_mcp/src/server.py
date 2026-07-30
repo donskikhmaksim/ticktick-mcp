@@ -198,9 +198,23 @@ def initialize_client():
 # in-server browser OAuth flow. Only /health is exposed here.
 
 
+# PLAN_retrofit.md §16.11 / references/testing-deploy.md §14: /health must
+# say WHICH build is live, not just "up" — otherwise "feature X doesn't
+# work" is indistinguishable from "the Railway build never landed".
+# RAILWAY_GIT_COMMIT_SHA is set automatically by Railway's build environment;
+# falls back to "unknown" for local/non-Railway runs, never raises.
+_APP_VERSION = "0.1.0"  # pyproject.toml [project].version, kept in sync by hand
+_APP_COMMIT = os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown")[:12]
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request: Request) -> Response:
-    return JSONResponse({"status": "ok", "ticktick_connected": ticktick is not None})
+    return JSONResponse({
+        "status": "ok",
+        "ticktick_connected": ticktick is not None,
+        "version": _APP_VERSION,
+        "commit": _APP_COMMIT,
+    })
 
 
 # --- Attachment transfer links (/dl, /ul) -----------------------------------

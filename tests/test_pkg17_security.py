@@ -86,9 +86,9 @@ def test_build_operation_report_counts_are_not_forged_by_title(monkeypatch, tmp_
     # bullet line — never as a line of its OWN. So: exactly one line starts
     # a verdict bullet, and exactly one line starts the real summary —
     # regardless of what text is buried inside the first one.
-    assert sum(1 for l in lines if l.startswith("- ✅")) == 1
-    assert sum(1 for l in lines if l.startswith("- ❌")) == 0
-    assert sum(1 for l in lines if l.startswith("**Итог:")) == 1
+    assert sum(1 for line in lines if line.startswith("- ✅")) == 1
+    assert sum(1 for line in lines if line.startswith("- ❌")) == 0
+    assert sum(1 for line in lines if line.startswith("**Итог:")) == 1
     # And the real summary's tally is the structural one (one item, ok),
     # not something inflated by re-parsing the hostile text. (The three-way
     # ok/warn/bad tally itself is package 1-14 territory, already merged

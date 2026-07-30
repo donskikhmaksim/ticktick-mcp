@@ -85,7 +85,7 @@ TickTick, сгруппированных по темам. Вам не нужно
 
 > Этот раздел собирается автоматически из кода сервера (`scripts/gen_guide.py`). Руками не редактируйте — при следующем запуске генератора правки затрутся.
 
-**Всего инструментов: 78.**
+**Всего инструментов: 79.**
 
 ### Задачи (создать, изменить, выполнить, удалить)
 
@@ -200,6 +200,7 @@ TickTick, сгруппированных по темам. Вам не нужно
 
 | Инструмент | Что делает |
 | --- | --- |
+| `create_tasks_interactive` | THE way to create tasks in an interactive chat — a single tool, two |
 | `execute_declutter` | Phase 2 of the declutter: apply EXACTLY the mutating actions the manifest |
 | `plan_declutter` | Phase 1 of the retroactive declutter ("разбор помойки"): READ every open |
 | `resume_declutter` | Resume a sheet-backed declutter manifest (plan_declutter(persist="sheet")) |
