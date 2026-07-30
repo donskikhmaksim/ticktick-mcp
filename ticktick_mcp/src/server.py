@@ -5940,17 +5940,17 @@ async def get_habits() -> str:
     try:
         habits = await _run_blocking(lambda: ticktick_v2.get_habits())
         if not habits:
-            return "No habits found."
-        out = f"Habits ({len(habits)}):\n\n"
+            return "Привычки не найдены."
+        out = f"Привычки ({len(habits)}):\n\n"
         for h in habits:
             out += (f"- {h.get('name','?')}  (id: {h.get('id')})\n"
-                    f"    goal: {h.get('goal')} {h.get('unit','')} | type: {h.get('type')} | "
-                    f"total check-ins: {h.get('totalCheckIns', 0)}\n"
-                    f"    repeat: {h.get('repeatRule','')}\n")
+                    f"    цель: {h.get('goal')} {h.get('unit','')} | тип: {h.get('type')} | "
+                    f"всего чек-инов: {h.get('totalCheckIns', 0)}\n"
+                    f"    повтор: {h.get('repeatRule','')}\n")
         return out
     except Exception as e:
         logger.error(f"Error in get_habits: {e}")
-        return f"Error fetching habits: {str(e)}"
+        return f"Ошибка чтения привычек: {str(e)}"
 
 
 @mcp.tool()
@@ -6088,14 +6088,14 @@ async def get_habit_checkins(habit_name: str, habit_id: str, after_date: str) ->
         result = await _run_blocking(lambda: ticktick_v2.get_habit_checkins([habit_id], stamp))
         entries = result.get(habit_id, [])
         if not entries:
-            return f"No check-ins for '{habit_name}' since {after_date}."
-        labels = {2: "✓ done", 1: "✗ failed", 0: "○ not done"}
+            return f"Нет чек-инов для «{habit_name}» с {after_date}."
+        labels = {2: "выполнено", 1: "провалено", 0: "не выполнено"}
         lines = [f"- {e.get('checkinStamp')}: {labels.get(e.get('status'), e.get('status'))} "
-                 f"(value {e.get('value')}/{e.get('goal')})" for e in entries]
-        return f"Check-ins for '{habit_name}' ({len(entries)}):\n" + "\n".join(lines)
+                 f"(значение {e.get('value')}/{e.get('goal')})" for e in entries]
+        return f"Чек-ины «{habit_name}» ({len(entries)}):\n" + "\n".join(lines)
     except Exception as e:
         logger.error(f"Error in get_habit_checkins: {e}")
-        return f"Error fetching habit check-ins: {str(e)}"
+        return f"Ошибка чтения чек-инов привычки: {str(e)}"
 
 
 # ---------------------------------------------------------------------------
@@ -6480,7 +6480,7 @@ async def build_recurrence_rule(frequency: str, interval: int = 1,
     """
     freq = frequency.upper()
     if freq not in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY"):
-        return "Invalid frequency. Use DAILY, WEEKLY, MONTHLY, or YEARLY."
+        return "Неверная частота. Используй DAILY, WEEKLY, MONTHLY или YEARLY."
     parts = [f"FREQ={freq}", f"INTERVAL={max(1, interval)}"]
     if by_day:
         parts.append("BYDAY=" + ",".join(d.upper() for d in by_day))
@@ -8251,12 +8251,19 @@ async def get_changes(since: str, until: str = None,
         return f"Error fetching changes: {str(e)}"
 
 
+_PROJECT_MEMBERS_CAP = 200  # риск раздутия ответа практически нулевой, но кап формальный
+
+
 @mcp.tool(annotations=READONLY)
 async def get_project_members(project_id: str) -> str:
     """
     List the members of a shared project — owner and collaborators — with
     their user IDs (requires v2 API). Use a member's userId as the assignee
     field in create_tasks/update_tasks to assign a task to them.
+
+    ⚠️ Чувствительный read: выносит данные ДРУГИХ людей (имена, userId, роль),
+    а не только Максима — учитывай это, прежде чем пересказывать результат
+    кому-то ещё.
 
     Args:
         project_id: ID of the shared project
@@ -8270,13 +8277,17 @@ async def get_project_members(project_id: str) -> str:
             return ("Участники не найдены — проект не расшарен "
                     "или у API нет доступа к нему.")
         pname = _v2_project_names().get(project_id, project_id)
-        out = f"Участники проекта «{pname}» ({len(members)}):\n"
-        for m in members:
+        total = len(members)
+        shown = members[:_PROJECT_MEMBERS_CAP]
+        out = f"Участники проекта «{pname}» ({total}):\n"
+        for m in shown:
             name = m.get("displayName") or m.get("username") or "?"
             uid = m.get("userId") or m.get("userCode") or "?"
             role = " (владелец)" if m.get("isOwner") or m.get("owner") else ""
             status = "" if m.get("accepted", True) else "  [приглашение не принято]"
             out += f"- {name}{role} — userId: {uid}{status}\n"
+        if total > _PROJECT_MEMBERS_CAP:
+            out += f"... и ещё {total - _PROJECT_MEMBERS_CAP} (показано {_PROJECT_MEMBERS_CAP} из {total}).\n"
         return out
     except Exception as e:
         logger.error(f"Error in get_project_members: {e}")
@@ -8309,6 +8320,10 @@ async def get_tasks_by_assignee(assignee: str, include_completed: bool = False) 
     exists only for tasks in SHARED projects that were explicitly assigned via
     TickTick's "Assignee" field — a task merely mentioning someone, or created
     by them, is NOT assigned and won't appear here.
+
+    ⚠️ Чувствительный read: выносит, какие задачи назначены ДРУГОМУ человеку,
+    а не только Максиму — учитывай это, прежде чем пересказывать результат
+    кому-то ещё.
 
     Args:
         assignee: a person's name (matched against shared-project members,
@@ -8377,17 +8392,19 @@ async def list_project_columns(project_id: str) -> str:
     try:
         data = await _run_blocking(lambda: ticktick.get_project_with_data(project_id))
         if 'error' in data:
-            return f"Error fetching project: {data['error']}"
+            return f"Ошибка чтения проекта: {data['error']}"
         cols = data.get("columns", []) or []
+        pname = _v2_project_names().get(project_id, project_id)
         if not cols:
-            return ("This project has no kanban columns (it may be a list-view "
-                    "project). Switch its view to kanban to use sections.")
+            return (f"В проекте «{pname}» нет kanban-колонок (возможно, это "
+                    "проект с видом «список»). Переключи вид на kanban, "
+                    "чтобы появились секции.")
         cols = sorted(cols, key=lambda x: x.get("sortOrder", 0))
-        return f"Columns of project {project_id} ({len(cols)}):\n" + "\n".join(
+        return f"Колонки проекта «{pname}» ({len(cols)}):\n" + "\n".join(
             f"- {col.get('name', '?')}  (id: {col.get('id')})" for col in cols)
     except Exception as e:
         logger.error(f"Error in list_project_columns: {e}")
-        return f"Error fetching columns: {str(e)}"
+        return f"Ошибка чтения колонок: {str(e)}"
 
 
 @mcp.tool()
