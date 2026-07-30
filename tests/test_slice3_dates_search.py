@@ -4,12 +4,16 @@ get_engaged_tasks, get_next_tasks, get_completed_tasks.
 
 Two findings fixed here:
 
-1. Language outlier: like get_all_tasks in slice 2 (see test_slice2_reads.py),
-   get_recurring_tasks was hardcoded in Russian while every sibling in this
-   group (get_tasks_due_tomorrow/_in_days/_this_week, search_tasks,
-   get_engaged_tasks, get_next_tasks, get_completed_tasks — and the shared
-   _get_project_tasks_by_filter they funnel through) renders in English.
-   Fixed to English; task content itself is untouched.
+1. Language: retrofit package 4 (docs/PLAN_retrofit.md §4.4) mandates Russian
+   for every user-visible response of search_tasks/get_recurring_tasks/
+   get_completed_tasks (STANDARD.md references/output-format.md §7.4 — "весь
+   текст, видимый Максиму... по-русски. Без исключений."). This supersedes
+   the earlier English-canon fix that used to live here; get_recurring_tasks,
+   search_tasks and get_completed_tasks are now Russian. The other siblings
+   in this file (get_tasks_due_tomorrow/_in_days/_this_week, get_engaged_tasks,
+   get_next_tasks — and the shared _get_project_tasks_by_filter they funnel
+   through) are out of package 4's scope and stay English until their own
+   owning package translates them.
 
 2. Docstring honesty: get_tasks_due_this_week's filter is
    `today <= d <= today + 7 days`, i.e. TODAY plus the following 7 calendar
@@ -63,11 +67,10 @@ def _all_day_task(tid, title, offset_days, repeat=False):
     return task
 
 
-class TestRecurringTasksIsEnglish:
-    """get_recurring_tasks used to hard-code Russian strings; canon for this
-    group (established by the get_all_tasks fix in slice 2) is English."""
+class TestRecurringTasksIsRussian:
+    """get_recurring_tasks is Russian per §4.4 of the retrofit plan (package 4)."""
 
-    async def test_recurring_tasks_v2_branch_is_english(self, monkeypatch):
+    async def test_recurring_tasks_v2_branch_is_russian(self, monkeypatch):
         tasks = [
             {"id": "t1", "title": "Медитация", "repeatFlag": "RRULE:FREQ=DAILY",
              "projectId": "p1"},
@@ -77,25 +80,24 @@ class TestRecurringTasksIsEnglish:
 
         out = await s.get_recurring_tasks()
 
-        assert "Recurring tasks (1):" in out
+        assert "Повторяющиеся задачи (1):" in out
         assert "Медитация" in out
-        # regression guard: the old hardcoded Russian strings must be gone
-        assert "Повторяющиеся задачи" not in out
-        assert "Повторяющихся задач" not in out
+        # regression guard: the old English strings must be gone
+        assert "Recurring tasks" not in out
 
-    async def test_recurring_tasks_empty_is_english(self, monkeypatch):
+    async def test_recurring_tasks_empty_is_russian(self, monkeypatch):
         monkeypatch.setattr(s, "ticktick_v2", FakeV2([]))
 
         out = await s.get_recurring_tasks()
 
-        assert out == "No recurring tasks found."
+        assert out == "Повторяющихся задач не найдено."
 
-    async def test_recurring_tasks_search_term_empty_is_english(self, monkeypatch):
+    async def test_recurring_tasks_search_term_empty_is_russian(self, monkeypatch):
         monkeypatch.setattr(s, "ticktick_v2", FakeV2([]))
 
         out = await s.get_recurring_tasks(search_term="никогда")
 
-        assert out == "No recurring tasks found matching 'никогда'."
+        assert out == "Повторяющиеся задачи, соответствующие «никогда», не найдены."
 
 
 class TestDueThisWeekBoundary:
@@ -159,16 +161,16 @@ class TestSearchAndCompletedSmoke:
         tasks = [{"id": "t1", "title": "Позвонить в банк", "projectId": "p1"}]
         monkeypatch.setattr(s, "ticktick_v2", FakeV2(tasks))
         out = await s.search_tasks("банк")
-        assert "Tasks matching 'банк' (1):" in out
+        assert "Задачи, соответствующие «банк» (1):" in out
 
     async def test_search_tasks_rejects_blank_term(self, monkeypatch):
         monkeypatch.setattr(s, "ticktick_v2", FakeV2([]))
         out = await s.search_tasks("   ")
-        assert out == "Search term cannot be empty."
+        assert out == "Строка поиска не может быть пустой."
 
     async def test_get_completed_tasks_v2(self, monkeypatch):
         tasks = [{"id": "t1", "title": "Done thing"}]
         monkeypatch.setattr(s, "ticktick_v2", FakeV2(tasks))
         out = await s.get_completed_tasks(limit=10)
-        assert "Completed tasks (1):" in out
+        assert "Завершённые задачи (1):" in out
         assert "Done thing" in out

@@ -23,9 +23,9 @@ from starlette.responses import (JSONResponse, PlainTextResponse, Response,
                                  StreamingResponse)
 
 from .ticktick_client import TickTickClient, _normalize_date
-from .ticktick_v2_client import (ATTACHMENT_MAX_BYTES, TickTickAuthError,
-                                 TickTickV2Client, id2error_failures,
-                                 new_attachment_id)
+from .ticktick_v2_client import (ATTACHMENT_MAX_BYTES, COMPLETED_MAX_LIMIT,
+                                 TickTickAuthError, TickTickV2Client,
+                                 id2error_failures, new_attachment_id)
 from . import declutter_sheet
 
 # Set up logging
@@ -5460,17 +5460,26 @@ async def get_tasks_due_this_week() -> str:
 @mcp.tool(annotations=READONLY)
 async def search_tasks(search_term: str) -> str:
     """
-    Search for tasks in TickTick by title, content, or subtask titles. Ignores closed projects.
-    
+    Search open tasks in TickTick by title, content, or subtask titles.
+
+    Coverage is honest, not a single blanket guarantee — it differs by path:
+    with the v2 API configured (the usual case), this scans the full
+    open-task pool INCLUDING the Inbox; whether that pool also excludes tasks
+    from closed/archived projects is not guaranteed. Without v2 (fallback),
+    this iterates the official API's active project list — closed/archived
+    projects ARE excluded there by design, but the Inbox is NOT in that list
+    at all, so a term that only exists in the Inbox reads as "not found" on
+    this path.
+
     Args:
         search_term: Text to search for (case-insensitive)
     """
     err = _ensure_official()
     if err:
         return err
-    
+
     if not search_term.strip():
-        return "Search term cannot be empty."
+        return "Строка поиска не может быть пустой."
 
     try:
         # Prefer the v2 open-task pool: it includes the Inbox (which the
@@ -5480,11 +5489,14 @@ async def search_tasks(search_term: str) -> str:
             tasks = [t for t in open_tasks
                      if _task_matches_search(t, search_term)]
             if not tasks:
-                return f"No tasks found matching '{search_term}'."
-            return (f"Tasks matching '{search_term}' ({len(tasks)}):\n"
+                return f"Задачи, соответствующие «{search_term}», не найдены."
+            return (f"Задачи, соответствующие «{search_term}» ({len(tasks)}):\n"
                     + format_task_tree(tasks, 100))
 
-        # Fallback (no v2): iterate official projects — note this misses the Inbox.
+        # Fallback (no v2): iterate official projects — note this misses the
+        # Inbox. Delegates to _get_project_tasks_by_filter (package 3's
+        # helper, English template) — filter_name stays English so the
+        # sentence it's interpolated into doesn't come out half-translated.
         def search_filter(task: Dict[str, Any]) -> bool:
             return _task_matches_search(task, search_term)
 
@@ -5492,7 +5504,7 @@ async def search_tasks(search_term: str) -> str:
 
     except Exception as e:
         logger.error(f"Error in search_tasks: {e}")
-        return f"Error searching tasks: {str(e)}"
+        return f"Ошибка поиска задач: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def get_recurring_tasks(search_term: str = "") -> str:
@@ -5516,7 +5528,7 @@ async def get_recurring_tasks(search_term: str = "") -> str:
         else:
             projects = await _run_blocking(lambda: ticktick.get_projects())
             if 'error' in projects:
-                return f"Error fetching projects: {projects['error']}"
+                return f"Ошибка получения проектов: {projects['error']}"
             all_open = []
             for p in projects:
                 pid = p.get("id")
@@ -5528,17 +5540,17 @@ async def get_recurring_tasks(search_term: str = "") -> str:
             tasks = [t for t in tasks if _task_matches_search(t, search_term.strip())]
 
         if not tasks:
-            msg = (f"No recurring tasks found matching '{search_term}'." if search_term
-                   else "No recurring tasks found.")
+            msg = (f"Повторяющиеся задачи, соответствующие «{search_term}», не найдены."
+                   if search_term else "Повторяющихся задач не найдено.")
             return msg
 
-        label = (f"Recurring tasks matching '{search_term}' ({len(tasks)}):" if search_term
-                 else f"Recurring tasks ({len(tasks)}):")
+        label = (f"Повторяющиеся задачи, соответствующие «{search_term}» ({len(tasks)}):"
+                 if search_term else f"Повторяющиеся задачи ({len(tasks)}):")
         return label + "\n" + format_task_tree(tasks, 200)
 
     except Exception as e:
         logger.error(f"Error in get_recurring_tasks: {e}")
-        return f"Error retrieving recurring tasks: {str(e)}"
+        return f"Ошибка получения повторяющихся задач: {str(e)}"
 
 # New MCP Tools for Getting things done framework (Priority / Due Dates)
 
@@ -5687,8 +5699,15 @@ async def get_completed_tasks(limit: int = 50) -> str:
     """
     Get recently completed tasks across all lists (requires v2 API).
 
+    TickTick's v2 endpoint hard-caps this at COMPLETED_MAX_LIMIT (100)
+    regardless of the value passed — a `limit` above 100 is silently clamped
+    by the client library, so when exactly 100 tasks come back the response
+    says so explicitly: there may be more completed tasks than that, this
+    call just cannot see past the cap.
+
     Args:
-        limit: Maximum number of completed tasks to return (default 50)
+        limit: Maximum number of completed tasks to return (default 50,
+            hard-capped at 100 by the API)
     """
     err = _ensure_ready()
     if err:
@@ -5696,29 +5715,44 @@ async def get_completed_tasks(limit: int = 50) -> str:
     try:
         tasks = await _run_blocking(lambda: ticktick_v2.get_completed_tasks(limit=limit))
         if not tasks:
-            return "No completed tasks found."
-        out = f"Completed tasks ({len(tasks)}):\n\n"
+            return "Завершённых задач не найдено."
+        if len(tasks) == COMPLETED_MAX_LIMIT:
+            out = (f"Завершённые задачи — показано {COMPLETED_MAX_LIMIT} "
+                   "(потолок API TickTick, возможно есть ещё):\n\n")
+        else:
+            out = f"Завершённые задачи ({len(tasks)}):\n\n"
         return out + format_task_list(tasks)
     except Exception as e:
         logger.error(f"Error in get_completed_tasks: {e}")
-        return f"Error fetching completed tasks: {str(e)}"
+        return f"Ошибка получения завершённых задач: {str(e)}"
+
+
+_LIST_TAGS_CAP = 300
 
 
 @mcp.tool(annotations=READONLY)
 async def list_tags() -> str:
-    """List all tags in the account (requires v2 API)."""
+    """List all tags in the account (requires v2 API). Capped at 300 tags;
+    if there are more, the response says so explicitly instead of silently
+    truncating."""
     err = _ensure_ready()
     if err:
         return err
     try:
         tags = await _run_blocking(lambda: ticktick_v2.get_tags())
         if not tags:
-            return "No tags found."
-        lines = [f"- {t.get('label', t.get('name', '?'))}" for t in tags]
-        return f"Tags ({len(tags)}):\n\n" + "\n".join(lines)
+            return "Тегов не найдено."
+        total = len(tags)
+        shown = tags[:_LIST_TAGS_CAP]
+        lines = [f"- {t.get('label', t.get('name', '?'))}" for t in shown]
+        if total > _LIST_TAGS_CAP:
+            header = f"Теги — показано {len(shown)} из {total} (потолок сервера):\n\n"
+        else:
+            header = f"Теги ({total}):\n\n"
+        return header + "\n".join(lines)
     except Exception as e:
         logger.error(f"Error in list_tags: {e}")
-        return f"Error fetching tags: {str(e)}"
+        return f"Ошибка получения тегов: {str(e)}"
 
 
 @mcp.tool(annotations=READONLY)
@@ -5735,12 +5769,12 @@ async def get_tasks_by_tag(tag: str) -> str:
     try:
         tasks = await _run_blocking(lambda: ticktick_v2.get_tasks_by_tag(tag))
         if not tasks:
-            return f"No open tasks found with tag '{tag}'."
-        out = f"Tasks tagged '{tag}' ({len(tasks)}):\n\n"
+            return f"Открытых задач с тегом «{tag}» не найдено."
+        out = f"Задачи с тегом «{tag}» ({len(tasks)}):\n\n"
         return out + format_task_tree(tasks)
     except Exception as e:
         logger.error(f"Error in get_tasks_by_tag: {e}")
-        return f"Error fetching tasks by tag: {str(e)}"
+        return f"Ошибка получения задач по тегу: {str(e)}"
 
 
 @mcp.tool(annotations=READONLY)
@@ -5752,12 +5786,12 @@ async def get_inbox_tasks() -> str:
     try:
         tasks = await _run_blocking(lambda: ticktick_v2.get_inbox_tasks())
         if not tasks:
-            return "No open tasks in the Inbox."
-        out = f"Inbox tasks ({len(tasks)}):\n\n"
+            return "Во «Входящих» нет открытых задач."
+        out = f"Задачи во «Входящих» ({len(tasks)}):\n\n"
         return out + format_task_tree(tasks)
     except Exception as e:
         logger.error(f"Error in get_inbox_tasks: {e}")
-        return f"Error fetching inbox tasks: {str(e)}"
+        return f"Ошибка получения задач из «Входящих»: {str(e)}"
 
 
 @mcp.tool()
@@ -6068,23 +6102,33 @@ async def get_habit_checkins(habit_name: str, habit_id: str, after_date: str) ->
 # Filters / smart lists (v2)
 # ---------------------------------------------------------------------------
 
+_LIST_FILTERS_CAP = 300
+
+
 @mcp.tool(annotations=READONLY)
 async def list_filters() -> str:
-    """List saved smart-list filters with their query rules (requires v2 API)."""
+    """List saved smart-list filters with their query rules (requires v2
+    API). Capped at 300 filters; if there are more, the response says so
+    explicitly instead of silently truncating."""
     err = _ensure_ready()
     if err:
         return err
     try:
         filters = await _run_blocking(lambda: ticktick_v2.get_filters())
         if not filters:
-            return "No filters found."
-        out = f"Filters ({len(filters)}):\n\n"
-        for f in filters:
-            out += f"- {f.get('name','?')}  (id: {f.get('id')})\n    rule: {f.get('rule','')}\n"
+            return "Фильтров не найдено."
+        total = len(filters)
+        shown = filters[:_LIST_FILTERS_CAP]
+        if total > _LIST_FILTERS_CAP:
+            out = f"Фильтры — показано {len(shown)} из {total} (потолок сервера):\n\n"
+        else:
+            out = f"Фильтры ({total}):\n\n"
+        for f in shown:
+            out += f"- {f.get('name','?')}  (id: {f.get('id')})\n    правило: {f.get('rule','')}\n"
         return out
     except Exception as e:
         logger.error(f"Error in list_filters: {e}")
-        return f"Error fetching filters: {str(e)}"
+        return f"Ошибка получения фильтров: {str(e)}"
 
 
 # ---------------------------------------------------------------------------
@@ -6482,21 +6526,26 @@ async def run_filter(filter: str) -> str:
     try:
         tasks = await _run_blocking(lambda: ticktick_v2.run_filter(filter))
         if not tasks:
-            return f"Filter '{filter}' matched no open tasks."
-        out = f"Filter '{filter}' — {len(tasks)} task(s):\n\n"
+            return f"Фильтр «{filter}» не нашёл открытых задач."
+        out = f"Фильтр «{filter}» — {len(tasks)} задач(и):\n\n"
         return out + format_task_tree(tasks)
     except Exception as e:
         logger.error(f"Error in run_filter: {e}")
-        return f"Error running filter: {str(e)}"
+        return f"Ошибка запуска фильтра: {str(e)}"
 
 
 # ---------------------------------------------------------------------------
 # Project groups / folders (v2)
 # ---------------------------------------------------------------------------
 
+_LIST_PROJECT_GROUPS_CAP = 300
+
+
 @mcp.tool(annotations=READONLY)
 async def list_project_groups() -> str:
-    """List project groups (folders) (requires v2 API)."""
+    """List project groups (folders) (requires v2 API). Capped at 300
+    groups; if there are more, the response says so explicitly instead of
+    silently truncating."""
     err = _ensure_ready()
     if err:
         return err
@@ -6504,12 +6553,18 @@ async def list_project_groups() -> str:
         groups = await _run_blocking(lambda: ticktick_v2.list_project_groups())
         groups = [g for g in groups if not g.get("deleted")]
         if not groups:
-            return "No project groups found."
-        return f"Project groups ({len(groups)}):\n\n" + "\n".join(
-            f"- {g.get('name','?')}  (id: {g.get('id')})" for g in groups)
+            return "Групп проектов не найдено."
+        total = len(groups)
+        shown = groups[:_LIST_PROJECT_GROUPS_CAP]
+        if total > _LIST_PROJECT_GROUPS_CAP:
+            header = f"Группы проектов — показано {len(shown)} из {total} (потолок сервера):\n\n"
+        else:
+            header = f"Группы проектов ({total}):\n\n"
+        return header + "\n".join(
+            f"- {g.get('name','?')}  (id: {g.get('id')})" for g in shown)
     except Exception as e:
         logger.error(f"Error in list_project_groups: {e}")
-        return f"Error fetching project groups: {str(e)}"
+        return f"Ошибка получения групп проектов: {str(e)}"
 
 
 async def _live_groups(fresh: bool = True) -> List[Dict]:
@@ -6714,16 +6769,16 @@ async def get_statistics() -> str:
     try:
         s = await _run_blocking(lambda: ticktick_v2.get_statistics())
         if not s:
-            return "No statistics available."
+            return "Статистика недоступна."
         return (
-            f"Achievement score: {s.get('score')}  |  Level: {s.get('level')}\n"
-            f"Completed today: {s.get('todayCompleted')}  |  "
-            f"yesterday: {s.get('yesterdayCompleted')}  |  "
-            f"total: {s.get('totalCompleted')}"
+            f"Очки достижений: {s.get('score')}  |  Уровень: {s.get('level')}\n"
+            f"Завершено сегодня: {s.get('todayCompleted')}  |  "
+            f"вчера: {s.get('yesterdayCompleted')}  |  "
+            f"всего: {s.get('totalCompleted')}"
         )
     except Exception as e:
         logger.error(f"Error in get_statistics: {e}")
-        return f"Error fetching statistics: {str(e)}"
+        return f"Ошибка получения статистики: {str(e)}"
 
 
 @mcp.tool(annotations=READONLY)
@@ -6744,12 +6799,12 @@ async def get_trash(limit: int = 50) -> str:
     try:
         tasks = await _run_blocking(lambda: ticktick_v2.get_trash(limit))
         if not tasks:
-            return "Trash is empty."
-        out = f"Trashed tasks ({len(tasks)}):\n\n"
+            return "Корзина пуста."
+        out = f"Задачи в корзине ({len(tasks)}):\n\n"
         return out + format_task_list(tasks)
     except Exception as e:
         logger.error(f"Error in get_trash: {e}")
-        return f"Error fetching trash: {str(e)}"
+        return f"Ошибка получения корзины: {str(e)}"
 
 
 @mcp.tool()
