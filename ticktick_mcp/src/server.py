@@ -238,14 +238,24 @@ def _b64u_decode(text: str) -> bytes:
 
 def _sign_attachment_token(kind: str, project_id: str, task_id: str,
                            attachment_id: str, filename: str,
-                           ttl_minutes: int) -> Optional[str]:
+                           ttl_minutes: int, title: str = "") -> Optional[str]:
     """Build '<payload>.<signature>' for a /dl (kind='dl') or /ul (kind='ul')
-    link. Returns None when there is no MCP_SECRET to derive a key from."""
+    link. Returns None when there is no MCP_SECRET to derive a key from.
+
+    `title` (PLAN_retrofit.md п.9.1/9.4, package 9) is OPTIONAL and, when
+    given, embedded as payload key "tn" — the task's live title AT ISSUANCE
+    TIME. Only create_attachment_upload_url passes it today, so the /ul
+    identity-guard (attachment_upload_link, below) can detect a rename
+    between link issuance and use; get_attachment_download_url's /dl tokens
+    keep omitting it (package 5's territory, untouched) and simply carry no
+    "tn" key, same as before this field existed."""
     key = _link_key()
     if not key:
         return None
     payload = {"k": kind, "p": project_id, "t": task_id, "a": attachment_id,
                "n": filename or "", "e": int(time.time() + ttl_minutes * 60)}
+    if title:
+        payload["tn"] = title
     body = _b64u_encode(json.dumps(payload, separators=(",", ":"),
                                    sort_keys=True,
                                    ensure_ascii=False).encode("utf-8"))
@@ -379,12 +389,50 @@ async def attachment_download_link(request: Request) -> Response:
                              headers=headers)
 
 
+def _ul_audit(payload: Dict, token: str, *, size_bytes: int, verify: str,
+              extra: Optional[Dict] = None) -> None:
+    """PLAN_retrofit.md п.9.3 — the /ul relay is a documented exception from
+    the §3 interactive gate (a human mutates via curl, outside the model), so
+    it must carry its OWN audit trail instead: the gate's usual
+    `_journal_write` call never runs for this path. `actor` is
+    "human:out-of-band" (§11's label for a mutation the model never
+    witnessed); the token itself is NEVER logged — only a short prefix (safe
+    to correlate against server logs) and a full sha256 hash (lets an
+    incident review confirm/deny "was THIS exact link used" without the log
+    itself being a replay credential)."""
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": "ul_upload", "op": "attach_via_link",
+        "task_id": payload.get("t"), "project_id": payload.get("p"),
+        "attachment_id": payload.get("a"), "file_name": payload.get("n"),
+        "size_bytes": size_bytes, "verify": verify,
+        "token_prefix": token[:12] if token else "",
+        "token_sha256": hashlib.sha256(token.encode("ascii")).hexdigest() if token else "",
+    }
+    if extra:
+        record.update(extra)
+    _journal_write(record, actor="human:out-of-band")
+
+
 @mcp.custom_route("/ul/{token}", methods=["PUT"])
 async def attachment_upload_link(request: Request) -> Response:
     """Accept a raw request body and relay it into TickTick as the multipart
     upload it expects. The 20 MB cap is TickTick's own; the body is read in
-    chunks so an oversized upload is rejected without swallowing it whole."""
-    payload = _verify_attachment_token(request.path_params.get("token", ""), "ul")
+    chunks so an oversized upload is rejected without swallowing it whole.
+
+    PLAN_retrofit.md ПАКЕТ 9 — a human mutates here via curl, outside the
+    model, so the usual §3 plan/approve gate does not apply (documented
+    exception); compensated by three things this handler owns directly:
+    an identity-guard right before the upload (п.9.1 — the token can be up
+    to 120 min old, plenty of time for the task to be deleted/moved/renamed
+    since create_attachment_upload_url issued it), a fresh post-verify after
+    the upload that checks the attachment actually landed with the right
+    name/size (п.9.2, instead of trusting the 2xx body), and an audit-log
+    entry from THIS handler (п.9.3 — the only mutation on the server that
+    never passes through `_gate_single`/`_op_journal`, so without this call
+    it would leave zero trace)."""
+    token = request.path_params.get("token", "")
+    payload = _verify_attachment_token(token, "ul")
     if not payload:
         return PlainTextResponse(_BAD_LINK_MSG, status_code=404)
     # _ensure_ready can lazily (re-)initialize the clients, which does network
@@ -392,6 +440,33 @@ async def attachment_upload_link(request: Request) -> Response:
     err = await _run_blocking(_ensure_ready)
     if err:
         return PlainTextResponse(f"{err}\n", status_code=503)
+
+    # п.9.1 identity-guard — fail CLOSED: an unreadable state must never be
+    # treated as "task still there". Re-fetched fresh (not the cache from
+    # token issuance, which can be up to 120 min stale).
+    pre = await _run_blocking(lambda: _open_by_id(fresh=True))
+    if pre is None:
+        return PlainTextResponse(
+            "Не могу сверить — состояние TickTick сейчас недоступно. "
+            "Загрузка НЕ выполнена, ничего не потеряно — попробуй ещё раз "
+            "через минуту.\n", status_code=503)
+    live_task = pre.get(payload["t"])
+    if live_task is None:
+        return PlainTextResponse(
+            "Задача, для которой была выписана эта ссылка, больше не среди "
+            "открытых (удалена/завершена) — загрузка НЕ выполнена.\n",
+            status_code=409)
+    if live_task.get("projectId") != payload["p"]:
+        return PlainTextResponse(
+            "Задача переехала в другой проект с тех пор, как была выписана "
+            "эта ссылка — загрузка НЕ выполнена (перевыпусти ссылку).\n",
+            status_code=409)
+    live_title = live_task.get("title") or ""
+    if payload.get("tn") and not _names_agree(payload["tn"], live_title):
+        return PlainTextResponse(
+            "Задача была переименована с тех пор, как была выписана эта "
+            "ссылка (сейчас называется иначе) — загрузка НЕ выполнена "
+            "(перевыпусти ссылку).\n", status_code=409)
 
     buf = bytearray()
     async for chunk in request.stream():
@@ -416,9 +491,37 @@ async def attachment_upload_link(request: Request) -> Response:
         logger.error(f"/ul upstream error: {e}")
         return PlainTextResponse(f"TickTick не принял файл: {e}\n",
                                  status_code=502)
+
+    # п.9.2 post-verify — a 2xx from upload_attachment_bytes is not proof by
+    # itself (STANDARD.md §5.1): re-read the task's attachments fresh and
+    # confirm this exact file (by id, falling back to name+size) is really
+    # there before telling the caller "ok".
+    verify = "unverified"
+    try:
+        post_atts = await _run_blocking(lambda: _merged_task_attachments(payload["t"]))
+        match = next((a for a in post_atts if a.get("id") == payload["a"]), None)
+        if match is None:
+            match = next((a for a in post_atts
+                         if (a.get("fileName") or a.get("name")) == name), None)
+        if match is None:
+            verify = "not_found"
+        else:
+            match_size = match.get("fileSize") or match.get("size")
+            if match_size is not None and int(match_size) != len(buf):
+                verify = "size_mismatch"
+            else:
+                verify = "confirmed"
+    except Exception as e:
+        logger.warning(f"/ul post-verify failed: {e}")
+        verify = "unverified"
+
+    # п.9.3 audit — the only write path that never passes through
+    # `_gate_single`, so this handler is the sole source of a journal line.
+    _ul_audit(payload, token, size_bytes=len(buf), verify=verify)
+
     return JSONResponse({"status": "ok", "fileName": name,
                          "size_bytes": len(buf), "task_id": payload["t"],
-                         "attachment_id": payload["a"]})
+                         "attachment_id": payload["a"], "verify": verify})
 
 
 # Single source of truth for TickTick's priority levels (0/1/3/5).
@@ -7000,62 +7103,180 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
 @mcp.tool()
 async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
                               url: str = None,
-                              content_base64: str = None, filename: str = None) -> str:
+                              content_base64: str = None, filename: str = None,
+                              manifest_id: str = "", user_reply: str = "",
+                              automation_key: str = "") -> str:
     """
-    Attach a file to a task (requires v2 API). Provide the file either by URL
-    (the server downloads it) or as base64 content — e.g. a file fetched from
-    Google Drive or generated by Claude. Max 20 MB.
+    Прикрепить файл к задаче (требуется v2 API). Файл передаётся ЛИБО ссылкой
+    (сервер сам скачает), ЛИБО base64-содержимым — например, файлом,
+    полученным из Google Drive или сгенерированным Claude. Максимум 20 МБ.
+
+    Гейтовано 🟡 (docs/DESIGN_approval_gate.md, PLAN_retrofit.md п.9.5): два
+    вызова ОДНОГО И ТОГО ЖЕ инструмента, ничего не меняется на 1-м.
+
+    1-й вызов (manifest_id опущен): ничего не загружает. Строит одноразовый
+    манифест — url/content_base64/filename ПРИВЯЗАНЫ к нему, на 2-м вызове их
+    нельзя подменить — и возвращает план для показа пользователю.
+    2-й вызов (ПОСЛЕ того как пользователь реально ответил): повтори вызов с
+    manifest_id=<id из 1-го вызова> и user_reply=<дословная последняя реплика
+    пользователя> — url/content_base64/filename ИЗ ЭТОГО вызова игнорируются,
+    используются сохранённые в манифесте. НЕ делай 2-й вызов в тот же ход,
+    что и 1-й.
+
+    automation_key — ТОЛЬКО для headless-автоматики (см. create_tasks): при
+    валидном ключе гейт (план/подтверждение) пропускается целиком и вызов с
+    объектом сразу исполняется; identity-guard, post-verify и аудит-лог — нет,
+    они выполняются всегда.
 
     Args:
-        task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
-        task_id: ID of the task
-        project_id: ID of the task's project (auto-corrected if stale)
-        url: Public/direct URL to download the file from (optional)
-        content_base64: Base64-encoded file content (optional, alternative to url)
-        filename: File name to store it as (optional; inferred from url if omitted)
+        task_title: Название задачи (для сверки личности и показа в плане)
+        task_id: ID задачи
+        project_id: ID проекта задачи (автокоррекция при устаревшем значении)
+        url: Публичная/прямая ссылка на файл (опционально)
+        content_base64: Содержимое файла в base64 (опционально, альтернатива url)
+        filename: Имя файла для сохранения (опционально; иначе берётся из url)
+        manifest_id: id из 1-го вызова — передай на 2-м, чтобы реально загрузить
+        user_reply: Скопируй сюда ДОСЛОВНО последнее сообщение пользователя,
+            которым он подтвердил действие. Не сочиняй и не пересказывай
+            своими словами. Если пользователь ещё не ответил — не вызывай
+            этот инструмент.
+        automation_key: см. выше — только для headless-автоматики
     """
     err = _ensure_ready()
     if err:
         return err
-    if not url and not content_base64:
-        return "Provide either a url or content_base64 for the file."
+    if not manifest_id and not url and not content_base64:
+        return _refuse("Не передан ни url, ни content_base64 — нечего прикреплять.")
+
     title = task_title or _lookup_task_title(task_id)
     pre = _open_by_id(fresh=True)
     if pre is None:
-        return _STATE_UNAVAILABLE_MSG
+        return _refuse("Не могу сверить — состояние TickTick сейчас "
+                       "недоступно (v2 не отвечает или не настроен).")
     g = _guard_task(task_id, task_title or "", project_id, by_id=pre)
     if g.status == "mismatch":
-        return (f"🛑 НЕ прикрепил — id это «{g.title}», а НЕ «{task_title}». "
-                "Ничего не тронул.")
-    warn = ""
+        return _refuse(f"id это «{g.title}», а НЕ «{task_title}».")
+    identity_warn = []
     if g.status == "missing":
-        warn = ("\n⚠️ id не среди открытых задач (возможно, завершена) — "
-                "название НЕ проверено.")
+        identity_warn.append("id не среди открытых задач (возможно, "
+                             "завершена) — название не проверено.")
+    pid = g.project_id or _resolve_project_id(task_id, project_id)
+    live_title = g.title or title
+
+    gate = _gate_single(
+        action="attach_file", tool_name="attach_file_to_task",
+        objects=[{"id": task_id, "title": live_title, "projectId": pid,
+                 "url": url, "content_base64": content_base64,
+                 "filename": filename}],
+        manifest_id=manifest_id, user_reply=user_reply, tier=1,
+        preview_lines=[
+            f"Прикрепить {'файл «' + filename + '»' if filename else 'файл'} "
+            f"к задаче «{live_title}»"
+            + (f" (по ссылке {url})" if url else " (переданным содержимым)")],
+        automation_key=automation_key)
+    if not gate.proceed:
+        return gate.message
+
+    obj = gate.tasks[0]
+    stored_title = obj.get("title") or title
+    url = obj.get("url")
+    content_base64 = obj.get("content_base64")
+    filename = obj.get("filename")
+    pid = obj.get("projectId") or pid
+
+    # Right-before-mutation re-check (STANDARD.md §4): `g`/`pre` above were
+    # refreshed on THIS call (both call #1 and call #2 run the guard from
+    # scratch) — compare against the manifest's STORED title to catch a
+    # rename that happened between plan and confirm, not just at plan time.
+    if stored_title and g.status == "ok" and not _names_agree(stored_title, g.title):
+        return _refuse(
+            f"задача с этого id сейчас называется «{g.title}», а план был "
+            f"для «{stored_title}» — похоже, её переименовали между планом "
+            "и подтверждением.",
+            "Начни заново: attach_file_to_task(...) без manifest_id.")
+
+    actor = _resolve_automation_actor(automation_key) or "human"
     try:
-        pid = g.project_id or _resolve_project_id(task_id, project_id)
-        pre_count = len((pre.get(task_id) or {}).get("attachments") or [])
+        pre_atts = ({a.get("id") for a in
+                    await _run_blocking(lambda: _merged_task_attachments(task_id))
+                    if a.get("id")} if task_id in pre else set())
+    except Exception:
+        pre_atts = set()
+
+    try:
         att = await _run_blocking(lambda: ticktick_v2.upload_attachment(
             pid, task_id, url=url, content_base64=content_base64, filename=filename))
         # The endpoint can return a 2xx with an empty body — don't fabricate
         # details from {}; post-verify against the task's attachment list.
         shown_name = att.get("fileName") or filename or \
             ((url or "").split("?")[0].rstrip("/").split("/")[-1] or "attachment")
-        size = att.get("size")
-        size_str = f"{size} bytes" if size is not None else "размер неизвестен"
+        expected_size = None
+        if content_base64:
+            try:
+                expected_size = len(base64.b64decode(content_base64))
+            except Exception:
+                expected_size = None
+        elif att.get("size") is not None:
+            expected_size = att.get("size")
+        size_str = f"{expected_size} байт" if expected_size is not None else "размер неизвестен"
+
+        # п.9.6 — verify by NAME + SIZE, not just a count that a parallel
+        # upload on the same task could bump for an unrelated reason.
+        warnings = list(identity_warn)
         post = _open_by_id(fresh=True)
         if post is None:
-            verify = f" {_UNVERIFIED_MSG}"
-        elif task_id in post:
-            post_count = len((post.get(task_id) or {}).get("attachments") or [])
-            verify = (" (проверено: вложение видно на задаче)"
-                      if post_count > pre_count else
-                      " ⚠️ вложение НЕ видно на задаче — проверь вручную")
+            status = "⚠️"
+            verify_note = _UNVERIFIED_MSG
+        elif task_id not in post:
+            status = "⚠️"
+            verify_note = "Задача не среди открытых — вложение не проверить."
         else:
-            verify = " (задача не среди открытых — вложение не проверить)"
-        return f"Attached '{shown_name}' ({size_str}) to '{title}'{verify}{warn}"
+            try:
+                post_atts = await _run_blocking(
+                    lambda: _merged_task_attachments(task_id))
+            except Exception:
+                post_atts = None
+            if post_atts is None:
+                status = "⚠️"
+                verify_note = "Не удалось перечитать список вложений — проверь вручную."
+            else:
+                candidates = [a for a in post_atts
+                             if (a.get("fileName") or a.get("name")) == shown_name]
+                # Prefer a candidate that's NEW since pre (id not in pre_atts)
+                # so a same-named attachment that already existed doesn't
+                # masquerade as this upload.
+                match = next((a for a in candidates if a.get("id") not in pre_atts),
+                            None) or (candidates[0] if candidates else None)
+                if match is None:
+                    status = "⚠️"
+                    verify_note = f"Вложение «{shown_name}» не найдено на задаче — проверь вручную."
+                else:
+                    match_size = match.get("fileSize") or match.get("size")
+                    if (expected_size is not None and match_size is not None
+                            and int(match_size) != int(expected_size)):
+                        status = "⚠️"
+                        verify_note = (f"Вложение найдено, но размер расходится "
+                                      f"(ожидали {expected_size} байт, на задаче "
+                                      f"{match_size}) — проверь вручную.")
+                    else:
+                        status = "✅"
+                        verify_note = ""
+        if verify_note:
+            warnings.append(verify_note)
+
+        rid = _op_journal(
+            "attach", [{"taskId": task_id, "title": stored_title,
+                       "snapshot": {"fileName": shown_name, "size": expected_size}}],
+            summary=f"Прикреплён файл «{shown_name}» к «{stored_title}»",
+            actor=actor, user_reply=user_reply or None)
+
+        return _tool_response(
+            status, "Прикреплён **1** файл",
+            bullets=[f"«{shown_name}» ({size_str}) → «{stored_title}»"],
+            warnings=warnings, proof=_report_line(rid))
     except Exception as e:
         logger.error(f"Error in attach_file_to_task: {e}")
-        return f"Error attaching file: {str(e)}"
+        return _refuse(f"не удалось прикрепить файл к «{stored_title}»: {e}")
 
 
 # Base64-encoded response payloads are ~4/3 the raw byte size, plus the MCP
@@ -7170,7 +7391,7 @@ async def _resolve_attachment_ref(task_id: str, project_id: str = None,
     return (pid, att_id, name), None
 
 
-@mcp.tool()
+@mcp.tool(annotations=READONLY)
 async def download_task_attachment(task_id: str, project_id: str = None,
                                    attachment_id: str = None,
                                    filename: str = None,
@@ -7297,7 +7518,8 @@ async def get_attachment_download_url(task_id: str, project_id: str = None,
 async def create_attachment_upload_url(task_id: str, project_id: str = None,
                                        filename: str = None,
                                        size_bytes: int = None,
-                                       ttl_minutes: int = 15) -> str:
+                                       ttl_minutes: int = 15,
+                                       task_name: str = None) -> str:
     """
     Create a temporary upload LINK that puts a file onto a task (requires v2
     API) without the file passing through this conversation. Counterpart of
@@ -7315,6 +7537,14 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
     Requires the server to know its own public address (PUBLIC_BASE_URL or
     Railway's RAILWAY_PUBLIC_DOMAIN) and MCP_SECRET to be set.
 
+    task_name is REQUIRED IN PRACTICE (kept optional in the signature only so
+    old positional calls don't crash — PLAN_retrofit.md п.9.4): without it,
+    this tool refuses. It is the live task title, used for an identity-guard
+    against the task_id right here at issuance time (so a link can no longer
+    be minted for a task_id that doesn't exist), AND embedded in the signed
+    token so the /ul endpoint can re-check it hasn't been renamed by the time
+    someone actually uploads through the link — up to 120 minutes later.
+
     Args:
         task_id: ID of the task the file will be attached to
         project_id: ID of the task's project (optional; auto-resolved)
@@ -7323,6 +7553,7 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
         size_bytes: Expected file size, if known (checked against the 20 MB cap
             up front so the user isn't told "too big" only after uploading)
         ttl_minutes: How long the link stays valid, 1-120 (default 15)
+        task_name: Current title of the task (required — see above)
     """
     err = _ensure_ready()
     if err:
@@ -7332,21 +7563,42 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
         return _NO_PUBLIC_URL_MSG
     if not SECRET:
         return _NO_SECRET_MSG
+    if not (task_name or "").strip():
+        return _refuse(
+            "Не передан task_name.",
+            "Без него нельзя сверить, что ссылка выписывается на ту же "
+            "задачу, которую видит пользователь — повтори вызов с "
+            "task_name=<точное текущее название задачи>.")
     if size_bytes and size_bytes > ATTACHMENT_MAX_BYTES:
         return (f"Файл {size_bytes // (1024*1024)} МБ — TickTick принимает "
                 f"максимум {ATTACHMENT_MAX_BYTES // (1024*1024)} МБ. Ссылку не делаю.")
     try:
-        pid = project_id or _resolve_project_id(task_id, project_id)
+        pre = _open_by_id(fresh=True)
+        if pre is None:
+            return _refuse(
+                "Не могу сверить — состояние TickTick сейчас недоступно "
+                "(v2 не отвечает или не настроен).")
+        g = _guard_task(task_id, task_name, project_id, by_id=pre)
+        if g.status == "mismatch":
+            return _refuse(f"id это «{g.title}», а НЕ «{task_name}».",
+                           "Ссылку не выписываю.")
+        warn = ""
+        if g.status == "missing":
+            warn = ("\n⚠️ id не среди открытых задач (возможно, завершена) — "
+                    "название НЕ проверено.")
+        pid = g.project_id or _resolve_project_id(task_id, project_id)
         if not pid:
             return f"Could not resolve project_id for task {task_id}; pass it explicitly."
+        live_title = g.title or task_name
         att_id = new_attachment_id()
         name = filename or f"attachment_{att_id}"
         ttl = _clamp_link_ttl(ttl_minutes)
-        token = _sign_attachment_token("ul", pid, task_id, att_id, name, ttl)
+        token = _sign_attachment_token("ul", pid, task_id, att_id, name, ttl,
+                                       title=live_title)
         if not token:
             return _NO_SECRET_MSG
         url = f"{base}/ul/{token}"
-        return (f"Ссылка для загрузки «{name}» на задачу {task_id} "
+        return (f"Ссылка для загрузки «{name}» на задачу «{live_title}» "
                 f"(действует {ttl} мин, максимум "
                 f"{ATTACHMENT_MAX_BYTES // (1024*1024)} МБ):\n{url}\n\n"
                 "Загрузить может человек с телефона/компьютера или скрипт — "
@@ -7354,7 +7606,8 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
                 "мне недоступен). Команда:\n"
                 f"  curl -X PUT --upload-file ПУТЬ_К_ФАЙЛУ \"{url}\"\n\n"
                 "Файл появится на задаче сразу после успешной загрузки; "
-                "проверить — list_task_attachments.")
+                "проверить — list_task_attachments."
+                f"{warn}")
     except Exception as e:
         logger.error(f"Error in create_attachment_upload_url: {e}")
         return f"Error building upload link: {str(e)}"

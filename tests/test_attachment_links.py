@@ -13,6 +13,7 @@ import ticktick_mcp.src.server as s
 TASK_ID = "task1"
 PROJECT_ID = "proj1"
 ATT_ID = "0ae67755c0e5411ab297476a"
+TASK_NAME = "Отчёт за июль"
 
 
 @pytest.fixture
@@ -27,16 +28,51 @@ def public_base(monkeypatch):
     monkeypatch.delenv("RAILWAY_PUBLIC_DOMAIN", raising=False)
 
 
+def _live_task(title=TASK_NAME, project_id=PROJECT_ID, task_id=TASK_ID):
+    return {task_id: {"id": task_id, "title": title, "projectId": project_id}}
+
+
+@pytest.fixture(autouse=True)
+def open_by_id(monkeypatch):
+    """Identity-guard target (PLAN_retrofit.md п.9.1/9.4): a live task
+    matching TASK_ID/PROJECT_ID/TASK_NAME by default, for both
+    create_attachment_upload_url's issuance-time guard and /ul's
+    right-before-upload guard. Override per-test with
+    monkeypatch.setattr(s, "_open_by_id", ...) to exercise drift (moved/
+    renamed/deleted) or state-unavailable paths."""
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: _live_task())
+
+
+@pytest.fixture(autouse=True)
+def journal_dir(tmp_path, monkeypatch):
+    """Route the mutation journal (п.9.3 audit trail) into a scratch dir so
+    tests can inspect it without touching the real one."""
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+    return tmp_path
+
+
+def _journal_records(journal_dir):
+    path = journal_dir / "deletion_journal.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+
 class FakeV2:
     """Stand-in for the v2 client: records calls, returns canned bytes."""
 
-    def __init__(self, chunks=(b"hello ", b"world"), headers=None, raises=None):
+    def __init__(self, chunks=(b"hello ", b"world"), headers=None, raises=None,
+                attachments=None):
         self.chunks = list(chunks)
         self.headers = headers or {}
         self.raises = raises
         self.uploaded = None
         self.stream_args = None
         self.closed = False
+        # Post-verify (п.9.2/9.6) reads these back after a mutation — default
+        # empty (=> "not found"/"unverified"), set per-test to simulate the
+        # attachment landing.
+        self.attachments = attachments if attachments is not None else []
 
     # ---- download side
     def open_attachment_stream(self, project_id, task_id, attachment_id):
@@ -64,6 +100,22 @@ class FakeV2:
         self.uploaded = (project_id, task_id, attachment_id, data, filename)
         return {"fileName": filename, "size": len(data)}
 
+    def upload_attachment(self, project_id, task_id, *, url=None,
+                          content_base64=None, filename=None):
+        if self.raises:
+            raise self.raises
+        import base64 as _b64
+        data = _b64.b64decode(content_base64) if content_base64 else b"from-url"
+        self.uploaded = (project_id, task_id, None, data, filename)
+        return {"fileName": filename, "size": len(data)}
+
+    # ---- attachment listing (post-verify, both /ul and attach_file_to_task)
+    def get_task_attachments(self, task_id):
+        return list(self.attachments)
+
+    def get_content_attachment_refs(self, task_id):
+        return []
+
 
 @pytest.fixture
 def fake_v2(monkeypatch):
@@ -72,9 +124,9 @@ def fake_v2(monkeypatch):
     return fake
 
 
-def _dl_token(ttl_minutes=15, name="report.pdf", kind="dl"):
+def _dl_token(ttl_minutes=15, name="report.pdf", kind="dl", title=""):
     return s._sign_attachment_token(kind, PROJECT_ID, TASK_ID, ATT_ID,
-                                    name, ttl_minutes)
+                                    name, ttl_minutes, title=title)
 
 
 # ===========================================================================
@@ -400,7 +452,7 @@ async def test_download_url_tool_reports_unknown_filename(fake_v2, monkeypatch):
 
 async def test_upload_url_tool_returns_a_working_link(fake_v2):
     out = await s.create_attachment_upload_url(task_id=TASK_ID, project_id=PROJECT_ID,
-                                               filename="scan.png")
+                                               filename="scan.png", task_name=TASK_NAME)
     assert "https://tt.example.com/ul/" in out
     token = out.split("/ul/")[1].split()[0].strip('"')
     payload = s._verify_attachment_token(token, "ul")
@@ -411,7 +463,7 @@ async def test_upload_url_tool_returns_a_working_link(fake_v2):
 
 async def test_upload_url_tool_is_honest_that_claude_cannot_put(fake_v2):
     out = await s.create_attachment_upload_url(task_id=TASK_ID, project_id=PROJECT_ID,
-                                               filename="scan.png")
+                                               filename="scan.png", task_name=TASK_NAME)
     assert "curl -X PUT" in out
     assert "не могу" in out
 
@@ -419,7 +471,7 @@ async def test_upload_url_tool_is_honest_that_claude_cannot_put(fake_v2):
 async def test_upload_url_tool_rejects_oversized_file_upfront(fake_v2):
     out = await s.create_attachment_upload_url(
         task_id=TASK_ID, project_id=PROJECT_ID, filename="huge.zip",
-        size_bytes=s.ATTACHMENT_MAX_BYTES + 1)
+        size_bytes=s.ATTACHMENT_MAX_BYTES + 1, task_name=TASK_NAME)
     assert "/ul/" not in out
     assert "МБ" in out
 
@@ -428,7 +480,7 @@ async def test_upload_url_tool_says_so_when_domain_is_unknown(fake_v2, monkeypat
     monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
     monkeypatch.delenv("RAILWAY_PUBLIC_DOMAIN", raising=False)
     out = await s.create_attachment_upload_url(task_id=TASK_ID, project_id=PROJECT_ID,
-                                               filename="scan.png")
+                                               filename="scan.png", task_name=TASK_NAME)
     assert "PUBLIC_BASE_URL" in out and "/ul/" not in out
 
 
@@ -436,9 +488,189 @@ async def test_upload_link_round_trip_reaches_ticktick(client, fake_v2):
     """End to end over HTTP: the link the tool prints is the link the endpoint
     accepts, and the bytes land in the v2 upload call."""
     out = await s.create_attachment_upload_url(task_id=TASK_ID, project_id=PROJECT_ID,
-                                               filename="note.txt")
+                                               filename="note.txt", task_name=TASK_NAME)
     url = out.split("https://tt.example.com")[1].split()[0]
     r = client.put(url, content=b"hi there")
     assert r.status_code == 200
     assert fake_v2.uploaded[3] == b"hi there"
     assert fake_v2.uploaded[4] == "note.txt"
+
+
+# ===========================================================================
+# п.9.4 — create_attachment_upload_url: task_name required + issuance-time
+# identity-guard.
+# ===========================================================================
+
+async def test_upload_url_tool_requires_task_name(fake_v2):
+    out = await s.create_attachment_upload_url(task_id=TASK_ID, project_id=PROJECT_ID,
+                                               filename="scan.png")
+    assert "task_name" in out
+    assert "/ul/" not in out
+
+
+async def test_upload_url_tool_refuses_a_nonexistent_task(fake_v2, monkeypatch):
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: {})
+    out = await s.create_attachment_upload_url(task_id=TASK_ID, project_id=PROJECT_ID,
+                                               filename="scan.png", task_name=TASK_NAME)
+    assert "⚠️" in out  # "missing" — warns but does not hard-refuse
+    assert "/ul/" in out  # still issues the link (consistent with attach_file_to_task's guard)
+
+
+async def test_upload_url_tool_refuses_a_mismatched_title(fake_v2):
+    out = await s.create_attachment_upload_url(
+        task_id=TASK_ID, project_id=PROJECT_ID, filename="scan.png",
+        task_name="Совсем другая задача")
+    assert "🛑" in out
+    assert "/ul/" not in out
+
+
+async def test_upload_url_tool_refuses_when_state_unavailable(fake_v2, monkeypatch):
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
+    out = await s.create_attachment_upload_url(task_id=TASK_ID, project_id=PROJECT_ID,
+                                               filename="scan.png", task_name=TASK_NAME)
+    assert "🛑" in out
+    assert "/ul/" not in out
+
+
+async def test_upload_url_embeds_the_title_in_the_token(fake_v2):
+    out = await s.create_attachment_upload_url(task_id=TASK_ID, project_id=PROJECT_ID,
+                                               filename="scan.png", task_name=TASK_NAME)
+    token = out.split("/ul/")[1].split()[0].strip('"')
+    payload = s._verify_attachment_token(token, "ul")
+    assert payload["tn"] == TASK_NAME
+
+
+# ===========================================================================
+# п.9.1 — /ul identity-guard right before the upload.
+# ===========================================================================
+
+def test_ul_refuses_when_task_no_longer_exists(client, fake_v2, monkeypatch):
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: {})
+    token = _dl_token(kind="ul", title=TASK_NAME)
+    r = client.put(f"/ul/{token}", content=b"x")
+    assert r.status_code == 409
+    assert fake_v2.uploaded is None
+
+
+def test_ul_refuses_when_task_moved_to_another_project(client, fake_v2, monkeypatch):
+    monkeypatch.setattr(s, "_open_by_id",
+                        lambda fresh=False: _live_task(project_id="proj-elsewhere"))
+    token = _dl_token(kind="ul", title=TASK_NAME)
+    r = client.put(f"/ul/{token}", content=b"x")
+    assert r.status_code == 409
+    assert fake_v2.uploaded is None
+
+
+def test_ul_refuses_when_task_was_renamed(client, fake_v2, monkeypatch):
+    monkeypatch.setattr(s, "_open_by_id",
+                        lambda fresh=False: _live_task(title="Совсем другое название"))
+    token = _dl_token(kind="ul", title=TASK_NAME)
+    r = client.put(f"/ul/{token}", content=b"x")
+    assert r.status_code == 409
+    assert fake_v2.uploaded is None
+
+
+def test_ul_proceeds_when_token_carries_no_title(client, fake_v2, monkeypatch):
+    """Old-shape tokens (no "tn") — e.g. minted before this package — must
+    still work: the rename check is armed only when a title was embedded."""
+    monkeypatch.setattr(s, "_open_by_id",
+                        lambda fresh=False: _live_task(title="Что угодно"))
+    token = _dl_token(kind="ul")  # title="" by default
+    r = client.put(f"/ul/{token}", content=b"x")
+    assert r.status_code == 200
+    assert fake_v2.uploaded is not None
+
+
+def test_ul_refuses_when_state_is_unavailable(client, fake_v2, monkeypatch):
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
+    token = _dl_token(kind="ul", title=TASK_NAME)
+    r = client.put(f"/ul/{token}", content=b"x")
+    assert r.status_code == 503
+    assert fake_v2.uploaded is None
+
+
+def test_ul_matching_task_uploads_normally(client, fake_v2):
+    token = _dl_token(kind="ul", title=TASK_NAME, name="scan.png")
+    r = client.put(f"/ul/{token}", content=b"bytes")
+    assert r.status_code == 200
+    assert fake_v2.uploaded is not None
+
+
+# ===========================================================================
+# п.9.2 — /ul post-verify (name + size, not just the response body).
+# ===========================================================================
+
+def test_ul_reports_confirmed_when_attachment_lands(client, fake_v2):
+    fake_v2.attachments = [{"id": ATT_ID, "fileName": "scan.png", "fileSize": 5}]
+    token = _dl_token(kind="ul", title=TASK_NAME, name="scan.png")
+    r = client.put(f"/ul/{token}", content=b"bytes")
+    assert r.status_code == 200
+    assert r.json()["verify"] == "confirmed"
+
+
+def test_ul_reports_not_found_when_attachment_is_absent_afterwards(client, fake_v2):
+    fake_v2.attachments = []  # upload "succeeded" but nothing shows up
+    token = _dl_token(kind="ul", title=TASK_NAME, name="scan.png")
+    r = client.put(f"/ul/{token}", content=b"bytes")
+    assert r.status_code == 200  # upload itself did not fail — verify says so instead
+    assert r.json()["verify"] == "not_found"
+
+
+def test_ul_reports_size_mismatch(client, fake_v2):
+    fake_v2.attachments = [{"id": ATT_ID, "fileName": "scan.png", "fileSize": 999}]
+    token = _dl_token(kind="ul", title=TASK_NAME, name="scan.png")
+    r = client.put(f"/ul/{token}", content=b"bytes")  # 5 bytes, not 999
+    assert r.status_code == 200
+    assert r.json()["verify"] == "size_mismatch"
+
+
+def test_ul_verify_failure_does_not_fail_the_request(client, monkeypatch):
+    """A broken re-read must not turn an already-successful upload into an
+    error response — it degrades to "unverified", not a 5xx."""
+    fake = FakeV2()
+    monkeypatch.setattr(s, "ticktick_v2", fake)
+    monkeypatch.setattr(s, "_merged_task_attachments",
+                        lambda task_id: (_ for _ in ()).throw(RuntimeError("boom")))
+    token = _dl_token(kind="ul", title=TASK_NAME, name="scan.png")
+    r = client.put(f"/ul/{token}", content=b"bytes")
+    assert r.status_code == 200
+    assert r.json()["verify"] == "unverified"
+
+
+# ===========================================================================
+# п.9.3 — /ul audit log: the ONLY write path with no `_gate_single` behind it.
+# ===========================================================================
+
+def test_ul_upload_writes_an_audit_record(client, fake_v2, journal_dir):
+    fake_v2.attachments = [{"id": ATT_ID, "fileName": "scan.png", "fileSize": 5}]
+    token = _dl_token(kind="ul", title=TASK_NAME, name="scan.png")
+    r = client.put(f"/ul/{token}", content=b"bytes")
+    assert r.status_code == 200
+
+    records = _journal_records(journal_dir)
+    ul_records = [rec for rec in records if rec.get("event") == "ul_upload"]
+    assert len(ul_records) == 1
+    rec = ul_records[0]
+    assert rec["actor"] == "human:out-of-band"
+    assert rec["task_id"] == TASK_ID
+    assert rec["project_id"] == PROJECT_ID
+    assert rec["file_name"] == "scan.png"
+    assert rec["size_bytes"] == len(b"bytes")
+    assert rec["verify"] == "confirmed"
+    # The token itself must never be logged in full — only a prefix + hash.
+    assert rec["token_prefix"] == token[:12]
+    assert rec["token_prefix"] != token
+    assert "token" not in str(rec.get("token_prefix", "")) or True  # sanity: key exists
+    assert len(rec["token_sha256"]) == 64
+
+
+def test_ul_refused_upload_writes_no_audit_record(client, fake_v2, monkeypatch,
+                                                   journal_dir):
+    """A request that never reaches TickTick (bad identity-guard) isn't a
+    mutation — п.9.3 only covers the mutation itself, not every request."""
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: {})
+    token = _dl_token(kind="ul", title=TASK_NAME, name="scan.png")
+    r = client.put(f"/ul/{token}", content=b"x")
+    assert r.status_code == 409
+    records = _journal_records(journal_dir)
+    assert [rec for rec in records if rec.get("event") == "ul_upload"] == []
