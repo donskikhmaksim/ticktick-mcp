@@ -262,15 +262,22 @@ elicitation сейчас недоступен. Держим его как **це
 Опираемся на `DESIGN_write_tool_taxonomy.md`. Гейт — только там, где он оправдан;
 на мелком обратимом — ничего, чтобы Максим не делал лишних «да».
 
-- **Тир 🟢 — без гейта (15 инструментов):** `create_tasks`,
+- **Тир 🟢 — без гейта (16 инструментов):** `create_tasks`,
   `execute_task_creation`, `create_subtask`, `duplicate_task`, `checkin_habit`,
   `create_project`, `create_project_column`, `create_project_group`,
   `delete_project_group`, `move_project_to_group`, `create_tag`,
   `add_task_comment`, `update_task_comment`, `attach_file_to_task`,
-  `download_task_attachment`. `_require_consent()` их пропускает. Здесь гейт
-  только мешает.
-- **Тир 🟡 — лёгкое подтверждение (12):** `update_tasks`, `complete_tasks`,
-  `move_tasks`, `set_task_parent`, `unset_task_parent`, `set_task_tags`,
+  `download_task_attachment`, `unset_task_parent`. `_require_consent()` их
+  пропускает. Здесь гейт только мешает.
+  **`unset_task_parent`** — ИСПРАВЛЕНО (было ошибочно перечислено в 🟡 ниже, а
+  в коде гейта не было НИКОГДА; см. PLAN_retrofit.md пакет 13, п.13.2,
+  подтверждено Максимом 2026-07-29, Вариант B): асимметрия с зеркальной
+  `set_task_parent` (та в 🟡) осознанная — вложение под НЕ ТОГО родителя
+  рискует потерять контекст среди чужих подзадач, а отцепление всегда идёт в
+  одно известное конечное состояние («стать задачей верхнего уровня»); риск
+  «не той задачи» закрывает identity-guard, а не диалог подтверждения.
+- **Тир 🟡 — лёгкое подтверждение (11):** `update_tasks`, `complete_tasks`,
+  `move_tasks`, `set_task_parent`, `set_task_tags`,
   `abandon_task`, `update_project`, `archive_project`, `delete_tag`,
   `delete_task_comment`, `restore_tasks`. Тот же `_require_consent()`, но
   `MIN_CONSENT_GAP=0` и допускается упрощённый путь: показать однострочный

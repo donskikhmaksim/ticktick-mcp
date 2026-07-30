@@ -6367,11 +6367,22 @@ async def get_habits() -> str:
         return f"Ошибка чтения привычек: {str(e)}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
                         status: int = 2, value: float = None) -> str:
     """
     Record a habit check-in (requires v2 API).
+
+    Гейт §3 (manifest_id/user_reply) сюда НАМЕРЕННО не подключён —
+    документированное исключение из инварианта 2 (PLAN_retrofit.md, пакет 13,
+    п.13.1, подтверждено Максимом 2026-07-29, Вариант B): чек-ин привычки —
+    рутинная ежедневная операция, обратимая обычной перезаписью (повторный
+    checkin_habit с другим status/value на ту же дату просто перезапишет
+    запись, старое значение не теряется молча — см. дубль-проверку ниже).
+    Это не пропуск защиты, а её замена другой парой механизмов: identity-guard
+    (сверка habit_id↔habit_name перед записью) и post-verify (свежее
+    независимое чтение после записи) ниже уже полноценно закрывают риски «не
+    та привычка» и «тихо не записалось».
 
     После записи сервер сам перечитывает check-ins свежим запросом
     (независимо от того, что было отправлено) и подтверждает в ответе, что
@@ -6379,7 +6390,7 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
     результат пользователю ДОСЛОВНО, не пересказывай своими словами.
 
     Args:
-        habit_name: Name of the habit (shown first in the summary you show the user, see get_habits) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
+        habit_name: Name of the habit (shown first in the summary you show the user, see get_habits) — identity-guard below refuses the write if this doesn't match the live name for habit_id
         habit_id: ID of the habit
         date: Date to check in as YYYY-MM-DD (optional; defaults to today — pass a past date to backfill)
         status: 2 = done (default), 1 = failed, 0 = not done
@@ -6430,11 +6441,12 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
                     if e.get("checkinStamp") == stamp), None)
         if dup is not None:
             dup_label = labels.get(dup.get("status"), dup.get("status"))
-            return (f"### ↷ Чек-ин «{real_name}» не записан\n\n"
-                    f"- дата: {when_fmt}\n"
-                    f"- на эту дату чек-ин **уже есть** (статус {dup_label}, "
-                    f"{dup.get('value')}/{dup.get('goal')})\n"
-                    "- повторная запись задвоила бы значение — ничего не изменено")
+            return _tool_response(
+                "↷", f"Чек-ин «{real_name}» не записан",
+                bullets=[f"дата: {when_fmt}",
+                         f"на эту дату чек-ин **уже есть** (статус {dup_label}, "
+                         f"{dup.get('value')}/{dup.get('goal')})",
+                         "повторная запись задвоила бы значение — ничего не изменено"])
         await _run_blocking(lambda: ticktick_v2.checkin_habit(
             habit_id, date=date, status=status, value=value, goal=goal))
         val = value if value is not None else (goal if status == 2 else 0.0)
@@ -6449,18 +6461,21 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
             written = next((e for e in fresh.get(habit_id, [])
                             if e.get("checkinStamp") == stamp), None)
         except Exception as e:
-            return (f"### ⚠️ Чек-ин «{real_name}» отправлен, проверка не выполнена\n\n"
-                    f"- дата: {when_fmt}\n"
-                    f"- запрос на статус **{labels[status]}** ({val}/{goal}) отправлен\n"
-                    f"- ⚠️ независимое перечитывание (`get_habit_checkins`) упало с ошибкой: {e} — "
-                    "исход НЕ подтверждён")
+            return _tool_response(
+                "⚠️", f"Чек-ин «{real_name}» отправлен, проверка не выполнена",
+                bullets=[f"дата: {when_fmt}",
+                         f"запрос на статус **{labels[status]}** ({val}/{goal}) отправлен",
+                         f"⚠️ независимое перечитывание (`get_habit_checkins`) упало с "
+                         f"ошибкой: {e} — исход НЕ подтверждён"])
 
         if written is None:
-            return (f"### ⚠️ Чек-ин «{real_name}» отправлен, но НЕ подтверждён\n\n"
-                    f"- дата: {when_fmt}\n"
-                    f"- запрос на статус **{labels[status]}** ({val}/{goal}) отправлен\n"
-                    "- ❌ при независимом перечитывании (`get_habit_checkins`) записи на эту "
-                    "дату НЕ нашлось — исход не подтверждён, возможно нужно время на синхронизацию")
+            return _tool_response(
+                "⚠️", f"Чек-ин «{real_name}» отправлен, но НЕ подтверждён",
+                bullets=[f"дата: {when_fmt}",
+                         f"запрос на статус **{labels[status]}** ({val}/{goal}) отправлен",
+                         "❌ при независимом перечитывании (`get_habit_checkins`) записи на "
+                         "эту дату НЕ нашлось — исход не подтверждён, возможно нужно время "
+                         "на синхронизацию"])
 
         w_status = written.get("status")
         w_value = written.get("value")
@@ -6468,18 +6483,21 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
         ok = (w_status == status)
         w_label = labels.get(w_status, w_status)
         if ok:
-            return (f"### ✅ Чек-ин привычки «{real_name}»\n\n"
-                    f"- дата: {when_fmt}\n"
-                    f"- статус: **{w_label}**, значение {w_value}/{w_goal}\n"
-                    "- 🧾 подтверждено независимым чтением (`get_habit_checkins`) сразу после записи")
-        return (f"### ❌ Чек-ин «{real_name}» разошёлся с подтверждением\n\n"
-                f"- дата: {when_fmt}\n"
-                f"- запрошено: **{labels[status]}** ({val}/{goal})\n"
-                f"- при независимом перечитывании: **{w_label}** ({w_value}/{w_goal})\n"
-                "- ⚠️ запись есть, но не совпадает с тем, что отправляли — проверь вручную")
+            return _tool_response(
+                "✅", f"Чек-ин привычки «{real_name}»",
+                bullets=[f"дата: {when_fmt}",
+                         f"статус: **{w_label}**, значение {w_value}/{w_goal}",
+                         "🧾 подтверждено независимым чтением (`get_habit_checkins`) сразу "
+                         "после записи"])
+        return _tool_response(
+            "❌", f"Чек-ин «{real_name}» разошёлся с подтверждением",
+            bullets=[f"дата: {when_fmt}",
+                     f"запрошено: **{labels[status]}** ({val}/{goal})",
+                     f"при независимом перечитывании: **{w_label}** ({w_value}/{w_goal})",
+                     "⚠️ запись есть, но не совпадает с тем, что отправляли — проверь вручную"])
     except Exception as e:
         logger.error(f"Error in checkin_habit: {e}")
-        return f"Error checking in habit: {str(e)}"
+        return _tool_response("❌", "Ошибка при записи чек-ина", warnings=[str(e)])
 
 
 @mcp.tool(annotations=READONLY)
@@ -6712,13 +6730,24 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
         return _tool_response("❌", "Ошибка при вложении задач",
                               warnings=[str(e)])
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 async def unset_task_parent(task_title: str, parent_task_title: str, task_id: str, parent_task_id: str, project_id: str) -> str:
     """
     Detach a subtask from its parent, making it a top-level task (requires v2 API).
 
+    Гейт §3 (manifest_id/user_reply) сюда НАМЕРЕННО не подключён —
+    документированное исключение из инварианта 2 (PLAN_retrofit.md, пакет 13,
+    п.13.2, подтверждено Максимом 2026-07-29, Вариант B). Асимметрия с
+    зеркальной set_task_parent (та гейтится) осознанная: вложение задачи под
+    НЕ ТОГО родителя рискует потерять контекст среди чужих подзадач и требует
+    подтверждения, а отцепление всегда идёт СТРОГО в одно известное конечное
+    состояние — «стать задачей верхнего уровня» — риск отцепить не ту задачу
+    закрывает identity-guard ниже (сверка id↔title и id↔живой parentId перед
+    мутацией), а не диалог подтверждения. Post-verify ниже перечитывает
+    parentId свежим запросом сразу после отцепления.
+
     Args:
-        task_title: Title of the subtask being detached (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
+        task_title: Title of the subtask being detached (shown first in the summary you show the user) — identity-guard below refuses the write if this doesn't match the live title/parent for task_id
         parent_task_title: Title of its current parent task
         task_id: ID of the subtask to detach
         parent_task_id: ID of its current parent
@@ -6755,19 +6784,26 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
         # Post-verify: the live parentId must actually be gone.
         fresh = _open_by_id(fresh=True)
         if api_err:
-            return (f"❌ НЕ отцепил «{task_title}» — TickTick отклонил: {api_err}\n"
-                    + _report_line(rid))
+            return _tool_response(
+                "❌", f"НЕ отцепил «{task_title}»",
+                warnings=[f"TickTick отклонил: {api_err}"],
+                proof=_report_line(rid))
         if fresh is None:
-            return (f"Отцепление «{task_title}» отправлено, но {_UNVERIFIED_MSG}\n"
-                    + _report_line(rid))
+            return _tool_response(
+                "⚠️", f"Отцепление «{task_title}» отправлено, не подтверждено",
+                warnings=[_UNVERIFIED_MSG],
+                proof=_report_line(rid))
         if (fresh.get(task_id) or {}).get("parentId"):
-            return (f"❌ НЕ отцепил «{task_title}» — parentId всё ещё стоит.\n"
-                    + _report_line(rid))
-        return (f"✓ «{task_title}» отцеплена от «{parent_task_title}» (проверено).\n"
-                + _report_line(rid))
+            return _tool_response(
+                "❌", f"НЕ отцепил «{task_title}»",
+                warnings=["parentId всё ещё стоит"],
+                proof=_report_line(rid))
+        return _tool_response(
+            "✅", f"«{task_title}» отцеплена от «{parent_task_title}»",
+            proof=_report_line(rid))
     except Exception as e:
         logger.error(f"Error in unset_task_parent: {e}")
-        return f"Error detaching subtask: {str(e)}"
+        return _tool_response("❌", "Ошибка при отцеплении подзадачи", warnings=[str(e)])
 
 
 @mcp.tool(annotations=WRITE)
