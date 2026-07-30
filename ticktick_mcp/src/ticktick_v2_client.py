@@ -17,12 +17,16 @@ does, every call raises TickTickAuthError asking for a fresh cookie.
 A username/password fallback remains for local/residential use only.
 """
 
+import contextlib
+import ipaddress
 import os
 import json
 import base64
 import logging
 import mimetypes
 import re
+import socket
+import threading
 import time
 import urllib.parse
 import uuid
@@ -64,6 +68,122 @@ def id2error_failures(resp: Any, ids: List[str]) -> Dict[str, str]:
     if not isinstance(errs, dict):
         return {}
     return {str(i): str(errs[i]) for i in ids if i in errs and errs[i]}
+
+
+def _is_public_ip(ip_str: str) -> bool:
+    """True only for a routable, non-internal IPv4/IPv6 address. Blocks the
+    cloud-metadata endpoint (169.254.169.254), loopback, RFC1918/ULA private
+    ranges, link-local, multicast, and other reserved space."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local or
+                ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _resolve_public_ips(hostname: str) -> List[str]:
+    """Resolve `hostname` ourselves and require every returned address to be
+    public. Raises ValueError otherwise. Doing our own resolution (instead of
+    letting `requests`/urllib3 resolve later) is what lets the caller pin the
+    connection to an address it has actually inspected — resolving twice would
+    reopen a DNS-rebinding gap (a name that answers with a public IP on our
+    lookup and a private one a few seconds later, on the library's lookup)."""
+    try:
+        infos = socket.getaddrinfo(hostname, 443, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        raise ValueError("could not resolve host") from e
+    ips = sorted({info[4][0] for info in infos})
+    if not ips:
+        raise ValueError("DNS resolution returned no addresses")
+    for ip in ips:
+        if not _is_public_ip(ip):
+            raise ValueError("URL resolves to a non-public address")
+    return ips
+
+
+def _assert_public_https_url(url: str) -> str:
+    """SSRF guard for any server-side fetch of a caller-supplied URL: only
+    `https`, only the default TLS port, and only hostnames that resolve
+    exclusively to public IPs. Returns the validated hostname."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https":
+        raise ValueError("only https:// URLs are allowed")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("URL has no host")
+    if parsed.port is not None and parsed.port != 443:
+        raise ValueError("only port 443 is allowed")
+    _resolve_public_ips(hostname)
+    return hostname
+
+
+_dns_pin_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _pin_resolution(hostname: str, pinned_ip: str):
+    """Force any resolution of `hostname` during this block to the single IP
+    we already validated as public, instead of letting `requests` re-resolve
+    the name itself right before connecting. Without this, an attacker's DNS
+    server can answer our validation lookup with a public IP and the
+    library's own (separate) lookup moments later with 169.254.169.254 —
+    classic DNS rebinding. Scoped to just this hostname, so it never affects
+    unrelated concurrent requests; if two calls race on the *same* hostname,
+    the worst case is a request briefly using the other call's pinned IP —
+    which was independently validated as public too, so no hole opens."""
+    real_getaddrinfo = socket.getaddrinfo
+
+    def _patched(host, *args, **kwargs):
+        if host == hostname:
+            host = pinned_ip
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    with _dns_pin_lock:
+        socket.getaddrinfo = _patched
+        try:
+            yield
+        finally:
+            socket.getaddrinfo = real_getaddrinfo
+
+
+def fetch_url_safely(url: str, *, max_bytes: int,
+                      timeout: int = REQUEST_TIMEOUT,
+                      max_redirects: int = 5) -> bytes:
+    """Download a caller-supplied URL with SSRF protections applied to every
+    hop: https-only, public-IP-only (including after DNS resolution, via
+    `_pin_resolution`), redirects followed manually (never `allow_redirects=
+    True` — that's the standard SSRF-filter bypass: a public host redirects to
+    an internal one) with the same validation re-run each time, and the body
+    streamed with a hard size cap instead of buffered whole into memory
+    (`r.content` on an attacker-controlled multi-GB response is a free OOM)."""
+    current = url
+    for _ in range(max_redirects + 1):
+        hostname = _assert_public_https_url(current)
+        pinned_ips = _resolve_public_ips(hostname)
+        with _pin_resolution(hostname, pinned_ips[0]):
+            resp = requests.get(current, timeout=timeout, stream=True,
+                                allow_redirects=False)
+        try:
+            if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location")
+                if not location:
+                    raise ValueError("redirect response had no Location header")
+                current = urllib.parse.urljoin(current, location)
+                continue
+            resp.raise_for_status()
+            buf = bytearray()
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                buf.extend(chunk)
+                if len(buf) > max_bytes:
+                    raise ValueError(
+                        f"remote file exceeds {max_bytes // (1024*1024)} MB limit")
+            return bytes(buf)
+        finally:
+            resp.close()
+    raise ValueError("too many redirects")
 
 
 def new_attachment_id() -> str:
@@ -729,9 +849,12 @@ class TickTickV2Client:
         POST /api/v1/attachment/upload/{projectId}/{taskId}/{attachmentId},
         multipart with a single `file` field."""
         if url:
-            r = requests.get(url, timeout=60)
-            r.raise_for_status()
-            data = r.content
+            # SSRF guard: https-only, public-IP-only (incl. after DNS
+            # resolution), redirects re-validated per hop, streamed with a
+            # hard cap — see fetch_url_safely(). Cap at ATTACHMENT_MAX_BYTES
+            # so a huge remote file fails fast instead of buffering into
+            # memory only to be rejected afterwards.
+            data = fetch_url_safely(url, max_bytes=ATTACHMENT_MAX_BYTES)
             if not filename:
                 filename = url.split("?")[0].rstrip("/").split("/")[-1] or "attachment"
         elif content_base64:

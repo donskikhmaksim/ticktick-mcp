@@ -46,7 +46,10 @@ def open_by_id(monkeypatch):
 @pytest.fixture(autouse=True)
 def journal_dir(tmp_path, monkeypatch):
     """Route the mutation journal (п.9.3 audit trail) into a scratch dir so
-    tests can inspect it without touching the real one."""
+    tests can inspect it without touching the real one. Also covers 17.3:
+    /dl and /ul durably record each consumed jti under this same
+    _JOURNAL_DIR (default '/data', a Railway volume — not writable/desired
+    in tests) so a token can only ever be used once."""
     monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
     return tmp_path
 
@@ -322,6 +325,44 @@ def test_dl_upstream_auth_failure_is_502(client, monkeypatch):
     monkeypatch.setattr(s, "ticktick_v2", FakeV2(raises=TickTickAuthError("expired")))
     r = client.get(f"/dl/{_dl_token()}")
     assert r.status_code == 502
+
+
+def test_dl_token_is_single_use(client, fake_v2):
+    """17.3: a signed link's TTL bounds how long it works, but a valid
+    signature only proves WE issued it — anyone who later sees the URL
+    (access log, Referer, chat transcript, screenshot) can replay it until
+    then unless the FIRST use burns it."""
+    token = _dl_token()
+    r1 = client.get(f"/dl/{token}")
+    assert r1.status_code == 200
+    r2 = client.get(f"/dl/{token}")
+    assert r2.status_code == 404
+    assert "устарела" in r2.text
+    # Second attempt must never have reached TickTick.
+    assert fake_v2.stream_args == (PROJECT_ID, TASK_ID, ATT_ID)
+
+
+def test_ul_token_is_single_use(client, fake_v2):
+    """Mandatory for /ul specifically — it's a write: a multi-use upload
+    link would let anyone who saw the URL overwrite the attachment
+    repeatedly within the TTL window."""
+    token = _dl_token(kind="ul", name="scan.png")
+    r1 = client.put(f"/ul/{token}", content=b"first")
+    assert r1.status_code == 200
+    assert fake_v2.uploaded[3] == b"first"
+    r2 = client.put(f"/ul/{token}", content=b"second")
+    assert r2.status_code == 404
+    assert fake_v2.uploaded[3] == b"first"  # unchanged — second call never ran
+
+
+def test_relay_tokens_with_the_same_jti_across_kinds_do_not_collide(client, fake_v2):
+    """Sanity check on _consume_relay_token: two DIFFERENT tokens (different
+    jti, since each is freshly minted) must not interfere with each other."""
+    t1 = _dl_token()
+    t2 = _dl_token()
+    assert t1 != t2
+    assert client.get(f"/dl/{t1}").status_code == 200
+    assert client.get(f"/dl/{t2}").status_code == 200
 
 
 def test_dl_without_v2_is_503(client, monkeypatch):

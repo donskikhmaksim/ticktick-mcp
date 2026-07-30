@@ -6,11 +6,14 @@ import json
 import mimetypes
 import os
 import re
+import secrets
+import threading
 import time
 import unicodedata
 import urllib.parse
 import uuid
 import logging
+import requests
 from datetime import date, datetime, timezone, timedelta
 from typing import Dict, List, Any, Literal, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -252,8 +255,13 @@ def _sign_attachment_token(kind: str, project_id: str, task_id: str,
     key = _link_key()
     if not key:
         return None
+    # "j": a per-token random id (128-bit CSPRNG, security-checklist.md §7)
+    # that lets the endpoint enforce single-use (17.3/§3) independently of
+    # the signature — the signature only proves WE issued the link, not that
+    # it hasn't already been used.
     payload = {"k": kind, "p": project_id, "t": task_id, "a": attachment_id,
-               "n": filename or "", "e": int(time.time() + ttl_minutes * 60)}
+               "n": filename or "", "e": int(time.time() + ttl_minutes * 60),
+               "j": secrets.token_urlsafe(16)}
     if title:
         payload["tn"] = title
     body = _b64u_encode(json.dumps(payload, separators=(",", ":"),
@@ -288,6 +296,63 @@ def _verify_attachment_token(token: str, kind: str) -> Optional[Dict]:
     if not (payload.get("p") and payload.get("t") and payload.get("a")):
         return None
     return payload
+
+
+_RELAY_TOKEN_LOCK = threading.Lock()
+
+
+def _relay_used_tokens_path() -> str:
+    return os.path.join(_JOURNAL_DIR, "relay_token_uses.jsonl")
+
+
+def _consume_relay_token(jti: str, exp: float) -> bool:
+    """Single-use gate for a /dl or /ul relay token's `jti` (security-
+    checklist.md §3): returns True only the FIRST time this jti is seen and
+    durably remembers it, so a second request for the same link — even after
+    a Railway redeploy, within the token's own TTL — is refused. A signed URL
+    lives on past this one request: access logs, browser history, a
+    screenshot. Without single-use, anyone who later sees that URL can use it
+    again until the TTL runs out; with it, the FIRST use burns it. Backed by
+    a small durable jsonl file (same volume the deletion/manifest journals
+    already use) rather than only in-memory state, so the reuse window can't
+    reopen on restart. Entries self-prune to their own `exp` on each rewrite
+    — bounded by TTL, not by total link volume. Fails CLOSED: if the jti is
+    missing (old pre-rollout token) or the durable store can't be written,
+    the token is treated as already used / never grantable, never as
+    reusable-without-limit."""
+    if not jti:
+        return False
+    path = _relay_used_tokens_path()
+    now = time.time()
+    with _RELAY_TOKEN_LOCK:
+        try:
+            os.makedirs(_JOURNAL_DIR, exist_ok=True)
+        except OSError:
+            return False
+        entries = []
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(rec, dict) and rec.get("exp", 0) > now:
+                        entries.append(rec)
+        except FileNotFoundError:
+            pass
+        if any(rec.get("jti") == jti for rec in entries):
+            return False
+        entries.append({"jti": jti, "exp": exp})
+        try:
+            tmp = f"{path}.tmp.{os.getpid()}"
+            with open(tmp, "w", encoding="utf-8") as f:
+                for rec in entries:
+                    f.write(json.dumps(rec) + "\n")
+            os.replace(tmp, path)
+        except OSError:
+            return False
+        return True
 
 
 def _public_base_url() -> Optional[str]:
@@ -350,6 +415,12 @@ async def attachment_download_link(request: Request) -> Response:
     Nothing is buffered: bytes go TickTick -> here -> client."""
     payload = _verify_attachment_token(request.path_params.get("token", ""), "dl")
     if not payload:
+        return PlainTextResponse(_BAD_LINK_MSG, status_code=404)
+    # 17.3: single-use — a valid, unexpired signature only proves WE issued
+    # this link, not that it's the first time it's been used. Same 404 as an
+    # invalid token: a re-request must not be distinguishable from a bad one.
+    if not await _run_blocking(
+            lambda: _consume_relay_token(payload.get("j"), payload["e"])):
         return PlainTextResponse(_BAD_LINK_MSG, status_code=404)
     # _ensure_ready can lazily (re-)initialize the clients, which does network
     # I/O — keep it off the event loop like every other blocking client call.
@@ -435,6 +506,14 @@ async def attachment_upload_link(request: Request) -> Response:
     payload = _verify_attachment_token(token, "ul")
     if not payload:
         return PlainTextResponse(_BAD_LINK_MSG, status_code=404)
+    # 17.3: single-use is mandatory for /ul specifically — it's a WRITE. A
+    # multi-use upload link within its TTL means anyone who ever saw the URL
+    # (access log, Referer, chat transcript) can overwrite the attachment
+    # repeatedly. Consume it BEFORE reading the body, so a stale/replayed
+    # request never gets far enough to matter.
+    if not await _run_blocking(
+            lambda: _consume_relay_token(payload.get("j"), payload["e"])):
+        return PlainTextResponse(_BAD_LINK_MSG, status_code=404)
     # _ensure_ready can lazily (re-)initialize the clients, which does network
     # I/O — keep it off the event loop like every other blocking client call.
     err = await _run_blocking(_ensure_ready)
@@ -488,9 +567,12 @@ async def attachment_upload_link(request: Request) -> Response:
         return PlainTextResponse("Сервер не может обратиться к TickTick "
                                  "(сессия истекла).\n", status_code=502)
     except Exception as e:
+        # security-checklist.md §3/§6: the holder of a /ul token is not an
+        # authenticated user of the underlying system — never repeat the raw
+        # upstream exception text back to them (log only) — it can contain
+        # request/response internals that aren't this caller's to see.
         logger.error(f"/ul upstream error: {e}")
-        return PlainTextResponse(f"TickTick не принял файл: {e}\n",
-                                 status_code=502)
+        return PlainTextResponse("TickTick не принял файл.\n", status_code=502)
 
     # п.9.2 post-verify — a 2xx from upload_attachment_bytes is not proof by
     # itself (STANDARD.md §5.1): re-read the task's attachments fresh and
@@ -698,6 +780,28 @@ _STATE_UNAVAILABLE_MSG = (
     "не настроен). Ничего не тронул.")
 _UNVERIFIED_MSG = ("⚠️ Исход НЕ ПОДТВЕРЖДЁН — состояние TickTick недоступно, "
                    "проверь вручную.")
+
+
+def _classify_fetch_error(e: Exception) -> str:
+    """Map an exception from fetching a caller-supplied URL to a short,
+    generic message safe to return to the caller. `str(e)` on a `requests`
+    exception typically embeds the FULL request URL (including any
+    query-string token — e.g. a Drive/S3 presigned link), so it must never be
+    echoed back verbatim; the full exception still goes to the server log."""
+    if isinstance(e, ValueError):
+        # Our own SSRF-guard / size-cap checks (_assert_public_https_url,
+        # fetch_url_safely) raise ValueError with a message that is already
+        # safe (no URL/query string in it).
+        return str(e)
+    if isinstance(e, requests.exceptions.Timeout):
+        return "source did not respond in time"
+    if isinstance(e, requests.exceptions.HTTPError):
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        return f"source returned an error (status {status})" if status else \
+            "source returned an error"
+    if isinstance(e, requests.exceptions.RequestException):
+        return "could not reach the source URL"
+    return "unexpected error while attaching the file"
 
 
 def _open_by_id(fresh: bool = False) -> Optional[Dict[str, Dict]]:
@@ -1293,7 +1397,11 @@ async def create_tasks(
         the created task's id as `(id:<id>)` so callers can link it without a
         follow-up title search.
     """
-    if not (SECRET and automation_key and hmac.compare_digest(automation_key, SECRET)):
+    # 17.5: resolved against the per-consumer TICKTICK_AUTOMATION_KEY_<name>
+    # keys (see _resolve_automation_actor), not the MCP_SECRET path secret —
+    # see the comment in _require_consent for why reusing MCP_SECRET here is
+    # a hole (it would put the path secret into the model's own transcript).
+    if _resolve_automation_actor(automation_key) is None:
         return ("🛑 Прямое создание — только для автоматики. Интерактивный флоу: "
                 "plan_task_creation (покажи эхо пользователю дословно) → явное "
                 "«да» → execute_task_creation(manifest_id, user_reply=<реплика>) "
@@ -2581,7 +2689,15 @@ def _require_consent(
     skipped (there is no plan_shown_at to compare against) but the
     affirmative-reply check still fully applies. Never mutates `manifest`
     except to invalidate it on an explicit "no"."""
-    if SECRET and automation_key and hmac.compare_digest(automation_key, SECRET):
+    # 17.5 (security-checklist.md §6): this used to compare automation_key
+    # against MCP_SECRET directly — the same secret that authenticates the
+    # /mcp URL path itself. That means the path secret would also have to be
+    # handed to every automation consumer as a tool ARGUMENT, i.e. placed in
+    # the model's own transcript, and one compromised consumer could not be
+    # revoked without rotating the path secret for everyone. Now resolved
+    # against the separate, per-consumer TICKTICK_AUTOMATION_KEY_<name> keys
+    # (see _resolve_automation_actor / п.1.1) instead.
+    if _resolve_automation_actor(automation_key) is not None:
         return ConsentResult(True, "automation_key")
     if tier <= 0:
         return ConsentResult(True, "tier0-no-gate")
@@ -2971,9 +3087,9 @@ def _gate_single(*, action: str, tool_name: str, objects: List[Dict],
     `_gate_batch`.
 
     `automation_key`: resolved via `_resolve_automation_actor` against the
-    NEW per-consumer `TICKTICK_AUTOMATION_KEY_<name>` keys from п.1.1 (NOT
-    the legacy `MCP_SECRET` `_require_consent` still checks for
-    `create_tasks` pre-migration). references/automation-secrets.md §8: a
+    per-consumer `TICKTICK_AUTOMATION_KEY_<name>` keys from п.1.1 — same as
+    `_require_consent` and `create_tasks` now use (17.5 migrated both off
+    the legacy direct `MCP_SECRET` comparison). references/automation-secrets.md §8: a
     valid key legitimately has no human to say "да" for, so it skips the
     plan→execute dance ENTIRELY — a single call with a valid `automation_key`
     and `objects` proceeds immediately, `manifest_id`/`user_reply` ignored.
@@ -3357,14 +3473,45 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
         return f"Error executing deletion manifest: {str(e)}"
 
 
+_STATUS_MARKS_RE = re.compile("[✅⚠️❌🛑↷🧾]")
+
+
+def _safe_text(text: Any, max_len: int = 120) -> str:
+    """Neutralize externally-authored text (task/project title, etc.) before
+    substituting it into a server-built markdown verdict line. Without this,
+    a title containing `\\n` / markdown / a status emoji could forge extra
+    bullet lines or a fake "Итог" inside operation_report's proof block —
+    undermining the one thing that block exists to guarantee (this is server-
+    authored proof the agent is told to reprint verbatim; see
+    security-checklist.md §1). Server-authored status marks and bullet
+    structure ("- ✅ **«…»**") are always applied OUTSIDE this function's
+    output, never inside it. Steps: (a) collapse \\r/\\n to a space — one
+    external object = one output line, (b) strip markdown block-structure
+    from the front of the string (#, >, -, *, |, ```), (c) strip the frozen
+    status-mark legend so a title can't impersonate a verdict, (d) hard
+    length cap so a giant title can't push the proof text out of view."""
+    s = "" if text is None else str(text)
+    s = s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    s = _STATUS_MARKS_RE.sub("", s)
+    s = s.lstrip()
+    while s[:1] in ("#", ">", "-", "*", "|", "`"):
+        s = s[1:].lstrip()
+    if len(s) > max_len:
+        s = s[:max_len] + "…"
+    return s
+
+
 def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
                  names: Dict) -> str:
     """One verdict line for one journaled item, judged from CURRENT live state."""
     tid = item.get("taskId")
-    title = item.get("title") or (item.get("snapshot") or {}).get("title") \
-        or f"[task {str(tid)[:8]}…]"
+    title = _safe_text(item.get("title") or (item.get("snapshot") or {}).get("title")
+        or f"[task {str(tid)[:8]}…]")
     live = live_map.get(tid)
     exp = item.get("expect") or {}
+    # Project/tag names are also externally authored (the user named the
+    # project) — same treatment before they land in a verdict line.
+    nm = lambda pid, fallback=None: _safe_text(names.get(pid, fallback if fallback is not None else pid))
 
     if op == "delete":
         return (f"- ❌ **«{title}»** — ВСЁ ЕЩЁ существует (удаление не состоялось "
@@ -3397,15 +3544,15 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         probs = []
         want_pid = exp.get("projectId")
         if want_pid and live.get("projectId") != want_pid:
-            probs.append(f"в «{names.get(live.get('projectId'), '?')}», а не "
-                         f"«{names.get(want_pid, want_pid)}»")
+            probs.append(f"в «{nm(live.get('projectId'), '?')}», а не "
+                         f"«{nm(want_pid, want_pid)}»")
         if exp.get("columnId") and live.get("columnId") != exp.get("columnId"):
             probs.append("раздел не применился")
         if probs:
             return f"- ⚠️ **«{title}»** — создана, но: " + "; ".join(probs)
         # State the FACTS, not agreement-with-intent: the reader must SEE where
         # it landed, so a wrong-but-consistent request is still visible.
-        facts = [f"в «{names.get(live.get('projectId'), live.get('projectId'))}»"]
+        facts = [f"в «{nm(live.get('projectId'), live.get('projectId'))}»"]
         if live.get("columnId"):
             facts.append("раздел применён")
         if live.get("dueDate"):
@@ -3415,9 +3562,9 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         return f"- ✅ **«{title}»** — создана {', '.join(facts)}"
     if op == "move":
         want = exp.get("projectId")
-        return (f"- ✅ **«{title}»** — в **«{names.get(want, want)}»**"
+        return (f"- ✅ **«{title}»** — в **«{nm(want, want)}»**"
                 if live.get("projectId") == want else
-                f"- ❌ **«{title}»** — осталась в «{names.get(live.get('projectId'), '?')}»")
+                f"- ❌ **«{title}»** — осталась в «{nm(live.get('projectId'), '?')}»")
     if op == "tags":
         want = set(exp.get("tags") or [])
         got = set(live.get("tags") or [])
@@ -3587,6 +3734,14 @@ _DC_OBSOLETE_STALE_DAYS = 60
 # should resolve well under this; the whole-pile case (what the timeout was
 # actually hit on) is exactly what should be narrowed via `scope` instead.
 _DC_MAX_TASKS = 200
+# 17.6 (security-checklist.md §4): plan_declutter's `max_tasks` argument can
+# raise the per-call cap above _DC_MAX_TASKS, but a cap that the caller can
+# override without any ceiling isn't a cap — the model can (and, asked to
+# "just declutter everything", will) pass an arbitrarily large value and walk
+# straight into the O(n^2) clustering pass over the whole account. This is a
+# hard, server-side maximum that `max_tasks` can NEVER exceed, independent of
+# what the argument says.
+_DC_MAX_TASKS_HARD_CAP = 500
 # Per-call timeout for the two declutter shim calls (judge_fn/smart_fn only —
 # NOT _dc_shim_json's default, which other/future callers may still rely on
 # at 90s). The two calls now run concurrently, so wall-clock cost is
@@ -4584,7 +4739,9 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
             call only. 0/unset keeps the default. Raise it when you deliberately
             want to declutter a bigger set and accept the extra time — the O(n^2)
             clustering and the bundled shim prompts grow with the set, and the
-            MCP client's ~60s timeout still applies, so keep it sane.
+            MCP client's ~60s timeout still applies, so keep it sane. Hard
+            ceiling: _DC_MAX_TASKS_HARD_CAP = 500, regardless of what you
+            pass here.
         persist: "ram" (default, unchanged behaviour) or "sheet" (durable —
             see above).
     """
@@ -4605,11 +4762,17 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
     # resolved scope is too big — see _DC_MAX_TASKS for the sizing rationale.
     # Read-only refusal: nothing above this point mutated anything, and
     # nothing below runs, so there is no partial analysis/journal entry.
-    cap = max_tasks if isinstance(max_tasks, int) and max_tasks > 0 else _DC_MAX_TASKS
+    requested_cap = max_tasks if isinstance(max_tasks, int) and max_tasks > 0 else _DC_MAX_TASKS
+    # 17.6: max_tasks can raise the cap for this call, but never past the
+    # hard ceiling — clamp regardless of what the argument asked for.
+    cap = min(requested_cap, _DC_MAX_TASKS_HARD_CAP)
     if len(tasks) > cap:
+        can_still_raise = (not (isinstance(max_tasks, int) and max_tasks > 0)
+                           and cap < _DC_MAX_TASKS_HARD_CAP)
         raise_hint = (
-            "" if (isinstance(max_tasks, int) and max_tasks > 0)
-            else f" Либо, если уверен в объёме, подними лимит: max_tasks={len(tasks)}.")
+            f" Либо, если уверен в объёме, подними лимит: "
+            f"max_tasks={min(len(tasks), _DC_MAX_TASKS_HARD_CAP)}."
+            if can_still_raise else "")
         return (f"🛑 Отказ: в этой области {len(tasks)} открытых задач — "
                 f"больше капа {cap} (на {len(tasks) - cap} "
                 "больше). Разбор такого объёма упрётся в таймаут ещё до "
@@ -7592,8 +7755,15 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
             bullets=[f"«{shown_name}» ({size_str}) → «{stored_title}»"],
             warnings=warnings, proof=_report_line(rid))
     except Exception as e:
+        # Don't echo str(e) to the caller: for a url= attach it's often a
+        # requests exception carrying the FULL request URL, including any
+        # query-string token (e.g. a Drive/S3 presigned link) — that would
+        # leak the secret into the tool response and the model's transcript.
+        # Full detail (safe to have a URL in a server-side log) still goes
+        # to the log; the reply gets a short, classified message only.
         logger.error(f"Error in attach_file_to_task: {e}")
-        return _refuse(f"не удалось прикрепить файл к «{stored_title}»: {e}")
+        return _refuse(f"не удалось прикрепить файл к «{stored_title}»: "
+                       f"{_classify_fetch_error(e)}")
 
 
 # Base64-encoded response payloads are ~4/3 the raw byte size, plus the MCP

@@ -131,11 +131,28 @@ def test_tier2_inline_no_manifest_only_needs_affirmative_reply():
                               user_reply="да, сливай").ok is True
 
 
-def test_automation_key_bypasses_everything():
+def test_automation_key_bypasses_everything(monkeypatch):
+    # 17.5: the automation-key bypass is resolved against the separate
+    # TICKTICK_AUTOMATION_KEY_<name> keys now, never against MCP_SECRET (the
+    # /mcp path secret) — see _resolve_automation_actor.
+    monkeypatch.setenv("TICKTICK_AUTOMATION_KEY", "test-automation-key")
     m = _fresh_manifest(consumed=True)  # would refuse on every other ground
     r = s._require_consent(action="delete", tier=2, manifest=m, user_reply="",
-                           automation_key=s.SECRET)
+                           automation_key="test-automation-key")
     assert r.ok is True
+
+
+def test_mcp_secret_no_longer_doubles_as_automation_key(monkeypatch):
+    """17.5 regression guard: MCP_SECRET (the /mcp path secret) must NOT
+    also work as automation_key — reusing it would mean handing the path
+    secret to every automation consumer as a tool ARGUMENT (visible in the
+    model's own transcript), and a compromised consumer could only be
+    revoked by rotating the path secret for everyone."""
+    monkeypatch.delenv("TICKTICK_AUTOMATION_KEY", raising=False)
+    m = _fresh_manifest(consumed=True)
+    r = s._require_consent(action="delete", tier=2, manifest=m, user_reply="",
+                           automation_key=s.SECRET)
+    assert r.ok is False
 
 
 def test_wrong_automation_key_does_not_bypass():
@@ -171,10 +188,28 @@ async def test_create_tasks_automation_key_still_bypasses(monkeypatch):
         return "created"
 
     monkeypatch.setattr(s, "_create_tasks_impl", fake_impl)
+    # 17.5: same migration as _require_consent — the per-consumer key, not
+    # MCP_SECRET.
+    monkeypatch.setenv("TICKTICK_AUTOMATION_KEY", "test-automation-key")
     result = await s.create_tasks("Test", [{"title": "X", "project_id": "p1"}],
-                                  automation_key=s.SECRET)
+                                  automation_key="test-automation-key")
     assert result == "created"
     assert len(calls) == 1
+
+
+async def test_create_tasks_mcp_secret_no_longer_bypasses(monkeypatch):
+    monkeypatch.delenv("TICKTICK_AUTOMATION_KEY", raising=False)
+    calls = []
+
+    async def fake_impl(summary, tasks):
+        calls.append((summary, tasks))
+        return "created"
+
+    monkeypatch.setattr(s, "_create_tasks_impl", fake_impl)
+    result = await s.create_tasks("Test", [{"title": "X", "project_id": "p1"}],
+                                  automation_key=s.SECRET)
+    assert "🛑" in result
+    assert calls == []
 
 
 # ===========================================================================
