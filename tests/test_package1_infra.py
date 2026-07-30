@@ -320,3 +320,70 @@ def test_gate_single_journals_actor_for_automation_execution(tmp_path, monkeypat
     assert exec_recs
     assert exec_recs[-1]["actor"] == "automation:tgbot"
     assert exec_recs[-1]["gate_ok"] is True
+
+
+# ===========================================================================
+# PLAN_retrofit.md §15.4 — create_tasks must journal `actor="automation:<name>"`
+# for a bot call, not the "human" default, so the journal can tell a bot's
+# create apart from an interactively-approved one after the fact.
+# ===========================================================================
+
+class _FakeTicktickCreate:
+    """Minimal `ticktick` (official-API) fake: create_task always succeeds."""
+
+    def create_task(self, title, project_id, **kwargs):
+        return {"id": "new-task-1", "title": title, "projectId": project_id}
+
+
+def test_create_tasks_journals_automation_actor_not_human(tmp_path, monkeypatch):
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+    monkeypatch.setattr(s, "_ensure_official", lambda: None)
+    monkeypatch.setattr(s, "ticktick", _FakeTicktickCreate())
+    # ticktick_v2 left falsy (None) on purpose: the post-verify branch is
+    # gated on `and ticktick_v2`, so this keeps the test to exactly the
+    # journal-actor plumbing under test, without needing a v2 fake too.
+    monkeypatch.setattr(s, "ticktick_v2", None)
+    monkeypatch.setenv("TICKTICK_AUTOMATION_KEY", "secret-default")
+    monkeypatch.delenv("MCP_SECRET", raising=False)
+
+    import asyncio
+    result = asyncio.run(s.create_tasks(
+        "Создаю задачу", [{"title": "X", "project_id": "p1"}],
+        automation_key="secret-default"))
+    assert "🛑" not in result
+
+    import json
+    path = tmp_path / "deletion_journal.jsonl"
+    recs = [json.loads(line) for line in path.read_text().strip().splitlines()]
+    create_recs = [r for r in recs if r.get("op") == "create"]
+    assert create_recs, "expected a 'create' journal record"
+    assert create_recs[-1]["actor"] == "automation:default"
+
+
+def test_create_tasks_interactive_execute_mode_journals_human(tmp_path, monkeypatch):
+    """The interactive (plan → approve → execute) path must keep journaling
+    'human' — only the direct automation_key path gets 'automation:<name>'."""
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+    monkeypatch.setattr(s, "_ensure_official", lambda: None)
+    monkeypatch.setattr(s, "ticktick", _FakeTicktickCreate())
+    monkeypatch.setattr(s, "ticktick_v2", None)
+
+    import time
+    mid = "actor-check-mid"
+    s._MANIFESTS[mid] = {
+        "kind": "create", "raw": [{"title": "X", "project_id": "p1"}],
+        "created": time.monotonic(), "plan_shown_at": time.monotonic() - 10,
+        "summary": "test", "consumed": False,
+    }
+
+    import asyncio
+    result = asyncio.run(s.create_tasks_interactive(
+        "test", manifest_id=mid, user_reply="да"))
+    assert "🛑" not in result
+
+    import json
+    path = tmp_path / "deletion_journal.jsonl"
+    recs = [json.loads(line) for line in path.read_text().strip().splitlines()]
+    create_recs = [r for r in recs if r.get("op") == "create"]
+    assert create_recs, "expected a 'create' journal record"
+    assert create_recs[-1]["actor"] == "human"

@@ -1331,10 +1331,11 @@ async def create_tasks(
     (up to 4 levels: task → subtask → sub-subtask → sub-sub-subtask).
 
     ⛔ INTERACTIVE ASSISTANTS: this tool will REFUSE your call. Use
-    plan_task_creation (read-only) → reprint its echo VERBATIM → get the
-    user's explicit «да/ок» → execute_task_creation(manifest_id, user_reply=...)
-    → operation_report. Do NOT try to fill automation_key — you don't know it
-    and guessing is a protocol violation.
+    create_tasks_interactive(summary, tasks) (read-only on the 1st call) →
+    reprint its echo VERBATIM → get the user's explicit «да/ок» →
+    create_tasks_interactive(manifest_id, user_reply=...) → operation_report.
+    Do NOT try to fill automation_key — you don't know it and guessing is a
+    protocol violation.
 
     automation_key is ONLY for headless automation clients (bots/pipelines):
     they pass their own connection secret to prove they are automation, which
@@ -1401,17 +1402,23 @@ async def create_tasks(
     # keys (see _resolve_automation_actor), not the MCP_SECRET path secret —
     # see the comment in _require_consent for why reusing MCP_SECRET here is
     # a hole (it would put the path secret into the model's own transcript).
-    if _resolve_automation_actor(automation_key) is None:
+    actor = _resolve_automation_actor(automation_key)
+    if actor is None:
         return ("🛑 Прямое создание — только для автоматики. Интерактивный флоу: "
-                "plan_task_creation (покажи эхо пользователю дословно) → явное "
-                "«да» → execute_task_creation(manifest_id, user_reply=<реплика>) "
-                "→ operation_report. Ничего не создано.")
-    return await _create_tasks_impl(summary, tasks)
+                "create_tasks_interactive(summary, tasks) (покажи эхо пользователю "
+                "дословно) → явное «да» → create_tasks_interactive(manifest_id, "
+                "user_reply=<реплика>) → operation_report. Ничего не создано.")
+    return await _create_tasks_impl(summary, tasks, actor=actor)
 
 
-async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
+async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]],
+                             actor: str = "human") -> str:
     """Shared creation engine behind create_tasks (direct/headless) and
-    execute_task_creation (approved manifest)."""
+    create_tasks_interactive (approved manifest). `actor` (PLAN_retrofit.md
+    §15.4) is journaled verbatim on the create record — "automation:<name>"
+    when called from create_tasks with a valid automation_key, "human" for
+    every interactive execute-mode call — so the journal can tell a bot's
+    create apart from a human-approved one after the fact."""
     err = _ensure_official()
     if err:
         return err
@@ -1483,7 +1490,7 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                         logger.warning(f"Column failed: {e}")
                         sub_notes.append(f"⚠️ раздел (column) не применился: {e}")
                 total = len(tasks_flat)
-                line = f"✓ «{title}» + {total - 1} подзадач (дерево, {total} всего)"
+                line = f"«{title}» + {total - 1} подзадач (дерево, {total} всего)"
                 if root_id:
                     line += f" (id:{root_id})"
                     to_verify.append((title, root_id, project_id, t.get("column_id")))
@@ -1586,7 +1593,7 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                     f"⚠️ запрошено {len(sub_items)} подзадач, но они требуют "
                     "v2 API — v2 недоступен, подзадачи НЕ созданы")
 
-            line = f"✓ «{title}»"
+            line = f"«{title}»"
             if sub_count:
                 line += f" + {sub_count} подзадач"
             if task_id:
@@ -1635,20 +1642,27 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                     f"⚠️ подзадачи НЕ подтвердились ({len(lost_subs)}): "
                     + ", ".join(f"«{t}»" for t in lost_subs))
 
-    parts = []
-    if created:
-        parts.append(f"Создано {len(created)}:\n" + "\n".join(created))
-    if warnings:
-        parts.append("Проверка назначения:\n" + "\n".join(warnings))
-    if failed:
-        parts.append(f"Ошибки ({len(failed)}):\n" + "\n".join(failed))
+    # PLAN_retrofit.md §15.8 — wrapped in the shared _tool_response helper
+    # (STANDARD.md §7.1) instead of the former bare "\n\n".join(parts), so
+    # the reply always starts with a self-contained "### <status> <headline>"
+    # first line.
+    bullets = [f"✅ {c}" for c in created] + [f"❌ {f}" for f in failed]
+    rid = ""
     if to_verify:
         rid = _op_journal("create", [
             {"taskId": v_id, "title": v_title,
              "expect": {"projectId": v_pid, **({"columnId": v_col} if v_col else {})}}
-            for v_title, v_id, v_pid, v_col in to_verify], summary)
-        parts.append(_report_line(rid))
-    return "\n\n".join(parts)
+            for v_title, v_id, v_pid, v_col in to_verify], summary, actor=actor)
+    if not bullets:
+        return _tool_response("↷", "Ничего не создано")
+    status = _batch_status(bullets)
+    if warnings and status == "✅":
+        status = "⚠️"
+    headline = f"Создано **{len(created)}**"
+    if failed:
+        headline += f", ошибок **{len(failed)}**"
+    return _tool_response(status, headline, bullets=bullets, warnings=warnings,
+                          proof=_report_line(rid) if to_verify else "")
 
 
 def _suggest_destinations(titles: List[str], names: Dict[str, str]) -> List[Dict]:
@@ -1728,40 +1742,89 @@ def _suggest_destinations(titles: List[str], names: Dict[str, str]) -> List[Dict
         return []
 
 
-@mcp.tool(annotations=READONLY)
-async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
-                             max_items: int = 50) -> str:
+@mcp.tool()
+async def create_tasks_interactive(summary: str, tasks: List[Dict[str, Any]] = None,
+                                   max_items: int = 50, manifest_id: str = "",
+                                   user_reply: str = "") -> str:
     """
-    Phase 1 of confirmed creation — THE way to create tasks in an interactive
-    chat: build a creation MANIFEST without creating anything. Read-only.
+    THE way to create tasks in an interactive chat — a single tool, two
+    modes, PLAN_retrofit.md §15.1 (STANDARD.md §3.1, same "one tool, two
+    calls" shape as delete_tasks). Replaces the former two-tool pair
+    `plan_task_creation` + `execute_task_creation`, which are now thin
+    deprecated redirects to THIS tool (§12 — old names never disappear).
 
-    Accepts the same task objects as create_tasks (title, project_id, content,
-    due_date, priority, tags, column_id, subtasks, …). project_id is OPTIONAL:
-    when the user didn't name a project, OMIT it — the server itself looks at
-    the owner's project list and proposes a destination PER TASK (sure /
-    ❓-unsure with a clarifying question). Do NOT guess a project yourself and
-    NEVER default to a sandbox like «Тест». The echo also flags title
-    duplicates already open in the destination. The user answers per item
-    («2 — в Fix&Roll»); re-plan with explicit project_id for corrections.
+    Call #1 (manifest_id/user_reply omitted): creates NOTHING — read-only.
+    Accepts the same task objects as create_tasks (title, project_id,
+    content, due_date, priority, tags, column_id, subtasks, …). project_id is
+    OPTIONAL: when the user didn't name a project, OMIT it — the server
+    itself looks at the owner's project list and proposes a destination PER
+    TASK (sure / ❓-unsure with a clarifying question). Do NOT guess a project
+    yourself and NEVER default to a sandbox like «Тест». The echo also flags
+    title duplicates already open in the destination. The user answers per
+    item («2 — в Fix&Roll»); re-plan (call #1 again) with explicit
+    project_id for corrections.
 
-    IMPORTANT: reprint the returned text VERBATIM and IN FULL to the user, ask
-    for explicit confirmation («ок?»), and only after their real reply call
-    execute_task_creation(manifest_id, user_reply=<their literal message>).
-    Afterwards run operation_report and reprint it — the flow is: спроси →
-    сделай → докажи. Creation is low-risk and reversible (🟢 — see
-    docs/DESIGN_write_tool_taxonomy.md), so execute_task_creation does not
-    hard-block on user_reply the way the deletion/declutter tools do; it's
-    still required in the signature for a uniform manifest format.
+    IMPORTANT: reprint the returned text VERBATIM and IN FULL to the user,
+    ask for explicit confirmation («ок?»), and only after their real reply
+    make call #2: create_tasks_interactive(manifest_id=<id from call #1>,
+    user_reply=<their literal message>) — do NOT make call #2 in the same
+    turn as call #1. Afterwards run operation_report and reprint it — the
+    flow is: спроси → сделай → докажи.
+
+    Call #2 (manifest_id + user_reply): creates exactly what call #1 planned.
+    Gated 🟡 — this goes through the SAME `_require_consent(tier=1)` as every
+    other gated tool (§3.3): an empty, negative, or fabricated-looking
+    `user_reply` is refused and NOTHING is created. (A stale comment used to
+    claim creation "does not hard-block on user_reply the way the
+    deletion/declutter tools do" — that was false; PLAN_retrofit.md §15.3
+    removed it. Creation is lower-risk/more-reversible than deletion, which
+    is why it's tier 🟡 not 🔴 — anti-duplet timing is looser (`min_gap`
+    default via tier 1) — but the affirmative-reply check itself is not
+    relaxed at all.)
+
+    NOTE on `object_hash` (PLAN_retrofit.md §15.5): unlike delete/declutter
+    manifests, this manifest carries NO `object_hash` binding. That is a
+    deliberate exception, not a silently-skipped check (§3.3 п.2): a create
+    manifest's items don't exist as TickTick objects yet at plan time, so
+    there is nothing live to hash and re-compare at execute time — the thing
+    being bound (project_id, title, …) is exactly what's stored verbatim in
+    the manifest and can't drift underneath it the way an existing task's
+    state can.
 
     Args:
         summary: one-line human sentence describing the batch
-        tasks: same objects create_tasks takes
+        tasks: same objects create_tasks takes — required on call #1,
+            ignored on call #2 (the manifest's own stored items are used)
         max_items: refuse to plan more than this many creations
+        manifest_id: id from call #1's response — pass on call #2 to actually create
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
     err = _ensure_official()
     if err:
         return err
     _prune_manifests()
+
+    if manifest_id:
+        m = _MANIFESTS.get(manifest_id)
+        if not m or m.get("kind") != "create":
+            return (f"🛑 Манифест создания {manifest_id} не найден/истёк/уже "
+                    "исполнен. Начни заново: "
+                    "create_tasks_interactive(summary, tasks).")
+        cr = _require_consent(action="create", tier=1, manifest=m,
+                              user_reply=user_reply)
+        if not cr.ok:
+            return cr.reason
+        m["consumed"] = True
+        result = await _create_tasks_impl(
+            m.get("summary") or "Создание по манифесту", m["raw"], actor="human")
+        # Independent verification is NOT optional: append the server-built
+        # report right here, so it reaches the user even if the model never
+        # asks for it.
+        rid_m = re.search(r'operation_report\(record_id="([\w-]+)"\)', result)
+        if rid_m:
+            result += "\n\n" + _build_operation_report(rid_m.group(1))
+        return result
+
     if not tasks:
         return "Пустой список — планировать нечего."
     if len(tasks) > max_items:
@@ -1843,48 +1906,57 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
                      "адресами._")
     lines.append("")
     lines.append("После явного «да» вызови "
-                 f"`execute_task_creation(manifest_id=\"{mid}\", "
+                 f"`create_tasks_interactive(manifest_id=\"{mid}\", "
                  "user_reply=\"<дословная реплика пользователя>\")` · "
                  "действует 1 час, одноразово.")
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# PLAN_retrofit.md §15.1/§12 — deprecated thin wrappers. `plan_task_creation`
+# and `execute_task_creation` merged into ONE tool, `create_tasks_interactive`
+# (above), which now owns all the logic that used to live in these two
+# functions. These wrappers are kept (never deleted — §12 signature
+# compatibility) purely so an old caller still gets a clear, non-crashing
+# redirect instead of a "tool not found" error.
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations=READONLY)
+async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]] = None,
+                             max_items: int = 50) -> str:
+    """
+    ↷ DEPRECATED — merged into `create_tasks_interactive` (PLAN_retrofit.md
+    §15.1). Read-only, like before: builds NOTHING, just redirects.
+
+    Call `create_tasks_interactive(summary, tasks, max_items=...)` instead —
+    identical call #1 (planning) behaviour, same manifest kind, same
+    `execute` continuation via `create_tasks_interactive(manifest_id=...,
+    user_reply=...)`.
+    """
+    return ("↷ `plan_task_creation` объединён с `execute_task_creation` в "
+            "один инструмент `create_tasks_interactive` (см. "
+            "PLAN_retrofit.md §15.1). Вызови "
+            f"`create_tasks_interactive(summary=\"{summary}\", tasks=[...], "
+            f"max_items={max_items})` — то же планирование, тот же манифест. "
+            "Ничего не запланировано этим вызовом.")
+
+
 @mcp.tool()
 async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
     """
-    Phase 2: create exactly what plan_task_creation planned and the user
-    approved. Runs the normal creation engine (id echo, destination
-    post-verify, operation_report record). One-shot. Gated 🟡
-    (docs/DESIGN_approval_gate.md): user_reply is HARD-enforced — an empty,
-    negative, or fabricated-looking reply is refused and nothing is created.
+    ↷ DEPRECATED — merged into `create_tasks_interactive` (PLAN_retrofit.md
+    §15.1). Nothing is created by THIS wrapper.
 
-    Args:
-        manifest_id: id from plan_task_creation
-        user_reply: the user's literal reply approving the plan — REQUIRED,
-            must be a genuine affirmative («да»/«ok»/…), verbatim, not
-            invented
+    Call `create_tasks_interactive(manifest_id=..., user_reply=...)` instead
+    — same manifest store, same `_require_consent(tier=1)` gate.
     """
-    err = _ensure_official()
-    if err:
-        return err
-    _prune_manifests()
-    m = _MANIFESTS.get(manifest_id)
-    if not m or m.get("kind") != "create":
-        return (f"🛑 Манифест создания {manifest_id} не найден/истёк/уже "
-                "исполнен. Сначала plan_task_creation.")
-    cr = _require_consent(action="create", tier=1, manifest=m,
-                          user_reply=user_reply)
-    if not cr.ok:
-        return cr.reason
-    m["consumed"] = True
-    result = await _create_tasks_impl(m.get("summary") or "Создание по манифесту",
-                                      m["raw"])
-    # Independent verification is NOT optional: append the server-built report
-    # right here, so it reaches the user even if the model never asks for it.
-    rid_m = re.search(r'operation_report\(record_id="([\w-]+)"\)', result)
-    if rid_m:
-        result += "\n\n" + _build_operation_report(rid_m.group(1))
-    return result
+    return ("↷ `execute_task_creation` объединён с `plan_task_creation` в "
+            "один инструмент `create_tasks_interactive` (см. "
+            "PLAN_retrofit.md §15.1). Вызови "
+            f"`create_tasks_interactive(manifest_id=\"{manifest_id}\", "
+            "user_reply=\"<дословная реплика пользователя>\")` — тот же "
+            "манифест, та же проверка согласия. Ничего не создано этим "
+            "вызовом.")
 
 
 @mcp.tool(annotations=DESTRUCTIVE)
@@ -2419,21 +2491,35 @@ async def _complete_tasks_impl(summary: str, tasks: List[Dict[str, str]]) -> str
                               warnings=[str(e)])
 @mcp.tool()
 async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = None,
-                       manifest_id: str = "", user_reply: str = "") -> str:
+                       manifest_id: str = "", user_reply: str = "",
+                       max_items: int = 50) -> str:
     """
     ⚠️ Delete one or more tasks permanently. Gated (🔴 — even a SINGLE
-    deletion): this is now a two-call plan → user says yes → execute flow,
-    same shape as plan_task_deletion/execute_task_deletion.
+    deletion): a two-call plan → user says yes → execute flow. THE single
+    entry point for deletion — PLAN_retrofit.md §15.2 folded the former
+    standalone `plan_task_deletion`/`execute_task_deletion` tool pair in
+    here (both are now thin deprecated redirects, §12).
 
     Call #1 (manifest_id omitted): resolves `tasks` against live state and
     returns a one-shot manifest — nothing is deleted yet. Show that manifest
     to the user VERBATIM and wait for their real reply.
+      - ≤ DIRECT_DELETE_CAP tasks AND none has with_subtasks=true:
+        direct-delete-shaped manifest (title required per item — identity
+        guard always on).
+      - > DIRECT_DELETE_CAP tasks, OR any item has with_subtasks=true:
+        automatically switches to the BULK planning path (same as the
+        former plan_task_deletion) — resolves
+        {"taskId","title","projectId","with_subtasks"} against live state,
+        expands with_subtasks=true into the item's FULL open subtree
+        (server-side, any depth), and refuses outright above `max_items`.
 
     Call #2 (after the user actually replied): repeat the call with
     manifest_id=<id from call #1> and user_reply=<the user's literal last
     message> — `tasks` is ignored (the manifest's own stored items are used,
     so the set can't be swapped between the two calls). Do NOT make call #2
-    in the same turn as call #1.
+    in the same turn as call #1. Works identically for both the direct and
+    bulk manifest shapes above — same `_require_consent(tier=2)` gate either
+    way.
 
     summary (FIRST arg): one-line human sentence in the user's language,
     Destructive — START WITH ⚠️, e.g.
@@ -2445,15 +2531,14 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
     [{"title": "Buy milk", "projectName": "Groceries", "taskId": "abc",
       "projectId": "xyz"}]
 
-    BULK (more than DIRECT_DELETE_CAP tasks) is refused here outright — use
-    plan_task_deletion → execute_task_deletion instead.
-
     Args:
         summary: Human-readable line starting with ⚠️ (see above)
-        tasks: List of {"title","projectName","taskId","projectId"} objects
-            — required on call #1, ignored on call #2
+        tasks: List of {"title","projectName","taskId","projectId",
+            "with_subtasks"} objects — required on call #1, ignored on call #2
         manifest_id: from call #1's response — pass on call #2 to actually delete
         user_reply: the user's literal reply approving the plan — required on call #2
+        max_items: bulk path only — refuse to plan more than this many
+            deletions after subtask expansion (blast cap)
     """
     err = _ensure_ready()
     if err:
@@ -2477,18 +2562,21 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
     # SINGLE task → direct delete allowed, but only fully armed: the title is
     # REQUIRED (identity guard always on), the manifest is one-shot and needs
     # explicit user consent, the snapshot is journaled once executed, and
-    # operation_report works for it. BULK (>cap) → two-phase manifest only
-    # (plan → text approval → execute → independent report).
+    # operation_report works for it. BULK (>cap, OR any item asks for
+    # with_subtasks) → two-phase manifest via the bulk planning engine folded
+    # in from the former plan_task_deletion (PLAN_retrofit.md §15.2) — the
+    # direct path below has no subtree-expansion logic at all, so a single
+    # parent-task delete with with_subtasks=true MUST also go through the
+    # bulk path or its subtasks would silently survive.
     direct_cap = int(os.environ.get("DIRECT_DELETE_CAP", "1"))
-    if len(tasks) > direct_cap:
-        return (f"🛑 Пакетное удаление ({len(tasks)} задач) — только через "
-                "манифест: plan_task_deletion → (аппрув) → execute_task_deletion "
-                "→ operation_report. Напрямую можно удалить только "
-                f"{direct_cap} задачу за вызов.")
+    wants_subtasks = any(t.get("with_subtasks") for t in tasks)
+    if len(tasks) > direct_cap or wants_subtasks:
+        return _build_bulk_deletion_manifest(summary, tasks, max_items)
     if any(not (t.get("title") or "").strip() for t in tasks):
         return ("🛑 Для прямого удаления обязателен title каждой задачи — "
-                "сверка id↔название должна быть взведена. Добавь title "
-                "(или используй plan_task_deletion).")
+                "сверка id↔название должна быть взведена. Добавь title, или "
+                "передай больше задач за раз — свыше DIRECT_DELETE_CAP "
+                "delete_tasks сама строит план с разворачиванием подзадач.")
     try:
         # Resolve every task against live state FIRST: correct the projectId for
         # open tasks (a wrong one makes TickTick silently no-op the delete),
@@ -2506,7 +2594,7 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
             lines.append(
                 f"↷ Не среди открытых {len(missing)} — пропущено (сверить "
                 "название нельзя, значит удалять нельзя). Если это завершённая "
-                "задача — используй plan_task_deletion: "
+                "задача — план тоже строится через delete_tasks: "
                 + ", ".join(f"«{m['title']}»" for m in missing))
         if not found:
             lines.insert(0, "Нечего удалять — среди открытых задач не нашёл "
@@ -3196,41 +3284,26 @@ def _gate_single(*, action: str, tool_name: str, objects: List[Dict],
     return _GateOutcome(False, message="\n".join(lines))
 
 
-@mcp.tool(annotations=READONLY)
-async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
-                             max_items: int = 50) -> str:
-    """
-    Phase 1 of SAFE deletion — the two-phase (plan → user says yes →
-    execute) path, REQUIRED for bulk deletes and for parent+subtree deletes.
-    (A single task MAY still be removed directly via delete_tasks when its
-    title is supplied, up to DIRECT_DELETE_CAP=1 — that path is ALSO gated,
-    not disabled; anything larger than the cap is refused there and routed
-    here.) Builds a deletion MANIFEST without deleting anything. Read-only —
-    safe to call without confirmation.
+def _build_bulk_deletion_manifest(summary: str, tasks: List[Dict[str, str]],
+                                  max_items: int = 50) -> str:
+    """Bulk-deletion planning engine — builds a one-shot manifest without
+    deleting anything (call-#1/plan-mode half of the two-mode gate,
+    STANDARD.md §3.1). This is the former body of the standalone
+    `plan_task_deletion` tool, folded into `delete_tasks` itself
+    (PLAN_retrofit.md §15.2): `delete_tasks` now IS the single "one tool, two
+    modes" entry point for BOTH direct (≤DIRECT_DELETE_CAP) and bulk
+    (>DIRECT_DELETE_CAP) deletion — call #2 (manifest_id + user_reply) was
+    ALREADY generic over any "delete"-kind manifest regardless of which path
+    built it, so only the plan side needed folding in. `plan_task_deletion`/
+    `execute_task_deletion` are now thin deprecated wrappers (§12) pointing
+    back at `delete_tasks`.
 
     Each requested {taskId, title?, projectId?, with_subtasks?} is resolved
-    against LIVE state: ids that don't exist or whose live title doesn't match
-    the given one are EXCLUDED and reported. with_subtasks=true expands the
-    item's open subtasks into the manifest (server-side, from live state). The
-    returned manifest lists exactly what WOULD be deleted — as the SERVER sees
-    it, not as the caller claims.
-
-    IMPORTANT: reprint the returned manifest text VERBATIM and IN FULL in your
-    own reply to the user (tool-result blocks may be collapsed in some UIs —
-    your message is always fully visible), then STOP and wait for their real
-    reply — do NOT call execute in this same turn. Only once the human has
-    actually answered, call execute_task_deletion(manifest_id,
-    user_reply=<their literal last message, verbatim — do not paraphrase or
-    invent it>), and afterwards operation_report(record_id) for the
-    independent outcome check.
-
-    Nothing is deleted by this tool. Manifests are one-shot and expire in 1 h.
-
-    Args:
-        summary: one-line human sentence (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
-        tasks: List of {"taskId","title","projectId","with_subtasks"} — title recommended
-        max_items: refuse to plan more than this many deletions (blast cap)
-    """
+    against LIVE state: ids that don't exist or whose live title doesn't
+    match the given one are EXCLUDED and reported. with_subtasks=true expands
+    the item's open subtasks into the manifest (server-side, from live
+    state). The returned manifest lists exactly what WOULD be deleted — as
+    the SERVER sees it, not as the caller claims. Nothing is deleted here."""
     err = _ensure_ready()
     if err:
         return err
@@ -3316,54 +3389,64 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
     lines.append("Покажи этот план пользователю дословно и ДОЖДИСЬ его "
                  "отдельного ответа (не отвечай за него). Когда он явно "
                  "согласится, вызови "
-                 f"`execute_task_deletion(manifest_id=\"{mid}\", "
+                 f"`delete_tasks(summary=\"{summary}\", manifest_id=\"{mid}\", "
                  "user_reply=\"<дословная реплика пользователя>\")` — НЕ в "
                  "этом же ходе. Манифест одноразовый, действует 1 час.")
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# PLAN_retrofit.md §15.2/§12 — deprecated thin wrappers. `plan_task_deletion`
+# and `execute_task_deletion` merged into `delete_tasks` (above), which now
+# owns bulk planning too (via `_build_bulk_deletion_manifest`) on top of its
+# pre-existing generic execute-by-manifest_id path. Kept — never deleted — so
+# an old caller gets a clear redirect instead of "tool not found".
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations=READONLY)
+async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
+                             max_items: int = 50) -> str:
+    """
+    ↷ DEPRECATED — merged into `delete_tasks` (PLAN_retrofit.md §15.2).
+    Read-only, like before: plans NOTHING itself, just redirects.
+
+    Call `delete_tasks(summary, tasks, max_items=...)` instead — for more
+    than DIRECT_DELETE_CAP tasks it now builds the exact same bulk manifest
+    this tool used to (including with_subtasks expansion), then continues
+    with `delete_tasks(manifest_id=..., user_reply=...)`.
+    """
+    return ("↷ `plan_task_deletion` объединён с `execute_task_deletion` в "
+            "`delete_tasks` (см. PLAN_retrofit.md §15.2). Вызови "
+            f"`delete_tasks(summary=\"{summary}\", tasks=[...], "
+            f"max_items={max_items})` — при количестве задач больше "
+            "DIRECT_DELETE_CAP она сама построит план (манифест) с "
+            "разворачиванием подзадач, точно как раньше plan_task_deletion. "
+            "Ничего не запланировано этим вызовом.")
+
+
 @mcp.tool()
 async def execute_task_deletion(manifest_id: str, user_reply: str = "") -> str:
     """
-    Phase 2: execute a deletion manifest created by plan_task_deletion.
+    ↷ DEPRECATED — merged into `delete_tasks` (PLAN_retrofit.md §15.2).
+    Nothing is executed by THIS wrapper.
 
-    Deletes EXACTLY the manifest's items — the caller cannot add or swap tasks
-    here. Gated (🔴 docs/DESIGN_approval_gate.md): `user_reply` must be the
-    user's VERBATIM last chat message, given ONLY after they actually saw the
-    plan and replied — do not paraphrase, summarize, or invent it, and do not
-    call this in the same turn where you printed the plan. The server checks
-    it's a genuine affirmative reply (not a negation, not empty, not you
-    echoing back manifest jargon), enforces a minimum gap since the plan was
-    shown, and consumes the manifest once. Every item is also re-verified
-    against live state (renamed since planning → skipped); full task
-    snapshots are appended to the deletion journal before the delete; the
-    effect is post-verified against fresh state.
-
-    Args:
-        manifest_id: id returned by plan_task_deletion
-        user_reply: the user's literal last message approving the plan
+    Call `delete_tasks(summary=..., manifest_id=..., user_reply=...)`
+    instead — same manifest store, same `_require_consent(tier=2)` gate.
     """
-    err = _ensure_ready()
-    if err:
-        return err
-    _prune_manifests()
-    m = _MANIFESTS.get(manifest_id)
-    if not m or m.get("kind") != "delete":
-        return (f"🛑 Манифест удаления {manifest_id} не найден/истёк/уже "
-                "исполнен. Сначала plan_task_deletion.")
-    cr = _require_consent(action="delete", tier=2, manifest=m,
-                          user_reply=user_reply,
-                          object_ids=[it["taskId"] for it in m["items"]])
-    if not cr.ok:
-        return cr.reason
-    return await _execute_task_deletion_impl(manifest_id, m)
+    return ("↷ `execute_task_deletion` объединён с `plan_task_deletion` в "
+            "`delete_tasks` (см. PLAN_retrofit.md §15.2). Вызови "
+            f"`delete_tasks(summary=\"...\", manifest_id=\"{manifest_id}\", "
+            "user_reply=\"<дословная реплика пользователя>\")` — тот же "
+            "манифест, та же проверка согласия. Ничего не удалено этим "
+            "вызовом.")
 
 
 async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None) -> str:
     """Shared deletion engine: does the actual TickTick delete for a
-    plan_task_deletion manifest, once consent has already been granted (by
-    execute_task_deletion) or is inherited from an ALREADY-consented outer
-    action (execute_declutter/_execute_declutter_from_sheet build a fresh
+    delete_tasks/`_build_bulk_deletion_manifest` "delete"-kind manifest, once
+    consent has already been granted (by `delete_tasks` call #2) or is
+    inherited from an ALREADY-consented outer action
+    (execute_declutter/_execute_declutter_from_sheet build a fresh
     sub-manifest and call straight in here — the human already said yes to
     the outer declutter, so re-asking for this internal step would just be
     the model self-confirming with extra steps)."""
@@ -3371,7 +3454,7 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
         m = _MANIFESTS.get(manifest_id)
     if not m or m.get("kind") != "delete":
         return (f"🛑 Манифест удаления {manifest_id} не найден/истёк/уже "
-                "исполнен. Сначала plan_task_deletion.")
+                "исполнен. Сначала delete_tasks(summary, tasks).")
     try:
         by_id = _open_by_id(fresh=True)
         if by_id is None:
@@ -3435,39 +3518,49 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
                 [{"taskId": r["taskId"], "projectId": r["projectId"]} for r in ready]))
             api_fail = id2error_failures(resp, [r["taskId"] for r in ready])
         still = _open_by_id(fresh=True) if ready else {}
-        lines = []
+        bullets: List[str] = []
+        warnings: List[str] = []
         if still is None:
             deleted, failed = [], []
-            lines.append(f"Отправлено на удаление {len(ready)}, но "
-                         f"{_UNVERIFIED_MSG}")
+            warnings.append(f"Отправлено на удаление {len(ready)}, но "
+                            f"{_UNVERIFIED_MSG}")
         else:
             deleted = [r["title"] for r in ready
                        if r["taskId"] not in still and r["taskId"] not in api_fail]
             failed = [r["title"] for r in ready
                       if r["taskId"] in still or r["taskId"] in api_fail]
         if api_fail:
-            lines.append("❌ TickTick отклонил " + str(len(api_fail)) + ": "
-                         + "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items()))
+            bullets.append("❌ TickTick отклонил " + str(len(api_fail)) + ": "
+                           + "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items()))
         if deleted:
-            lines.append(f"🗑 Удалено {len(deleted)}/{len(m['items'])}: "
-                         + ", ".join(f"«{t}»" for t in deleted))
+            bullets.append(f"✅ Удалено {len(deleted)}/{len(m['items'])}: "
+                           + ", ".join(f"«{t}»" for t in deleted))
         if drifted:
-            lines.append(
-                f"⏭ Пропущены {len(drifted)} (не совпали с одобренным планом — "
+            # ↷ — a plan-item that no longer matches live state (STANDARD.md
+            # §7.2 frozen legend; the former unlegended "⏭" is not allowed).
+            bullets.append(
+                f"↷ Пропущены {len(drifted)} (не совпали с одобренным планом — "
                 "перепланируй): "
                 + ", ".join(f"«{t}» ({why})" for t, why in drifted))
         if failed:
-            lines.append(f"❌ НЕ удалено {len(failed)} (всё ещё в TickTick): "
-                         + ", ".join(f"«{t}»" for t in failed))
+            bullets.append(f"❌ НЕ удалено {len(failed)} (всё ещё в TickTick): "
+                           + ", ".join(f"«{t}»" for t in failed))
+        proof_parts = []
         if journal:
-            lines.append(f"🧾 Снапшоты удалённого — в журнале: {journal} "
-                         "(восстановление: restore_tasks из корзины, либо "
-                         "пересоздание из снапшота).")
+            proof_parts.append(f"🧾 Снапшоты удалённого — в журнале: {journal} "
+                               "(восстановление: restore_tasks из корзины, либо "
+                               "пересоздание из снапшота).")
         # Append the server-built independent report — not optional, the model
         # can't skip what's already in the tool result.
         if deleted or failed:
-            lines.append("\n" + _build_operation_report(manifest_id))
-        return "\n".join(lines) if lines else "Ничего не удалено."
+            proof_parts.append(_build_operation_report(manifest_id))
+        proof = "\n\n".join(proof_parts)
+        if not bullets and not warnings:
+            return _tool_response("↷", "Ничего не удалено")
+        status = _batch_status(bullets) if bullets else "⚠️"
+        headline = f"Удалено **{len(deleted)}**/{len(m['items'])}"
+        return _tool_response(status, headline, bullets=bullets,
+                              warnings=warnings, proof=proof)
     except Exception as e:
         logger.error(f"Error in execute_task_deletion: {e}")
         return f"Error executing deletion manifest: {str(e)}"
@@ -5033,7 +5126,24 @@ async def execute_declutter(manifest_id: str, user_reply: str = "") -> str:
         if not out_blocks:
             return "Нечего применять — в манифесте не было правок."
 
-        combined = "\n\n".join(out_blocks)
+        # PLAN_retrofit.md §15.7 (STANDARD.md §7.1 п.1/5, §7.3): a single
+        # top-level "### <status> <headline>" first — the former reply was
+        # just three "## …" sub-blocks concatenated with no overall verdict,
+        # forcing the reader to assemble the summary themselves. Each
+        # sub-engine (delete/update_tasks/set_task_parent) already emits its
+        # own _tool_response-wrapped "### <status> …" internally — reuse
+        # THOSE statuses (not a re-guess) via `_batch_status`, same
+        # partial-success-→-⚠️ rule as everywhere else (§7.3).
+        sub_status_chars = []
+        for block in out_blocks:
+            sm = re.search(r'###\s*([✅⚠️❌🛑↷])', block)
+            if sm:
+                sub_status_chars.append(sm.group(1))
+        overall_status = _batch_status(sub_status_chars) if sub_status_chars else "↷"
+        n_actions = (len(actions["delete"]) + len(actions["rename"])
+                    + sum(len(g["children"]) for g in actions["group"]))
+        header = f"### {overall_status} Разбор применён — действий **{n_actions}**"
+        combined = header + "\n\n" + "\n\n".join(out_blocks)
         # Consolidated independent check: pull every journalled record id the
         # sub-tools referenced and append the server-built report for each.
         for rid in re.findall(r'operation_report\(record_id="([\w-]+)"\)', combined):
@@ -5168,12 +5278,13 @@ async def delete_task_with_subtasks(
     """
     DEPRECATED / always refuses. Subtree deletion is NOT performed here —
     this tool exists only to catch old callers and redirect them. It always
-    returns a refusal pointing to plan_task_deletion with {"taskId", "title",
-    "with_subtasks": true}, which expands the ENTIRE open subtree into a
-    manifest for approval (already gated 🔴 — plan_task_deletion →
-    execute_task_deletion(manifest_id, user_reply=...)). No argument below
-    has any effect; nothing is ever deleted by THIS tool, regardless of what
-    you pass.
+    returns a refusal pointing to delete_tasks with {"taskId", "title",
+    "with_subtasks": true} (PLAN_retrofit.md §15.2/§15.9: the former
+    plan_task_deletion/execute_task_deletion pair is now folded into
+    delete_tasks), which expands the ENTIRE open subtree into a manifest for
+    approval (already gated 🔴 — delete_tasks(...) → delete_tasks(manifest_id,
+    user_reply=...)). No argument below has any effect; nothing is ever
+    deleted by THIS tool, regardless of what you pass.
 
     Args:
         summary: unused — has no effect, kept for backward-compatible calls
@@ -5190,8 +5301,9 @@ async def delete_task_with_subtasks(
     # no journal, no post-verify and an unhandled 'missing' guard — one env
     # var away from being the only unguarded destructive path in the cluster.)
     return ("🛑 Удаление дерева — только через манифест. Используй "
-            "plan_task_deletion с {\"taskId\": ..., \"title\": ..., "
-            "\"with_subtasks\": true} — план сам развернёт ВСЁ поддерево "
+            "delete_tasks с tasks=[{\"taskId\": ..., \"title\": ..., "
+            "\"with_subtasks\": true}] (больше DIRECT_DELETE_CAP — план "
+            "построится автоматически) — план сам развернёт ВСЁ поддерево "
             "(включая под-подзадачи), покажет полный список на аппрув, а "
             "operation_report подтвердит результат.")
 
@@ -5391,8 +5503,10 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
     try:
         result = await _run_blocking(lambda: ticktick.delete_project(project_id))
         if 'error' in result:
-            return (f"❌ TickTick отклонил удаление проекта «{live_name}»: "
-                    f"{result['error']}\n{_report_line(record_id)}")
+            return _tool_response(
+                "❌", f"Проект «{live_name}» НЕ удалён",
+                warnings=[f"TickTick отклонил: {result['error']}"],
+                proof=_report_line(record_id))
 
         # Post-verify against FRESH state: the project must no longer resolve.
         if ticktick_v2:
@@ -5401,23 +5515,24 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
             except Exception:
                 pass
         names_after = _v2_project_names_or_none()
-        lines = []
         if names_after is None:
             # Fetch failed outright — a failed refetch must never read as a
             # confirmed deletion (the TickTick call above may have genuinely
             # succeeded; we just couldn't check).
-            lines.append(f"⚠️ Проект «{live_name}» отправлен на удаление, но "
-                         "проверить результат не удалось (не получилось "
-                         "перечитать список проектов) — исход НЕ ПОДТВЕРЖДЁН. "
-                         "Повтори operation_report позже.")
-        elif names_after.get(project_id):
-            lines.append(f"❌ Проект «{live_name}» ВСЁ ЕЩЁ существует — "
-                         "удаление не подтвердилось.")
-        else:
-            lines.append(f"🗑 Проект «{live_name}» удалён вместе с {count} "
-                         "задачами.")
-        lines.append(_report_line(record_id))
-        return "\n".join(lines)
+            return _tool_response(
+                "⚠️", f"Проект «{live_name}» отправлен на удаление, но НЕ "
+                "подтверждён",
+                warnings=["Не получилось перечитать список проектов — исход "
+                          "НЕ ПОДТВЕРЖДЁН. Повтори operation_report позже."],
+                proof=_report_line(record_id))
+        if names_after.get(project_id):
+            return _tool_response(
+                "❌", f"Проект «{live_name}» ВСЁ ЕЩЁ существует",
+                warnings=["Удаление не подтвердилось."],
+                proof=_report_line(record_id))
+        return _tool_response(
+            "✅", f"Удалён проект «{live_name}» вместе с {count} задачами",
+            proof=_report_line(record_id))
     except Exception as e:
         logger.error(f"Error in delete_project: {e}")
         return f"Error deleting project: {str(e)}"

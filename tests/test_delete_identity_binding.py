@@ -53,7 +53,7 @@ async def test_task_moved_to_another_project_since_the_plan_is_not_deleted(
                              "title": "Купить молоко", "project": "Покупки",
                              "snapshot": {"title": "Купить молоко"}}])
 
-    out = await s.execute_task_deletion("mid-moved", user_reply="да")
+    out = await s.delete_tasks("test", manifest_id="mid-moved", user_reply="да")
     assert fake.deleted_ids == []
     assert "t1" in live
     assert "Пропущены" in out and "проект" in out
@@ -69,7 +69,7 @@ async def test_sheet_style_item_without_project_id_is_bound_by_project_name(
                              "title": "Дубль", "project": "Покупки",
                              "snapshot": {"title": "Дубль"}}])
 
-    out = await s.execute_task_deletion("mid-sheet", user_reply="да")
+    out = await s.delete_tasks("test", manifest_id="mid-sheet", user_reply="да")
     assert fake.deleted_ids == []
     assert "Пропущены" in out
 
@@ -81,7 +81,7 @@ async def test_matching_title_and_project_is_deleted(monkeypatch, tmp_path):
                           "title": "Купить молоко", "project": "Покупки",
                           "snapshot": {"title": "Купить молоко"}}])
 
-    out = await s.execute_task_deletion("mid-ok", user_reply="да")
+    out = await s.delete_tasks("test", manifest_id="mid-ok", user_reply="да")
     assert fake.deleted_ids == ["t1"]
     assert "Удалено 1" in out
 
@@ -96,7 +96,7 @@ async def test_item_without_a_title_is_never_deleted_unverified(
                                 "title": "", "project": "Покупки",
                                 "snapshot": {}}])
 
-    out = await s.execute_task_deletion("mid-untitled", user_reply="да")
+    out = await s.delete_tasks("test", manifest_id="mid-untitled", user_reply="да")
     assert fake.deleted_ids == []
     assert "t1" in live
     assert "Пропущены" in out
@@ -119,7 +119,7 @@ async def test_neighbouring_task_is_untouched_when_one_item_drifts(
          "snapshot": {"title": "B"}},
     ])
 
-    out = await s.execute_task_deletion("mid-mixed", user_reply="да")
+    out = await s.delete_tasks("test", manifest_id="mid-mixed", user_reply="да")
     assert fake.deleted_ids == ["t1"]
     assert "t3" in live and "t2" in live
     assert "Пропущены 1" in out

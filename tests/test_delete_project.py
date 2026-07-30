@@ -143,7 +143,7 @@ async def test_correct_confirm_deletes_and_journals(monkeypatch, tmp_path):
 
     result = await s.delete_project("Работа", "p1", user_reply="да")
     assert fake.deleted_ids == ["p1"]
-    assert "удалён вместе с 2" in result
+    assert "вместе с 2" in result
     assert "operation_report" in result
 
     journal_path = tmp_path / "deletion_journal.jsonl"
@@ -185,7 +185,7 @@ async def test_zero_task_project_still_requires_explicit_confirm(monkeypatch, tm
 
     result = await s.delete_project("Пусто", "p1", user_reply="да")
     assert fake.deleted_ids == ["p1"]
-    assert "удалён вместе с 0" in result
+    assert "вместе с 0" in result
 
 
 # ---- post-verify catches a false-positive TickTick response --------------

@@ -169,22 +169,24 @@ def test_wrong_automation_key_does_not_bypass():
 async def test_create_tasks_direct_path_refuses_interactive_callers(monkeypatch):
     calls = []
 
-    async def fake_impl(summary, tasks):
-        calls.append((summary, tasks))
+    async def fake_impl(summary, tasks, actor="human"):
+        calls.append((summary, tasks, actor))
         return "created"
 
     monkeypatch.setattr(s, "_create_tasks_impl", fake_impl)
     result = await s.create_tasks("Test", [{"title": "X", "project_id": "p1"}])
     assert "🛑" in result
-    assert "plan_task_creation" in result
+    # PLAN_retrofit.md §15.1: plan_task_creation/execute_task_creation merged
+    # into create_tasks_interactive — the refusal now points there.
+    assert "create_tasks_interactive" in result
     assert calls == []
 
 
 async def test_create_tasks_automation_key_still_bypasses(monkeypatch):
     calls = []
 
-    async def fake_impl(summary, tasks):
-        calls.append((summary, tasks))
+    async def fake_impl(summary, tasks, actor="human"):
+        calls.append((summary, tasks, actor))
         return "created"
 
     monkeypatch.setattr(s, "_create_tasks_impl", fake_impl)
@@ -195,14 +197,17 @@ async def test_create_tasks_automation_key_still_bypasses(monkeypatch):
                                   automation_key="test-automation-key")
     assert result == "created"
     assert len(calls) == 1
+    # PLAN_retrofit.md §15.4: the journal actor must reflect the automation
+    # consumer, not the interactive-default "human".
+    assert calls[0][2] == "automation:default"
 
 
 async def test_create_tasks_mcp_secret_no_longer_bypasses(monkeypatch):
     monkeypatch.delenv("TICKTICK_AUTOMATION_KEY", raising=False)
     calls = []
 
-    async def fake_impl(summary, tasks):
-        calls.append((summary, tasks))
+    async def fake_impl(summary, tasks, actor="human"):
+        calls.append((summary, tasks, actor))
         return "created"
 
     monkeypatch.setattr(s, "_create_tasks_impl", fake_impl)
@@ -213,16 +218,18 @@ async def test_create_tasks_mcp_secret_no_longer_bypasses(monkeypatch):
 
 
 # ===========================================================================
-# execute_task_creation — Slice 1 real gate: tier bumped 0 -> 1, now HARD
-# enforced (creation is still reversible, but the model can no longer
-# self-confirm by passing an empty/blank user_reply).
+# create_tasks_interactive (execute mode) — PLAN_retrofit.md §15.1 merged
+# plan_task_creation + execute_task_creation into this single tool. Slice 1
+# real gate: tier bumped 0 -> 1, now HARD enforced (creation is still
+# reversible, but the model can no longer self-confirm by passing an
+# empty/blank user_reply).
 # ===========================================================================
 
 async def test_execute_task_creation_empty_reply_is_refused_and_does_not_create(monkeypatch):
     calls = []
 
-    async def fake_impl(summary, tasks):
-        calls.append((summary, tasks))
+    async def fake_impl(summary, tasks, actor="human"):
+        calls.append((summary, tasks, actor))
         return "created ok"
     monkeypatch.setattr(s, "_create_tasks_impl", fake_impl)
     monkeypatch.setattr(s, "_ensure_official", lambda: None)
@@ -232,7 +239,7 @@ async def test_execute_task_creation_empty_reply_is_refused_and_does_not_create(
                          "created": time.monotonic(),
                          "plan_shown_at": time.monotonic() - 10,
                          "summary": "test", "consumed": False}
-    result = await s.execute_task_creation(mid, user_reply="")
+    result = await s.create_tasks_interactive("test", manifest_id=mid, user_reply="")
     assert "🛑" in result
     assert calls == []
     assert s._MANIFESTS[mid]["consumed"] is False  # retryable
@@ -246,13 +253,14 @@ async def test_execute_task_creation_negative_reply_is_refused(monkeypatch):
                          "created": time.monotonic(),
                          "plan_shown_at": time.monotonic() - 10,
                          "summary": "test", "consumed": False}
-    result = await s.execute_task_creation(mid, user_reply="нет, отмена")
+    result = await s.create_tasks_interactive("test", manifest_id=mid,
+                                              user_reply="нет, отмена")
     assert "🛑" in result
     assert s._MANIFESTS[mid]["consumed"] is True  # a "no" burns the plan
 
 
 async def test_execute_task_creation_with_genuine_yes_creates(monkeypatch):
-    async def fake_impl(summary, tasks):
+    async def fake_impl(summary, tasks, actor="human"):
         return "created ok"
     monkeypatch.setattr(s, "_create_tasks_impl", fake_impl)
     monkeypatch.setattr(s, "_ensure_official", lambda: None)
@@ -262,15 +270,36 @@ async def test_execute_task_creation_with_genuine_yes_creates(monkeypatch):
                          "created": time.monotonic(),
                          "plan_shown_at": time.monotonic() - 10,
                          "summary": "test", "consumed": False}
-    result = await s.execute_task_creation(mid, user_reply="да, создавай")
+    result = await s.create_tasks_interactive("test", manifest_id=mid,
+                                              user_reply="да, создавай")
     assert "created ok" in result
     assert s._MANIFESTS[mid]["consumed"] is True
 
 
 async def test_execute_task_creation_unknown_manifest_is_refused(monkeypatch):
     monkeypatch.setattr(s, "_ensure_official", lambda: None)
-    result = await s.execute_task_creation("no-such-manifest", user_reply="да")
+    result = await s.create_tasks_interactive("test", manifest_id="no-such-manifest",
+                                              user_reply="да")
     assert "🛑" in result
+
+
+# ===========================================================================
+# plan_task_creation / execute_task_creation — deprecated wrappers (§12):
+# never delete the old names, they must redirect instead of mutating.
+# ===========================================================================
+
+async def test_plan_task_creation_wrapper_redirects_without_planning(monkeypatch):
+    before = set(s._MANIFESTS)
+    result = await s.plan_task_creation("Test", [{"title": "X", "project_id": "p1"}])
+    assert "↷" in result
+    assert "create_tasks_interactive" in result
+    assert set(s._MANIFESTS) == before  # nothing was planned
+
+
+async def test_execute_task_creation_wrapper_redirects_without_creating(monkeypatch):
+    result = await s.execute_task_creation("some-mid", user_reply="да")
+    assert "↷" in result
+    assert "create_tasks_interactive" in result
 
 
 # ===========================================================================
@@ -371,19 +400,40 @@ async def test_delete_tasks_manifest_is_one_shot(monkeypatch, tmp_path):
     assert "🛑" in second
 
 
-async def test_delete_tasks_bulk_over_cap_is_unaffected_by_the_gate(monkeypatch):
-    monkeypatch.setattr(s, "_ensure_ready", lambda: None)
+async def test_delete_tasks_bulk_over_cap_builds_a_plan(monkeypatch, tmp_path):
+    # PLAN_retrofit.md §15.2: over-cap no longer refuses outright — delete_tasks
+    # itself now folds in the former plan_task_deletion bulk-planning engine.
+    live = {
+        "t1": {"id": "t1", "title": "A", "projectId": "p1"},
+        "t2": {"id": "t2", "title": "B", "projectId": "p1"},
+        "t3": {"id": "t3", "title": "C", "projectId": "p1"},
+    }
+    fake = _wire_delete_tasks(monkeypatch, live, tmp_path)
     result = await s.delete_tasks("⚠️ Удаляю 3", [
         {"taskId": "t1", "title": "A", "projectId": "p1"},
         {"taskId": "t2", "title": "B", "projectId": "p1"},
         {"taskId": "t3", "title": "C", "projectId": "p1"},
     ])
-    assert "🛑" in result
-    assert "plan_task_deletion" in result
+    assert fake.deleted_ids == []  # nothing deleted on call #1
+    assert "manifest_id=" in result
+    assert "План удаления" in result
+    mid = _extract_manifest_id(result)
+    assert s._MANIFESTS[mid]["kind"] == "delete"
+    assert len(s._MANIFESTS[mid]["items"]) == 3
+
+
+async def test_plan_task_deletion_wrapper_redirects_without_planning(monkeypatch):
+    before = set(s._MANIFESTS)
+    result = await s.plan_task_deletion("⚠️ Удаляю", [
+        {"taskId": "t1", "title": "A", "projectId": "p1"}])
+    assert "↷" in result
+    assert "delete_tasks" in result
+    assert set(s._MANIFESTS) == before
 
 
 # ===========================================================================
-# execute_task_deletion — the plan_task_deletion → execute pair
+# delete_tasks (execute mode, manifest built by the bulk path) — PLAN_retrofit.md
+# §15.2 merged plan_task_deletion + execute_task_deletion into delete_tasks.
 # ===========================================================================
 
 async def test_execute_task_deletion_requires_affirmative_reply(monkeypatch, tmp_path):
@@ -403,15 +453,21 @@ async def test_execute_task_deletion_requires_affirmative_reply(monkeypatch, tmp
         "summary": "test", "consumed": False,
     }
 
-    refused = await s.execute_task_deletion(mid, user_reply="")
+    refused = await s.delete_tasks("test", manifest_id=mid, user_reply="")
     assert "t1" in live
     assert fake.deleted_ids == []
     assert "🛑" in refused
 
-    await s.execute_task_deletion(mid, user_reply="да")
+    await s.delete_tasks("test", manifest_id=mid, user_reply="да")
     assert fake.deleted_ids == ["t1"]
     assert "t1" not in live
     assert s._MANIFESTS[mid]["consumed"] is True
+
+
+async def test_execute_task_deletion_wrapper_redirects_without_deleting(monkeypatch):
+    result = await s.execute_task_deletion("some-mid", user_reply="да")
+    assert "↷" in result
+    assert "delete_tasks" in result
 
 
 # ===========================================================================

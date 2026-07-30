@@ -339,11 +339,13 @@ async def test_restore_tasks_full_gate_cycle(monkeypatch):
 
 
 # ===========================================================================
-# execute_task_creation — tier bumped 0 -> 1, now hard-enforced
+# create_tasks_interactive (execute mode) — tier bumped 0 -> 1, now
+# hard-enforced. PLAN_retrofit.md §15.1 merged the former standalone
+# execute_task_creation into create_tasks_interactive.
 # ===========================================================================
 
 async def test_execute_task_creation_hard_enforced(monkeypatch):
-    async def fake_impl(summary, tasks):
+    async def fake_impl(summary, tasks, actor="human"):
         return "created ok"
     monkeypatch.setattr(s, "_create_tasks_impl", fake_impl)
     monkeypatch.setattr(s, "_ensure_official", lambda: None)
@@ -354,11 +356,12 @@ async def test_execute_task_creation_hard_enforced(monkeypatch):
                          "plan_shown_at": time.monotonic(),
                          "summary": "test", "consumed": False}
 
-    refused = await s.execute_task_creation(mid, user_reply="")
+    refused = await s.create_tasks_interactive("test", manifest_id=mid, user_reply="")
     assert "🛑" in refused
     assert s._MANIFESTS[mid]["consumed"] is False
 
-    result = await s.execute_task_creation(mid, user_reply="да, создавай")
+    result = await s.create_tasks_interactive("test", manifest_id=mid,
+                                              user_reply="да, создавай")
     assert "created ok" in result
     assert s._MANIFESTS[mid]["consumed"] is True
 
