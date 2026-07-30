@@ -423,69 +423,70 @@ async def attachment_upload_link(request: Request) -> Response:
 
 # Single source of truth for TickTick's priority levels (0/1/3/5).
 PRIORITY_MAP = {0: "None", 1: "Low", 3: "Medium", 5: "High"}
+PRIORITY_MAP_RU = {0: "Нет", 1: "Низкий", 3: "Средний", 5: "Высокий"}
 
 
 # Format a task object from TickTick for better display
 def format_task(task: Dict) -> str:
     """Format a task into a human-readable string (title first, ids at the end)."""
-    formatted = f"Title: {task.get('title', 'No title')}\n"
+    formatted = f"Заголовок: {task.get('title', 'Без заголовка')}\n"
 
     # Add dates if available
     if task.get('startDate'):
-        formatted += f"Start Date: {task.get('startDate')}\n"
+        formatted += f"Дата начала: {task.get('startDate')}\n"
     if task.get('dueDate'):
-        formatted += f"Due Date: {task.get('dueDate')}\n"
-    
+        formatted += f"Срок: {task.get('dueDate')}\n"
+
     # Add priority if available
     priority = task.get('priority', 0)
-    formatted += f"Priority: {PRIORITY_MAP.get(priority, str(priority))}\n"
-    
+    formatted += f"Приоритет: {PRIORITY_MAP_RU.get(priority, str(priority))}\n"
+
     # Add status if available
-    status = "Completed" if task.get('status') == 2 else "Active"
-    formatted += f"Status: {status}\n"
-    
+    status = "Завершена" if task.get('status') == 2 else "Активна"
+    formatted += f"Статус: {status}\n"
+
     # Add content if available
     if task.get('content'):
-        formatted += f"\nContent:\n{task.get('content')}\n"
-    
+        formatted += f"\nСодержание:\n{task.get('content')}\n"
+
     # Add subtasks if available
     items = task.get('items', [])
     if items:
-        formatted += f"\nSubtasks ({len(items)}):\n"
+        formatted += f"\nПодзадачи ({len(items)}):\n"
         for i, item in enumerate(items, 1):
             status = "✓" if item.get('status') == 1 else "□"
-            formatted += f"{i}. [{status}] {item.get('title', 'No title')}\n"
+            formatted += f"{i}. [{status}] {item.get('title', 'Без заголовка')}\n"
 
     # Ids last — needed for follow-up calls, but not the headline.
-    formatted += f"(id: {task.get('id', '?')} | project: {task.get('projectId', '?')})\n"
+    formatted += f"(id: {task.get('id', '?')} | проект: {task.get('projectId', '?')})\n"
     return formatted
 
 # Format a project object from TickTick for better display
 def format_project(project: Dict) -> str:
     """Format a project into a human-readable string (name first, id at the end)."""
-    formatted = f"Name: {project.get('name', 'No name')}\n"
+    formatted = f"Название: {project.get('name', 'Без названия')}\n"
 
     # Add color if available
     if project.get('color'):
-        formatted += f"Color: {project.get('color')}\n"
-    
+        formatted += f"Цвет: {project.get('color')}\n"
+
     # Add view mode if available
     if project.get('viewMode'):
-        formatted += f"View Mode: {project.get('viewMode')}\n"
-    
+        formatted += f"Режим отображения: {project.get('viewMode')}\n"
+
     # Add closed status if available
     if 'closed' in project:
-        formatted += f"Closed: {'Yes' if project.get('closed') else 'No'}\n"
-    
+        formatted += f"Закрыт: {'Да' if project.get('closed') else 'Нет'}\n"
+
     # Add kind if available
     if project.get('kind'):
-        formatted += f"Kind: {project.get('kind')}\n"
+        formatted += f"Тип: {project.get('kind')}\n"
 
     # Id last — needed for follow-up calls, but not the headline.
     formatted += f"(id: {project.get('id', '?')})\n"
     return formatted
 
-_PRIO_SHORT = {0: "", 1: "P-Low", 3: "P-Med", 5: "P-High"}
+_PRIO_SHORT = {0: "", 1: "Приор.низк", 3: "Приор.сред", 5: "Приор.выс"}
 
 
 def format_task_line(task: Dict, project_name: str = None) -> str:
@@ -494,10 +495,10 @@ def format_task_line(task: Dict, project_name: str = None) -> str:
     bits = []
     if project_name:
         bits.append(f"[{project_name}]")
-    bits.append(task.get("title") or "(no title)")
+    bits.append(task.get("title") or "(без названия)")
     meta = []
     if task.get("dueDate"):
-        meta.append("due " + str(task["dueDate"])[:10])
+        meta.append("срок " + str(task["dueDate"])[:10])
     pr = _PRIO_SHORT.get(task.get("priority", 0))
     if pr:
         meta.append(pr)
@@ -874,7 +875,7 @@ def format_task_list(tasks: List[Dict], limit: int = 100) -> str:
     lines = [format_task_line(t, names.get(t.get("projectId"))) for t in tasks[:limit]]
     out = "\n".join(lines)
     if len(tasks) > limit:
-        out += f"\n... and {len(tasks) - limit} more."
+        out += f"\n… и ещё {len(tasks) - limit}."
     return out
 
 
@@ -917,7 +918,7 @@ def format_task_tree(tasks: List[Dict], limit: int = 200) -> str:
 
     out = "\n".join(lines)
     if len(tasks) > limit:
-        out += f"\n... and {len(tasks) - limit} more."
+        out += f"\n… и ещё {len(tasks) - limit}."
     return out
 
 
@@ -944,9 +945,15 @@ async def _run_blocking(func, *args, **kwargs):
 
 # MCP Tools
 
+# Honest caps for the group-2 read tools (§10.1 — no silent truncation: the
+# response always says "показано N из M" when the cap actually cuts anything).
+_PROJECTS_LIST_CAP = 200
+_PROJECT_TASKS_CAP = 150
+
+
 @mcp.tool(annotations=READONLY)
 async def get_projects() -> str:
-    """Get all projects from TickTick."""
+    """Получить все проекты из TickTick."""
     err = _ensure_official()
     if err:
         return err
@@ -954,94 +961,103 @@ async def get_projects() -> str:
     try:
         projects = await _run_blocking(lambda: ticktick.get_projects())
         if 'error' in projects:
-            return f"Error fetching projects: {projects['error']}"
-        
+            return f"Ошибка получения проектов: {projects['error']}"
+
         if not projects:
-            return "No projects found."
-        
-        result = f"Found {len(projects)} projects:\n\n"
-        for i, project in enumerate(projects, 1):
-            result += f"Project {i}:\n" + format_project(project) + "\n"
-        
+            return "Проекты не найдены."
+
+        shown = projects[:_PROJECTS_LIST_CAP]
+        result = f"Найдено проектов: {len(projects)}"
+        if len(projects) > _PROJECTS_LIST_CAP:
+            result += f" (показано {len(shown)} из {len(projects)})"
+        result += ":\n\n"
+        for i, project in enumerate(shown, 1):
+            result += f"Проект {i}:\n" + format_project(project) + "\n"
+
         return result
     except Exception as e:
         logger.error(f"Error in get_projects: {e}")
-        return f"Error retrieving projects: {str(e)}"
+        return f"Ошибка получения проектов: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def get_project(project_id: str) -> str:
     """
-    Get details about a specific project.
-    
+    Получить сведения о конкретном проекте.
+
     Args:
-        project_id: ID of the project
+        project_id: ID проекта
     """
     err = _ensure_official()
     if err:
         return err
-    
+
     try:
         project = await _run_blocking(lambda: ticktick.get_project(project_id))
         if 'error' in project:
-            return f"Error fetching project: {project['error']}"
-        
+            return f"Ошибка получения проекта: {project['error']}"
+
         return format_project(project)
     except Exception as e:
         logger.error(f"Error in get_project: {e}")
-        return f"Error retrieving project: {str(e)}"
+        return f"Ошибка получения проекта: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def get_project_tasks(project_id: str) -> str:
     """
-    Get all tasks in a specific project.
-    
+    Получить все задачи в конкретном проекте.
+
     Args:
-        project_id: ID of the project
+        project_id: ID проекта
     """
     err = _ensure_official()
     if err:
         return err
-    
+
     try:
         project_data = await _run_blocking(lambda: ticktick.get_project_with_data(project_id))
         if 'error' in project_data:
-            return f"Error fetching project data: {project_data['error']}"
-        
+            return f"Ошибка получения данных проекта: {project_data['error']}"
+
         tasks = project_data.get('tasks', [])
+        project_name = project_data.get('project', {}).get('name', project_id)
         if not tasks:
-            return f"No tasks found in project '{project_data.get('project', {}).get('name', project_id)}'."
-        
-        result = f"Found {len(tasks)} tasks in project '{project_data.get('project', {}).get('name', project_id)}':\n\n"
-        for i, task in enumerate(tasks, 1):
-            result += f"Task {i}:\n" + format_task(task) + "\n"
-        
+            return f"В проекте «{project_name}» задач не найдено."
+
+        shown = tasks[:_PROJECT_TASKS_CAP]
+        result = f"Найдено задач в проекте «{project_name}»: {len(tasks)}"
+        if len(tasks) > _PROJECT_TASKS_CAP:
+            result += f" (показано {len(shown)} из {len(tasks)})"
+        result += ":\n\n"
+        for i, task in enumerate(shown, 1):
+            result += f"Задача {i}:\n" + format_task(task) + "\n"
+
         return result
     except Exception as e:
         logger.error(f"Error in get_project_tasks: {e}")
-        return f"Error retrieving project tasks: {str(e)}"
+        return f"Ошибка получения задач проекта: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def get_task(project_id: str, task_id: str) -> str:
     """
-    Get details about a specific task.
-    
+    Получить сведения о конкретной задаче.
+
     Args:
-        project_id: ID of the project
-        task_id: ID of the task
+        project_id: ID проекта
+        task_id: ID задачи
     """
     err = _ensure_official()
     if err:
         return err
-    
+
     try:
         task = await _run_blocking(lambda: ticktick.get_task(project_id, task_id))
         if 'error' in task:
-            return f"Error fetching task: {task['error']}"
-        
+            return f"Ошибка получения задачи: {task['error']}"
+
         return format_task(task)
     except Exception as e:
         logger.error(f"Error in get_task: {e}")
-        return f"Error retrieving task: {str(e)}"
+        return f"Ошибка получения задачи: {str(e)}"
 
 def _build_v2_task_obj(node: Dict, project_id: str, task_id: str,
                        parent_id: str = None) -> Dict:
@@ -5236,11 +5252,11 @@ def _get_project_tasks_by_filter(filter_func, filter_name: str) -> str:
 @mcp.tool(annotations=READONLY)
 async def get_all_tasks() -> str:
     """
-    Get ALL open tasks across every project and the Inbox in one fast call.
+    Получить ВСЕ открытые задачи по всем проектам и Inbox одним быстрым вызовом.
 
-    Preferred over get_project_tasks when you need a full picture — this uses
-    the v2 sync state (single request, includes Inbox) when available, falling
-    back to the official API otherwise.
+    Предпочтительнее get_project_tasks, когда нужна полная картина — использует
+    v2 sync state (один запрос, включает Inbox), если доступен, иначе падает
+    обратно на официальный API.
     """
     err = _ensure_official()
     if err:
@@ -5250,17 +5266,17 @@ async def get_all_tasks() -> str:
         if ticktick_v2:
             tasks = await _run_blocking(lambda: ticktick_v2.get_open_tasks())
             if not tasks:
-                return "No tasks found."
+                return "Задачи не найдены."
             names = _v2_project_names()
             by_project: Dict[str, list] = {}
             for t in tasks:
                 pid = t.get("projectId", "")
                 by_project.setdefault(pid, []).append(t)
-            out = f"All open tasks ({len(tasks)}):\n\n"
+            out = f"Все открытые задачи ({len(tasks)}):\n\n"
             for pid, ptasks in by_project.items():
                 pname = names.get(pid, pid or "Inbox")
                 top = [t for t in ptasks if not t.get("parentId")]
-                out += f"── {pname} ({len(top)} tasks) ──\n"
+                out += f"── {pname} ({len(top)} задач) ──\n"
                 out += format_task_tree(top, 500)
                 out += "\n"
             return out
@@ -5270,7 +5286,7 @@ async def get_all_tasks() -> str:
 
     except Exception as e:
         logger.error(f"Error in get_all_tasks: {e}")
-        return f"Error retrieving tasks: {str(e)}"
+        return f"Ошибка получения задач: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
 async def get_tasks_by_priority(priority_id: int) -> str:
