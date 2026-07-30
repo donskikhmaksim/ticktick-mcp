@@ -6728,39 +6728,100 @@ async def get_task_comments(task_title: str, project_id: str, task_id: str) -> s
         return f"Error fetching comments: {str(e)}"
 
 
-@mcp.tool()
-async def add_task_comment(task_title: str, text: str, project_id: str, task_id: str) -> str:
+@mcp.tool(annotations=WRITE)
+async def add_task_comment(task_title: str, text: str, project_id: str, task_id: str,
+                           manifest_id: str = "", user_reply: str = "",
+                           automation_key: str = "") -> str:
     """
-    Add a comment to a task (requires v2 API).
+    Добавить комментарий к задаче (requires v2 API). Гейт согласия —
+    STANDARD.md §3.1: один инструмент, два вызова.
+
+    1-й вызов (manifest_id и user_reply не переданы): ничего не мутирует —
+    сверяет task_id с живым состоянием (identity-guard) и возвращает план
+    (превью текста комментария) с manifest_id. Покажи план пользователю
+    дословно и ДОЖДИСЬ его отдельного ответа (там нет диалога подтверждения
+    на стороне сервера — это твоя задача, не сервера).
+    2-й вызов: тот же инструмент с manifest_id (из 1-го вызова) и
+    user_reply=<дословный ответ пользователя> — исполняет и делает
+    post-verify (свежий get_task_comments, сверка появления текста).
 
     Args:
-        task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
-        text: Comment text
-        project_id: ID of the project
-        task_id: ID of the task
+        task_title: Название задачи — сверяется с живым состоянием (identity-guard)
+        text: Текст комментария
+        project_id: ID проекта
+        task_id: ID задачи
+        manifest_id: id манифеста из 1-го вызова (пусто на 1-м вызове)
+        user_reply: Скопируй сюда ДОСЛОВНО последнее сообщение пользователя,
+            которым он подтвердил действие. Не сочиняй и не пересказывай
+            своими словами. Если пользователь ещё не ответил — не вызывай
+            этот инструмент.
+        automation_key: ключ headless-автоматики (references/automation-secrets.md) — человеку не заполнять
     """
     err = _ensure_ready()
     if err:
         return err
+    g = _guard_task(task_id, task_title or "", project_id)
+    if g.status == "unavailable":
+        return g.message
+    if g.status == "mismatch":
+        return _refuse(f"НЕ добавил комментарий — id указывает на «{g.title}», "
+                        f"а не «{task_title}».")
+    warnings = []
+    if g.status == "missing":
+        # Commenting a completed task is legitimate, but the id↔title check
+        # could not run — say so instead of implying it did.
+        warnings.append("id не среди открытых задач (возможно, завершена) — "
+                        "название НЕ проверено.")
+    live_title = g.title or task_title
+    pid = g.project_id or project_id
+
+    outcome = _gate_single(
+        action="comment_add", tool_name="add_task_comment",
+        objects=[{"id": task_id, "title": live_title, "text": text}],
+        manifest_id=manifest_id, user_reply=user_reply, tier=1,
+        preview_lines=[f"**«{live_title}»** — новый комментарий: «{text}»"],
+        automation_key=automation_key,
+    )
+    if not outcome.proceed:
+        return outcome.message
+
+    obj = outcome.tasks[0]
+    text = obj.get("text", text)
+    actor = _resolve_automation_actor(automation_key) or "human"
     try:
-        g = _guard_task(task_id, task_title or "", project_id)
-        if g.status == "unavailable":
-            return g.message
-        if g.status == "mismatch":
-            return (f"🛑 НЕ добавил комментарий — id это «{g.title}», а НЕ "
-                    f"«{task_title}». Ничего не тронул.")
-        warn = ""
-        if g.status == "missing":
-            # Commenting a completed task is legitimate, but the id↔title
-            # check could not run — say so instead of implying it did.
-            warn = ("\n⚠️ id не среди открытых задач (возможно, завершена) — "
-                    "название НЕ проверено.")
-        await _run_blocking(lambda: ticktick_v2.add_task_comment(
-            g.project_id or project_id, task_id, text))
-        return f"Comment added to '{task_title}'.{warn}"
+        await _run_blocking(lambda: ticktick_v2.add_task_comment(pid, task_id, text))
     except Exception as e:
         logger.error(f"Error in add_task_comment: {e}")
-        return f"Error adding comment: {str(e)}"
+        return _tool_response(
+            "❌", f"Не удалось добавить комментарий к «{live_title}»",
+            warnings=warnings + [f"Ошибка API: {str(e)}"])
+
+    # Post-verify (PLAN_retrofit.md п.8.3): свежий запрос, сверка появления
+    # комментария с тем же текстом — раньше "Comment added" выдавалось по
+    # факту отсутствия исключения (200 OK как доказательство).
+    comment_id = None
+    status = "⚠️"
+    verify_line = "🧾 Проверка не удалась — не смог перечитать комментарии."
+    try:
+        cms = await _run_blocking(lambda: ticktick_v2.get_task_comments(pid, task_id))
+        found = next((c for c in (cms or []) if (c.get("title") or "") == text), None)
+        if found is not None:
+            comment_id = found.get("id")
+            status = "✅"
+            verify_line = "🧾 Проверено: комментарий найден в свежем списке (post-verify)."
+        else:
+            status = "⚠️"
+            verify_line = ("🧾 Комментарий отправлен, но НЕ найден при "
+                           "перечитывании — проверь вручную.")
+    except Exception as e:
+        logger.error(f"Error verifying add_task_comment: {e}")
+
+    rid = _op_journal("comment_add", [{"taskId": task_id, "title": live_title,
+                                       "text": text, "commentId": comment_id}],
+                      f"Комментарий к «{live_title}»", actor=actor)
+    proof = verify_line + (("\n" + _report_line(rid)) if rid else "")
+    return _tool_response(status, f"Комментарий к «{live_title}» добавлен",
+                          bullets=[f"«{text}»"], warnings=warnings, proof=proof)
 
 
 # ---------------------------------------------------------------------------
@@ -7521,89 +7582,253 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None) -> 
 # Comment edit/delete (v2)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 async def update_task_comment(task_title: str, text: str, project_id: str,
-                              task_id: str, comment_id: str) -> str:
+                              task_id: str, comment_id: str,
+                              manifest_id: str = "", user_reply: str = "",
+                              automation_key: str = "") -> str:
     """
-    Edit a task comment (requires v2 API).
+    Изменить текст комментария к задаче (requires v2 API). Гейт согласия —
+    STANDARD.md §3.1: один инструмент, два вызова.
+
+    1-й вызов (manifest_id и user_reply не переданы): ничего не мутирует —
+    сверяет task_id (identity-guard) и comment_id с живым состоянием,
+    возвращает план (старый → новый текст) с manifest_id. Покажи план
+    пользователю дословно и ДОЖДИСЬ его отдельного ответа.
+    2-й вызов: тот же инструмент с manifest_id (из 1-го вызова) и
+    user_reply=<дословный ответ пользователя> — исполняет и делает
+    post-verify (свежий get_task_comments, сверка нового текста).
 
     Args:
-        task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
-        text: New comment text
-        project_id: ID of the project
-        task_id: ID of the task
-        comment_id: ID of the comment to edit
+        task_title: Название задачи — сверяется с живым состоянием (identity-guard)
+        text: Новый текст комментария
+        project_id: ID проекта
+        task_id: ID задачи
+        comment_id: ID изменяемого комментария
+        manifest_id: id манифеста из 1-го вызова (пусто на 1-м вызове)
+        user_reply: Скопируй сюда ДОСЛОВНО последнее сообщение пользователя,
+            которым он подтвердил действие. Не сочиняй и не пересказывай
+            своими словами. Если пользователь ещё не ответил — не вызывай
+            этот инструмент.
+        automation_key: ключ headless-автоматики (references/automation-secrets.md) — человеку не заполнять
     """
     err = _ensure_ready()
     if err:
         return err
+    g = _guard_task(task_id, task_title or "", project_id)
+    if g.status == "unavailable":
+        return g.message
+    if g.status == "mismatch":
+        return _refuse(f"НЕ изменил комментарий — id указывает на «{g.title}», "
+                        f"а не «{task_title}».")
+    warnings = []
+    if g.status == "missing":
+        warnings.append("id не среди открытых задач — название НЕ проверено.")
+    live_title = g.title or task_title
+    pid = g.project_id or project_id
+
+    # Identity-guard for the COMMENT itself (id + container=task), re-read
+    # fresh on every call — this also doubles as the "old text" for the plan
+    # preview.
     try:
-        g = _guard_task(task_id, task_title or "", project_id)
-        if g.status == "unavailable":
-            return g.message
-        if g.status == "mismatch":
-            return (f"🛑 НЕ изменил комментарий — id это «{g.title}», а НЕ "
-                    f"«{task_title}». Ничего не тронул.")
-        pid = g.project_id or project_id
+        cms_pre = await _run_blocking(lambda: ticktick_v2.get_task_comments(pid, task_id))
+    except Exception as e:
+        logger.error(f"Error in update_task_comment (pre-read): {e}")
+        return _refuse(f"Не смог прочитать комментарии задачи «{live_title}» — "
+                        f"отказ (не редактирую вслепую): {str(e)}")
+    old = next((c for c in (cms_pre or []) if c.get("id") == comment_id), None)
+    if old is None:
+        return _refuse(f"НЕ изменил — комментария {comment_id} нет на задаче "
+                        f"«{live_title}» (уже удалён или чужой id).")
+    old_text = old.get("title") or ""
+
+    preview_line = f"**«{live_title}»** — комментарий: «{old_text}» → «{text}»"
+    outcome = _gate_single(
+        action="comment_update", tool_name="update_task_comment",
+        objects=[{"id": comment_id, "title": live_title, "text": text,
+                 "old_text": old_text}],
+        manifest_id=manifest_id, user_reply=user_reply, tier=1,
+        preview_lines=[preview_line],
+        automation_key=automation_key,
+    )
+    if not outcome.proceed:
+        return outcome.message
+
+    obj = outcome.tasks[0]
+    text = obj.get("text", text)
+    old_text = obj.get("old_text", old_text)
+    actor = _resolve_automation_actor(automation_key) or "human"
+    try:
         # (client-side: update_task_comment fetches the comment first and
         # raises if comment_id is absent — a moved/stale pid errors loudly)
         await _run_blocking(lambda: ticktick_v2.update_task_comment(pid, task_id, comment_id, text))
-        # Post-verify: the new text must be visible in the comment list.
-        cms = await _run_blocking(lambda: ticktick_v2.get_task_comments(pid, task_id))
-        cm = next((c for c in cms if c.get("id") == comment_id), None)
-        if cm is None:
-            return (f"❌ Комментарий к '{task_title}' после правки НЕ найден — "
-                    "исход не подтверждён, проверь вручную.")
-        if (cm.get("title") or "") != text:
-            return (f"❌ Правка комментария к '{task_title}' НЕ применилась "
-                    "(текст прежний).")
-        warn = ("\n⚠️ id не среди открытых задач — название НЕ проверено."
-                if g.status == "missing" else "")
-        return f"Comment on '{task_title}' updated (проверено).{warn}"
     except Exception as e:
         logger.error(f"Error in update_task_comment: {e}")
-        return f"Error updating comment: {str(e)}"
+        return _tool_response(
+            "❌", f"Не удалось изменить комментарий к «{live_title}»",
+            warnings=warnings + [f"Ошибка API: {str(e)}"])
+
+    # Post-verify: the new text must be visible in a FRESH comment list.
+    status = "❌"
+    verify_line = "🧾 Комментарий после правки НЕ найден — исход не подтверждён, проверь вручную."
+    try:
+        cms = await _run_blocking(lambda: ticktick_v2.get_task_comments(pid, task_id))
+        cm = next((c for c in (cms or []) if c.get("id") == comment_id), None)
+        if cm is None:
+            status = "❌"
+            verify_line = ("🧾 Комментарий после правки НЕ найден — исход "
+                           "не подтверждён, проверь вручную.")
+        elif (cm.get("title") or "") != text:
+            status = "❌"
+            verify_line = "🧾 Текст комментария НЕ изменился (расхождение с post-verify)."
+        else:
+            status = "✅"
+            verify_line = "🧾 Проверено: новый текст найден в свежем списке (post-verify)."
+    except Exception as e:
+        logger.error(f"Error verifying update_task_comment: {e}")
+        status = "⚠️"
+        verify_line = "🧾 Проверка не удалась — не смог перечитать комментарии."
+
+    rid = _op_journal("comment_update", [{"taskId": task_id, "title": live_title,
+                                          "commentId": comment_id,
+                                          "old_text": old_text, "text": text}],
+                      f"Правка комментария к «{live_title}»", actor=actor)
+    proof = verify_line + (("\n" + _report_line(rid)) if rid else "")
+    return _tool_response(status, f"Комментарий к «{live_title}» изменён",
+                          bullets=[f"«{old_text}» → «{text}»"],
+                          warnings=warnings, proof=proof)
 
 
-@mcp.tool()
-async def delete_task_comment(task_title: str, project_id: str, task_id: str, comment_id: str) -> str:
+@mcp.tool(annotations=DESTRUCTIVE)
+async def delete_task_comment(task_title: str, project_id: str, task_id: str,
+                              comment_id: str, manifest_id: str = "",
+                              user_reply: str = "", automation_key: str = "") -> str:
     """
-    Delete a task comment (requires v2 API).
+    Удалить комментарий к задаче — НЕОБРАТИМО, у TickTick нет корзины для
+    комментариев (requires v2 API). Гейт согласия — STANDARD.md §3.1, tier 🔴
+    (2): один инструмент, два вызова, с анти-дуплетом по времени между планом
+    и исполнением.
+
+    1-й вызов (manifest_id и user_reply не переданы): ничего не удаляет —
+    сверяет task_id (identity-guard) и comment_id с живым состоянием,
+    возвращает план (текст удаляемого комментария) с manifest_id. Покажи план
+    пользователю дословно и ДОЖДИСЬ его отдельного ответа.
+    2-й вызов: тот же инструмент с manifest_id (из 1-го вызова) и
+    user_reply=<дословный ответ пользователя> — ПЕРЕД удалением пишет в
+    журнал снимок (полный живой объект комментария) удаляемого комментария,
+    иначе восстановить вручную нечего, затем удаляет и делает post-verify
+    (свежий get_task_comments, комментарий должен исчезнуть).
 
     Args:
-        task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
-        project_id: ID of the project
-        task_id: ID of the task
-        comment_id: ID of the comment to delete
+        task_title: Название задачи — сверяется с живым состоянием (identity-guard)
+        project_id: ID проекта
+        task_id: ID задачи
+        comment_id: ID удаляемого комментария
+        manifest_id: id манифеста из 1-го вызова (пусто на 1-м вызове)
+        user_reply: Скопируй сюда ДОСЛОВНО последнее сообщение пользователя,
+            которым он подтвердил действие. Не сочиняй и не пересказывай
+            своими словами. Если пользователь ещё не ответил — не вызывай
+            этот инструмент.
+        automation_key: ключ headless-автоматики (references/automation-secrets.md) — человеку не заполнять
     """
     err = _ensure_ready()
     if err:
         return err
+    g = _guard_task(task_id, task_title or "", project_id)
+    if g.status == "unavailable":
+        return g.message
+    if g.status == "mismatch":
+        return _refuse(f"НЕ удалил комментарий — id указывает на «{g.title}», "
+                        f"а не «{task_title}».")
+    warnings = []
+    if g.status == "missing":
+        warnings.append("id не среди открытых задач — название НЕ проверено.")
+    live_title = g.title or task_title
+    pid = g.project_id or project_id
+
+    # Existence pre-check: refuse a stale comment_id instead of no-opping.
     try:
-        g = _guard_task(task_id, task_title or "", project_id)
-        if g.status == "unavailable":
-            return g.message
-        if g.status == "mismatch":
-            return (f"🛑 НЕ удалил комментарий — id это «{g.title}», а НЕ "
-                    f"«{task_title}». Ничего не тронул.")
-        pid = g.project_id or project_id
-        # Existence pre-check: refuse a stale comment_id instead of no-opping.
-        cms = await _run_blocking(lambda: ticktick_v2.get_task_comments(pid, task_id))
-        if not any(c.get("id") == comment_id for c in cms):
-            return (f"🛑 НЕ удалил — комментария {comment_id} нет на задаче "
-                    f"'{task_title}' (уже удалён или чужой id). Ничего не тронул.")
+        cms_pre = await _run_blocking(lambda: ticktick_v2.get_task_comments(pid, task_id))
+    except Exception as e:
+        logger.error(f"Error in delete_task_comment (pre-read): {e}")
+        return _refuse(f"Не смог прочитать комментарии задачи «{live_title}» — "
+                        f"отказ (не удаляю вслепую): {str(e)}")
+    live_comment = next((c for c in (cms_pre or []) if c.get("id") == comment_id), None)
+    if live_comment is None:
+        return _refuse(f"НЕ удалил — комментария {comment_id} нет на задаче "
+                        f"«{live_title}» (уже удалён или чужой id).")
+    comment_text = live_comment.get("title") or ""
+
+    preview_line = f"**«{live_title}»** — удалить комментарий: «{comment_text}»"
+    outcome = _gate_single(
+        action="comment_delete", tool_name="delete_task_comment",
+        objects=[{"id": comment_id, "title": live_title, "text": comment_text}],
+        manifest_id=manifest_id, user_reply=user_reply, tier=2,
+        preview_lines=[preview_line],
+        automation_key=automation_key,
+    )
+    if not outcome.proceed:
+        return outcome.message
+
+    actor = _resolve_automation_actor(automation_key) or "human"
+
+    # Pre-snapshot (PLAN_retrofit.md п.8.2): re-read the comment FRESH right
+    # before deleting — the object stored in the manifest at plan time may be
+    # stale by execute time — and journal the FULL live comment dict (not the
+    # narrow per-kind slice _snapshot_of(kind="comment") would produce: that
+    # field list guesses generic names ("content"/"text"/"authorName"/...)
+    # that don't match this API's actual shape — the text lives in "title",
+    # per ticktick_v2_client.update_task_comment above. Максим смягчил
+    # правило снимка: при сомнении — снимай ШИРЕ, весь объект, не тонко
+    # режь — so the full live dict is journaled here instead.
+    try:
+        cms_fresh = await _run_blocking(lambda: ticktick_v2.get_task_comments(pid, task_id))
+    except Exception as e:
+        logger.error(f"Error in delete_task_comment (fresh pre-read): {e}")
+        return _refuse(f"Не смог перечитать комментарии задачи «{live_title}» "
+                        f"перед удалением — отказ (не удаляю вслепую): {str(e)}")
+    fresh_comment = next((c for c in (cms_fresh or []) if c.get("id") == comment_id), None)
+    if fresh_comment is None:
+        gone_warning = "Комментарий исчез между планом и исполнением — удалять нечего."
+        return _tool_response(
+            "↷", f"Комментарий на «{live_title}» уже удалён",
+            warnings=warnings + [gone_warning])
+
+    pre_snapshot = dict(fresh_comment)
+    rid = _op_journal("comment_delete", [{"taskId": task_id, "title": live_title,
+                                          "commentId": comment_id,
+                                          "snapshot": pre_snapshot}],
+                      f"Удаление комментария к «{live_title}»", actor=actor)
+
+    try:
         await _run_blocking(lambda: ticktick_v2.delete_task_comment(pid, task_id, comment_id))
-        # Post-verify: the comment must actually be gone.
-        cms = await _run_blocking(lambda: ticktick_v2.get_task_comments(pid, task_id))
-        if any(c.get("id") == comment_id for c in cms):
-            return (f"❌ Комментарий на '{task_title}' ВСЁ ЕЩЁ существует — "
-                    "удаление не сработало.")
-        warn = ("\n⚠️ id не среди открытых задач — название НЕ проверено."
-                if g.status == "missing" else "")
-        return f"Comment on '{task_title}' deleted (проверено).{warn}"
     except Exception as e:
         logger.error(f"Error in delete_task_comment: {e}")
-        return f"Error deleting comment: {str(e)}"
+        return _tool_response(
+            "❌", f"Не удалось удалить комментарий к «{live_title}»",
+            warnings=warnings + [f"Ошибка API: {str(e)}"],
+            proof=_report_line(rid) if rid else "")
+
+    # Post-verify: the comment must actually be gone from a FRESH read.
+    status = "❌"
+    verify_line = "🧾 Комментарий ВСЁ ЕЩЁ существует — удаление не подтвердилось."
+    try:
+        cms = await _run_blocking(lambda: ticktick_v2.get_task_comments(pid, task_id))
+        if any(c.get("id") == comment_id for c in (cms or [])):
+            status = "❌"
+            verify_line = "🧾 Комментарий ВСЁ ЕЩЁ существует — удаление не подтвердилось."
+        else:
+            status = "✅"
+            verify_line = "🧾 Проверено: комментарий отсутствует в свежем списке (post-verify)."
+    except Exception as e:
+        logger.error(f"Error verifying delete_task_comment: {e}")
+        status = "⚠️"
+        verify_line = "🧾 Проверка не удалась — не смог перечитать комментарии."
+
+    proof = verify_line + (("\n" + _report_line(rid)) if rid else "")
+    return _tool_response(status, f"Комментарий на «{live_title}» удалён",
+                          bullets=[f"«{comment_text}»"], warnings=warnings,
+                          proof=proof)
 
 
 # ---------------------------------------------------------------------------
