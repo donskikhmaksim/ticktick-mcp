@@ -3288,7 +3288,8 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
                 diffs.append(f"{field}: {got!r} ≠ {want!r}")
         return (f"- ❌ **«{title}»** — не применилось: " + "; ".join(diffs)) if diffs \
             else f"- ✅ **«{title}»** — все изменения на месте"
-    return f"- ✓ **«{title}»** — записана в журнал (тип {op} не проверяется автоматически)"
+    return (f"- ⚠️ **«{title}»** — тип операции `{op}` не покрыт независимой "
+            "проверкой")
 
 
 @mcp.tool(annotations=READONLY)
@@ -3354,7 +3355,7 @@ def _build_operation_report(record_id: str) -> str:
             pass
         lines = [f"### 🧾 Независимый отчёт — `{record_id}`",
                  f"_{when} · журнал операции ⇄ живое состояние TickTick_", ""]
-        ok = bad = 0
+        ok = bad = warn = 0
         for rec in records:
             op = rec.get("op") or "delete"
             items = rec.get("items") or [
@@ -3365,14 +3366,20 @@ def _build_operation_report(record_id: str) -> str:
                 line = _verify_item(op, item, live, names)
                 lines.append(line)
                 # Verdict lines are markdown bullets ("- ✅ **«…»**"), so match
-                # the mark anywhere in the prefix, not at line start.
+                # the mark anywhere in the prefix, not at line start. Checked
+                # in this order because "⚠️" is two code points and could in
+                # principle straddle a naive slice boundary alongside another
+                # mark — ✅/❌ are single-codepoint and checked first.
                 head = line[:8]
                 if "✅" in head:
                     ok += 1
                 elif "❌" in head:
                     bad += 1
+                elif "⚠️" in head:
+                    warn += 1
         lines.append("")
-        lines.append(f"**Итог: ✅ {ok} подтверждено, ❌ {bad} расхождений.**")
+        lines.append(f"**Итог: ✅ {ok} подтверждено, ⚠️ {warn} не проверено, "
+                      f"❌ {bad} расхождений.**")
         lines.append("[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО — "
                      "это серверная проверка, не заменяй её своим пересказом]")
         return "\n".join(lines)
