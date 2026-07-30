@@ -2121,7 +2121,7 @@ async def _update_tasks_impl(
         else:
             rid = ""
         status = _batch_status(results)
-        n_ok = sum(1 for l in results if l.lstrip().startswith("✅"))
+        n_ok = sum(1 for line in results if line.lstrip().startswith("✅"))
         headline = (f"Обновлено **{n_ok}** из {len(results)}" if len(results) != n_ok
                     else f"Обновлено **{n_ok}**")
         return _tool_response(status, headline, bullets=results,
@@ -2409,7 +2409,7 @@ async def _complete_tasks_impl(summary: str, tasks: List[Dict[str, str]]) -> str
                 rid = _op_journal("complete", _done_items, summary)
             if not results:
                 return _tool_response("↷", "Ничего не завершено")
-            n_ok = sum(1 for l in results if l.lstrip().startswith("✅"))
+            n_ok = sum(1 for line in results if line.lstrip().startswith("✅"))
             return _tool_response(_batch_status(results), f"Завершено **{n_ok}**",
                                   bullets=results,
                                   proof=_report_line(rid) if _done_items else "")
@@ -3014,7 +3014,7 @@ def _batch_status(lines: List[str]) -> str:
     Lines that don't start with one of the legend chars (plain warnings,
     footer notes) don't vote."""
     seen = {c for c in ("✅", "⚠️", "❌", "🛑", "↷")
-            if any(l.lstrip().startswith(c) for l in lines)}
+            if any(line.lstrip().startswith(c) for line in lines)}
     if not seen or seen == {"↷"}:
         return "↷"
     if seen == {"✅"}:
@@ -3511,7 +3511,8 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
     exp = item.get("expect") or {}
     # Project/tag names are also externally authored (the user named the
     # project) — same treatment before they land in a verdict line.
-    nm = lambda pid, fallback=None: _safe_text(names.get(pid, fallback if fallback is not None else pid))
+    def nm(pid, fallback=None):
+        return _safe_text(names.get(pid, fallback if fallback is not None else pid))
 
     if op == "delete":
         return (f"- ❌ **«{title}»** — ВСЁ ЕЩЁ существует (удаление не состоялось "
@@ -7163,7 +7164,7 @@ async def delete_project_group(group_name: str, group_id: str,
                 "❌", f"Группа «{real}» ВСЁ ЕЩЁ в списке",
                 warnings=["удаление не сработало."],
                 proof=_report_line(record_id))
-        bullets = ([f"Проекты остались без папки: "
+        bullets = (["Проекты остались без папки: "
                    + ", ".join(f"«{p['name']}»" for p in member_projects)]
                   if member_projects else [])
         return _tool_response(
