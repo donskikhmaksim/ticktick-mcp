@@ -90,8 +90,10 @@ def test_build_operation_report_counts_are_not_forged_by_title(monkeypatch, tmp_
     assert sum(1 for l in lines if l.startswith("- ❌")) == 0
     assert sum(1 for l in lines if l.startswith("**Итог:")) == 1
     # And the real summary's tally is the structural one (one item, ok),
-    # not something inflated by re-parsing the hostile text.
-    assert "**Итог: ✅ 1 подтверждено, ❌ 0 расхождений.**" in report
+    # not something inflated by re-parsing the hostile text. (The three-way
+    # ok/warn/bad tally itself is package 1-14 territory, already merged
+    # into HEAD — this just checks the hostile title can't skew it.)
+    assert "**Итог: ✅ 1 подтверждено, ⚠️ 0 не проверено, ❌ 0 расхождений.**" in report
 
 
 # ---------------------------------------------------------------------------

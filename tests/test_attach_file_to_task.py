@@ -265,7 +265,11 @@ async def test_upload_exception_is_refused_cleanly(wired):
         task_title=TASK_TITLE, task_id=TASK_ID, project_id=PROJECT_ID,
         manifest_id=mid, user_reply="да")
     assert "🛑" in out
-    assert "upstream 500" in out
+    # 17.x: raw upstream exception text must never be echoed back to the
+    # caller (it can carry request/response internals, e.g. a URL with a
+    # secret query-string token) — only the classified, generic message is.
+    assert "upstream 500" not in out
+    assert "unexpected error while attaching the file" in out
 
 
 async def test_successful_attach_writes_an_audit_journal_entry(wired, tmp_path):
