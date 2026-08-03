@@ -303,9 +303,37 @@ run_step railway variables set \
   TICKTICK_CLIENT_SECRET="$CLIENT_SECRET" \
   USER_TIMEZONE="$TIMEZONE"
 
-echo "Запускаю сборку из форка..."
-run_step railway redeploy --service "$SERVICE_NAME" --from-source --yes || \
-  run_step railway redeploy --service "$SERVICE_NAME" --from-source || true
+# `railway redeploy` (даже с --from-source) не проверен вживую на этом
+# сервисе — а обычный `redeploy` БЕЗ этого флага, как выяснилось на практике
+# на других сервисах, тихо перезапускает СТАРЫЙ собранный образ вместо того
+# чтобы подтянуть свежий коммит. Не полагаемся на недоказанное: клонируем
+# форк и заливаем `railway up` напрямую — гарантированно доставляет СЕГОДНЯШНИЙ
+# код при каждом запуске, и при первой установке, и при повторном (обновлении).
+echo "Загружаю и собираю свежий код из форка..."
+FRESH_DIR=$(mktemp -d)
+if ! (cd "$FRESH_DIR" && git clone --depth 1 "https://github.com/$FORK_REPO.git" . --quiet) 2>&1; then
+  echo "❌ Не смог скачать $FORK_REPO для деплоя."
+  exit 1
+fi
+DEPLOY_ATTEMPT=0
+DEPLOY_MAX=24  # до ~4 минут ожидания, если source connect ещё сам собирает параллельно
+DEPLOY_OUT=""
+while true; do
+  if DEPLOY_OUT=$(cd "$FRESH_DIR" && railway up --service "$SERVICE_NAME" --detach --json 2>&1); then
+    break
+  fi
+  DEPLOY_ATTEMPT=$((DEPLOY_ATTEMPT + 1))
+  if [[ $DEPLOY_ATTEMPT -ge $DEPLOY_MAX ]]; then
+    echo "❌ Не получилось задеплоить свежий код после $DEPLOY_MAX попыток."
+    echo "── полный вывод ──────────────────────────"
+    echo "$DEPLOY_OUT"
+    echo "───────────────────────────────────────────"
+    rm -rf "$FRESH_DIR"
+    exit 1
+  fi
+  sleep 10
+done
+rm -rf "$FRESH_DIR"
 
 echo "Генерирую домен..."
 DOMAIN_RAW=$(set +o pipefail; railway domain --service "$SERVICE_NAME" --json 2>&1)
