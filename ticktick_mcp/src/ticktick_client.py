@@ -63,18 +63,27 @@ _DATE_ONLY = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
 def _normalize_date(value):
     """If a date is given without a time (YYYY-MM-DD), it's a ZONE-INDEPENDENT
-    all-day calendar date: return (value at UTC midnight, True). Otherwise return
+    all-day calendar date: return (value at UTC NOON, True). Otherwise return
     (value, False).
 
-    We deliberately anchor the date at +0000 (UTC midnight), NOT the user's local
-    zone. A positive-offset local midnight (e.g. Europe/Moscow +03) serializes to
-    the PREVIOUS UTC day, whose date part TickTick then renders one calendar day
-    early (#36). UTC midnight keeps the date part verbatim regardless of the
-    account's offset sign, and the read side takes dueDate[:10] for all-day tasks,
-    so it round-trips to the same calendar date. Timed values pass through
-    untouched — they carry their own offset."""
+    We deliberately anchor at 12:00 UTC, not midnight (#36 fix used midnight;
+    hardened after a repeated reports of all-day dates landing one day early
+    even with a correctly-computed literal date — consistent with TickTick's
+    OWN app/website converting the stored instant into the ACCOUNT's own
+    timezone before display, not reading the date part verbatim as this
+    server's OWN round-trip tests assumed. Midnight UTC survives that for
+    positive-offset accounts (e.g. Europe/Moscow +03) but NOT negative-offset
+    ones (e.g. US Pacific -07/-08): midnight UTC minus 7-8h falls on the
+    PREVIOUS calendar day). Noon UTC has slack in both directions — every
+    real-world UTC offset from -12 to +12 (the practical range) lands the
+    displayed instant on the SAME calendar day regardless of which way
+    TickTick (or anything else reading this) converts it. Our own read side
+    (_all_day_date) takes dueDate[:10] verbatim regardless of the time
+    component, so this doesn't affect anything on our side — it only
+    protects against a third-party renderer that doesn't. Timed values pass
+    through untouched — they carry their own offset."""
     if value and _DATE_ONLY.match(value.strip()):
-        return value.strip() + "T00:00:00.000+0000", True
+        return value.strip() + "T12:00:00.000+0000", True
     return value, False
 
 class TickTickClient:

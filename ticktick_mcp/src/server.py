@@ -1076,6 +1076,14 @@ async def create_tasks(
 
     Dates: use "YYYY-MM-DD" for all-day; full ISO "YYYY-MM-DDThh:mm:ss+0000"
     only when the user specified an exact time. Do NOT invent a time.
+    For "today"/"tomorrow"/"yesterday" or a bare weekday name (RU too:
+    "сегодня"/"завтра"/"вчера", "понедельник".."воскресенье"/"пн".."вс") pass
+    that WORD literally instead of computing the date yourself — the server
+    resolves it off its own real clock (a weekday name resolves to the
+    nearest such day from today, today included). This matters in long
+    conversations: if your own sense of "today" has drifted (stale context),
+    a self-computed date silently lands on the wrong day; the literal word
+    never can.
 
     ── Examples ──
 
@@ -1136,6 +1144,9 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
     sub_verify = []  # (title, id) of created SUBTASKS — existence re-checked too
 
     for i, t in enumerate(tasks):
+        # Idempotent: a no-op if plan_task_creation already resolved these
+        # (defends direct/headless callers that skip the plan phase).
+        _resolve_dates_in_task_tree(t)
         title = t.get("title")
         project_id = t.get("project_id") or t.get("projectId")
         if not title or not project_id:
@@ -1477,6 +1488,11 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     if len(tasks) > max_items:
         return (f"🛑 Отказ: {len(tasks)} создани(й) — больше капа {max_items}. "
                 "Разбей на части или подними max_items осознанно.")
+    # Resolve "today"/"tomorrow"/etc. off the real clock BEFORE building the
+    # preview, so what the user approves is already the real calendar date —
+    # not a word the calling model computed (possibly with stale context).
+    for t in tasks:
+        _resolve_dates_in_task_tree(t)
     names = _v2_project_names()
     good, refused, pending = [], [], []  # pending: no project given → suggest
     for i, t in enumerate(tasks, 1):
@@ -1632,7 +1648,10 @@ async def update_tasks(
     Supported fields per item:
       taskId (required), projectId (required for single/advanced),
       title (current title, for the dialog), new_title, content,
-      start_date ("YYYY-MM-DD" = all-day; full ISO only if time given),
+      start_date ("YYYY-MM-DD" = all-day; full ISO only if time given; or the
+        literal word "today"/"tomorrow"/"yesterday"/a weekday name — RU too —
+        resolved by the server off its own clock, immune to your own date
+        drifting),
       due_date (same rule), priority (0/1/3/5),
       repeat_flag (single task only; use build_recurrence_rule),
       reminders (single task only; use build_reminder),
@@ -1654,6 +1673,14 @@ async def update_tasks(
     err = _ensure_official()
     if err:
         return err
+    # Resolve "today"/"tomorrow"/etc. off the real clock BEFORE the manifest
+    # is built (call #1) — the preview the user approves and what actually
+    # gets written must be the same date, not a word the caller computed.
+    if tasks:
+        for t in tasks:
+            for key in ("due_date", "start_date"):
+                if key in t:
+                    t[key] = _resolve_relative_date(t[key])
     outcome = _gate_batch("update", "update_tasks", tasks, summary,
                           manifest_id, user_reply, _describe_update_item)
     if not outcome.proceed:
@@ -4750,6 +4777,69 @@ def _task_due_local_date(task: Dict[str, Any]):
 
 def _today_local():
     return datetime.now(_USER_TZ).date()
+
+
+# A long-running chat can drift a day behind the wall clock (stale date
+# context) — the caller then computes its own "today" wrong and silently
+# writes yesterday's date as "today" for the rest of that conversation. Every
+# task actually gets that literal wrong date; nothing here can detect it after
+# the fact. So relative day-words are resolved SERVER-SIDE, off the real clock
+# + USER_TIMEZONE, instead of trusting the caller's own arithmetic — the class
+# of bug this closes, not just a one-off case.
+_RELATIVE_DATE_WORDS = {
+    "today": 0, "сегодня": 0,
+    "tomorrow": 1, "завтра": 1,
+    "yesterday": -1, "вчера": -1,
+}
+
+# Bare weekday name ("Monday", "понедельник", "пн") -> the NEAREST occurrence
+# from today (today itself counts, if today already is that weekday) —
+# resolved off the real clock, same as the today/tomorrow/yesterday words
+# above. A weekday name is just as easy for a caller with stale date context
+# to land one day off on (reported case: asked for Monday, got Sunday — a
+# plain -1-day drift wearing a different name).
+_WEEKDAY_NAMES = {
+    "monday": 0, "понедельник": 0, "пн": 0,
+    "tuesday": 1, "вторник": 1, "вт": 1,
+    "wednesday": 2, "среда": 2, "ср": 2,
+    "thursday": 3, "четверг": 3, "чт": 3,
+    "friday": 4, "пятница": 4, "пт": 4,
+    "saturday": 5, "суббота": 5, "сб": 5,
+    "sunday": 6, "воскресенье": 6, "вс": 6,
+}
+
+
+def _resolve_relative_date(value):
+    """'today'/'tomorrow'/'yesterday' or a bare weekday name (RU too,
+    case-insensitive) -> real 'YYYY-MM-DD' from THIS server's clock.
+    Anything else (an already-literal date, a full ISO timestamp, None)
+    passes through unchanged — idempotent, safe to call on values that were
+    already resolved."""
+    if not isinstance(value, str):
+        return value
+    key = value.strip().lower()
+    offset = _RELATIVE_DATE_WORDS.get(key)
+    if offset is not None:
+        return (_today_local() + timedelta(days=offset)).isoformat()
+    weekday = _WEEKDAY_NAMES.get(key)
+    if weekday is not None:
+        today = _today_local()
+        delta = (weekday - today.weekday()) % 7
+        return (today + timedelta(days=delta)).isoformat()
+    return value
+
+
+def _resolve_dates_in_task_tree(node: Dict[str, Any]) -> None:
+    """Mutates due_date/start_date in place on `node` and recursively through
+    node['subtasks'] (root + nested creation tree)."""
+    if not isinstance(node, dict):
+        return
+    for key in ("due_date", "start_date"):
+        if key in node:
+            node[key] = _resolve_relative_date(node[key])
+    for child in (node.get("subtasks") or []):
+        if isinstance(child, dict):
+            _resolve_dates_in_task_tree(child)
 
 
 def _is_task_due_today(task: Dict[str, Any]) -> bool:

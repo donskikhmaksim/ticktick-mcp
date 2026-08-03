@@ -10,10 +10,27 @@
 
 set -eo pipefail
 
+# ── Часовой пояс по умолчанию — берём с ЭТОГО компьютера ────────────────────
+# Раньше был захардкожен Europe/Moscow — если человек ставит себе сервер не из
+# Москвы (и не передаёт --timezone явно), TickTick получал ЧУЖОЙ часовой пояс,
+# и "сегодня"/даты у него уезжали на день. Берём системную таймзону машины, на
+# которой реально выполняется установка — она почти всегда верна для того,
+# кто установку и запускает. Fallback на Europe/Moscow только если ничего не
+# удалось определить (например, редкий минимальный Linux без обоих файлов).
+detect_local_timezone() {
+  local tz=""
+  if [[ -L /etc/localtime ]]; then
+    tz=$(readlink /etc/localtime | sed -E 's#.*/zoneinfo/##')
+  elif [[ -f /etc/timezone ]]; then
+    tz=$(cat /etc/timezone 2>/dev/null)
+  fi
+  [[ -n "$tz" && "$tz" != "/etc/localtime" ]] && echo "$tz" || echo "Europe/Moscow"
+}
+
 # ── Парсинг аргументов ─────────────────────────────────────────────────────
 CLIENT_ID=""
 CLIENT_SECRET=""
-TIMEZONE="Europe/Moscow"
+TIMEZONE="$(detect_local_timezone)"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -106,6 +123,7 @@ if [[ "${RW_VERSION:-0}" -lt 4 ]]; then
   exit 1
 fi
 ok "Railway CLI $(set +o pipefail; railway --version 2>&1 | head -1)"
+ok "Часовой пояс для дат в TickTick: $TIMEZONE (определён по этому компьютеру; если не тот — перезапусти с --timezone)"
 
 # ── Шаг 2: GitHub CLI + форк ────────────────────────────────────────────────
 step "2/5  Форкаю репозиторий на твой GitHub"
