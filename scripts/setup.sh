@@ -141,6 +141,15 @@ if command -v gh &>/dev/null; then
   if gh auth status &>/dev/null; then
     GH_USER=$(gh api user --jq .login 2>/dev/null || true)
     if [[ -n "$GH_USER" ]]; then
+      ok "Залогинен в GitHub как: $GH_USER"
+      UPSTREAM_OWNER_ONLY="${UPSTREAM_REPO%%/*}"
+      if [[ "$GH_USER" == "$UPSTREAM_OWNER_ONLY" ]]; then
+        echo -e "${YELLOW}⚠️  Это владелец апстрима ($UPSTREAM_REPO).${RESET}"
+        echo "   Если ставишь ДЛЯ СЕБЯ — это нормально, продолжай."
+        echo "   Если ставишь ДЛЯ ДРУГОГО ЧЕЛОВЕКА — форк «в себя» не даст ему"
+        echo "   ни изоляции токенов, ни автообновления. Прерви (Ctrl+C) и"
+        echo "   переключи: gh auth switch --hostname github.com --user <его-логин>"
+      fi
       echo "Форкаю $UPSTREAM_REPO в твой аккаунт $GH_USER (идемпотентно)..."
       # --clone=false: форк нам нужен только как источник для Railway, локальная
       # копия не требуется. Если форк уже есть — gh просто сообщит об этом.
@@ -403,90 +412,107 @@ ok "Сервер живёт на https://$DOMAIN"
 # ── Шаг 5: Авторизация в TickTick (локальный auth-флоу) ─────────────────────
 step "5/5  Войди в свой TickTick"
 
-echo ""
-echo "Сейчас откроется браузер с логином TickTick — войди в СВОЙ аккаунт и"
-echo "нажми Allow. Токен получается локально (client_secret не покидает твою"
-echo "машину) и записывается в переменную сервера."
-echo ""
+# Идемпотентность: не гоняем повторный вход, если аккаунт уже подключён (сам
+# /health это знает). Раньше этот шаг выполнялся БЕЗУСЛОВНО при каждом
+# запуске — даже когда просто обновляли код на уже работающем сервере.
+ALREADY_CONNECTED=$(curl -s --max-time 10 "https://$DOMAIN/health" 2>/dev/null | grep -o '"ticktick_connected":[[:space:]]*true' || true)
 
-# Нужен uv для локального auth-флоу (uv run сам поставит зависимости пакета).
-if ! command -v uv &>/dev/null; then
-  echo "Устанавливаю uv (для локальной авторизации)..."
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  export PATH="$HOME/.local/bin:$PATH"
-fi
+if [[ -n "$ALREADY_CONNECTED" ]]; then
+  ok "TickTick уже подключён (аккаунт авторизован ранее) — пропускаю повторный вход."
+else
+  echo ""
+  echo "Сейчас откроется браузер с логином TickTick — войди в СВОЙ аккаунт и"
+  echo "нажми Allow. Токен получается локально (client_secret не покидает твою"
+  echo "машину) и записывается в переменную сервера."
+  echo ""
 
-WORK_DIR=$(mktemp -d)
-# Гарантированно чистим временную папку на любом выходе.
-trap 'rm -rf "$WORK_DIR"' EXIT
-cd "$WORK_DIR"
+  # Нужен uv для локального auth-флоу (uv run сам поставит зависимости пакета).
+  if ! command -v uv &>/dev/null; then
+    echo "Устанавливаю uv (для локальной авторизации)..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
+  fi
 
-echo "Скачиваю репозиторий для авторизации..."
-git clone --depth 1 "https://github.com/$UPSTREAM_REPO" . --quiet
+  WORK_DIR=$(mktemp -d)
+  # Гарантированно чистим временную папку на любом выходе.
+  trap 'rm -rf "$WORK_DIR"' EXIT
+  cd "$WORK_DIR"
 
-# Кладём client_id/secret в .env — их читает локальный auth-флоу.
-cat > .env <<EOF
+  echo "Скачиваю репозиторий для авторизации..."
+  git clone --depth 1 "https://github.com/$UPSTREAM_REPO" . --quiet
+
+  # Кладём client_id/secret в .env — их читает локальный auth-флоу.
+  cat > .env <<EOF
 TICKTICK_CLIENT_ID=$CLIENT_ID
 TICKTICK_CLIENT_SECRET=$CLIENT_SECRET
 EOF
 
-ask "Нажми Enter чтобы открыть браузер для входа в TickTick..."
-read -r
+  ask "Нажми Enter чтобы открыть браузер для входа в TickTick..."
+  read -r
 
-# uv run сам создаёт venv и ставит зависимости; auth пишет токены в .env.
-uv run --python 3.12 -m ticktick_mcp.cli auth || {
-  echo "❌ Локальная авторизация не удалась. Проверь Client ID/Secret и повтори."
-  exit 1
-}
+  # uv run сам создаёт venv и ставит зависимости; auth пишет токены в .env.
+  uv run --python 3.12 -m ticktick_mcp.cli auth || {
+    echo "❌ Локальная авторизация не удалась. Проверь Client ID/Secret и повтори."
+    exit 1
+  }
 
-ACCESS_TOKEN=$(set +o pipefail; grep '^TICKTICK_ACCESS_TOKEN=' .env | head -1 | cut -d= -f2-)
-REFRESH_TOKEN=$(set +o pipefail; grep '^TICKTICK_REFRESH_TOKEN=' .env | head -1 | cut -d= -f2-)
+  ACCESS_TOKEN=$(set +o pipefail; grep '^TICKTICK_ACCESS_TOKEN=' .env | head -1 | cut -d= -f2-)
+  REFRESH_TOKEN=$(set +o pipefail; grep '^TICKTICK_REFRESH_TOKEN=' .env | head -1 | cut -d= -f2-)
 
-if [[ -z "$ACCESS_TOKEN" ]]; then
-  echo "❌ Не нашёл TICKTICK_ACCESS_TOKEN после авторизации. Повтори попытку."
-  exit 1
+  if [[ -z "$ACCESS_TOKEN" ]]; then
+    echo "❌ Не нашёл TICKTICK_ACCESS_TOKEN после авторизации. Повтори попытку."
+    exit 1
+  fi
+
+  echo "Сохраняю токены в переменные сервера (Railway передеплоит автоматически)..."
+  if [[ -n "$REFRESH_TOKEN" ]]; then
+    run_step railway variables set --service "$SERVICE_NAME" \
+      TICKTICK_ACCESS_TOKEN="$ACCESS_TOKEN" \
+      TICKTICK_REFRESH_TOKEN="$REFRESH_TOKEN"
+  else
+    run_step railway variables set --service "$SERVICE_NAME" \
+      TICKTICK_ACCESS_TOKEN="$ACCESS_TOKEN"
+  fi
+  ok "TickTick подключён"
 fi
-
-echo "Сохраняю токены в переменные сервера (Railway передеплоит автоматически)..."
-if [[ -n "$REFRESH_TOKEN" ]]; then
-  run_step railway variables set --service "$SERVICE_NAME" \
-    TICKTICK_ACCESS_TOKEN="$ACCESS_TOKEN" \
-    TICKTICK_REFRESH_TOKEN="$REFRESH_TOKEN"
-else
-  run_step railway variables set --service "$SERVICE_NAME" \
-    TICKTICK_ACCESS_TOKEN="$ACCESS_TOKEN"
-fi
-ok "TickTick подключён"
 
 # ── Опционально: расширенные функции (кука v2) ─────────────────────────────
-echo ""
-echo -e "${BOLD}Хочешь включить расширенные функции${RESET} (теги, привычки, корзина,"
-echo "завершённые задачи, перемещение между списками)?"
-echo "Это требует один ручной шаг — куку из Chrome. Можно сделать позже."
-echo ""
-ask "Настроить сейчас? (y/n):"
-read -r ENABLE_V2
+# Идемпотентность: если кука уже стоит — не спрашиваем заново при каждом
+# обновлении. Проверяем только НАЛИЧИЕ переменной, значение не читаем/не печатаем.
+HAS_V2_TOKEN=$(railway variables --service "$SERVICE_NAME" --kv 2>/dev/null | grep -c '^TICKTICK_V2_TOKEN=' || true)
 
-if [[ "$ENABLE_V2" == "y" || "$ENABLE_V2" == "Y" ]]; then
+if [[ "$HAS_V2_TOKEN" -gt 0 ]]; then
+  ok "Расширенные функции уже включены (кука v2 уже задана) — пропускаю."
+else
   echo ""
-  echo -e "  1. Открой ${BOLD}ticktick.com${RESET} в Chrome и войди в свой аккаунт"
-  echo -e "  2. Нажми ${BOLD}F12${RESET} (или Option+Cmd+I на Mac)"
-  echo -e "  3. Выбери вкладку ${BOLD}Application${RESET}"
-  echo "  4. Слева: Storage → Cookies → https://ticktick.com"
-  echo -e "  5. В поле Filter введи: ${BOLD}t${RESET}"
-  echo -e "  6. Найди строку с именем ${BOLD}t${RESET} (одна буква)"
-  echo "  7. Двойной клик по значению в колонке Value → скопируй"
+  echo -e "${BOLD}Хочешь включить расширенные функции${RESET} (теги, привычки, корзина,"
+  echo "завершённые задачи, перемещение между списками)?"
+  echo "Это требует один ручной шаг — куку из Chrome. Можно сделать позже."
   echo ""
-  ask "Вставь значение куки t:"
-  read -r -s V2_TOKEN
-  echo ""
+  ask "Настроить сейчас? (y/n):"
+  read -r ENABLE_V2
 
-  if [[ -n "$V2_TOKEN" ]]; then
-    if run_step railway variables set --service "$SERVICE_NAME" TICKTICK_V2_TOKEN="$V2_TOKEN"; then
-      ok "Расширенные функции включены"
-    else
-      echo "⚠️  Не получилось сохранить куку автоматически. Не страшно — добавь её"
-      echo "   вручную в Railway → твой сервис → Variables → TICKTICK_V2_TOKEN."
+  if [[ "$ENABLE_V2" == "y" || "$ENABLE_V2" == "Y" ]]; then
+    echo ""
+    echo -e "  1. Открой ${BOLD}ticktick.com${RESET} в Chrome и войди в свой аккаунт"
+    echo -e "  2. Нажми ${BOLD}F12${RESET} (или Option+Cmd+I на Mac)"
+    echo -e "  3. Выбери вкладку ${BOLD}Application${RESET}"
+    echo "  4. Слева: Storage → Cookies → https://ticktick.com"
+    echo -e "  5. В поле Filter введи: ${BOLD}t${RESET}"
+    echo -e "  6. Найди строку с именем ${BOLD}t${RESET} (одна буква)"
+    echo "  7. Двойной клик по значению в колонке Value → скопируй"
+    echo ""
+    ask "Вставь значение куки t:"
+    read -r -s V2_TOKEN
+    echo ""
+
+    if [[ -n "$V2_TOKEN" ]]; then
+      if run_step railway variables set --service "$SERVICE_NAME" TICKTICK_V2_TOKEN="$V2_TOKEN"; then
+        ok "Расширенные функции включены"
+      else
+        echo "⚠️  Не получилось сохранить куку автоматически. Не страшно — добавь её"
+        echo "   вручную в Railway → твой сервис → Variables → TICKTICK_V2_TOKEN."
+      fi
     fi
   fi
 fi
