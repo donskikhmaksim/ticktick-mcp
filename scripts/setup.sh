@@ -250,6 +250,24 @@ if [[ -z "$EXISTING_PROJECT_ID" ]]; then
   fi
 fi
 
+# ID проекта нужен явно (не только через ambient `railway link` в этой
+# директории) — деплой ниже клонирует репозиторий в СВОЮ ВРЕМЕННУЮ папку, где
+# никакого линка нет, и передаёт -p/-e напрямую в `railway up`. Резолвим
+# заново по имени — работает и для переиспользованного, и для нового проекта.
+PROJECT_ID=$(railway list --json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    for p in json.load(sys.stdin):
+        if p.get('name') == 'ticktick-mcp' and not p.get('deletedAt'):
+            print(p['id']); break
+except Exception:
+    pass
+" 2>/dev/null || true)
+if [[ -z "$PROJECT_ID" ]]; then
+  echo "❌ Не смог определить ID проекта ticktick-mcp."
+  exit 1
+fi
+
 # Создаём сервис бота (если ещё нет) — источник (форк) подключается к
 # существующему сервису, поэтому сервис нужен ДО source connect.
 if [[ -z "$SERVICE_NAME" ]]; then
@@ -317,17 +335,18 @@ if ! (cd "$FRESH_DIR" && git clone --depth 1 "https://github.com/$FORK_REPO.git"
 fi
 DEPLOY_ATTEMPT=0
 DEPLOY_MAX=24  # до ~4 минут ожидания, если source connect ещё сам собирает параллельно
-DEPLOY_OUT=""
 while true; do
-  if DEPLOY_OUT=$(cd "$FRESH_DIR" && railway up --service "$SERVICE_NAME" --detach --json 2>&1); then
+  # -p/-e напрямую: команда идёт из СВЕЖЕЙ временной папки, где нет своего
+  # `railway link` — без этого падает NO_LINKED_PROJECT (ambient-линк из
+  # директории скрипта на неё не распространяется). Вывод НЕ прячем в
+  # переменную — иначе на экране пусто по 1-3 минуты, пока идёт сборка, и
+  # выглядит как зависание, хотя всё работает.
+  if (cd "$FRESH_DIR" && railway up --service "$SERVICE_NAME" -p "$PROJECT_ID" -e production --detach); then
     break
   fi
   DEPLOY_ATTEMPT=$((DEPLOY_ATTEMPT + 1))
   if [[ $DEPLOY_ATTEMPT -ge $DEPLOY_MAX ]]; then
-    echo "❌ Не получилось задеплоить свежий код после $DEPLOY_MAX попыток."
-    echo "── полный вывод ──────────────────────────"
-    echo "$DEPLOY_OUT"
-    echo "───────────────────────────────────────────"
+    echo "❌ Не получилось задеплоить свежий код после $DEPLOY_MAX попыток (см. вывод выше)."
     rm -rf "$FRESH_DIR"
     exit 1
   fi
