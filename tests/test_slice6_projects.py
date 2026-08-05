@@ -98,6 +98,34 @@ async def test_create_project_postverify_fetch_failure_is_unverified(monkeypatch
     assert "НЕ подтверждён" in result
 
 
+async def test_create_project_automation_key_bypasses_user_reply(monkeypatch):
+    """Headless callers (tg-ai-assistant's Mini App / background pipeline)
+    pass their own connection secret as automation_key on call #2 instead of
+    a human user_reply — the tier-🟡 _gate_single wrapper must accept that
+    the same way _gate_batch/create_tasks already do
+    (references/automation-secrets.md §8, regression from commit 532e485
+    removing the tier-🟢 exemption without adding automation_key here)."""
+    fake = FakeOfficialCreate({"id": "p1", "name": "Работа"})
+    _wire_official(monkeypatch, fake)
+    preview = await s.create_project("Работа")
+    mid = _extract_manifest_id(preview)
+    result = await s.create_project("Работа", manifest_id=mid,
+                                    automation_key=s.SECRET)
+    assert result.startswith("### ✅")
+    assert fake.get_calls == 1
+
+
+async def test_create_project_wrong_automation_key_still_refused(monkeypatch):
+    fake = FakeOfficialCreate({"id": "p1", "name": "Работа"})
+    _wire_official(monkeypatch, fake)
+    preview = await s.create_project("Работа")
+    mid = _extract_manifest_id(preview)
+    result = await s.create_project("Работа", manifest_id=mid,
+                                    automation_key="not-the-real-secret")
+    assert "🛑" in result
+    assert fake.get_calls == 0
+
+
 # ---------------------------------------------------------------------------
 # update_project
 # ---------------------------------------------------------------------------

@@ -2625,13 +2625,17 @@ def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
 # confirmation" — create/reversible edits, not delete) per
 # docs/DESIGN_write_tool_taxonomy.md's former 🟢 tier.
 def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
-                 manifest_id: str, user_reply: str, describe_fn) -> _GateOutcome:
+                 manifest_id: str, user_reply: str, describe_fn,
+                 automation_key: str = "") -> _GateOutcome:
     """Call #1 (manifest_id omitted): stores `params` VERBATIM in a one-shot
     manifest and returns a preview built by describe_fn(params) — nothing is
     mutated. Call #2 (manifest_id + user_reply): _require_consent(tier=1, ...)
-    is checked, then the STORED params (never call #2's own arguments) are
-    handed back via `.extra` — same no-swap contract as _gate_batch. No
-    object_hash/binding here (mirrors plan_task_creation, which also skips it
+    is checked (a valid `automation_key` short-circuits the user_reply check,
+    same headless-bypass contract as create_tasks/_gate_batch — see
+    references/automation-secrets.md §8), then the STORED params (never call
+    #2's own arguments) are handed back via `.extra` — same no-swap contract
+    as _gate_batch. No object_hash/binding here (mirrors plan_task_creation,
+    which also skips it
     for brand-new objects that don't exist yet to re-hash against).
 
     NOTE on one-shot: unlike _gate_batch (which relies on _require_consent
@@ -2649,7 +2653,8 @@ def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
                 f"🛑 Манифест {manifest_id} не найден/истёк/уже исполнен. "
                 f"Начни заново: {tool_name}(...) без manifest_id."))
         cr = _require_consent(action=kind, tier=1, manifest=m,
-                              user_reply=user_reply, min_gap=0)
+                              user_reply=user_reply, min_gap=0,
+                              automation_key=automation_key)
         if not cr.ok:
             return _GateOutcome(False, message=cr.reason)
         m["consumed"] = True
@@ -4664,6 +4669,7 @@ async def create_project(
     view_mode: str = "list",
     manifest_id: str = "",
     user_reply: str = "",
+    automation_key: str = "",
 ) -> str:
     """
     Create a new project in TickTick. Gated 🟡 (docs/DESIGN_approval_gate.md):
@@ -4676,12 +4682,19 @@ async def create_project(
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         name: Project name (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         color: Color code (hex format) (optional)
         view_mode: View mode - one of list, kanban, or timeline (optional)
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_official()
     if err:
@@ -4694,7 +4707,8 @@ async def create_project(
     params = {"name": name, "color": color, "view_mode": view_mode}
     outcome = _gate_single("create_project", "create_project",
                            params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_create_project)
+                           manifest_id, user_reply, _describe_create_project,
+                           automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _create_project_impl(**outcome.extra)
@@ -5442,6 +5456,7 @@ async def create_subtask(
     priority: int = 0,
     manifest_id: str = "",
     user_reply: str = "",
+    automation_key: str = "",
 ) -> str:
     """
     Create a subtask for a parent task within the same project. Gated 🟡
@@ -5455,6 +5470,12 @@ async def create_subtask(
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         parent_task_title: Title of the parent task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         subtask_title: Title of the new subtask
@@ -5464,6 +5485,7 @@ async def create_subtask(
         priority: Priority level (0: None, 1: Low, 3: Medium, 5: High) (optional)
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_official()
     if err:
@@ -5478,7 +5500,8 @@ async def create_subtask(
               "content": content, "priority": priority}
     outcome = _gate_single("create_subtask", "create_subtask",
                            params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_create_subtask)
+                           manifest_id, user_reply, _describe_create_subtask,
+                           automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _create_subtask_impl(**outcome.extra)
@@ -5803,7 +5826,8 @@ def _describe_checkin_habit(p: Dict) -> str:
 @mcp.tool()
 async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
                         status: int = 2, value: float = None,
-                        manifest_id: str = "", user_reply: str = "") -> str:
+                        manifest_id: str = "", user_reply: str = "",
+                        automation_key: str = "") -> str:
     """
     Record a habit check-in (requires v2 API). Gated 🟡
     (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
@@ -5815,6 +5839,12 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
     user_reply=<the user's literal last message> — the other arguments are
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
 
     После записи сервер сам перечитывает check-ins свежим запросом
     (независимо от того, что было отправлено) и подтверждает в ответе, что
@@ -5829,6 +5859,7 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
         value: Numeric value for quantitative habits (optional; defaults to the goal when done)
         manifest_id: from call #1's response — pass on call #2 to actually record
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
@@ -5852,7 +5883,8 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
               "status": status, "value": value}
     outcome = _gate_single("checkin_habit", "checkin_habit",
                            params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_checkin_habit)
+                           manifest_id, user_reply, _describe_checkin_habit,
+                           automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _checkin_habit_impl(**outcome.extra)
@@ -6165,7 +6197,8 @@ def _describe_unset_task_parent(p: Dict) -> str:
 @mcp.tool()
 async def unset_task_parent(task_title: str, parent_task_title: str, task_id: str,
                             parent_task_id: str, project_id: str,
-                            manifest_id: str = "", user_reply: str = "") -> str:
+                            manifest_id: str = "", user_reply: str = "",
+                            automation_key: str = "") -> str:
     """
     Detach a subtask from its parent, making it a top-level task (requires v2
     API). Gated 🟡 (docs/DESIGN_approval_gate.md): two calls, same tool name —
@@ -6178,6 +6211,12 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         task_title: Title of the subtask being detached (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         parent_task_title: Title of its current parent task
@@ -6186,6 +6225,7 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
         project_id: ID of the project both tasks live in
         manifest_id: from call #1's response — pass on call #2 to actually detach
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
@@ -6195,7 +6235,8 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
               "project_id": project_id}
     outcome = _gate_single("unset_task_parent", "unset_task_parent",
                            params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_unset_task_parent)
+                           manifest_id, user_reply, _describe_unset_task_parent,
+                           automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _unset_task_parent_impl(**outcome.extra)
@@ -6468,7 +6509,8 @@ def _describe_create_project_group(p: Dict) -> str:
 
 @mcp.tool()
 async def create_project_group(name: str, manifest_id: str = "",
-                               user_reply: str = "") -> str:
+                               user_reply: str = "",
+                               automation_key: str = "") -> str:
     """
     Create a project group (folder) (requires v2 API). Gated 🟡
     (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
@@ -6481,10 +6523,17 @@ async def create_project_group(name: str, manifest_id: str = "",
     call (the manifest's own stored value is used). Do NOT make call #2 in
     the same turn as call #1.
 
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         name: Name of the new group (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
@@ -6492,7 +6541,8 @@ async def create_project_group(name: str, manifest_id: str = "",
     params = {"name": name}
     outcome = _gate_single("create_project_group", "create_project_group",
                            params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_create_project_group)
+                           manifest_id, user_reply, _describe_create_project_group,
+                           automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _create_project_group_impl(**outcome.extra)
@@ -6526,7 +6576,8 @@ def _describe_delete_project_group(p: Dict) -> str:
 
 @mcp.tool()
 async def delete_project_group(group_name: str, group_id: str,
-                               manifest_id: str = "", user_reply: str = "") -> str:
+                               manifest_id: str = "", user_reply: str = "",
+                               automation_key: str = "") -> str:
     """
     Delete a project group/folder (projects inside are kept, just ungrouped)
     (requires v2 API). Gated 🟡 (docs/DESIGN_approval_gate.md): two calls,
@@ -6539,11 +6590,18 @@ async def delete_project_group(group_name: str, group_id: str,
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         group_name: Name of the group (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         group_id: ID of the group
         manifest_id: from call #1's response — pass on call #2 to actually delete
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
@@ -6551,7 +6609,8 @@ async def delete_project_group(group_name: str, group_id: str,
     params = {"group_name": group_name, "group_id": group_id}
     outcome = _gate_single("delete_project_group", "delete_project_group",
                            params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_delete_project_group)
+                           manifest_id, user_reply, _describe_delete_project_group,
+                           automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _delete_project_group_impl(**outcome.extra)
@@ -6592,7 +6651,8 @@ def _describe_move_project_to_group(p: Dict) -> str:
 
 @mcp.tool()
 async def move_project_to_group(project_name: str, project_id: str, group_id: str,
-                                manifest_id: str = "", user_reply: str = "") -> str:
+                                manifest_id: str = "", user_reply: str = "",
+                                automation_key: str = "") -> str:
     """
     Move a project into a group/folder (requires v2 API). Gated 🟡
     (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
@@ -6605,12 +6665,19 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         project_name: Name of the project (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         project_id: ID of the project to move
         group_id: ID of the destination group, or "NONE" to ungroup
         manifest_id: from call #1's response — pass on call #2 to actually move
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
@@ -6618,7 +6685,8 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
     params = {"project_name": project_name, "project_id": project_id, "group_id": group_id}
     outcome = _gate_single("move_project_to_group", "move_project_to_group",
                            params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_move_project_to_group)
+                           manifest_id, user_reply, _describe_move_project_to_group,
+                           automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _move_project_to_group_impl(**outcome.extra)
@@ -6707,7 +6775,8 @@ def _describe_add_task_comment(p: Dict) -> str:
 
 @mcp.tool()
 async def add_task_comment(task_title: str, text: str, project_id: str, task_id: str,
-                           manifest_id: str = "", user_reply: str = "") -> str:
+                           manifest_id: str = "", user_reply: str = "",
+                           automation_key: str = "") -> str:
     """
     Add a comment to a task (requires v2 API). Gated 🟡
     (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
@@ -6720,6 +6789,12 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         text: Comment text
@@ -6727,6 +6802,7 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
         task_id: ID of the task
         manifest_id: from call #1's response — pass on call #2 to actually add
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
@@ -6735,7 +6811,8 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
               "task_id": task_id}
     outcome = _gate_single("add_task_comment", "add_task_comment",
                            params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_add_task_comment)
+                           manifest_id, user_reply, _describe_add_task_comment,
+                           automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _add_task_comment_impl(**outcome.extra)
@@ -6948,7 +7025,8 @@ def _describe_attach_file_to_task(p: Dict) -> str:
 async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
                               url: str = None,
                               content_base64: str = None, filename: str = None,
-                              manifest_id: str = "", user_reply: str = "") -> str:
+                              manifest_id: str = "", user_reply: str = "",
+                              automation_key: str = "") -> str:
     """
     Attach a file to a task (requires v2 API). Provide the file either by URL
     (the server downloads it) or as base64 content — e.g. a file fetched from
@@ -6963,6 +7041,12 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         task_id: ID of the task
@@ -6972,6 +7056,7 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
         filename: File name to store it as (optional; inferred from url if omitted)
         manifest_id: from call #1's response — pass on call #2 to actually attach
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
@@ -6982,7 +7067,8 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
               "url": url, "content_base64": content_base64, "filename": filename}
     outcome = _gate_single("attach_file_to_task", "attach_file_to_task",
                            params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_attach_file_to_task)
+                           manifest_id, user_reply, _describe_attach_file_to_task,
+                           automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _attach_file_to_task_impl(**outcome.extra)
@@ -7344,7 +7430,7 @@ def _describe_create_tag(p: Dict) -> str:
 
 @mcp.tool()
 async def create_tag(name: str, color: str = None, manifest_id: str = "",
-                     user_reply: str = "") -> str:
+                     user_reply: str = "", automation_key: str = "") -> str:
     """
     Create a tag (requires v2 API). color is an optional hex like '#FF6161'.
     Gated 🟡 (docs/DESIGN_approval_gate.md): two calls, same tool name —
@@ -7357,11 +7443,18 @@ async def create_tag(name: str, color: str = None, manifest_id: str = "",
     this call (the manifest's own stored values are used). Do NOT make call
     #2 in the same turn as call #1.
 
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         name: Tag name (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         color: Optional hex color like '#FF6161'
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
@@ -7369,7 +7462,8 @@ async def create_tag(name: str, color: str = None, manifest_id: str = "",
     params = {"name": name, "color": color}
     outcome = _gate_single("create_tag", "create_tag",
                            params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_create_tag)
+                           manifest_id, user_reply, _describe_create_tag,
+                           automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _create_tag_impl(**outcome.extra)
@@ -7541,7 +7635,8 @@ def _describe_duplicate_task(p: Dict) -> str:
 
 @mcp.tool()
 async def duplicate_task(summary: str, task_id: str, task_title: str = None,
-                         manifest_id: str = "", user_reply: str = "") -> str:
+                         manifest_id: str = "", user_reply: str = "",
+                         automation_key: str = "") -> str:
     """
     Duplicate a task within the same project (requires v2 API). Gated 🟡
     (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
@@ -7554,6 +7649,12 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     summary (FIRST arg): one-line human sentence in the user's language shown
     at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Дублирую задачу „Купить молоко"».
 
@@ -7563,6 +7664,7 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
         task_title: Title of the task (optional but recommended for confirmation)
         manifest_id: from call #1's response — pass on call #2 to actually duplicate
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
@@ -7570,7 +7672,8 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
     params = {"summary": summary, "task_id": task_id, "task_title": task_title}
     outcome = _gate_single("duplicate_task", "duplicate_task",
                            params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_duplicate_task)
+                           manifest_id, user_reply, _describe_duplicate_task,
+                           automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _duplicate_task_impl(**outcome.extra)
@@ -7625,7 +7728,8 @@ def _describe_update_task_comment(p: Dict) -> str:
 @mcp.tool()
 async def update_task_comment(task_title: str, text: str, project_id: str,
                               task_id: str, comment_id: str,
-                              manifest_id: str = "", user_reply: str = "") -> str:
+                              manifest_id: str = "", user_reply: str = "",
+                              automation_key: str = "") -> str:
     """
     Edit a task comment (requires v2 API). Gated 🟡
     (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
@@ -7638,6 +7742,12 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         text: New comment text
@@ -7646,6 +7756,7 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
         comment_id: ID of the comment to edit
         manifest_id: from call #1's response — pass on call #2 to actually edit
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
@@ -7654,7 +7765,8 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
               "task_id": task_id, "comment_id": comment_id}
     outcome = _gate_single("update_task_comment", "update_task_comment",
                            params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_update_task_comment)
+                           manifest_id, user_reply, _describe_update_task_comment,
+                           automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _update_task_comment_impl(**outcome.extra)
@@ -8487,7 +8599,8 @@ def _describe_create_project_column(p: Dict) -> str:
 @mcp.tool()
 async def create_project_column(project_id: str, name: str,
                                 project_name: str = "",
-                                manifest_id: str = "", user_reply: str = "") -> str:
+                                manifest_id: str = "", user_reply: str = "",
+                                automation_key: str = "") -> str:
     """
     Create a kanban column/section inside a project (including the Inbox) and
     return its id (requires v2 API). Use the returned id as column_id in
@@ -8502,6 +8615,12 @@ async def create_project_column(project_id: str, name: str,
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Sections only render in a project's kanban view; switch the project's view
     to kanban to see them.
 
@@ -8513,6 +8632,7 @@ async def create_project_column(project_id: str, name: str,
             creating the column elsewhere)
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
@@ -8520,7 +8640,8 @@ async def create_project_column(project_id: str, name: str,
     params = {"project_id": project_id, "name": name, "project_name": project_name}
     outcome = _gate_single("create_project_column", "create_project_column",
                            params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_create_project_column)
+                           manifest_id, user_reply, _describe_create_project_column,
+                           automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _create_project_column_impl(**outcome.extra)
