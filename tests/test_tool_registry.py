@@ -8,10 +8,10 @@ import asyncio
 from ticktick_mcp.src import server
 
 
-def test_all_79_tools_registered():
+def test_all_81_tools_registered():
     tools = asyncio.run(server.mcp.list_tools())
-    assert len(tools) == 79, (
-        f"expected 79 registered @mcp.tool()s, got {len(tools)} — "
+    assert len(tools) == 81, (
+        f"expected 81 registered @mcp.tool()s, got {len(tools)} — "
         "a decorator likely got glued to the previous line (grep for "
         "'[^ ]@mcp\\.tool' in server.py). PLAN_retrofit.md §15.1/§15.10: was "
         "78 before package 15 — plan_task_creation + execute_task_creation "
@@ -20,8 +20,16 @@ def test_all_79_tools_registered():
         "+1). plan_task_deletion/execute_task_deletion also merged (§15.2), "
         "but that fold went INTO the pre-existing delete_tasks (no new tool "
         "name), so their net contribution is 0 — both old names stay "
-        "registered as wrappers, no third tool was added."
+        "registered as wrappers, no third tool was added (79 total). "
+        "assign_owners (backlog feature, plan_assign/execute_assign) added "
+        "two brand-new tools on top of that — net +2 (81 total)."
     )
+
+
+def test_assign_owners_tools_registered():
+    tools = asyncio.run(server.mcp.list_tools())
+    names = {t.name for t in tools}
+    assert {"plan_assign", "execute_assign"} <= names
 
 
 def test_attach_file_to_task_is_registered():

@@ -9876,6 +9876,463 @@ async def get_tasks_by_assignee(assignee: str, include_completed: bool = False) 
         return f"Error fetching tasks by assignee: {str(e)}"
 
 
+# ---------------------------------------------------------------------------
+# assign_owners (БЭКЛОГ-фича, отдельная от declutter) — plan_assign/
+# execute_assign. Same two-phase gate/RAM-manifest engine every other
+# gated write in this file uses (_MANIFESTS/_require_consent/
+# _manifest_object_hash — see STANDARD.md §1 инвариант 2/3/4). execute_assign
+# does NOT reimplement identity-guard/post-verify/journal from scratch: it
+# mirrors the exact multi-task branch of update_tasks's own engine
+# (_split_tasks_by_state → ticktick_v2.batch_update_tasks → per-item
+# _verify_item("update", ...) → _op_journal) rather than calling
+# _update_tasks_impl directly — that function's single-task branch (len==1)
+# does NOT include "assignee" in the field set it post-verifies (a
+# pre-existing gap in that path, out of scope to fix here since tool bodies
+# predating this package are frozen per PLAN_retrofit.md), so reusing it
+# would silently skip post-verify whenever a plan happens to propose exactly
+# one assignment.
+# ---------------------------------------------------------------------------
+
+_ASN_MAX_TASKS = 200           # soft cap — same reasoning as _DC_MAX_TASKS
+_ASN_MAX_TASKS_HARD_CAP = 500  # hard ceiling, max_tasks can never exceed it
+
+
+def _asn_propose_owner(title: str, content: str, column_name: str,
+                       members: List[Dict]) -> Optional[Dict]:
+    """Rule-based (no-shim) heuristic for ONE task: propose an owner by
+    matching a project member's display name against the task's kanban
+    column name first (a column named after a person, e.g. "Максим", is a
+    common convention), then against the task's title/content. Returns
+    {"userId","name","reason"} or None when no member's name is found
+    anywhere relevant — fail-closed: no owner is ever guessed without a
+    textual match, the task is simply left out of the plan (surfaced
+    separately as "не предложено")."""
+    def _has(haystack: str, needle: str) -> bool:
+        h, n = _norm_name(haystack or ""), _norm_name(needle or "")
+        return bool(h and n and n in h)
+
+    for m in members:
+        name = (m.get("displayName") or m.get("username") or "").strip()
+        uid = m.get("userId") or m.get("userCode")
+        if not name or not uid:
+            continue
+        if column_name and _has(column_name, name):
+            return {"userId": str(uid), "name": name,
+                    "reason": f"по названию колонки «{column_name}»"}
+    text = f"{title or ''} {content or ''}"
+    for m in members:
+        name = (m.get("displayName") or m.get("username") or "").strip()
+        uid = m.get("userId") or m.get("userCode")
+        if not name or not uid:
+            continue
+        if _has(text, name):
+            return {"userId": str(uid), "name": name,
+                    "reason": "имя упомянуто в названии/описании задачи"}
+    return None
+
+
+def _asn_shim_propose(candidates: List[Dict], members_by_project: Dict[str, List[Dict]],
+                      fail_tracker: Optional[list] = None) -> Dict[str, Dict]:
+    """Best-effort CLAUDE_CLI shim pass over ALL candidates in one prompt —
+    same shim/helper as declutter's judge (_dc_shim_json). Returns
+    {taskId: {"userId","name","reason"}} for whichever tasks the shim was
+    confident about; a taskId simply absent from the result means "no
+    confident guess" — the caller falls back to the rule-based heuristic for
+    those, exactly like a None from _asn_propose_owner. Never raises; any
+    failure (unset/unreachable/malformed) yields an empty dict — fail-closed,
+    same as the rule-based path returning None."""
+    if not _dc_shim_available() or not candidates:
+        return {}
+    payload = []
+    for c in candidates:
+        members = members_by_project.get(c["projectId"], [])
+        payload.append({
+            "taskId": c["taskId"], "title": c["title"],
+            "content": (c.get("content") or "")[:200],
+            "column": c.get("column") or "",
+            "members": [{"userId": str(m.get("userId") or m.get("userCode") or ""),
+                         "name": m.get("displayName") or m.get("username") or ""}
+                        for m in members if m.get("userId") or m.get("userCode")],
+        })
+    system = ("Ты помогаешь распределить задачи TickTick по исполнителям. "
+              "Для КАЖДОЙ задачи посмотри на title/content/column и список "
+              "members её проекта, и предложи owner ТОЛЬКО если уверен "
+              "(явное упоминание имени, роль, недвусмысленный контекст). "
+              "Если не уверен — задачу пропусти, НЕ гадай. Ответь JSON-массивом "
+              "[{\"taskId\":\"...\",\"userId\":\"...\",\"name\":\"...\","
+              "\"reason\":\"коротко почему\"}] — только те задачи, где ты "
+              "уверен, остальные не включай.")
+    data = _dc_shim_json(system, json.dumps(payload, ensure_ascii=False),
+                         timeout=_DC_SHIM_TIMEOUT, fail_tracker=fail_tracker)
+    out: Dict[str, Dict] = {}
+    if not isinstance(data, list):
+        return out
+    valid_ids = {c["taskId"] for c in candidates}
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        tid, uid, name = row.get("taskId"), row.get("userId"), row.get("name")
+        if tid in valid_ids and uid and name:
+            out[tid] = {"userId": str(uid), "name": str(name),
+                        "reason": str(row.get("reason") or "shim-судья")}
+    return out
+
+
+async def _asn_resolve_scope(scope: str) -> Optional[List[Dict]]:
+    """Resolve `scope` to a list of open task dicts. '#tag' delegates to
+    ticktick_v2.get_tasks_by_tag (same helper get_tasks_by_tag the tool
+    uses); everything else reuses declutter's project/column scope filter
+    over ALL open tasks (_dc_scope_filter/_dc_column_names_for_scope — same
+    forms plan_declutter accepts: '', 'inbox', a project substring,
+    'Project/Column'). Returns None when live state is unavailable (caller
+    turns that into _STATE_UNAVAILABLE_MSG)."""
+    s = (scope or "").strip()
+    if s.startswith("#"):
+        tag = s[1:].strip()
+        if not tag or not ticktick_v2:
+            return []
+        try:
+            return await _run_blocking(lambda: ticktick_v2.get_tasks_by_tag(tag))
+        except Exception as e:
+            logger.warning(f"assign scope tag lookup failed: {e}")
+            return []
+    by_id = _open_by_id(fresh=True)
+    if by_id is None:
+        return None
+    names = _v2_project_names()
+    col_names = await _dc_column_names_for_scope(s, names)
+    return _dc_scope_filter(list(by_id.values()), names, s, col_names)
+
+
+@mcp.tool(annotations=READONLY)
+async def plan_assign(scope: str = "", max_tasks: int = 0) -> str:
+    """
+    Phase 1 of assign_owners (БЭКЛОГ-фича): READ open tasks WITHOUT an
+    assignee in `scope`, and for each PROPOSE an owner — never assigns
+    anything, never writes to TickTick. Read-only, same shape as
+    plan_declutter.
+
+    Owner heuristic per task: when the CLAUDE_CLI shim is configured it
+    judges first (same shim declutter uses, bundled into one prompt over all
+    candidates) and only its CONFIDENT picks are used; every task the shim
+    skipped (or when the shim is unset/unreachable) falls back to a
+    rule-based heuristic — a project member's display name found in the
+    task's kanban column name, else found in the task's title/content.
+    Tasks where no member's name is found anywhere are listed separately as
+    "не предложено" and are NOT part of the manifest — nothing forces a
+    guess.
+
+    Only tasks in SHARED projects (get_project_members returns collaborators)
+    can be assigned at all — TickTick's assignee field doesn't exist on
+    personal projects; those are skipped with a note, never silently dropped.
+
+    IMPORTANT: reprint the returned manifest VERBATIM to the user and STOP —
+    wait for their real reply, then call execute_assign(manifest_id,
+    user_reply=<their literal last message, verbatim>). Nothing mutates
+    until then. One-shot, expires in 1h (same _MANIFEST_TTL as every other
+    plan_*).
+
+    Args:
+        scope: '' (whole open pile, capped), 'inbox', a project-name
+            substring, 'Project/Column' (one kanban column — same forms as
+            plan_declutter's scope), or '#tag' (a TickTick tag name).
+        max_tasks: override the default cap (_ASN_MAX_TASKS=200) for this
+            call only; hard ceiling _ASN_MAX_TASKS_HARD_CAP=500 always
+            applies regardless of what's passed here.
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    _prune_manifests()
+    tasks = await _asn_resolve_scope(scope)
+    if tasks is None:
+        return _STATE_UNAVAILABLE_MSG
+    candidates_all = [t for t in tasks if not t.get("assignee")]
+    if not candidates_all:
+        return ("Незакреплённых задач (без исполнителя) в этой области нет"
+                + (f" (scope='{scope}')" if scope else "") + ".")
+    requested_cap = max_tasks if isinstance(max_tasks, int) and max_tasks > 0 else _ASN_MAX_TASKS
+    cap = min(requested_cap, _ASN_MAX_TASKS_HARD_CAP)
+    if len(candidates_all) > cap:
+        can_still_raise = (not (isinstance(max_tasks, int) and max_tasks > 0)
+                           and cap < _ASN_MAX_TASKS_HARD_CAP)
+        raise_hint = (f" Либо подними лимит: "
+                     f"max_tasks={min(len(candidates_all), _ASN_MAX_TASKS_HARD_CAP)}."
+                     if can_still_raise else "")
+        return (f"🛑 Отказ: в этой области {len(candidates_all)} задач без "
+                f"исполнителя — больше капа {cap}. Сузь scope (проект, "
+                "'Проект/Колонка', '#тег') и попробуй снова"
+                + raise_hint
+                + (f" (текущий scope='{scope}')" if scope else " (scope не задан)")
+                + ".")
+
+    names = _v2_project_names()
+    project_ids = sorted({t.get("projectId") for t in candidates_all if t.get("projectId")})
+    members_by_project: Dict[str, List[Dict]] = {}
+    unshared_names: List[str] = []
+    for pid in project_ids:
+        try:
+            members = await _run_blocking(lambda p=pid: ticktick_v2.get_project_members(p))
+        except Exception as e:
+            logger.warning(f"assign: get_project_members({pid}) failed: {e}")
+            members = []
+        if members:
+            members_by_project[pid] = members
+        else:
+            unshared_names.append(names.get(pid, pid))
+
+    assignable = [t for t in candidates_all if t.get("projectId") in members_by_project]
+    skipped_unshared = [t for t in candidates_all if t.get("projectId") not in members_by_project]
+
+    col_names_cache: Dict[str, Dict[str, str]] = {}
+
+    async def _col_name(pid: str, cid: str) -> str:
+        if not cid:
+            return ""
+        if pid not in col_names_cache:
+            try:
+                cols = await _run_blocking(lambda p=pid: ticktick_v2.get_project_columns(p))
+            except Exception:
+                cols = []
+            col_names_cache[pid] = {c.get("id"): (c.get("name") or c.get("title") or "")
+                                    for c in cols or [] if c.get("id")}
+        return col_names_cache[pid].get(cid, "")
+
+    shim_candidates = []
+    task_extra: Dict[str, Dict] = {}
+    for t in assignable:
+        tid = t.get("id") or t.get("taskId")
+        pid = t.get("projectId")
+        col = await _col_name(pid, t.get("columnId"))
+        task_extra[tid] = {"projectId": pid, "title": t.get("title") or "",
+                           "content": t.get("content") or "", "column": col}
+        shim_candidates.append({"taskId": tid, "projectId": pid,
+                                "title": t.get("title") or "",
+                                "content": t.get("content") or "", "column": col})
+
+    shim_used = _dc_shim_available()
+    shim_fail_tracker: list = []
+    shim_proposals = (_asn_shim_propose(shim_candidates, members_by_project,
+                                        fail_tracker=shim_fail_tracker)
+                      if shim_used else {})
+    shim_call_failed = bool(shim_fail_tracker)
+
+    proposed: List[Dict] = []
+    not_proposed: List[Dict] = []
+    for t in assignable:
+        tid = t.get("id") or t.get("taskId")
+        extra = task_extra[tid]
+        pick = shim_proposals.get(tid) or _asn_propose_owner(
+            extra["title"], extra["content"], extra["column"],
+            members_by_project.get(extra["projectId"], []))
+        if pick:
+            proposed.append({
+                "taskId": tid, "projectId": extra["projectId"],
+                "title": extra["title"],
+                "project": names.get(extra["projectId"], extra["projectId"]),
+                "column": extra["column"],
+                "assignee": pick["userId"], "assignee_name": pick["name"],
+                "reason": pick["reason"],
+            })
+        else:
+            not_proposed.append({"title": extra["title"],
+                                 "project": names.get(extra["projectId"], extra["projectId"])})
+
+    mid = uuid.uuid4().hex[:12]
+    now = time.monotonic()
+    _MANIFESTS[mid] = {"kind": "assign", "items": proposed,
+                       "created": now, "plan_shown_at": now, "consumed": False,
+                       "object_hash": _manifest_object_hash(
+                           "assign", [it["taskId"] for it in proposed]),
+                       "summary": f"Назначение исполнителей ({len(proposed)} задач)"}
+
+    when = datetime.now(_USER_TZ).strftime("%d.%m.%Y %H:%M")
+    lines = [f"### 👤 План назначения исполнителей — {when} ({_USER_TZ.key})",
+             f"_Манифест `{mid}` · проверено задач без исполнителя: "
+             f"{len(candidates_all)} · ничего ещё не назначено_"]
+    if not shim_used:
+        lines.append("⚠️ _CLAUDE_CLI shim недоступен → только по правилу "
+                     "(имя участника в колонке/названии/описании задачи)._")
+    elif shim_call_failed:
+        lines.append("⚠️ _CLAUDE_CLI shim настроен, но хотя бы один вызов не "
+                     "удался — часть предложений могла остаться на "
+                     "rule-based эвристике вместо судьи._")
+    lines.append("")
+
+    if proposed:
+        lines.append(f"#### 👤 Предложено назначить — {len(proposed)}")
+        for it in proposed:
+            lines.append(
+                f"- **«{it['title']}»** — {it['project']} (`{it['taskId']}`) → "
+                f"**{it['assignee_name']}** _({it['reason']})_")
+        lines.append("")
+    else:
+        lines.append("**Ни для одной задачи не удалось уверенно предложить "
+                     "владельца** — манифест пуст, применять нечего.")
+
+    if not_proposed:
+        lines.append(f"#### 🚩 Не предложено (нет уверенного совпадения) — "
+                     f"{len(not_proposed)}")
+        for it in not_proposed[:50]:
+            lines.append(f"- «{it['title']}» — {it['project']}")
+        if len(not_proposed) > 50:
+            lines.append(f"    ... и ещё {len(not_proposed) - 50}")
+        lines.append("")
+
+    if skipped_unshared:
+        uniq = sorted(set(unshared_names))
+        lines.append(f"#### ⚠️ Пропущено — проект(ы) не расшарены (нет участников): "
+                     f"{len(skipped_unshared)} задач в {', '.join(uniq)}")
+        lines.append("")
+
+    if not proposed:
+        return "\n".join(lines)
+
+    lines.append(f"**Итого к назначению: {len(proposed)}**.")
+    lines.append("")
+    lines.append("Покажи этот план пользователю дословно и ДОЖДИСЬ его "
+                 "отдельного ответа. Когда он явно согласится, вызови "
+                 f"`execute_assign(manifest_id=\"{mid}\", "
+                 "user_reply=\"<дословная реплика пользователя>\")` — НЕ в "
+                 "этом же ходе. Действует 1 час, одноразово. Каждое "
+                 "назначение пройдёт через identity-guard + журнал + "
+                 "независимую сверку, как у update_tasks.")
+    return "\n".join(lines)
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+async def execute_assign(manifest_id: str, user_reply: str = "") -> str:
+    """
+    Phase 2 of assign_owners: apply EXACTLY the owner proposals plan_assign
+    made and the user approved — nothing else, nothing recomputed. Gated 🟡
+    (docs/DESIGN_approval_gate.md): `user_reply` must be the user's VERBATIM
+    last chat message, given ONLY after they actually saw the plan and
+    replied — not paraphrased/invented, and not called in the same turn
+    where the plan was printed.
+
+    Each assignment is identity-guarded against FRESH live state
+    (_split_tasks_by_state — refuses any task whose id no longer resolves to
+    the title plan_assign saw), applied via the official v2 batch-update
+    endpoint, then independently post-verified by re-reading live state and
+    diffing the `assignee` field — a call that 200s but doesn't actually
+    move the field is reported as ❌, not ✅. Every run is written to the
+    same mutation journal update_tasks uses (operation_report(record_id=...)
+    replays the independent check). One-shot manifest, 1h TTL.
+
+    Args:
+        manifest_id: id from plan_assign
+        user_reply: the user's literal last message approving the plan
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    _prune_manifests()
+    m = _MANIFESTS.get(manifest_id)
+    if not m or m.get("kind") != "assign":
+        return (f"🛑 Манифест {manifest_id} не найден/истёк/уже исполнен. "
+                "Начни заново: plan_assign(scope=...).")
+    items = m.get("items") or []
+    if not items:
+        m["consumed"] = True
+        return "🛑 Манифест пуст (нечего было предложить) — исполнять нечего."
+    object_ids = [it["taskId"] for it in items]
+    cr = _require_consent(action="assign", tier=1, manifest=m,
+                          user_reply=user_reply, object_ids=object_ids, min_gap=0)
+    if not cr.ok:
+        return cr.reason
+    m["consumed"] = True
+    return await _asn_apply(m.get("summary") or "Назначение исполнителей", items)
+
+
+async def _asn_apply(summary: str, items: List[Dict]) -> str:
+    """Pure mutation logic for execute_assign — no consent gate (already
+    checked by the caller). Mirrors update_tasks's own multi-task branch
+    (_split_tasks_by_state → ticktick_v2.batch_update_tasks → per-item
+    _verify_item("update", ...) → _op_journal) rather than delegating to
+    _update_tasks_impl — see the module-level comment above plan_assign for
+    why (that function's single-task branch doesn't post-verify assignee)."""
+    err = _ensure_ready()
+    if err:
+        return err
+    try:
+        by_id = _open_by_id(fresh=True)
+        if by_id is None:
+            return _STATE_UNAVAILABLE_MSG
+        found, mismatch, missing = _split_tasks_by_state(items, by_id=by_id)
+        ok_ids = {f["taskId"] for f in found}
+        label_of = {}
+        by_task_id = {it["taskId"]: it for it in items}
+        changes = []
+        snap_by_id = {}
+        for it in items:
+            tid = it["taskId"]
+            if tid not in ok_ids:
+                continue
+            label_of[tid] = it.get("title") or _lookup_task_title(tid)
+            snap_by_id[tid] = _snapshot_of((by_id or {}).get(tid))
+            changes.append({"taskId": tid, "assignee": it["assignee"]})
+
+        api_fail = {}
+        if changes:
+            resp = await _run_blocking(lambda: ticktick_v2.batch_update_tasks(changes))
+            api_fail = id2error_failures(resp, [c["taskId"] for c in changes])
+
+        result_items = [{"taskId": ch["taskId"],
+                         "title": label_of.get(ch["taskId"], ""),
+                         "expect": {"changes": {"assignee": ch["assignee"]}},
+                         "snapshot": snap_by_id.get(ch["taskId"], {})}
+                        for ch in changes]
+        assigned, not_applied = [], []
+        unverified = False
+        if changes:
+            fresh = _open_by_id(fresh=True)
+            if fresh is None:
+                unverified = True
+            else:
+                names = _v2_project_names()
+                for res_it in result_items:
+                    tid = res_it["taskId"]
+                    lbl = label_of.get(tid, res_it["title"])
+                    if tid in api_fail:
+                        not_applied.append(f"«{lbl}» — TickTick отклонил: {api_fail[tid]}")
+                        continue
+                    verdict = _verify_item("update", res_it, fresh, names)
+                    if "✅" in verdict[:8]:
+                        owner = by_task_id.get(tid, {}).get("assignee_name") or "?"
+                        assigned.append(f"«{lbl}» → {owner}")
+                    else:
+                        not_applied.append(verdict.lstrip("- "))
+
+        bullets = []
+        if assigned:
+            bullets.append(f"✅ Назначено {len(assigned)} (проверено): "
+                           + ", ".join(assigned))
+        if unverified:
+            bullets.append(f"⚠️ Отправлено {len(changes)}, но {_UNVERIFIED_MSG}")
+        if not_applied:
+            bullets.append(f"❌ НЕ применилось {len(not_applied)}:\n  - "
+                           + "\n  - ".join(not_applied))
+        if mismatch:
+            bullets.append(_mismatch_report(mismatch, "назначил"))
+        if missing:
+            bullets.append(f"↷ Не найдены среди открытых {len(missing)} "
+                           "(неверный id/завершены/изменились с момента плана): "
+                           + ", ".join(f"«{ms['title']}»" for ms in missing))
+        rid = ""
+        if changes:
+            rid = _op_journal("update", result_items, summary)
+        if not bullets:
+            return _tool_response("↷", "Ничего не назначено")
+        status = _batch_status(bullets)
+        headline = f"Назначено **{len(assigned)}**"
+        return _tool_response(status, headline, bullets=bullets,
+                              proof=_report_line(rid) if changes else "")
+    except Exception as e:
+        logger.error(f"Error in execute_assign: {e}")
+        return _tool_response("❌", "Ошибка при назначении исполнителей",
+                              warnings=[str(e)])
+
+
 @mcp.tool(annotations=READONLY)
 async def list_project_columns(project_id: str) -> str:
     """

@@ -85,7 +85,7 @@ TickTick, сгруппированных по темам. Вам не нужно
 
 > Этот раздел собирается автоматически из кода сервера (`scripts/gen_guide.py`). Руками не редактируйте — при следующем запуске генератора правки затрутся.
 
-**Всего инструментов: 79.**
+**Всего инструментов: 81.**
 
 ### Задачи (создать, изменить, выполнить, удалить)
 
@@ -201,7 +201,9 @@ TickTick, сгруппированных по темам. Вам не нужно
 | Инструмент | Что делает |
 | --- | --- |
 | `create_tasks_interactive` | THE way to create tasks in an interactive chat — a single tool, two |
+| `execute_assign` | Phase 2 of assign_owners: apply EXACTLY the owner proposals plan_assign |
 | `execute_declutter` | Phase 2 of the declutter: apply EXACTLY the mutating actions the manifest |
+| `plan_assign` | Phase 1 of assign_owners (БЭКЛОГ-фича): READ open tasks WITHOUT an |
 | `plan_declutter` | Phase 1 of the retroactive declutter ("разбор помойки"): READ every open |
 | `resume_declutter` | Resume a sheet-backed declutter manifest (plan_declutter(persist="sheet")) |
 | `set_declutter_decision` | Set the `decision` column (approved/rejected) for specific rows of a |
