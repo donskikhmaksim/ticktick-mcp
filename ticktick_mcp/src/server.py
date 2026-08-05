@@ -7492,7 +7492,15 @@ async def search_all_tasks(
 
         # Comments: slow opt-in. Fetch per task (no bulk API), skip tasks known to
         # have zero comments, and stop after a fixed number of fetches.
-        COMMENT_FETCH_CAP = 150
+        # 100, not 150: these are sequential network round-trips (no
+        # concurrency, no batching), and the MCP client this tool runs
+        # through has a hard ~60s timeout (see _DC_MAX_TASKS above for the
+        # same constraint measured elsewhere in this file) — at 150 fetches
+        # even a modest ~350ms/call already eats ~53s on top of the open/
+        # closed pool work that runs before this loop, leaving no margin; a
+        # timeout returns nothing at all, which is worse than an honestly
+        # capped partial result.
+        COMMENT_FETCH_CAP = 100
         comment_matches: List[Dict[str, Any]] = []
         comment_fetches = 0
         comment_capped = False
