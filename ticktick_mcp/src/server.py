@@ -5399,12 +5399,13 @@ _V2_DISABLED_MSG = (
 
 
 @mcp.tool(annotations=READONLY)
-async def get_completed_tasks(limit: int = 50) -> str:
+async def get_completed_tasks(limit: int = 100) -> str:
     """
     Get recently completed tasks across all lists (requires v2 API).
 
     Args:
-        limit: Maximum number of completed tasks to return (default 50)
+        limit: Maximum number of completed tasks to return (default 100 —
+            the API's own hard cap, so there's no reason to default lower)
     """
     err = _ensure_ready()
     if err:
