@@ -27,10 +27,16 @@ from .ticktick_v2_client import (ATTACHMENT_MAX_BYTES, TickTickAuthError,
                                  TickTickV2Client, id2error_failures,
                                  new_attachment_id)
 from . import declutter_sheet
+from . import tg_approval
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Опциональный внеполосный Telegram-фактор (см. tg_approval.py doc-comment).
+# Загружается всегда (даже выключенным) — так call-сайты не ветвятся на
+# "а вдруг конфига нет", `enabled_for()` просто всегда False в этом случае.
+_TG_CFG = tg_approval.load_tg_approval_config()
 
 # --- Transport / deployment config (read from environment) ---
 # Local default is stdio; on Railway set MCP_TRANSPORT=streamable-http.
@@ -2163,7 +2169,8 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
                     "исполнен. Начни заново: delete_tasks(summary, tasks).")
         cr = _require_consent(action="delete", tier=2, manifest=m,
                               user_reply=user_reply,
-                              object_ids=[it["taskId"] for it in m["items"]])
+                              object_ids=[it["taskId"] for it in m["items"]],
+                              tool="delete_tasks", manifest_id=manifest_id)
         if not cr.ok:
             return cr.reason
         return await _execute_task_deletion_impl(manifest_id, m)
@@ -2238,7 +2245,7 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
                        f"`delete_tasks(summary=\"{summary}\", manifest_id=\"{mid}\", "
                        "user_reply=\"<дословная реплика пользователя>\")` — "
                        "НЕ в этом же ходе. Манифест одноразовый, действует 1 час.")
-        return "\n".join(preview)
+        return _maybe_tg_notify_plan("delete_tasks", mid, "\n".join(preview))
     except Exception as e:
         logger.error(f"Error in delete_tasks: {e}")
         return f"Error deleting tasks: {str(e)}"
@@ -2359,6 +2366,29 @@ class ConsentResult:
         return self.ok
 
 
+def _maybe_tg_notify_plan(tool: str, manifest_id: str, preview_text: str) -> str:
+    """Зовётся ПОСЛЕ создания манифеста (`_MANIFESTS[mid] = {...}`), ПЕРЕД
+    возвратом превью-текста моделью — портирует поведение gmail-mcp's
+    requireConsent's "фаза плана" ветки на архитектуру ticktick-mcp, где
+    plan_*/аналоги — ОТДЕЛЬНЫЕ функции от _require_consent() (не единый
+    dual-mode вызов, как в TS). Fail-closed (та же дисциплина, что в TS): если
+    отправка в Telegram упала, манифест ИНВАЛИДИРУЕТСЯ, а не остаётся
+    доступным через голое user_reply без второго фактора."""
+    if not (tool and tg_approval.enabled_for(_TG_CFG, tool)):
+        return preview_text
+    ok, err = tg_approval.notify_plan(_TG_CFG, manifest_id, preview_text, tool)
+    if not ok:
+        m = _MANIFESTS.get(manifest_id)
+        if m is not None:
+            m["consumed"] = True
+        return (f"🛑 Не смог отправить запрос подтверждения в Telegram ({err}). "
+                "Действие НЕ запланировано, ничего не изменено. Проверьте "
+                "бота/настройки Telegram-подтверждения и попробуйте снова.")
+    return (preview_text + "\n\n_⏳ Запрос на подтверждение отправлен в "
+            "Telegram — подтвердите кнопкой в боте, затем ответьте «да» "
+            "здесь._")
+
+
 _NO_REPLY_INSTRUCTION = (
     "🛑 Нужно подтверждение пользователя, а не самого себя: этот инструмент "
     "физически необратим/массовый, поэтому вызывай его ТОЛЬКО после того, "
@@ -2373,6 +2403,7 @@ def _require_consent(
     *, action: str, tier: int, manifest: Optional[Dict] = None,
     user_reply: Optional[str] = None, automation_key: str = "",
     object_ids: Optional[List[str]] = None, min_gap: Optional[float] = None,
+    tool: str = "", manifest_id: str = "",
 ) -> ConsentResult:
     """The single gate every mutating tool in tiers 🟡(1)/🔴(2) must pass
     before touching live state or writing an "approved" decision — see
@@ -2416,6 +2447,27 @@ def _require_consent(
 
     if not _is_affirmative_reply(user_reply):
         return ConsentResult(False, _NO_REPLY_INSTRUCTION)
+
+    # Опциональный внеполосный ТГ-фактор (см. tg_approval.py) — ВЫКЛ по
+    # умолчанию (TG_APPROVAL_ENABLED=false) и НЕ задействуется вовсе, если
+    # вызывающий код не передал `tool` (пустая строка = совместимость
+    # побайтово с поведением до этой правки). Встаёт ПОСЛЕ дешёвой проверки
+    # user_reply, ПЕРЕД таймером/consume — та же позиция, что в gmail-mcp's
+    # requireConsent.
+    if tool and tg_approval.enabled_for(_TG_CFG, tool):
+        approval = tg_approval.check_approval(manifest_id or (manifest or {}).get("_tg_manifest_id", ""))
+        if approval == "pending":
+            return ConsentResult(False, "⏳ Подтвердите кнопкой в Telegram-боте, затем "
+                                  "повторите. План ещё активен.")
+        if approval == "rejected":
+            if manifest is not None:
+                manifest["consumed"] = True
+            return ConsentResult(False, "🛑 Отклонено кнопкой в Telegram. План отменён, "
+                                  "ничего не сделано. Чтобы повторить — построй план заново.")
+        if approval == "none":
+            return ConsentResult(False, "🛑 Запрос подтверждения в Telegram не найден или "
+                                  "истёк по TTL. Построй план заново.")
+        # approval == "approved" → идём дальше.
 
     gap = _MIN_CONSENT_GAP if min_gap is None else min_gap
     if manifest is not None and gap > 0:
@@ -2683,7 +2735,7 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
                  f"`execute_task_deletion(manifest_id=\"{mid}\", "
                  "user_reply=\"<дословная реплика пользователя>\")` — НЕ в "
                  "этом же ходе. Манифест одноразовый, действует 1 час.")
-    return "\n".join(lines)
+    return _maybe_tg_notify_plan("delete_tasks", mid, "\n".join(lines))
 
 
 @mcp.tool()
@@ -4236,7 +4288,7 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
                  "этом же ходе. Действует 1 час, одноразово. Каждая правка "
                  "пройдёт через штатные удаление/обновление/вложение "
                  "(guard + журнал + сверка).")
-    return "\n".join(lines) + sheet_note
+    return _maybe_tg_notify_plan("execute_declutter", mid, "\n".join(lines) + sheet_note)
 
 
 @mcp.tool()
@@ -4275,7 +4327,8 @@ async def execute_declutter(manifest_id: str, user_reply: str = "") -> str:
     if m and m.get("kind") == "declutter" and m.get("persist") == "sheet":
         cr = _require_consent(action="declutter", tier=2, manifest=m,
                               user_reply=user_reply,
-                              object_ids=_dc_object_ids(m.get("actions") or {}))
+                              object_ids=_dc_object_ids(m.get("actions") or {}),
+                              tool="execute_declutter", manifest_id=manifest_id)
         if not cr.ok:
             return cr.reason
         return await _execute_declutter_from_sheet(manifest_id)
@@ -4288,7 +4341,8 @@ async def execute_declutter(manifest_id: str, user_reply: str = "") -> str:
             try:
                 if declutter_sheet.read_manifest_rows(manifest_id):
                     cr = _require_consent(action="declutter", tier=2,
-                                          manifest=None, user_reply=user_reply)
+                                          manifest=None, user_reply=user_reply,
+                                          tool="execute_declutter", manifest_id=manifest_id)
                     if not cr.ok:
                         return cr.reason
                     return await _execute_declutter_from_sheet(manifest_id)
@@ -4298,7 +4352,8 @@ async def execute_declutter(manifest_id: str, user_reply: str = "") -> str:
                 "исполнен. Сначала plan_declutter.")
     cr = _require_consent(action="declutter", tier=2, manifest=m,
                           user_reply=user_reply,
-                          object_ids=_dc_object_ids(m.get("actions") or {}))
+                          object_ids=_dc_object_ids(m.get("actions") or {}),
+                          tool="execute_declutter", manifest_id=manifest_id)
     if not cr.ok:
         return cr.reason
     m["consumed"] = True
@@ -4393,7 +4448,8 @@ async def resume_declutter(manifest_id: str, user_reply: str = "") -> str:
                 "DECLUTTER_SHEET_ID и GSHEETS_SA_JSON) — resume_declutter "
                 "работает только для планов, сохранённых с persist=\"sheet\".")
     cr = _require_consent(action="declutter", tier=2, manifest=None,
-                          user_reply=user_reply)
+                          user_reply=user_reply,
+                          tool="resume_declutter", manifest_id=manifest_id)
     if not cr.ok:
         return cr.reason
     return await _execute_declutter_from_sheet(manifest_id)
@@ -7998,6 +8054,18 @@ async def create_project_column(project_id: str, name: str,
 
 def main():
     """Main entry point for the MCP server."""
+    if _TG_CFG.enabled:
+        db_url = os.environ.get("CONSENT_DATABASE_URL", "").strip()
+        if not db_url:
+            raise RuntimeError(
+                "TG_APPROVAL_ENABLED=true, но CONSENT_DATABASE_URL не задан — "
+                "нужен общий Postgres (тот же, что у gmail/sheets/calendar/docs/"
+                "drive-mcp) для таблицы tg_approvals."
+            )
+        tg_approval.init_store(db_url)
+        logger.info("TG approval: Postgres подключен, слой активен "
+                    "(server=ticktick, webhook НЕ регистрируется — владелец gmail-mcp)")
+
     if not initialize_client():
         # Don't stop the server: on streamable-http this leaves /health
         # reachable, and tools that need `ticktick` already lazily retry
