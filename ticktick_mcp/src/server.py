@@ -3111,7 +3111,21 @@ _DC_OBSOLETE_STALE_DAYS = 60
 # the 60s ceiling. A single project or a day/week's worth of inbox triage
 # should resolve well under this; the whole-pile case (what the timeout was
 # actually hit on) is exactly what should be narrowed via `scope` instead.
-_DC_MAX_TASKS = 200
+# Bumped 200 -> 300 (2026-08-05 cap-sizing pass): a genuinely active user's
+# single project/column can plausibly hold 200-300+ untriaged tasks before
+# their first declutter — 200 was clipping that common case into an
+# unnecessary refusal+retry; 300 stays well inside the sub-second O(n^2) and
+# ~25s shim budget (see rationale above) while leaving real headroom under
+# _DC_MAX_TASKS_HARD_CAP=500 for the explicit-override path.
+_DC_MAX_TASKS = 300
+# 17.6 (security-checklist.md §4): plan_declutter's `max_tasks` argument can
+# raise the per-call cap above _DC_MAX_TASKS, but a cap that the caller can
+# override without any ceiling isn't a cap — the model can (and, asked to
+# "just declutter everything", will) pass an arbitrarily large value and walk
+# straight into the O(n^2) clustering pass over the whole account. This is a
+# hard, server-side maximum that `max_tasks` can NEVER exceed, independent of
+# what the argument says.
+_DC_MAX_TASKS_HARD_CAP = 500
 # Per-call timeout for the two declutter shim calls (judge_fn/smart_fn only —
 # NOT _dc_shim_json's default, which other/future callers may still rely on
 # at 90s). The two calls now run concurrently, so wall-clock cost is
@@ -4105,7 +4119,7 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
             project's column names. Narrowing a big project to one column is
             the intended way to fit under the size cap.
         dry_run: retained for symmetry; plan_declutter is always read-only
-        max_tasks: override the default size cap (_DC_MAX_TASKS = 200) for THIS
+        max_tasks: override the default size cap (_DC_MAX_TASKS = 300) for THIS
             call only. 0/unset keeps the default. Raise it when you deliberately
             want to declutter a bigger set and accept the extra time — the O(n^2)
             clustering and the bundled shim prompts grow with the set, and the
