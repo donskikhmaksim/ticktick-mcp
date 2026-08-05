@@ -43,6 +43,15 @@ REQUEST_TIMEOUT = 20
 # Completed-task endpoint hard-caps the page size.
 COMPLETED_MAX_LIMIT = 100
 
+# get_task_activity walks pages until one comes back empty/repeats, but stops
+# after this many pages regardless — a per-task edit log (title/due/move/etc.
+# events on ONE task), not an account-wide feed, so even a heavily-edited task
+# realistically tops out at a few dozen events/pages. 20 is a generous multiple
+# of that, kept as a safety net against a pathological task (e.g. years of daily
+# recurrence edits) turning one tool call into an unbounded number of HTTP
+# requests. Raise only if a real task is observed hitting this ceiling.
+TASK_ACTIVITY_MAX_PAGES = 20
+
 # TickTick spaces kanban columns with this default gap so new ones can be
 # slotted between existing columns without renumbering (mirrors the web app).
 COLUMN_SORT_STEP = 1099511627776
@@ -460,7 +469,7 @@ class TickTickV2Client:
 
     def get_task_activity(self, project_id: str = None, task_id: str = None,
                           *, skip: int = None, last_id: str = None,
-                          max_pages: int = 20) -> List[Dict]:
+                          max_pages: int = TASK_ACTIVITY_MAX_PAGES) -> List[Dict]:
         """Fetch the edit-history / activity log for a task.
 
         Endpoint confirmed via a live DevTools capture of TickTick's own
