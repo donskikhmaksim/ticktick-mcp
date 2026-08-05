@@ -8,8 +8,31 @@ the pre-write duplicate-check read) and only claims success if the fresh read
 actually shows the expected status/value. Output follows the unified markdown
 template from docs/DESIGN_output_format.md.
 
-No real network — the v2 client is faked."""
+No real network — the v2 client is faked.
+
+2026-08-05: checkin_habit is now gated 🟡 (two calls, same tool name — see
+docs/DESIGN_approval_gate.md and the removed tier-🟢 exemption). Every test
+below now does call #1 (plan, no mutation) then call #2 (manifest_id +
+user_reply="да") before asserting on the outcome that used to come straight
+back from a single call."""
+import re
+
 import ticktick_mcp.src.server as s
+
+
+def _extract_manifest_id(preview: str) -> str:
+    m = re.search(r'manifest_id="([0-9a-f]+)"', preview)
+    assert m, f"no manifest_id found in preview: {preview!r}"
+    return m.group(1)
+
+
+async def _checkin(*args, **kwargs):
+    """Runs checkin_habit's full plan->execute gate cycle and returns the
+    execute-phase result (what all the pre-existing assertions expect)."""
+    preview = await s.checkin_habit(*args, **kwargs)
+    assert "🛑" not in preview, f"plan phase unexpectedly refused: {preview!r}"
+    mid = _extract_manifest_id(preview)
+    return await s.checkin_habit(*args, manifest_id=mid, user_reply="да", **kwargs)
 
 
 class FakeHabitsV2:
@@ -79,7 +102,7 @@ async def test_checkin_habit_success_is_post_verified(monkeypatch):
     fake = FakeHabitsV2(HABITS)
     _wire(monkeypatch, fake)
 
-    result = await s.checkin_habit("Медитация", "h1", date="2026-07-28")
+    result = await _checkin("Медитация", "h1", date="2026-07-28")
 
     assert result.startswith("### ✅ Чек-ин привычки «Медитация»")
     assert "выполнено" in result
@@ -98,7 +121,7 @@ async def test_checkin_habit_silent_write_is_not_confirmed(monkeypatch):
     fake = FakeHabitsV2(HABITS, write_effect="silent")
     _wire(monkeypatch, fake)
 
-    result = await s.checkin_habit("Медитация", "h1", date="2026-07-28")
+    result = await _checkin("Медитация", "h1", date="2026-07-28")
 
     assert result.startswith("### ⚠️")
     assert "НЕ подтверждён" in result
@@ -116,7 +139,7 @@ async def test_checkin_habit_mismatch_is_flagged(monkeypatch):
     fake = FakeHabitsV2(HABITS, write_effect="mismatch")
     _wire(monkeypatch, fake)
 
-    result = await s.checkin_habit("Медитация", "h1", date="2026-07-28", status=2)
+    result = await _checkin("Медитация", "h1", date="2026-07-28", status=2)
 
     assert result.startswith("### ❌")
     assert "разошёлся с подтверждением" in result
@@ -134,7 +157,7 @@ async def test_checkin_habit_postverify_fetch_error_is_unconfirmed(monkeypatch):
     fake = FakeHabitsV2(HABITS, raise_on_call=2)
     _wire(monkeypatch, fake)
 
-    result = await s.checkin_habit("Медитация", "h1", date="2026-07-28")
+    result = await _checkin("Медитация", "h1", date="2026-07-28")
 
     assert result.startswith("### ⚠️")
     assert "проверка не выполнена" in result
@@ -152,7 +175,7 @@ async def test_checkin_habit_duplicate_is_refused_without_writing(monkeypatch):
     })
     _wire(monkeypatch, fake)
 
-    result = await s.checkin_habit("Медитация", "h1", date="2026-07-28")
+    result = await _checkin("Медитация", "h1", date="2026-07-28")
 
     assert result.startswith("### ↷")
     assert "уже есть" in result
@@ -167,7 +190,7 @@ async def test_checkin_habit_identity_guard_blocks_wrong_name(monkeypatch):
     fake = FakeHabitsV2(HABITS)
     _wire(monkeypatch, fake)
 
-    result = await s.checkin_habit("Бег", "h1", date="2026-07-28")
+    result = await _checkin("Бег", "h1", date="2026-07-28")
 
     assert result.startswith("🛑")
     assert fake.checkin_habit_calls == 0
@@ -188,6 +211,91 @@ async def test_checkin_habit_invalid_status_refused(monkeypatch):
     _wire(monkeypatch, fake)
 
     result = await s.checkin_habit("Медитация", "h1", date="2026-07-28", status=5)
+
+    assert result.startswith("🛑")
+    assert fake.checkin_habit_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-05: the gate itself — checkin_habit used to be tier-🟢 exempt from
+# _require_consent entirely. These lock in that the two-phase gate is real:
+# call #1 never mutates, call #2 hard-enforces user_reply, and the manifest
+# is one-shot.
+# ---------------------------------------------------------------------------
+
+async def test_checkin_habit_call1_previews_nothing_written(monkeypatch):
+    fake = FakeHabitsV2(HABITS)
+    _wire(monkeypatch, fake)
+
+    preview = await s.checkin_habit("Медитация", "h1", date="2026-07-28")
+
+    assert "manifest_id" in preview
+    assert "«Медитация»" in preview
+    assert fake.checkin_habit_calls == 0
+    assert fake.get_habit_checkins_calls == 0
+
+
+async def test_checkin_habit_call2_without_reply_is_refused_and_retryable(monkeypatch):
+    fake = FakeHabitsV2(HABITS)
+    _wire(monkeypatch, fake)
+
+    preview = await s.checkin_habit("Медитация", "h1", date="2026-07-28")
+    mid = _extract_manifest_id(preview)
+
+    refused = await s.checkin_habit("Медитация", "h1", date="2026-07-28",
+                                    manifest_id=mid, user_reply="")
+    assert "🛑" in refused
+    assert fake.checkin_habit_calls == 0
+
+    # manifest survives an empty (not explicitly negative) reply — retryable
+    result = await s.checkin_habit("Медитация", "h1", date="2026-07-28",
+                                   manifest_id=mid, user_reply="да, отметь")
+    assert fake.checkin_habit_calls == 1
+    assert "🛑" not in result
+
+
+async def test_checkin_habit_explicit_no_burns_the_manifest(monkeypatch):
+    fake = FakeHabitsV2(HABITS)
+    _wire(monkeypatch, fake)
+
+    preview = await s.checkin_habit("Медитация", "h1", date="2026-07-28")
+    mid = _extract_manifest_id(preview)
+
+    refused = await s.checkin_habit("Медитация", "h1", date="2026-07-28",
+                                    manifest_id=mid, user_reply="нет, погоди")
+    assert "🛑" in refused
+    assert fake.checkin_habit_calls == 0
+
+    dead = await s.checkin_habit("Медитация", "h1", date="2026-07-28",
+                                 manifest_id=mid, user_reply="да")
+    assert "🛑" in dead
+    assert fake.checkin_habit_calls == 0
+
+
+async def test_checkin_habit_manifest_is_one_shot(monkeypatch):
+    fake = FakeHabitsV2(HABITS)
+    _wire(monkeypatch, fake)
+
+    preview = await s.checkin_habit("Медитация", "h1", date="2026-07-28")
+    mid = _extract_manifest_id(preview)
+    await s.checkin_habit("Медитация", "h1", date="2026-07-28",
+                          manifest_id=mid, user_reply="да")
+    assert fake.checkin_habit_calls == 1
+
+    second = await s.checkin_habit("Медитация", "h1", date="2026-07-28",
+                                   manifest_id=mid, user_reply="да")
+    assert "🛑" in second
+    assert fake.checkin_habit_calls == 1  # nothing new happened
+
+
+async def test_checkin_habit_unknown_manifest_is_refused(monkeypatch):
+    fake = FakeHabitsV2(HABITS)
+    _wire(monkeypatch, fake)
+
+    result = await s.checkin_habit("Медитация", "h1", date="2026-07-28",
+                                   manifest_id="does-not-exist", user_reply="да")
+    assert "🛑" in result
+    assert fake.checkin_habit_calls == 0
 
     assert result.startswith("🛑")
     assert fake.checkin_habit_calls == 0

@@ -35,7 +35,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Callable, Dict, Optional
 
 import requests
 
@@ -198,12 +198,14 @@ def create_tg_approval(manifest_id: str, chat_id: str, message_id: Optional[int]
 def get_tg_approval(manifest_id: str) -> Optional[dict]:
     """Читает строку, ОБЯЗАТЕЛЬНО фильтруя server='ticktick' — сервер не
     должен читать чужие approval-строки (та же дисциплина, что у TS-серверов'
-    getTgApproval; см. tg_approval.ts's комментарий про cross-server read)."""
+    getTgApproval; см. tg_approval.ts's комментарий про cross-server read).
+    chat_id/message_id (добавлены 2026-08-05) нужны авто-исполнению по
+    кнопке, чтобы знать, КУДА писать итог (report_auto_execution_result)."""
     conn = _pg_pool.getconn()
     try:
         with conn, conn.cursor() as cur:
             cur.execute(
-                "SELECT status, expires_at FROM tg_approvals "
+                "SELECT status, expires_at, chat_id, message_id FROM tg_approvals "
                 "WHERE manifest_id = %s AND server = 'ticktick'",
                 (manifest_id,),
             )
@@ -212,7 +214,8 @@ def get_tg_approval(manifest_id: str) -> Optional[dict]:
         _pg_pool.putconn(conn)
     if not row:
         return None
-    return {"status": row[0], "expires_at": row[1]}
+    return {"status": row[0], "expires_at": row[1], "chat_id": row[2],
+            "message_id": row[3]}
 
 
 # ───────────────────────── Публичное API для server.py ─────────────────────
@@ -261,3 +264,116 @@ def check_approval(manifest_id: str) -> str:
     if _now_ms() > row["expires_at"]:
         return "none"
     return "pending"
+
+
+# ───────────────────── Авто-исполнение по кнопке (2026-08-05) ─────────────────
+#
+# Максим, ночь на 2026-08-05: «нажал кнопку в Telegram — должно сразу
+# исполниться на бэке, не ждать повторного вызова моделью». До этого кнопка
+# только переключала статус строки в `tg_approvals` — реальная мутация
+# происходила ТОЛЬКО когда модель САМА второй раз звала гейтованный тул с
+# `user_reply`; если человек ничего не писал в чат после нажатия, действие
+# могло не наступить никогда. Портировано с gmail-mcp/src/consent.ts's
+# `tryAutoExecute`/`TG_AUTO_REPLY_MARKER` и src/tg_approval.ts's
+# `reportAutoExecutionResult` — тот же контракт, адаптированный под
+# АРХИТЕКТУРНУЮ разницу: TS-сторона хранит и манифест, и tg_approvals в ОДНОМ
+# Postgres (один SQL JOIN находит кандидатов, `consumeManifest` — атомарный
+# `UPDATE ... RETURNING`). В ticktick-mcp манифесты (`_MANIFESTS` в server.py)
+# — это IN-MEMORY dict одного процесса, НЕ Postgres; только tg_approvals живёт
+# в общем Postgres. Поэтому здесь try_auto_execute() НЕ обращается к
+# _MANIFESTS напрямую (это создало бы обратную зависимость tg_approval.py →
+# server.py) — вместо этого server.py передаёт три callback'а
+# (get_manifest/consume_manifest/rehash), а поиск кандидатов (перебор
+# _MANIFESTS + check_approval на каждый) тоже живёт в server.py, где
+# _MANIFESTS реально виден.
+#
+# Два независимых режима гейта (Максим подтвердил явно, см. docstring
+# `_require_consent` в server.py) остаются нетронуты: обычный путь через
+# `_require_consent()` (чат-«да», без TG) НЕ меняется НИ НА БИТ — это
+# отдельная функция, вызываемая ТОЛЬКО фоновым поллером сервера, а не
+# альтернативная ветка внутри `_require_consent`.
+
+# Метка вместо `user_reply` человека — честно отражает происхождение (кнопка,
+# не текст), видна в аудит-логе/журнале мутаций. Специально НЕ похожа на
+# утвердительное слово из _CONSENT_AFFIRMATIVE_WORDS — если этот текст
+# случайно попадёт в _is_affirmative_reply() напрямую (например, по ошибке
+# передадут в обычный _require_consent), он НЕ должен пройти как настоящее
+# «да» человека.
+TG_AUTO_REPLY_MARKER = "[авто: подтверждено кнопкой в Telegram]"
+
+
+def try_auto_execute(
+    *,
+    manifest_id: str,
+    tool: str,
+    get_manifest: Callable[[str], Optional[Dict[str, Any]]],
+    consume_manifest: Callable[[str], Optional[Dict[str, Any]]],
+    rehash: Callable[[Dict[str, Any]], str],
+) -> Optional[Dict[str, Any]]:
+    """Аналог TS `tryAutoExecute`, адаптированный под in-memory манифесты
+    (см. блок-комментарий выше). Проверяет ТЕ ЖЕ инварианты, что и обычный
+    execute-путь через `_require_consent`, — КРОМЕ классификации текстового
+    `user_reply` (не нужна: нажатие кнопки уже было единственным доказанным
+    согласием для этого тула — `tg.enabled_for(tool)` было истинно в момент
+    постройки плана, иначе строки в `tg_approvals` не было бы вовсе):
+
+    1. Манифест существует и НЕ `consumed` (жив).
+    2. Манифест принадлежит именно этому `tool` (сверка, не слепое доверие
+       кандидату — на случай будущего расхождения между тем, как поллер
+       определил tool, и тем, что реально хранится в манифесте).
+    3. Binding: `rehash(manifest)` совпадает с `object_hash`, сохранённым при
+       планировании (тот же принцип, что у обычного `_require_consent`, —
+       см. его собственный честный комментарий о том, что в ticktick-mcp это
+       сверка с тем же самым сохранённым значением, а не с независимым живым
+       состоянием, так что и здесь это не более сильная защита, чем есть в
+       остальном коде; сохраняется ради единообразия и на случай будущего
+       усиления в одном месте).
+    4. Одноразовость: `consume_manifest(manifest_id)` — вызывающий (server.py)
+       обязан атомарно (синхронно, без `await` между чтением и записью флага
+       `consumed`) вернуть либо ту же живую копию манифеста с `consumed`
+       выставленным в True, либо None, если кто-то (гонка/повторный тик
+       поллера) уже успел его забрать.
+
+    Возвращает манифест dict (то, что вернул `consume_manifest`) при успехе,
+    иначе None (манифест неактуален — гонка/дрейф/просрочен/чужой tool) —
+    вызывающий поллер просто пропускает кандидата, это не ошибка."""
+    m = get_manifest(manifest_id)
+    if m is None or m.get("consumed"):
+        return None
+    if tool and m.get("_auto_tool", tool) != tool:
+        return None
+    stored_hash = m.get("object_hash")
+    if stored_hash:
+        try:
+            current_hash = rehash(m)
+        except Exception as e:
+            logger.warning(f"TG auto-execute: rehash failed for {manifest_id}: {e}")
+            return None
+        if current_hash != stored_hash:
+            return None
+    return consume_manifest(manifest_id)
+
+
+def report_auto_execution_result(cfg: TgApprovalConfig, chat_id: str,
+                                  message_id: Optional[int], report_text: str) -> None:
+    """Отправляет ИТОГ исполнения В ТО ЖЕ сообщение Telegram, где были кнопки
+    (Максим, 2026-08-05: «нажал кнопку — сразу исполнилось, результат — сюда
+    же»). `editMessageText` заменяет и текст (план → отчёт), и `reply_markup`
+    (кнопки снимаются тем же вызовом — Telegram API позволяет одним запросом).
+    Best-effort: если чат/сообщение недоступны (человек стёр сообщение руками)
+    — не бросает, просто логирует; реальное исполнение УЖЕ произошло и не
+    должно откатываться из-за того, что отчёт некуда вписать."""
+    if message_id is None:
+        logger.warning(f"TG auto-execute: messageId отсутствует, отчёт некуда "
+                       f"вписать (chat={chat_id})")
+        return
+    res = _tg_call(cfg, "editMessageText", {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": md_to_telegram_html(_clip(report_text)),
+        "parse_mode": "HTML",
+        "reply_markup": {"inline_keyboard": []},
+    })
+    if not res.get("ok"):
+        logger.warning(f"TG auto-execute: editMessageText failed for message "
+                       f"{message_id}: {res.get('description')}")

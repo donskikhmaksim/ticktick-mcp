@@ -15,6 +15,7 @@ from datetime import date, datetime, timezone, timedelta
 from typing import Dict, List, Any, Literal, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from dotenv import load_dotenv
@@ -1475,10 +1476,10 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     for explicit confirmation («ок?»), and only after their real reply call
     execute_task_creation(manifest_id, user_reply=<their literal message>).
     Afterwards run operation_report and reprint it — the flow is: спроси →
-    сделай → докажи. Creation is low-risk and reversible (🟢 — see
-    docs/DESIGN_write_tool_taxonomy.md), so execute_task_creation does not
-    hard-block on user_reply the way the deletion/declutter tools do; it's
-    still required in the signature for a uniform manifest format.
+    сделай → докажи. execute_task_creation IS hard-gated on user_reply, same
+    as every other mutating tool on this server (Maksim, 2026-08-05: no more
+    tier exemption for "it's just a create/reversible edit" — ALL write tools
+    go through plan→execute, without exception).
 
     Args:
         summary: one-line human sentence describing the batch
@@ -2609,6 +2610,67 @@ def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
         "— НЕ в этом же ходе (сам список tasks можно повторить как есть, на "
         "2-м вызове он игнорируется — используются данные из манифеста). "
         "Манифест одноразовый, действует 1 час.")
+    return _GateOutcome(False, message="\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Shared tier-🟢→🟡 gate for the SINGLE-object mutation tools that used to be
+# exempt from _require_consent altogether (create_project, create_tag,
+# checkin_habit, unset_task_parent, ...) — Maksim, 2026-08-05: "создание тоже
+# должно быть через флоу план→экзек, всё что не только читает — через этот
+# флоу" (no more tier exemption by "it's just a create/reversible edit").
+# Same "one tool, two calls" shape as _gate_batch above, but for a single
+# mutating call carrying arbitrary keyword params instead of a list of task
+# dicts (there is no natural per-item list to preview here). tier=1 ("light
+# confirmation" — create/reversible edits, not delete) per
+# docs/DESIGN_write_tool_taxonomy.md's former 🟢 tier.
+def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
+                 manifest_id: str, user_reply: str, describe_fn) -> _GateOutcome:
+    """Call #1 (manifest_id omitted): stores `params` VERBATIM in a one-shot
+    manifest and returns a preview built by describe_fn(params) — nothing is
+    mutated. Call #2 (manifest_id + user_reply): _require_consent(tier=1, ...)
+    is checked, then the STORED params (never call #2's own arguments) are
+    handed back via `.extra` — same no-swap contract as _gate_batch. No
+    object_hash/binding here (mirrors plan_task_creation, which also skips it
+    for brand-new objects that don't exist yet to re-hash against).
+
+    NOTE on one-shot: unlike _gate_batch (which relies on _require_consent
+    alone and — a pre-existing gap found while building this — never actually
+    flips `consumed` to True on the SUCCESS path, so a batch tool's manifest
+    is only "accidentally" one-shot when a retry happens to also trip its
+    identity-guard), this function marks `consumed = True` itself right here,
+    matching docs/DESIGN_approval_gate.md §4.3.3 item 4 ("after success,
+    consumed = True") literally."""
+    _prune_manifests()
+    if manifest_id:
+        m = _MANIFESTS.get(manifest_id)
+        if not m or m.get("kind") != kind:
+            return _GateOutcome(False, message=(
+                f"🛑 Манифест {manifest_id} не найден/истёк/уже исполнен. "
+                f"Начни заново: {tool_name}(...) без manifest_id."))
+        cr = _require_consent(action=kind, tier=1, manifest=m,
+                              user_reply=user_reply, min_gap=0)
+        if not cr.ok:
+            return _GateOutcome(False, message=cr.reason)
+        m["consumed"] = True
+        return _GateOutcome(True, extra=m.get("params") or {})
+
+    if not params:
+        return _GateOutcome(False, message="Нечего делать — пустые параметры.")
+    mid = uuid.uuid4().hex[:12]
+    now = time.monotonic()
+    _MANIFESTS[mid] = {"kind": kind, "params": params, "created": now,
+                       "plan_shown_at": now, "consumed": False}
+    lines = [f"### 📋 План — {describe_fn(params)}",
+             f"_Манифест `{mid}` · ничего ещё не изменено_", "",
+             "Покажи это пользователю дословно и ДОЖДИСЬ его отдельного "
+             "ответа (не отвечай за него). Когда он явно согласится, вызови "
+             f"{tool_name} СНОВА с теми же аргументами и добавь "
+             f'manifest_id="{mid}", user_reply="<дословная реплика '
+             'пользователя>" — НЕ в этом же ходе (сами аргументы можно '
+             "повторить как есть, на 2-м вызове они игнорируются — "
+             "используются данные из манифеста). Манифест одноразовый, "
+             "действует 1 час."]
     return _GateOutcome(False, message="\n".join(lines))
 
 
@@ -4356,6 +4418,20 @@ async def execute_declutter(manifest_id: str, user_reply: str = "") -> str:
                           tool="execute_declutter", manifest_id=manifest_id)
     if not cr.ok:
         return cr.reason
+    return await _execute_declutter_ram_impl(manifest_id, m)
+
+
+async def _execute_declutter_ram_impl(manifest_id: str, m: Dict) -> str:
+    """Shared declutter-application engine for the RAM-manifest branch (both
+    plain RAM plans and persist="sheet" plans whose RAM pointer is still
+    alive — the sheet-gone-after-restart case is handled separately by
+    _execute_declutter_from_sheet, called by the resume_declutter tool and by
+    execute_declutter's own sheet-persist/RAM-missing branches above).
+    Factored out of execute_declutter() 2026-08-05 so the TG auto-execute
+    poller (server.py's _AUTO_EXECUTORS registry) can call the exact same
+    mutation path a manually-confirmed «да» would have run, once consent has
+    already been granted by the caller (_require_consent, or the poller's
+    try_auto_execute — see tg_approval.py)."""
     m["consumed"] = True
     try:
         actions = m["actions"]
@@ -4561,28 +4637,59 @@ async def delete_task_with_subtasks(
             "operation_report подтвердит результат.")
 
 
+def _describe_create_project(p: Dict) -> str:
+    color = p.get("color") or "по умолчанию"
+    view = p.get("view_mode") or "list"
+    return f'Создаю проект «{p.get("name")}» (цвет {color}, вид {view})'
+
+
 @mcp.tool()
 async def create_project(
     name: str,
     color: str = "#F18181",
-    view_mode: str = "list"
+    view_mode: str = "list",
+    manifest_id: str = "",
+    user_reply: str = "",
 ) -> str:
     """
-    Create a new project in TickTick.
-    
+    Create a new project in TickTick. Gated 🟡 (docs/DESIGN_approval_gate.md):
+    two calls, same tool name — nothing is created on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is created yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — name/color/view_mode are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
+
     Args:
-        name: Project name
+        name: Project name (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         color: Color code (hex format) (optional)
         view_mode: View mode - one of list, kanban, or timeline (optional)
+        manifest_id: from call #1's response — pass on call #2 to actually create
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
     err = _ensure_official()
     if err:
         return err
-    
-    # Validate view_mode
+
+    # Validate view_mode up front (cheap, applies to both calls).
     if view_mode not in ["list", "kanban", "timeline"]:
         return "Invalid view_mode. Must be one of: list, kanban, timeline."
-    
+
+    params = {"name": name, "color": color, "view_mode": view_mode}
+    outcome = _gate_single("create_project", "create_project",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_create_project)
+    if not outcome.proceed:
+        return outcome.message
+    return await _create_project_impl(**outcome.extra)
+
+
+async def _create_project_impl(name: str, color: str = "#F18181",
+                               view_mode: str = "list") -> str:
+    """Pure mutation logic for create_project — no consent gate. Called only
+    by the gated create_project() above once the plan is approved."""
     try:
         project = await _run_blocking(
             ticktick.create_project,
@@ -5306,6 +5413,11 @@ async def get_next_tasks() -> str:
         logger.error(f"Error in get_next_tasks: {e}")
         return f"Error retrieving next tasks: {str(e)}"
 
+def _describe_create_subtask(p: Dict) -> str:
+    return (f'Создаю подзадачу «{p.get("subtask_title")}» под «'
+            f'{p.get("parent_task_title")}»')
+
+
 @mcp.tool()
 async def create_subtask(
     parent_task_title: str,
@@ -5313,10 +5425,21 @@ async def create_subtask(
     parent_task_id: str,
     project_id: str,
     content: str = None,
-    priority: int = 0
+    priority: int = 0,
+    manifest_id: str = "",
+    user_reply: str = "",
 ) -> str:
     """
-    Create a subtask for a parent task within the same project.
+    Create a subtask for a parent task within the same project. Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    created on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is created yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
 
     Args:
         parent_task_title: Title of the parent task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
@@ -5325,15 +5448,33 @@ async def create_subtask(
         project_id: ID of the project (must be same for both parent and subtask)
         content: Optional content/description for the subtask
         priority: Priority level (0: None, 1: Low, 3: Medium, 5: High) (optional)
+        manifest_id: from call #1's response — pass on call #2 to actually create
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
     err = _ensure_official()
     if err:
         return err
-    
-    # Validate priority
+
+    # Validate priority up front (cheap, applies to both calls).
     if priority not in [0, 1, 3, 5]:
         return "Invalid priority. Must be 0 (None), 1 (Low), 3 (Medium), or 5 (High)."
 
+    params = {"parent_task_title": parent_task_title, "subtask_title": subtask_title,
+              "parent_task_id": parent_task_id, "project_id": project_id,
+              "content": content, "priority": priority}
+    outcome = _gate_single("create_subtask", "create_subtask",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_create_subtask)
+    if not outcome.proceed:
+        return outcome.message
+    return await _create_subtask_impl(**outcome.extra)
+
+
+async def _create_subtask_impl(parent_task_title: str, subtask_title: str,
+                               parent_task_id: str, project_id: str,
+                               content: str = None, priority: int = 0) -> str:
+    """Pure mutation logic for create_subtask — no consent gate. Called only
+    by the gated create_subtask() above once the plan is approved."""
     # Identity guard on the PARENT: a stale parent_task_id would attach the new
     # subtask under a different task (or a dead one) while reporting success.
     g = _guard_task(parent_task_id, parent_task_title or "", project_id)
@@ -5635,11 +5776,30 @@ async def get_habits() -> str:
         return f"Error fetching habits: {str(e)}"
 
 
+_HABIT_STATUS_LABELS = {2: "выполнено", 1: "провалено", 0: "не выполнено"}
+
+
+def _describe_checkin_habit(p: Dict) -> str:
+    label = _HABIT_STATUS_LABELS.get(p.get("status"), p.get("status"))
+    when = p.get("date") or "сегодня"
+    return f'Отмечаю привычку «{p.get("habit_name")}» на {when}: {label}'
+
+
 @mcp.tool()
 async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
-                        status: int = 2, value: float = None) -> str:
+                        status: int = 2, value: float = None,
+                        manifest_id: str = "", user_reply: str = "") -> str:
     """
-    Record a habit check-in (requires v2 API).
+    Record a habit check-in (requires v2 API). Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    recorded on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is recorded yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
 
     После записи сервер сам перечитывает check-ins свежим запросом
     (независимо от того, что было отправлено) и подтверждает в ответе, что
@@ -5652,11 +5812,12 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
         date: Date to check in as YYYY-MM-DD (optional; defaults to today — pass a past date to backfill)
         status: 2 = done (default), 1 = failed, 0 = not done
         value: Numeric value for quantitative habits (optional; defaults to the goal when done)
+        manifest_id: from call #1's response — pass on call #2 to actually record
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
     err = _ensure_ready()
     if err:
         return err
-    labels = {2: "выполнено", 1: "провалено", 0: "не выполнено"}
     if status not in (0, 1, 2):
         return "🛑 Неверный status. Используй 2 (done), 1 (failed) или 0 (not done). Ничего не записано."
     # Strict date validation: '2026-7-4' would silently become stamp 202674
@@ -5671,6 +5832,22 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
         except ValueError:
             return (f"🛑 Неверный формат даты {date!r} — нужно строго "
                     "YYYY-MM-DD (например 2026-07-04). Ничего не записано.")
+
+    params = {"habit_name": habit_name, "habit_id": habit_id, "date": date,
+              "status": status, "value": value}
+    outcome = _gate_single("checkin_habit", "checkin_habit",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_checkin_habit)
+    if not outcome.proceed:
+        return outcome.message
+    return await _checkin_habit_impl(**outcome.extra)
+
+
+async def _checkin_habit_impl(habit_name: str, habit_id: str, date: str = None,
+                              status: int = 2, value: float = None) -> str:
+    """Pure mutation logic for checkin_habit — no consent gate. Called only
+    by the gated checkin_habit() above once the plan is approved."""
+    labels = _HABIT_STATUS_LABELS
     try:
         # Identity guard: the id must exist among live habits AND resolve to
         # the given name — a swapped pair would check in the WRONG habit while
@@ -5965,10 +6142,26 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
         logger.error(f"Error in set_task_parent: {e}")
         return f"Error nesting tasks: {str(e)}"
 
+def _describe_unset_task_parent(p: Dict) -> str:
+    return (f'Отцепляю «{p.get("task_title")}» от родителя '
+            f'«{p.get("parent_task_title")}»')
+
+
 @mcp.tool()
-async def unset_task_parent(task_title: str, parent_task_title: str, task_id: str, parent_task_id: str, project_id: str) -> str:
+async def unset_task_parent(task_title: str, parent_task_title: str, task_id: str,
+                            parent_task_id: str, project_id: str,
+                            manifest_id: str = "", user_reply: str = "") -> str:
     """
-    Detach a subtask from its parent, making it a top-level task (requires v2 API).
+    Detach a subtask from its parent, making it a top-level task (requires v2
+    API). Gated 🟡 (docs/DESIGN_approval_gate.md): two calls, same tool name —
+    nothing is changed on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is detached yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
 
     Args:
         task_title: Title of the subtask being detached (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
@@ -5976,10 +6169,28 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
         task_id: ID of the subtask to detach
         parent_task_id: ID of its current parent
         project_id: ID of the project both tasks live in
+        manifest_id: from call #1's response — pass on call #2 to actually detach
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
     err = _ensure_ready()
     if err:
         return err
+    params = {"task_title": task_title, "parent_task_title": parent_task_title,
+              "task_id": task_id, "parent_task_id": parent_task_id,
+              "project_id": project_id}
+    outcome = _gate_single("unset_task_parent", "unset_task_parent",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_unset_task_parent)
+    if not outcome.proceed:
+        return outcome.message
+    return await _unset_task_parent_impl(**outcome.extra)
+
+
+async def _unset_task_parent_impl(task_title: str, parent_task_title: str,
+                                  task_id: str, parent_task_id: str,
+                                  project_id: str) -> str:
+    """Pure mutation logic for unset_task_parent — no consent gate. Called
+    only by the gated unset_task_parent() above once the plan is approved."""
     try:
         by_id = _open_by_id(fresh=True)
         if by_id is None:
@@ -6236,12 +6447,45 @@ async def _live_groups(fresh: bool = True) -> List[Dict]:
     return [g for g in groups if not g.get("deleted")]
 
 
+def _describe_create_project_group(p: Dict) -> str:
+    return f'Создаю папку проектов «{p.get("name")}»'
+
+
 @mcp.tool()
-async def create_project_group(name: str) -> str:
-    """Create a project group (folder) (requires v2 API)."""
+async def create_project_group(name: str, manifest_id: str = "",
+                               user_reply: str = "") -> str:
+    """
+    Create a project group (folder) (requires v2 API). Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    created on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is created yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — `name` is ignored on this
+    call (the manifest's own stored value is used). Do NOT make call #2 in
+    the same turn as call #1.
+
+    Args:
+        name: Name of the new group (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
+        manifest_id: from call #1's response — pass on call #2 to actually create
+        user_reply: the user's literal reply approving the plan — required on call #2
+    """
     err = _ensure_ready()
     if err:
         return err
+    params = {"name": name}
+    outcome = _gate_single("create_project_group", "create_project_group",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_create_project_group)
+    if not outcome.proceed:
+        return outcome.message
+    return await _create_project_group_impl(**outcome.extra)
+
+
+async def _create_project_group_impl(name: str) -> str:
+    """Pure mutation logic for create_project_group — no consent gate. Called
+    only by the gated create_project_group() above once the plan is approved."""
     try:
         gid = await _run_blocking(lambda: ticktick_v2.create_project_group(name))
     except RuntimeError as e:
@@ -6260,18 +6504,47 @@ async def create_project_group(name: str) -> str:
     return f"Группа проектов «{name}» создана (проверено). (id: {gid})"
 
 
+def _describe_delete_project_group(p: Dict) -> str:
+    return (f'Удаляю папку проектов «{p.get("group_name")}» (сами проекты '
+            "останутся, просто без папки)")
+
+
 @mcp.tool()
-async def delete_project_group(group_name: str, group_id: str) -> str:
+async def delete_project_group(group_name: str, group_id: str,
+                               manifest_id: str = "", user_reply: str = "") -> str:
     """
-    Delete a project group/folder (projects inside are kept, just ungrouped) (requires v2 API).
+    Delete a project group/folder (projects inside are kept, just ungrouped)
+    (requires v2 API). Gated 🟡 (docs/DESIGN_approval_gate.md): two calls,
+    same tool name — nothing is changed on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is deleted yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
 
     Args:
         group_name: Name of the group (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         group_id: ID of the group
+        manifest_id: from call #1's response — pass on call #2 to actually delete
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
     err = _ensure_ready()
     if err:
         return err
+    params = {"group_name": group_name, "group_id": group_id}
+    outcome = _gate_single("delete_project_group", "delete_project_group",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_delete_project_group)
+    if not outcome.proceed:
+        return outcome.message
+    return await _delete_project_group_impl(**outcome.extra)
+
+
+async def _delete_project_group_impl(group_name: str, group_id: str) -> str:
+    """Pure mutation logic for delete_project_group — no consent gate. Called
+    only by the gated delete_project_group() above once the plan is approved."""
     try:
         # Identity guard (fresh): the id must exist AND resolve to the name.
         groups = await _live_groups()
@@ -6297,19 +6570,50 @@ async def delete_project_group(group_name: str, group_id: str) -> str:
         return f"Error deleting project group: {str(e)}"
 
 
+def _describe_move_project_to_group(p: Dict) -> str:
+    dest = "без папки" if p.get("group_id") == "NONE" else f'в папку id:{p.get("group_id")}'
+    return f'Перемещаю проект «{p.get("project_name")}» {dest}'
+
+
 @mcp.tool()
-async def move_project_to_group(project_name: str, project_id: str, group_id: str) -> str:
+async def move_project_to_group(project_name: str, project_id: str, group_id: str,
+                                manifest_id: str = "", user_reply: str = "") -> str:
     """
-    Move a project into a group/folder (requires v2 API).
+    Move a project into a group/folder (requires v2 API). Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    changed on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is moved yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
 
     Args:
         project_name: Name of the project (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         project_id: ID of the project to move
         group_id: ID of the destination group, or "NONE" to ungroup
+        manifest_id: from call #1's response — pass on call #2 to actually move
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
     err = _ensure_ready()
     if err:
         return err
+    params = {"project_name": project_name, "project_id": project_id, "group_id": group_id}
+    outcome = _gate_single("move_project_to_group", "move_project_to_group",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_move_project_to_group)
+    if not outcome.proceed:
+        return outcome.message
+    return await _move_project_to_group_impl(**outcome.extra)
+
+
+async def _move_project_to_group_impl(project_name: str, project_id: str,
+                                      group_id: str) -> str:
+    """Pure mutation logic for move_project_to_group — no consent gate.
+    Called only by the gated move_project_to_group() above once the plan is
+    approved."""
     try:
         # Identity guard on the project (fresh, fail-closed) …
         refuse = _guard_project(project_id, project_name, fresh=True,
@@ -6382,20 +6686,50 @@ async def get_task_comments(task_title: str, project_id: str, task_id: str) -> s
         return f"Error fetching comments: {str(e)}"
 
 
+def _describe_add_task_comment(p: Dict) -> str:
+    return f'Добавляю комментарий к «{p.get("task_title")}»: «{p.get("text")}»'
+
+
 @mcp.tool()
-async def add_task_comment(task_title: str, text: str, project_id: str, task_id: str) -> str:
+async def add_task_comment(task_title: str, text: str, project_id: str, task_id: str,
+                           manifest_id: str = "", user_reply: str = "") -> str:
     """
-    Add a comment to a task (requires v2 API).
+    Add a comment to a task (requires v2 API). Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    added on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is added yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
 
     Args:
         task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         text: Comment text
         project_id: ID of the project
         task_id: ID of the task
+        manifest_id: from call #1's response — pass on call #2 to actually add
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
     err = _ensure_ready()
     if err:
         return err
+    params = {"task_title": task_title, "text": text, "project_id": project_id,
+              "task_id": task_id}
+    outcome = _gate_single("add_task_comment", "add_task_comment",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_add_task_comment)
+    if not outcome.proceed:
+        return outcome.message
+    return await _add_task_comment_impl(**outcome.extra)
+
+
+async def _add_task_comment_impl(task_title: str, text: str, project_id: str,
+                                 task_id: str) -> str:
+    """Pure mutation logic for add_task_comment — no consent gate. Called
+    only by the gated add_task_comment() above once the plan is approved."""
     try:
         g = _guard_task(task_id, task_title or "", project_id)
         if g.status == "unavailable":
@@ -6590,14 +6924,29 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
         return f"Error restoring tasks: {str(e)}"
 
 
+def _describe_attach_file_to_task(p: Dict) -> str:
+    name = p.get("filename") or (p.get("url") or "").split("?")[0].rstrip("/").split("/")[-1] or "файл"
+    return f'Прикрепляю «{name}» к задаче «{p.get("task_title")}»'
+
+
 @mcp.tool()
 async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
                               url: str = None,
-                              content_base64: str = None, filename: str = None) -> str:
+                              content_base64: str = None, filename: str = None,
+                              manifest_id: str = "", user_reply: str = "") -> str:
     """
     Attach a file to a task (requires v2 API). Provide the file either by URL
     (the server downloads it) or as base64 content — e.g. a file fetched from
-    Google Drive or generated by Claude. Max 20 MB.
+    Google Drive or generated by Claude. Max 20 MB. Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    attached on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is attached yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
 
     Args:
         task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
@@ -6606,12 +6955,29 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
         url: Public/direct URL to download the file from (optional)
         content_base64: Base64-encoded file content (optional, alternative to url)
         filename: File name to store it as (optional; inferred from url if omitted)
+        manifest_id: from call #1's response — pass on call #2 to actually attach
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
     err = _ensure_ready()
     if err:
         return err
     if not url and not content_base64:
         return "Provide either a url or content_base64 for the file."
+    params = {"task_title": task_title, "task_id": task_id, "project_id": project_id,
+              "url": url, "content_base64": content_base64, "filename": filename}
+    outcome = _gate_single("attach_file_to_task", "attach_file_to_task",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_attach_file_to_task)
+    if not outcome.proceed:
+        return outcome.message
+    return await _attach_file_to_task_impl(**outcome.extra)
+
+
+async def _attach_file_to_task_impl(task_title: str, task_id: str, project_id: str,
+                                    url: str = None, content_base64: str = None,
+                                    filename: str = None) -> str:
+    """Pure mutation logic for attach_file_to_task — no consent gate. Called
+    only by the gated attach_file_to_task() above once the plan is approved."""
     title = task_title or _lookup_task_title(task_id)
     pre = _open_by_id(fresh=True)
     if pre is None:
@@ -6957,12 +7323,46 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
 # Tag write operations (v2)
 # ---------------------------------------------------------------------------
 
+def _describe_create_tag(p: Dict) -> str:
+    return f'Создаю тег «{p.get("name")}»' + (f' (цвет {p["color"]})' if p.get("color") else "")
+
+
 @mcp.tool()
-async def create_tag(name: str, color: str = None) -> str:
-    """Create a tag (requires v2 API). color is an optional hex like '#FF6161'."""
+async def create_tag(name: str, color: str = None, manifest_id: str = "",
+                     user_reply: str = "") -> str:
+    """
+    Create a tag (requires v2 API). color is an optional hex like '#FF6161'.
+    Gated 🟡 (docs/DESIGN_approval_gate.md): two calls, same tool name —
+    nothing is created on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is created yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — name/color are ignored on
+    this call (the manifest's own stored values are used). Do NOT make call
+    #2 in the same turn as call #1.
+
+    Args:
+        name: Tag name (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
+        color: Optional hex color like '#FF6161'
+        manifest_id: from call #1's response — pass on call #2 to actually create
+        user_reply: the user's literal reply approving the plan — required on call #2
+    """
     err = _ensure_ready()
     if err:
         return err
+    params = {"name": name, "color": color}
+    outcome = _gate_single("create_tag", "create_tag",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_create_tag)
+    if not outcome.proceed:
+        return outcome.message
+    return await _create_tag_impl(**outcome.extra)
+
+
+async def _create_tag_impl(name: str, color: str = None) -> str:
+    """Pure mutation logic for create_tag — no consent gate. Called only by
+    the gated create_tag() above once the plan is approved."""
     try:
         await _run_blocking(lambda: ticktick_v2.create_tag(name, color))
         # Lightweight inline check — create_tag doesn't write to the journal
@@ -7120,10 +7520,24 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None) -> st
         return f"Error abandoning task: {str(e)}"
 
 
+def _describe_duplicate_task(p: Dict) -> str:
+    return p.get("summary") or f'Дублирую задачу «{p.get("task_title") or p.get("task_id")}»'
+
+
 @mcp.tool()
-async def duplicate_task(summary: str, task_id: str, task_title: str = None) -> str:
+async def duplicate_task(summary: str, task_id: str, task_title: str = None,
+                         manifest_id: str = "", user_reply: str = "") -> str:
     """
-    Duplicate a task within the same project (requires v2 API).
+    Duplicate a task within the same project (requires v2 API). Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    duplicated on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is duplicated yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
     at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Дублирую задачу „Купить молоко"».
@@ -7132,10 +7546,24 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None) -> 
         summary: Human-readable confirmation line (see above)
         task_id: ID of the task
         task_title: Title of the task (optional but recommended for confirmation)
+        manifest_id: from call #1's response — pass on call #2 to actually duplicate
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
     err = _ensure_ready()
     if err:
         return err
+    params = {"summary": summary, "task_id": task_id, "task_title": task_title}
+    outcome = _gate_single("duplicate_task", "duplicate_task",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_duplicate_task)
+    if not outcome.proceed:
+        return outcome.message
+    return await _duplicate_task_impl(**outcome.extra)
+
+
+async def _duplicate_task_impl(summary: str, task_id: str, task_title: str = None) -> str:
+    """Pure mutation logic for duplicate_task — no consent gate. Called only
+    by the gated duplicate_task() above once the plan is approved."""
     title = task_title or _lookup_task_title(task_id)
     g = _guard_task(task_id, task_title or "")
     if g.status == "unavailable":
@@ -7175,11 +7603,25 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None) -> 
 # Comment edit/delete (v2)
 # ---------------------------------------------------------------------------
 
+def _describe_update_task_comment(p: Dict) -> str:
+    return f'Правлю комментарий на «{p.get("task_title")}»: новый текст «{p.get("text")}»'
+
+
 @mcp.tool()
 async def update_task_comment(task_title: str, text: str, project_id: str,
-                              task_id: str, comment_id: str) -> str:
+                              task_id: str, comment_id: str,
+                              manifest_id: str = "", user_reply: str = "") -> str:
     """
-    Edit a task comment (requires v2 API).
+    Edit a task comment (requires v2 API). Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    changed on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is changed yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
 
     Args:
         task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
@@ -7187,10 +7629,26 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
         project_id: ID of the project
         task_id: ID of the task
         comment_id: ID of the comment to edit
+        manifest_id: from call #1's response — pass on call #2 to actually edit
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
     err = _ensure_ready()
     if err:
         return err
+    params = {"task_title": task_title, "text": text, "project_id": project_id,
+              "task_id": task_id, "comment_id": comment_id}
+    outcome = _gate_single("update_task_comment", "update_task_comment",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_update_task_comment)
+    if not outcome.proceed:
+        return outcome.message
+    return await _update_task_comment_impl(**outcome.extra)
+
+
+async def _update_task_comment_impl(task_title: str, text: str, project_id: str,
+                                    task_id: str, comment_id: str) -> str:
+    """Pure mutation logic for update_task_comment — no consent gate. Called
+    only by the gated update_task_comment() above once the plan is approved."""
     try:
         g = _guard_task(task_id, task_title or "", project_id)
         if g.status == "unavailable":
@@ -7998,13 +8456,28 @@ async def list_project_columns(project_id: str) -> str:
         return f"Error fetching columns: {str(e)}"
 
 
+def _describe_create_project_column(p: Dict) -> str:
+    dest = p.get("project_name") or p.get("project_id")
+    return f'Создаю раздел (колонку) «{p.get("name")}» в проекте «{dest}»'
+
+
 @mcp.tool()
 async def create_project_column(project_id: str, name: str,
-                                project_name: str = "") -> str:
+                                project_name: str = "",
+                                manifest_id: str = "", user_reply: str = "") -> str:
     """
     Create a kanban column/section inside a project (including the Inbox) and
     return its id (requires v2 API). Use the returned id as column_id in
-    create_task/update_task to route tasks into this section.
+    create_task/update_task to route tasks into this section. Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    created on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is created yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
 
     Sections only render in a project's kanban view; switch the project's view
     to kanban to see them.
@@ -8015,10 +8488,26 @@ async def create_project_column(project_id: str, name: str,
         project_name: Name of the project (recommended — arms the identity
             guard so a stale/wrong project_id is refused instead of silently
             creating the column elsewhere)
+        manifest_id: from call #1's response — pass on call #2 to actually create
+        user_reply: the user's literal reply approving the plan — required on call #2
     """
     err = _ensure_ready()
     if err:
         return err
+    params = {"project_id": project_id, "name": name, "project_name": project_name}
+    outcome = _gate_single("create_project_column", "create_project_column",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_create_project_column)
+    if not outcome.proceed:
+        return outcome.message
+    return await _create_project_column_impl(**outcome.extra)
+
+
+async def _create_project_column_impl(project_id: str, name: str,
+                                      project_name: str = "") -> str:
+    """Pure mutation logic for create_project_column — no consent gate.
+    Called only by the gated create_project_column() above once the plan is
+    approved."""
     # Identity guard: the id must resolve to a live project (and to the given
     # name when one is passed) — a wrong id would create the column elsewhere.
     refuse = _guard_project(project_id, project_name or "", fresh=True,
@@ -8052,6 +8541,176 @@ async def create_project_column(project_id: str, name: str,
                 f"⚠️ {_UNVERIFIED_MSG} ({e})")
 
 
+# ---------------------------------------------------------------------------
+# TG auto-execute: registry + candidate finder + background poller
+# (2026-08-05) — Python port of gmail-mcp's autoExecute.ts/http.ts
+# runAutoExecutePoller. See tg_approval.py's block comment above
+# try_auto_execute() for the architectural difference (in-memory _MANIFESTS
+# here vs. one shared Postgres on the TS side) and why the candidate search
+# below (walk _MANIFESTS, ask tg_approval.check_approval per id) is a
+# per-item probe rather than a single SQL JOIN.
+# ---------------------------------------------------------------------------
+
+class _AutoExecutorEntry:
+    __slots__ = ("rehash", "execute")
+
+    def __init__(self, rehash, execute):
+        self.rehash = rehash    # Callable[[Dict], str]
+        self.execute = execute  # async Callable[[str, Dict], Awaitable[str]]
+
+
+# Registry keyed by the SAME `tool` string used at the manifest's
+# _maybe_tg_notify_plan(tool, ...) call site (which is also what
+# TG_APPROVAL_TOOLS allowlists against) — NOT by manifest "kind" directly,
+# though in practice each kind maps to exactly one tool today (see
+# _AUTO_EXECUTE_TOOL_FOR_KIND below). Populated once at import time, mirroring
+# gmail-mcp's autoExecute.ts registerAutoExecutor() module-level calls.
+_AUTO_EXECUTORS: Dict[str, _AutoExecutorEntry] = {}
+
+
+def _register_auto_executor(tool: str, rehash, execute) -> None:
+    _AUTO_EXECUTORS[tool] = _AutoExecutorEntry(rehash, execute)
+
+
+def _rehash_delete_manifest(m: Dict) -> str:
+    ids = [it["taskId"] for it in (m.get("items") or [])]
+    return _manifest_object_hash("delete", ids)
+
+
+async def _auto_execute_delete_tasks(manifest_id: str, m: Dict) -> str:
+    return await _execute_task_deletion_impl(manifest_id, m)
+
+
+def _rehash_declutter_manifest(m: Dict) -> str:
+    return _manifest_object_hash("declutter", _dc_object_ids(m.get("actions") or {}))
+
+
+async def _auto_execute_declutter(manifest_id: str, m: Dict) -> str:
+    if m.get("persist") == "sheet":
+        return await _execute_declutter_from_sheet(manifest_id)
+    return await _execute_declutter_ram_impl(manifest_id, m)
+
+
+_register_auto_executor("delete_tasks", _rehash_delete_manifest, _auto_execute_delete_tasks)
+_register_auto_executor("execute_declutter", _rehash_declutter_manifest, _auto_execute_declutter)
+# resume_declutter deliberately has NO separate registry entry: every
+# sheet-persist declutter plan is tagged tool="execute_declutter" at the ONE
+# place its manifest is created (plan_declutter, via _maybe_tg_notify_plan) —
+# resume_declutter reuses that SAME manifest_id/tg_approvals row later, it
+# never creates its own. So a RAM-manifest candidate for a declutter plan is
+# always found and dispatched under "execute_declutter" above, regardless of
+# which of the two tools a human would eventually call. The one case this
+# poller genuinely cannot reach is the scenario resume_declutter itself
+# exists for — the RAM pointer is GONE (process restarted between plan and
+# button-press): there is nothing in _MANIFESTS left to scan, by definition.
+# That gap is structural (a RAM-only candidate list can't see state that was
+# never durable), not a missing registration, and is called out in full in
+# the handoff report rather than worked around here.
+
+# Maps a manifest's "kind" to the tool name it was created/tagged under, for
+# the ONE spot below that needs to go from "found a _MANIFESTS entry" to
+# "which _AUTO_EXECUTORS key" without re-deriving it from scratch. Extend
+# this (and _AUTO_EXECUTORS) together when a future kind gets TG wiring.
+_AUTO_EXECUTE_TOOL_FOR_KIND = {"delete": "delete_tasks", "declutter": "execute_declutter"}
+
+
+def _find_tg_auto_execute_candidates() -> List[Dict]:
+    """Candidates for auto-execution: this server's own (in-memory) manifests
+    that are AWAITING_CONSENT-equivalent (not consumed, not TTL-expired —
+    _prune_manifests already dropped anything past that) whose `kind` maps to
+    a registered tool AND whose Telegram approval row is already APPROVED.
+    Unlike the TS side's single SQL JOIN (both tables live in one Postgres),
+    this walks _MANIFESTS in RAM and asks tg_approval.check_approval(id) —
+    one Postgres round-trip PER live manifest — which is fine because the
+    number of concurrently AWAITING_CONSENT manifests is always small
+    (single-owner bot, human-paced approvals)."""
+    _prune_manifests()
+    out: List[Dict] = []
+    for mid, m in list(_MANIFESTS.items()):
+        if m.get("consumed"):
+            continue
+        tool = _AUTO_EXECUTE_TOOL_FOR_KIND.get(m.get("kind") or "")
+        if not tool or tool not in _AUTO_EXECUTORS:
+            continue
+        if not tg_approval.enabled_for(_TG_CFG, tool):
+            continue
+        try:
+            approval = tg_approval.check_approval(mid)
+        except Exception as e:
+            logger.warning(f"TG auto-execute: check_approval({mid}) failed: {e}")
+            continue
+        if approval != "approved":
+            continue
+        row = tg_approval.get_tg_approval(mid)
+        if not row:
+            continue
+        out.append({"manifest_id": mid, "tool": tool,
+                    "chat_id": row.get("chat_id"), "message_id": row.get("message_id")})
+    return out
+
+
+async def _tg_auto_execute_tick() -> None:
+    """One pass: find candidates, execute each via its registered executor,
+    report the result back into the Telegram message. Mirrors gmail-mcp's
+    runAutoExecutePoller — errors from ONE candidate never abort the others."""
+    for c in _find_tg_auto_execute_candidates():
+        mid, tool = c["manifest_id"], c["tool"]
+        entry = _AUTO_EXECUTORS.get(tool)
+        if entry is None:
+            continue
+        try:
+            consumed = tg_approval.try_auto_execute(
+                manifest_id=mid, tool=tool,
+                get_manifest=lambda i: _MANIFESTS.get(i),
+                consume_manifest=_consume_manifest_for_auto_execute,
+                rehash=entry.rehash,
+            )
+            if consumed is None:
+                continue  # race/drift/already consumed — not an error
+            report_text = await entry.execute(mid, consumed)
+            tg_approval.report_auto_execution_result(
+                _TG_CFG, c["chat_id"], c["message_id"], report_text)
+        except Exception as e:
+            logger.error(f"TG auto-execute: ошибка при исполнении "
+                        f"{tool}/{mid}: {e}")
+            try:
+                tg_approval.report_auto_execution_result(
+                    _TG_CFG, c["chat_id"], c["message_id"],
+                    f"🛑 Ошибка при автоисполнении «{tool}»: {e}")
+            except Exception:
+                pass
+
+
+def _consume_manifest_for_auto_execute(manifest_id: str) -> Optional[Dict]:
+    """The atomic one-shot step try_auto_execute() needs (see its docstring):
+    called with NO `await` between the `consumed` check and the flip, so
+    under asyncio's single-threaded event loop nothing else can interleave —
+    this IS the atomic compare-and-set (the Python-side equivalent of the TS
+    store's `UPDATE ... WHERE status = 'AWAITING_CONSENT' ... RETURNING`)."""
+    m = _MANIFESTS.get(manifest_id)
+    if m is None or m.get("consumed"):
+        return None
+    m["consumed"] = True
+    return m
+
+
+_TG_AUTO_EXECUTE_INTERVAL_S = float(os.environ.get("TG_AUTO_EXECUTE_INTERVAL_S", "10"))
+
+
+async def _tg_auto_execute_poller_loop() -> None:
+    """Background loop started from main() (see _run_server() below) only
+    when TG_APPROVAL_ENABLED — every ~10s (env-tunable), forever, for the
+    life of the process. A single tick's exception must never kill the loop
+    (Maksim would then lose auto-execute silently until the next deploy)."""
+    logger.info(f"TG auto-execute: poller started (every {_TG_AUTO_EXECUTE_INTERVAL_S:.0f}s)")
+    while True:
+        await asyncio.sleep(_TG_AUTO_EXECUTE_INTERVAL_S)
+        try:
+            await _tg_auto_execute_tick()
+        except Exception as e:
+            logger.error(f"TG auto-execute poller: unhandled error: {e}")
+
+
 def main():
     """Main entry point for the MCP server."""
     if _TG_CFG.enabled:
@@ -8078,10 +8737,32 @@ def main():
     if TRANSPORT == "streamable-http":
         logger.info(f"Starting TickTick MCP server (streamable-http) on "
                     f"http://{HOST}:{PORT}{STREAMABLE_PATH}")
-        mcp.run(transport="streamable-http")
     else:
         logger.info("Starting TickTick MCP server (stdio)")
-        mcp.run(transport="stdio")
+    # anyio.run(...) here mirrors exactly what FastMCP.run() does internally
+    # (see mcp.server.fastmcp.FastMCP.run's source: `anyio.run(self.run_stdio_async)`
+    # / `anyio.run(self.run_streamable_http_async)`) — swapped in so the TG
+    # auto-execute poller can be started as a real asyncio task on the SAME
+    # event loop the MCP server itself runs on, instead of `mcp.run(transport=...)`
+    # which owns/blocks on its own loop with no hook to attach a background
+    # task to. Behaviour is unchanged when TG_APPROVAL_ENABLED=false (no task
+    # is created; the two transport branches call the exact same *_async
+    # methods FastMCP.run() would have).
+    anyio.run(_run_server_with_auto_execute_poller)
+
+
+async def _run_server_with_auto_execute_poller() -> None:
+    poller_task = None
+    if _TG_CFG.enabled:
+        poller_task = asyncio.create_task(_tg_auto_execute_poller_loop())
+    try:
+        if TRANSPORT == "streamable-http":
+            await mcp.run_streamable_http_async()
+        else:
+            await mcp.run_stdio_async()
+    finally:
+        if poller_task is not None:
+            poller_task.cancel()
 
 
 if __name__ == "__main__":

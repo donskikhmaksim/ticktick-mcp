@@ -7,8 +7,31 @@ post-verify convention (server.py:5782, re-reads the live group list) applied
 to each of the four. Output is also unified to the markdown template from
 docs/DESIGN_output_format.md (### <emoji> header, body, 🧾 proof line).
 
-No real network — the official (v1) and v2 clients are faked."""
+No real network — the official (v1) and v2 clients are faked.
+
+2026-08-05: create_project and create_project_column are now gated 🟡 (two
+calls, same tool name — the removed tier-🟢 exemption, see
+docs/DESIGN_approval_gate.md). Their tests now run the full plan->execute
+cycle before asserting on the outcome that used to come straight back from a
+single call."""
+import re
+
 import ticktick_mcp.src.server as s
+
+
+def _extract_manifest_id(preview: str) -> str:
+    m = re.search(r'manifest_id="([0-9a-f]+)"', preview)
+    assert m, f"no manifest_id found in preview: {preview!r}"
+    return m.group(1)
+
+
+async def _gated_call(fn, *args, **kwargs):
+    """Runs a gated tool's full plan->execute cycle and returns the
+    execute-phase result."""
+    preview = await fn(*args, **kwargs)
+    assert "🛑" not in preview, f"plan phase unexpectedly refused: {preview!r}"
+    mid = _extract_manifest_id(preview)
+    return await fn(*args, manifest_id=mid, user_reply="да", **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +62,7 @@ def _wire_official(monkeypatch, fake):
 async def test_create_project_success_is_post_verified(monkeypatch):
     fake = FakeOfficialCreate({"id": "p1", "name": "Работа", "color": "#F18181"})
     _wire_official(monkeypatch, fake)
-    result = await s.create_project("Работа")
+    result = await _gated_call(s.create_project, "Работа")
     assert result.startswith("### ✅")
     assert "Работа" in result
     assert "🧾" in result
@@ -50,7 +73,7 @@ async def test_create_project_api_error_is_refused(monkeypatch):
     fake = FakeOfficialCreate({})
     fake.create_project = lambda name, color="#F18181", view_mode="list": {"error": "boom"}
     _wire_official(monkeypatch, fake)
-    result = await s.create_project("Работа")
+    result = await _gated_call(s.create_project, "Работа")
     assert result.startswith("### ❌")
     assert "boom" in result
     assert fake.get_calls == 0
@@ -62,7 +85,7 @@ async def test_create_project_postverify_mismatch_is_unverified(monkeypatch):
     fake = FakeOfficialCreate({"id": "p1", "name": "Работа"},
                               fresh={"id": "OTHER", "name": "??"})
     _wire_official(monkeypatch, fake)
-    result = await s.create_project("Работа")
+    result = await _gated_call(s.create_project, "Работа")
     assert result.startswith("### ⚠️")
     assert "НЕ подтверждён" in result
 
@@ -70,7 +93,7 @@ async def test_create_project_postverify_mismatch_is_unverified(monkeypatch):
 async def test_create_project_postverify_fetch_failure_is_unverified(monkeypatch):
     fake = FakeOfficialCreate({"id": "p1", "name": "Работа"}, get_error="rate limited")
     _wire_official(monkeypatch, fake)
-    result = await s.create_project("Работа")
+    result = await _gated_call(s.create_project, "Работа")
     assert result.startswith("### ⚠️")
     assert "НЕ подтверждён" in result
 
@@ -250,7 +273,7 @@ async def test_create_project_column_success_is_post_verified(monkeypatch):
     fake_v2 = FakeV2Column()
     fake_official = FakeOfficialColumns([{"id": "col1", "name": "В работе"}])
     _wire_column(monkeypatch, fake_v2, fake_official, {"p1": "Работа"})
-    result = await s.create_project_column("p1", "В работе", project_name="Работа")
+    result = await _gated_call(s.create_project_column, "p1", "В работе", project_name="Работа")
     assert result.startswith("### ✅")
     assert "В работе" in result
     assert "🧾" in result
@@ -260,7 +283,7 @@ async def test_create_project_column_postverify_not_found_is_unverified(monkeypa
     fake_v2 = FakeV2Column()
     fake_official = FakeOfficialColumns([])  # new column doesn't show up
     _wire_column(monkeypatch, fake_v2, fake_official, {"p1": "Работа"})
-    result = await s.create_project_column("p1", "В работе", project_name="Работа")
+    result = await _gated_call(s.create_project_column, "p1", "В работе", project_name="Работа")
     assert result.startswith("### ⚠️")
     assert "НЕ подтверждён" in result
 
@@ -269,7 +292,7 @@ async def test_create_project_column_api_rejection_is_refused(monkeypatch):
     fake_v2 = FakeV2Column(create_error="rejected")
     fake_official = FakeOfficialColumns([])
     _wire_column(monkeypatch, fake_v2, fake_official, {"p1": "Работа"})
-    result = await s.create_project_column("p1", "В работе", project_name="Работа")
+    result = await _gated_call(s.create_project_column, "p1", "В работе", project_name="Работа")
     assert result.startswith("### ❌")
     assert "rejected" in result
 
@@ -278,6 +301,6 @@ async def test_create_project_column_postverify_fetch_failure_is_unverified(monk
     fake_v2 = FakeV2Column()
     fake_official = FakeOfficialColumns([], data_error="down")
     _wire_column(monkeypatch, fake_v2, fake_official, {"p1": "Работа"})
-    result = await s.create_project_column("p1", "В работе", project_name="Работа")
+    result = await _gated_call(s.create_project_column, "p1", "В работе", project_name="Работа")
     assert result.startswith("### ⚠️")
     assert "НЕ подтверждён" in result
