@@ -571,6 +571,15 @@ def _v2_project_names() -> Dict:
     return {}
 
 
+def _group_names_from_state(st: Dict) -> Dict:
+    """{groupId: folder name} out of an ALREADY-FETCHED v2 state snapshot.
+    Split out of _v2_group_names() so a caller that needs several things from
+    the state (get_projects: folders AND the Inbox) reads it once."""
+    return {g["id"]: g.get("name")
+            for g in (st.get("projectGroups") or [])
+            if g.get("id") and not g.get("deleted")}
+
+
 def _v2_group_names() -> Optional[Dict]:
     """Map groupId -> folder name from the cached v2 state, or None when the
     folder list could not be read at all.
@@ -586,12 +595,53 @@ def _v2_group_names() -> Optional[Dict]:
     if not ticktick_v2:
         return None
     try:
-        st = ticktick_v2.get_state()
-        return {g["id"]: g.get("name")
-                for g in (st.get("projectGroups") or [])
-                if g.get("id") and not g.get("deleted")}
+        return _group_names_from_state(ticktick_v2.get_state())
     except Exception:
         return None
+
+
+def _inbox_from_state(st: Dict) -> Optional[Dict]:
+    """The built-in Inbox as an ordinary project record, from an
+    ALREADY-FETCHED v2 state snapshot (None when the state carries no
+    inboxId).
+
+    The official Open API has no concept of the Inbox at all: GET /project
+    omits it, so a listing built from that endpoint alone reads as "there is
+    no Inbox / nothing in it" while tasks quietly sit in it.
+
+    The id is the v2 `inboxId` ("inbox<userId>") — deliberately NOT a made-up
+    label: it is the very same id the rest of this server addresses the Inbox
+    by (_v2_project_names, the `projectId` every Inbox task carries,
+    get_inbox_tasks' filter, _guard_project's liveness check), so an id taken
+    out of the listing actually works in the follow-up calls.
+    """
+    iid = st.get("inboxId")
+    return {"id": iid, "name": "Inbox", "kind": "TASK"} if iid else None
+
+
+def _inbox_project() -> Optional[Dict]:
+    """_inbox_from_state() against the live (cached) v2 state; None when v2 is
+    unavailable or the state can't be read."""
+    if not ticktick_v2:
+        return None
+    try:
+        return _inbox_from_state(ticktick_v2.get_state())
+    except Exception:
+        return None
+
+
+def _v2_groups_and_inbox() -> tuple:
+    """(folder map, Inbox record) from ONE read of the v2 state — the project
+    listing needs both, and neither is worth a second state fetch. Either
+    element is None when it isn't knowable (no v2 / unreadable state / no
+    inboxId), exactly as the single-purpose helpers above return."""
+    if not ticktick_v2:
+        return None, None
+    try:
+        st = ticktick_v2.get_state()
+    except Exception:
+        return None, None
+    return _group_names_from_state(st), _inbox_from_state(st)
 
 
 def _lookup_task_title(task_id: str) -> str:
@@ -1033,8 +1083,10 @@ async def _run_blocking(func, *args, **kwargs):
 
 @mcp.tool(annotations=READONLY)
 async def get_projects() -> str:
-    """Get all projects from TickTick, each with the folder (project group)
-    it sits in — "Folder: (none)" when it sits in none."""
+    """Get all projects from TickTick — including the built-in Inbox — each
+    with the folder (project group) it sits in ("Folder: (none)" when it sits
+    in none). The Inbox is listed first and its id works like any other
+    project id here (read it with get_project_tasks, target it on create)."""
     err = _ensure_official()
     if err:
         return err
@@ -1044,11 +1096,20 @@ async def get_projects() -> str:
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
 
+        # One v2 state read for the whole listing: the folder map (resolved
+        # once, not per project) and the built-in Inbox.
+        group_names, inbox = await _run_blocking(_v2_groups_and_inbox)
+
+        # The official /project endpoint omits the Inbox entirely, so without
+        # this the listing reads as "you have no Inbox" while tasks sit in it.
+        # Matched by id, so if TickTick ever starts returning the Inbox
+        # itself, it is NOT listed twice.
+        if inbox and not any(p.get("id") == inbox["id"] for p in projects):
+            projects = [inbox] + projects
+
         if not projects:
             return "No projects found."
 
-        # Resolve the folder map once for the whole listing, not per project.
-        group_names = await _run_blocking(_v2_group_names)
         result = f"Found {len(projects)} projects:\n\n"
         for i, project in enumerate(projects, 1):
             result += f"Project {i}:\n" + format_project(project, group_names) + "\n"
@@ -1065,12 +1126,19 @@ async def get_project(project_id: str) -> str:
     group) it sits in — "Folder: (none)" when it sits in none.
 
     Args:
-        project_id: ID of the project
+        project_id: ID of the project (the Inbox id from get_projects works too)
     """
     err = _ensure_official()
     if err:
         return err
-    
+
+    # The Inbox is not a project for the official API — asking it about the
+    # Inbox id is an error, not a project card. Serve it from the v2 state so
+    # an id taken out of get_projects doesn't dead-end here.
+    inbox = await _run_blocking(_inbox_project)
+    if inbox and project_id == inbox["id"]:
+        return format_project(inbox)
+
     try:
         project = await _run_blocking(lambda: ticktick.get_project(project_id))
         if 'error' in project:
@@ -1088,14 +1156,21 @@ async def get_project(project_id: str) -> str:
 async def get_project_tasks(project_id: str) -> str:
     """
     Get all tasks in a specific project.
-    
+
     Args:
-        project_id: ID of the project
+        project_id: ID of the project (the Inbox id from get_projects works too)
     """
     err = _ensure_official()
     if err:
         return err
-    
+
+    # Same as get_project: the official /project/<id>/data endpoint knows
+    # nothing about the Inbox, so route the Inbox id to the v2-backed reader
+    # instead of returning its "project not found" to the caller.
+    inbox = await _run_blocking(_inbox_project)
+    if inbox and project_id == inbox["id"]:
+        return await get_inbox_tasks()
+
     try:
         project_data = await _run_blocking(lambda: ticktick.get_project_with_data(project_id))
         if 'error' in project_data:
