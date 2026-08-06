@@ -1838,9 +1838,9 @@ async def _update_tasks_impl(
                 if fresh is None:
                     line = f"✏️ «{shown_title}» отправлено, но {_UNVERIFIED_MSG}"
                 else:
-                    verdict = _verify_item("update", item, fresh,
-                                           _v2_project_names())
-                    if "✅" in verdict[:8]:
+                    status, verdict = _verify_item("update", item, fresh,
+                                                   _v2_project_names())
+                    if status == "ok":
                         line = f"✏️ «{shown_title}» обновлено (проверено)"
                     else:
                         line = (f"❌ «{shown_title}» — изменения НЕ видны в "
@@ -1932,8 +1932,8 @@ async def _update_tasks_impl(
                             f"«{label_of.get(it['taskId'], it['title'])}» — "
                             f"TickTick отклонил: {api_fail[it['taskId']]}")
                         continue
-                    verdict = _verify_item("update", it, fresh, names)
-                    if "✅" in verdict[:8]:
+                    status, verdict = _verify_item("update", it, fresh, names)
+                    if status == "ok":
                         updated.append(label_of.get(it["taskId"], it["title"]))
                     else:
                         not_applied.append(verdict.lstrip("- "))
@@ -2957,8 +2957,16 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
 
 
 def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
-                 names: Dict) -> str:
-    """One verdict line for one journaled item, judged from CURRENT live state."""
+                 names: Dict) -> Tuple[str, str]:
+    """One verdict for one journaled item, judged from CURRENT live state.
+
+    Returns (status, line): status is exactly one of "ok"/"warn"/"bad" — the
+    ONLY thing the caller may tally on (see _build_operation_report). Never
+    derive the status by re-parsing `line`'s leading glyph: that indirection
+    is what let a printed ⚠️ discrepancy go uncounted before (the "0
+    расхождений while listing 4" bug). Every return statement below states
+    its status explicitly, right next to the line it belongs to.
+    """
     tid = item.get("taskId")
     title = item.get("title") or (item.get("snapshot") or {}).get("title") \
         or f"[task {str(tid)[:8]}…]"
@@ -2966,16 +2974,17 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
     exp = item.get("expect") or {}
 
     if op == "delete":
-        return (f"- ❌ **«{title}»** — ВСЁ ЕЩЁ существует (удаление не состоялось "
-                "или восстановлена)" if live else f"- ✅ **«{title}»** — удалена")
+        return (("bad", f"- ❌ **«{title}»** — ВСЁ ЕЩЁ существует (удаление не "
+                 "состоялось или восстановлена)") if live else
+                ("ok", f"- ✅ **«{title}»** — удалена"))
     if op == "restore":
-        return (f"- ✅ **«{title}»** — снова среди открытых" if live else
-                f"- ❌ **«{title}»** — НЕ появилась среди открытых "
-                "(восстановление не подтвердилось)")
+        return (("ok", f"- ✅ **«{title}»** — снова среди открытых") if live else
+                ("bad", f"- ❌ **«{title}»** — НЕ появилась среди открытых "
+                 "(восстановление не подтвердилось)"))
     if op in ("complete", "abandon"):
         verb = "закрыта" if op == "complete" else "отмечена «не буду делать»"
-        return (f"- ❌ **«{title}»** — всё ещё среди открытых" if live
-                else f"- ✅ **«{title}»** — {verb} (ушла из открытых)")
+        return (("bad", f"- ❌ **«{title}»** — всё ещё среди открытых") if live
+                else ("ok", f"- ✅ **«{title}»** — {verb} (ушла из открытых)"))
     if op == "delete_project":
         # tid here is the PROJECT id, not a task id. Re-fetch fresh via the
         # None-distinguishing helper rather than trusting the `names` dict
@@ -2983,15 +2992,16 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         # "project confirmed deleted".
         fresh_names = _v2_project_names_or_none()
         if fresh_names is None:
-            return (f"- ⚠️ **«{title}»** — проект: проверка не удалась (не "
-                    "получилось перечитать список проектов), исход НЕ "
+            return ("warn", f"- ⚠️ **«{title}»** — проект: проверка не удалась "
+                    "(не получилось перечитать список проектов), исход НЕ "
                     "ПОДТВЕРЖДЁН")
         still = fresh_names.get(tid)
-        return (f"- ❌ **«{title}»** — проект ВСЁ ЕЩЁ существует (удаление не "
-                "подтвердилось)" if still else
-                f"- ✅ **«{title}»** — проект удалён")
+        return (("bad", f"- ❌ **«{title}»** — проект ВСЁ ЕЩЁ существует "
+                 "(удаление не подтвердилось)") if still else
+                ("ok", f"- ✅ **«{title}»** — проект удалён"))
     if live is None:
-        return f"- ❌ **«{title}»** — не найдена среди открытых (ожидалась живой)"
+        return ("bad", f"- ❌ **«{title}»** — не найдена среди открытых "
+                "(ожидалась живой)")
     if op == "create":
         probs = []
         want_pid = exp.get("projectId")
@@ -3001,7 +3011,8 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         if exp.get("columnId") and live.get("columnId") != exp.get("columnId"):
             probs.append("раздел не применился")
         if probs:
-            return f"- ⚠️ **«{title}»** — создана, но: " + "; ".join(probs)
+            return ("warn", f"- ⚠️ **«{title}»** — создана, но: "
+                    + "; ".join(probs))
         # State the FACTS, not agreement-with-intent: the reader must SEE where
         # it landed, so a wrong-but-consistent request is still visible.
         facts = [f"в «{names.get(live.get('projectId'), live.get('projectId'))}»"]
@@ -3011,29 +3022,30 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
             facts.append(f"срок {str(live['dueDate'])[:10]}")
         if live.get("priority"):
             facts.append(f"приоритет {PRIORITY_MAP.get(live['priority'], live['priority'])}")
-        return f"- ✅ **«{title}»** — создана {', '.join(facts)}"
+        return ("ok", f"- ✅ **«{title}»** — создана {', '.join(facts)}")
     if op == "move":
         want = exp.get("projectId")
-        return (f"- ✅ **«{title}»** — в **«{names.get(want, want)}»**"
+        return (("ok", f"- ✅ **«{title}»** — в **«{names.get(want, want)}»**")
                 if live.get("projectId") == want else
-                f"- ❌ **«{title}»** — осталась в «{names.get(live.get('projectId'), '?')}»")
+                ("bad", f"- ❌ **«{title}»** — осталась в «{names.get(live.get('projectId'), '?')}»"))
     if op == "tags":
         want = set(exp.get("tags") or [])
         got = set(live.get("tags") or [])
-        return (f"- ✅ **«{title}»** — теги {sorted(got)}" if want == got else
-                f"- ❌ **«{title}»** — теги {sorted(got)}, ожидались {sorted(want)}")
+        return (("ok", f"- ✅ **«{title}»** — теги {sorted(got)}") if want == got
+                else ("bad", f"- ❌ **«{title}»** — теги {sorted(got)}, "
+                      f"ожидались {sorted(want)}"))
     if op == "parent":
         want = exp.get("parentId")  # None = detached
         got = live.get("parentId")
         # A parentId "applied" toward a parent that is NOT itself alive among
         # open tasks is an orphaning, not a success — check the parent too.
         if want and want not in live_map:
-            return (f"- ❌ **«{title}»** — родитель {str(want)[:8]}… НЕ среди "
-                    "открытых задач (вложение под несуществующего/закрытого "
-                    "родителя)")
+            return ("bad", f"- ❌ **«{title}»** — родитель {str(want)[:8]}… НЕ "
+                    "среди открытых задач (вложение под несуществующего/"
+                    "закрытого родителя)")
         ok = (got == want) if want else not got
-        return (f"- ✅ **«{title}»** — родитель применён" if ok else
-                f"- ❌ **«{title}»** — parentId={got!r}, ожидался {want!r}")
+        return (("ok", f"- ✅ **«{title}»** — родитель применён") if ok else
+                ("bad", f"- ❌ **«{title}»** — parentId={got!r}, ожидался {want!r}"))
     if op == "update":
         changes = exp.get("changes") or {}
         diffs = []
@@ -3048,9 +3060,14 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
                     diffs.append(f"tags: {got} ≠ {want}")
             elif got != want:
                 diffs.append(f"{field}: {got!r} ≠ {want!r}")
-        return (f"- ❌ **«{title}»** — не применилось: " + "; ".join(diffs)) if diffs \
-            else f"- ✅ **«{title}»** — все изменения на месте"
-    return f"- ✓ **«{title}»** — записана в журнал (тип {op} не проверяется автоматически)"
+        return (("bad", f"- ❌ **«{title}»** — не применилось: " + "; ".join(diffs))
+                if diffs else ("ok", f"- ✅ **«{title}»** — все изменения на месте"))
+    # Op type without a dedicated verifier: NOT auto-verified — this is a
+    # warning, not a silent success, and must count as one. Also: the ASCII
+    # "✓" glyph is banned as a status marker by the frozen legend
+    # (output-format.md §7.2) — use ⚠️ like every other "not verified" case.
+    return ("warn", f"- ⚠️ **«{title}»** — записана в журнал (тип {op} не "
+            "проверяется автоматически)")
 
 
 @mcp.tool(annotations=READONLY)
@@ -3116,7 +3133,16 @@ def _build_operation_report(record_id: str) -> str:
             pass
         lines = [f"### 🧾 Независимый отчёт — `{record_id}`",
                  f"_{when} · журнал операции ⇄ живое состояние TickTick_", ""]
-        ok = bad = 0
+        # Single source of truth: every verdict is collected here FIRST, as a
+        # (status, printed_line) pair. The lines printed below and the tally
+        # further down are both derived from THIS SAME list — never a
+        # separately-incremented counter re-parsing the printed text. That
+        # structurally rules out the printed bullets and the "Итог" count
+        # ever disagreeing (was the root cause of "0 расхождений" printed
+        # alongside 4 explicit ⚠️ discrepancy bullets: those bullets started
+        # with ⚠️, which the old head-substring counter never matched, so
+        # they were listed but never tallied).
+        verdicts: List[Tuple[str, str]] = []
         for rec in records:
             op = rec.get("op") or "delete"
             items = rec.get("items") or [
@@ -3124,17 +3150,22 @@ def _build_operation_report(record_id: str) -> str:
                 for s in rec.get("deleted", [])
             ]
             for item in items:
-                line = _verify_item(op, item, live, names)
-                lines.append(line)
-                # Verdict lines are markdown bullets ("- ✅ **«…»**"), so match
-                # the mark anywhere in the prefix, not at line start.
-                head = line[:8]
-                if "✅" in head:
-                    ok += 1
-                elif "❌" in head:
-                    bad += 1
+                verdicts.append(_verify_item(op, item, live, names))
+        lines.extend(line for _, line in verdicts)
+        ok = sum(1 for status, _ in verdicts if status == "ok")
+        warn = sum(1 for status, _ in verdicts if status == "warn")
+        bad = sum(1 for status, _ in verdicts if status == "bad")
         lines.append("")
-        lines.append(f"**Итог: ✅ {ok} подтверждено, ❌ {bad} расхождений.**")
+        lines.append(f"**Итог: ✅ {ok} подтверждено, ⚠️ {warn} не проверено, "
+                      f"❌ {bad} расхождений.**")
+        # Explicit, unambiguous overall verdict for headless/programmatic
+        # consumers (e.g. the tg-ai-assistant bot) that must not read a
+        # report with any discrepancy or unverified item as success.
+        overall = "❌" if bad else ("⚠️" if warn else "✅")
+        tail = ("есть расхождения — это НЕ успех." if bad else
+                "есть непроверенные пункты — это НЕ полный успех." if warn else
+                "всё подтверждено.")
+        lines.append(f"**Статус операции: {overall}** — {tail}")
         lines.append("[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО — "
                      "это серверная проверка, не заменяй её своим пересказом]")
         return "\n".join(lines)

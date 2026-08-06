@@ -162,7 +162,12 @@ async def test_correct_confirm_deletes_and_journals(monkeypatch, tmp_path):
     rid = rec1["manifest"]
     report = s._build_operation_report(rid)
     assert "проект удалён" in report
-    assert "Итог: ✅ 3 подтверждено, ❌ 0 расхождений" in report
+    # Format update (see tests/test_operation_report_consistency.py): the
+    # tally now also states the ⚠️ ("не проверено") count explicitly, per
+    # the canonical template in identity-postverify.md §5.3 — previously it
+    # was silently dropped from the count entirely.
+    assert "Итог: ✅ 3 подтверждено, ⚠️ 0 не проверено, ❌ 0 расхождений" in report
+    assert "Статус операции: ✅" in report
 
 
 async def test_zero_task_project_still_requires_explicit_confirm(monkeypatch, tmp_path):
