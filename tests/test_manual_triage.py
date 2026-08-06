@@ -1152,19 +1152,19 @@ async def test_execution_order_is_least_destructive_first(monkeypatch, tmp_path)
 # (см. test_call2_ignores_a_swapped_operations_list) проходит, даже если один
 # из слоёв сломать, — поэтому у каждого слоя есть ещё и свой прямой тест.
 
-def test_gate_hands_back_the_stored_operations_not_call2_arguments():
+async def test_gate_hands_back_the_stored_operations_not_call2_arguments():
     """Слой (б), напрямую через `_gate_batch`: даже если тул однажды начнёт
     передавать на call #2 свой список, исполнить обязано сохранённое."""
     planned = [{"op": "delete", "task_id": "a1", "title": "Купить молоко",
                 "said": "не нужно"}]
-    plan = s._gate_batch("manual_triage", "manual_triage", planned, "Разбираю",
-                         "", "", s._describe_triage_op, items_arg="operations")
+    plan = await s._gate_batch("manual_triage", "manual_triage", planned, "Разбираю",
+                               "", "", s._describe_triage_op, items_arg="operations")
     mid = _mid(plan.message)
 
     swapped = [{"op": "delete", "task_id": "zz", "title": "Посторонняя задача",
                 "said": "подмена"}]
-    out = s._gate_batch("manual_triage", "manual_triage", swapped, "Разбираю",
-                        mid, "да", s._describe_triage_op, items_arg="operations")
+    out = await s._gate_batch("manual_triage", "manual_triage", swapped, "Разбираю",
+                              mid, "да", s._describe_triage_op, items_arg="operations")
 
     assert out.proceed is True
     assert [o["task_id"] for o in out.tasks] == ["a1"]

@@ -1936,8 +1936,7 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     # помечает манифест `tg_notified`, из-за чего execute-фаза начинает
     # требовать нажатие. Fail-closed: не смогли отправить — манифест гаснет,
     # наружу уходит текст ошибки вместо плана.
-    return await _run_blocking(_maybe_tg_notify_plan, "create_tasks", mid,
-                               "\n".join(lines))
+    return await _maybe_tg_notify_plan("create_tasks", mid, "\n".join(lines))
 
 
 @mcp.tool()
@@ -2079,8 +2078,8 @@ async def update_tasks(
             for key in ("due_date", "start_date"):
                 if key in t:
                     t[key] = _resolve_relative_date(t[key])
-    outcome = _gate_batch("update", "update_tasks", tasks, summary,
-                          manifest_id, user_reply, _describe_update_item)
+    outcome = await _gate_batch("update", "update_tasks", tasks, summary,
+                                manifest_id, user_reply, _describe_update_item)
     if not outcome.proceed:
         return outcome.message
     return await _update_tasks_impl(outcome.summary, outcome.tasks)
@@ -2414,7 +2413,7 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]] = None,
     err = _ensure_official()
     if err:
         return err
-    outcome = _gate_batch(
+    outcome = await _gate_batch(
         "complete", "complete_tasks", tasks, summary, manifest_id, user_reply,
         lambda t: f"**«{t.get('title') or t.get('taskId')}»**")
     if not outcome.proceed:
@@ -2665,14 +2664,13 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
                        "user_reply=\"<дословная реплика пользователя>\")` — "
                        "НЕ в этом же ходе. Манифест одноразовый, "
                        f"действует {_manifest_ttl_phrase()}.")
-        # Через поток, а не напрямую: внутри синхронный requests и сон на 429
-        # (до _MAX_SEND_WAIT_S на КАЖДЫЙ кусок), а длинный план — это до
-        # десятка сообщений подряд с профилактическими паузами между ними.
-        # Вызванное прямо из корутины, это держит event loop на всё время
-        # отправки — то есть зависший /health и заткнувшиеся MCP-сессии. Тот
-        # же приём, которым уже вынесены публикация отчёта и перепроверка.
-        return await _run_blocking(_maybe_tg_notify_plan, "delete_tasks", mid,
-                                   "\n".join(preview))
+        # Хук — корутина: сетевую часть (синхронный requests, паузы между
+        # кусками, сон на 429 до _MAX_SEND_WAIT_S на КАЖДЫЙ кусок) он уводит в
+        # поток сам, одинаково для всех 22 гейтованных тулов. Раньше поток
+        # заказывал каждый вызывающий вручную, и сделали это ровно три места
+        # из двадцати двух — см. `_maybe_tg_notify_plan`.
+        return await _maybe_tg_notify_plan("delete_tasks", mid,
+                                           "\n".join(preview))
     except Exception as e:
         logger.error(f"Error in delete_tasks: {e}")
         return f"Error deleting tasks: {str(e)}"
@@ -3221,25 +3219,70 @@ class ConsentResult:
         return self.ok
 
 
-def _maybe_tg_notify_plan(tool: str, manifest_id: str, preview_text: str) -> str:
+async def _maybe_tg_notify_plan(tool: str, manifest_id: str,
+                                preview_text: str) -> str:
     """Зовётся ПОСЛЕ создания манифеста (`_MANIFESTS[mid] = {...}`), ПЕРЕД
     возвратом превью-текста моделью — портирует поведение gmail-mcp's
     requireConsent's "фаза плана" ветки на архитектуру ticktick-mcp, где
     plan_*/аналоги — ОТДЕЛЬНЫЕ функции от _require_consent() (не единый
     dual-mode вызов, как в TS). Fail-closed (та же дисциплина, что в TS): если
     отправка в Telegram упала, манифест ИНВАЛИДИРУЕТСЯ, а не остаётся
-    доступным через голое user_reply без второго фактора."""
+    доступным через голое user_reply без второго фактора.
+
+    КОРУТИНА, А НЕ ОБЫЧНАЯ ФУНКЦИЯ (2026-08-06, задача #115). Внутри
+    `tg_approval.notify_plan` — синхронные `requests`, профилактические паузы
+    между кусками и честный сон на 429 «retry after N» (до `_MAX_SEND_WAIT_S`
+    на КАЖДЫЙ кусок). Длинный план — это до десятка сообщений подряд, и
+    Telegram душит именно такую серию, так что реальная отправка занимает
+    секунды, а в патологии — минуты. Пока она шла прямо в event loop'е, стоял
+    ВЕСЬ сервер: другие вызовы инструментов, фоновый поллер автоисполнения,
+    /health. Раньше этим путём ходили два тула (у них уже стоял ручной
+    `_run_blocking`), после перевода всех мутирующих действий на кнопку — 22,
+    поэтому оборачивать каждый вызывающий вручную стало и дорого, и
+    ненадёжно: вынос переехал СЮДА, в единственную общую воронку фазы плана.
+
+    Порядок и атомарность (почему это безопасно):
+      • в поток уходит РОВНО `tg_approval.notify_plan` — единственное, что
+        ходит в сеть/БД, и оно не трогает `_MANIFESTS`. Всё, что читает или
+        пишет манифесты, осталось в event loop'е, то есть по-прежнему
+        однопоточно (тот же инвариант, что у `_tg_auto_execute_pending`);
+      • внутренний порядок notify_plan (INSERT строки → sendMessage →
+        UPDATE message_id) вынос не меняет: функция уезжает в поток целиком.
+    """
     if not (tool and tg_approval.enabled_for(_TG_CFG, tool)):
         return preview_text
-    ok, err = tg_approval.notify_plan(_TG_CFG, manifest_id, preview_text, tool)
+    # ПОМЕТКА ДО ОТПРАВКИ, А НЕ ПОСЛЕ (2026-08-06, гонка, которую создаёт
+    # сам вынос в поток). `tg_notified` — это то, по чему `_tg_button_only`
+    # решает, что текстовое «да» для плана больше не принимается. Пока
+    # отправка была синхронной, между появлением кнопки в Telegram и
+    # простановкой пометки не мог влезть НИКТО: event loop стоял. Теперь loop
+    # свободен, и окно «кнопки уже видны, а манифест ещё не помечен» — это
+    # окно, в котором параллельный execute с сочинённым «да» прошёл бы мимо
+    # второго фактора. Поэтому помечаем ПЕРЕД await, а при неудачной отправке
+    # честно откатываем (см. ниже) — итоговое состояние манифеста в обоих
+    # исходах ровно то же, что и до выноса.
+    m = _MANIFESTS.get(manifest_id)
+    if m is not None:
+        m["tg_notified"] = True
+        m["_tg_tool"] = tool
+        m["_tg_manifest_id"] = manifest_id
+    ok, err = await _run_blocking(tg_approval.notify_plan, _TG_CFG,
+                                  manifest_id, preview_text, tool)
     if not ok:
         m = _MANIFESTS.get(manifest_id)
         if m is not None:
+            # Сначала гасим (fail-closed), только потом снимаем
+            # предварительную пометку: между этими двумя строками нет await,
+            # так что промежуточного состояния «не помечен и ещё жив» не
+            # видит никто.
             m["consumed"] = True
+            m.pop("tg_notified", None)
+            m.pop("_tg_tool", None)
+            m.pop("_tg_manifest_id", None)
         return (f"🛑 Не смог отправить запрос подтверждения в Telegram ({err}). "
                 "Действие НЕ запланировано, ничего не изменено. Проверьте "
                 "бота/настройки Telegram-подтверждения и попробуйте снова.")
-    # УСПЕШНО отправлено → ПОМЕЧАЕМ САМ МАНИФЕСТ (2026-08-06, фикс
+    # УСПЕШНО отправлено → манифест ПОМЕЧЕН (2026-08-06, фикс
     # недетерминированного гейта). До этой правки факт «план ушёл в Telegram»
     # нигде не сохранялся: execute-фаза заново решала, нужен ли ТГ-фактор, по
     # аргументу `tool`, который один путь передавал (delete_tasks), а другой
@@ -3249,11 +3292,7 @@ def _maybe_tg_notify_plan(tool: str, manifest_id: str, preview_text: str) -> str
     # угадывает. Fail-closed: если план ушёл в TG, «да» в чате БЕЗ approved-
     # строки не проходит НИКОГДА, чем бы ни был вызов execute.
     m = _MANIFESTS.get(manifest_id)
-    if m is not None:
-        m["tg_notified"] = True
-        m["_tg_tool"] = tool
-        m["_tg_manifest_id"] = manifest_id
-    else:
+    if m is None:
         # Не должно случаться (все вызывающие создают манифест ДО отправки).
         # Не fail-closed-отказ: кнопка в TG всё равно ни к чему не приведёт —
         # ни поллер, ни execute не найдут манифеста, — но это ошибка порядка
@@ -3350,7 +3389,21 @@ def _require_consent(
     branch, or a sheet-backed declutter row) — the binding/timing checks are
     skipped (there is no plan_shown_at to compare against) but the
     affirmative-reply check still fully applies. Never mutates `manifest`
-    except to invalidate it on an explicit "no"."""
+    except to invalidate it on an explicit "no".
+
+    ОСТАЁТСЯ СИНХРОННОЙ НАМЕРЕННО (2026-08-06, #115). Внутри есть поход в
+    Postgres — `tg_approval.check_approval` (один индексируемый SELECT), и
+    соблазн унести его в поток тем же `_run_blocking`, каким унесена отправка
+    плана, ошибочен. Вся одноразовость манифеста держится на том, что между
+    проверкой (`consumed`/TTL/binding/approval) и простановкой
+    `m["consumed"] = True` у вызывающего гейта НЕТ точки переключения:
+    появится await — и два параллельных execute одного плана смогут пройти
+    проверку оба, то есть операция выполнится дважды. Цена вопроса разная на
+    порядки: отправка плана — это до нескольких МИНУТ ожидания на флуд-
+    отказах, а этот SELECT — миллисекунды (в патологии секунды, ограничены
+    CONSENT_PG_CONNECT_TIMEOUT_S / CONSENT_PG_STATEMENT_TIMEOUT_MS). Если
+    когда-нибудь понадобится унести и его — сначала нужен явный захват
+    манифеста ДО await (compare-and-set «в работе»), а не голый вынос."""
     if _automation_key_matches(automation_key):
         return ConsentResult(True, "automation_key")
     if tier <= 0:
@@ -3730,11 +3783,11 @@ def _gate_batch_preview_lines(tool_name: str, mid: str, summary: str,
     return lines
 
 
-def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
-                summary: str, manifest_id: str, user_reply: str,
-                describe_item, extra: Optional[Dict] = None,
-                items_arg: str = "tasks",
-                notes: Optional[List[str]] = None) -> _GateOutcome:
+async def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
+                      summary: str, manifest_id: str, user_reply: str,
+                      describe_item, extra: Optional[Dict] = None,
+                      items_arg: str = "tasks",
+                      notes: Optional[List[str]] = None) -> _GateOutcome:
     """Runs the two-call consent gate. Returns a _GateOutcome: when
     `.proceed` is True, the caller must actually run the mutation using
     `.tasks`/`.summary`/`.extra`; when False, `.message` is the full response
@@ -3745,7 +3798,14 @@ def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
     `tasks`. `items_arg` — как ЭТОТ тул называет свой список в собственной
     сигнатуре (у всех «списочных» тулов это `tasks`, у manual_triage —
     `operations`); подставляется в печатаемую модели инструкцию для call #2,
-    чтобы она не позвала тул несуществующим именем аргумента."""
+    чтобы она не позвала тул несуществующим именем аргумента.
+
+    КОРУТИНА (2026-08-06, #115): единственный await здесь — отправка плана в
+    Telegram в самом конце ветки call #1 (`_maybe_tg_notify_plan`, который
+    уводит сетевую часть в поток). Ветка call #2 остаётся полностью
+    синхронной: между проверкой `_require_consent` и `m["consumed"] = True`
+    нет ни одной точки переключения, поэтому одноразовость манифеста
+    по-прежнему держится на однопоточности event loop'а."""
     _prune_manifests()
     if manifest_id:
         m = _MANIFESTS.get(manifest_id)
@@ -3798,7 +3858,7 @@ def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
     # Все три правки живут вместе: здесь остаётся один вызов.
     lines = _gate_batch_preview_lines(tool_name, mid, summary, tasks,
                                       describe_item, items_arg, notes)
-    return _GateOutcome(False, message=_maybe_tg_notify_plan(
+    return _GateOutcome(False, message=await _maybe_tg_notify_plan(
         tool_name, mid, "\n".join(lines)))
 
 
@@ -3813,9 +3873,9 @@ def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
 # dicts (there is no natural per-item list to preview here). tier=1 ("light
 # confirmation" — create/reversible edits, not delete) per
 # docs/DESIGN_write_tool_taxonomy.md's former 🟢 tier.
-def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
-                 manifest_id: str, user_reply: str, describe_fn,
-                 automation_key: str = "") -> _GateOutcome:
+async def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
+                       manifest_id: str, user_reply: str, describe_fn,
+                       automation_key: str = "") -> _GateOutcome:
     """Call #1 (manifest_id omitted): stores `params` VERBATIM in a one-shot
     manifest and returns a preview built by describe_fn(params) — nothing is
     mutated. Call #2 (manifest_id + user_reply): _require_consent(tier=1, ...)
@@ -3836,7 +3896,11 @@ def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
     item 4 ("after success, consumed = True") literally. _gate_batch does
     the same — see its own SUCCESS-path branch — so both functions are
     genuinely one-shot on their own, not just "accidentally" so via a retry
-    that happens to also trip the identity-guard."""
+    that happens to also trip the identity-guard.
+
+    КОРУТИНА по той же причине и с той же оговоркой, что и `_gate_batch`
+    выше (#115): await ровно один — отправка плана в Telegram в конце ветки
+    call #1; ветка call #2 синхронна от проверки согласия до `consumed`."""
     _prune_manifests()
     if manifest_id:
         m = _MANIFESTS.get(manifest_id)
@@ -3882,7 +3946,7 @@ def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
              "повторить как есть, на 2-м вызове они игнорируются — "
              "используются данные из манифеста). Манифест одноразовый, "
              f"действует {_manifest_ttl_phrase()}."]
-    return _GateOutcome(False, message=_maybe_tg_notify_plan(
+    return _GateOutcome(False, message=await _maybe_tg_notify_plan(
         tool_name, mid, "\n".join(lines)))
 
 
@@ -4016,10 +4080,9 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
                  "user_reply=\"<дословная реплика пользователя>\")` — НЕ в "
                  "этом же ходе. Манифест одноразовый, "
                  f"действует {_manifest_ttl_phrase()}.")
-    # В поток по той же причине, что и в delete_tasks выше: синхронная
-    # отправка нескольких сообщений с паузами не должна держать event loop.
-    return await _run_blocking(_maybe_tg_notify_plan, "delete_tasks", mid,
-                               "\n".join(lines))
+    # Сетевую часть отправки уводит в поток сам хук (см. delete_tasks выше и
+    # докстринг `_maybe_tg_notify_plan`) — здесь просто await.
+    return await _maybe_tg_notify_plan("delete_tasks", mid, "\n".join(lines))
 
 
 @mcp.tool()
@@ -5660,7 +5723,8 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
                  "этом же ходе. Действует 1 час, одноразово. Каждая правка "
                  "пройдёт через штатные удаление/обновление/вложение "
                  "(guard + журнал + сверка).")
-    return _maybe_tg_notify_plan("execute_declutter", mid, "\n".join(lines) + sheet_note)
+    return await _maybe_tg_notify_plan("execute_declutter", mid,
+                                       "\n".join(lines) + sheet_note)
 
 
 # DISABLED 2026-08-04 — см. пометку у plan_declutter выше.
@@ -6008,10 +6072,10 @@ async def create_project(
         return "Invalid view_mode. Must be one of: list, kanban, timeline."
 
     params = {"name": name, "color": color, "view_mode": view_mode}
-    outcome = _gate_single("create_project", "create_project",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_create_project,
-                           automation_key=automation_key)
+    outcome = await _gate_single("create_project", "create_project",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_create_project,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _create_project_impl(**outcome.extra)
@@ -6218,7 +6282,8 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
         # угадывать свой план по разнице списка ожидающих до/после вызова —
         # что и делал агент уборки, получив 19 «планов без идентификатора».
         lines.insert(1, _plan_id_line(new_mid, "ничего ещё не удалено"))
-        return _maybe_tg_notify_plan("delete_project", new_mid, "\n".join(lines))
+        return await _maybe_tg_notify_plan("delete_project", new_mid,
+                                           "\n".join(lines))
 
     if m is not None:
         m["consumed"] = True  # one-shot: план сгорел вместе с исполнением
@@ -6925,10 +6990,10 @@ async def create_subtask(
     params = {"parent_task_title": parent_task_title, "subtask_title": subtask_title,
               "parent_task_id": parent_task_id, "project_id": project_id,
               "content": content, "priority": priority}
-    outcome = _gate_single("create_subtask", "create_subtask",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_create_subtask,
-                           automation_key=automation_key)
+    outcome = await _gate_single("create_subtask", "create_subtask",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_create_subtask,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _create_subtask_impl(**outcome.extra)
@@ -7147,7 +7212,7 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]] = None,
     err = _ensure_ready()
     if err:
         return err
-    outcome = _gate_batch(
+    outcome = await _gate_batch(
         "move", "move_tasks", tasks, summary, manifest_id, user_reply,
         lambda t: f"**«{t.get('title') or t.get('taskId')}»** → {to_project_name or to_project_id}",
         extra={"to_project_id": to_project_id, "to_project_name": to_project_name})
@@ -7343,10 +7408,10 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
 
     params = {"habit_name": habit_name, "habit_id": habit_id, "date": date,
               "status": status, "value": value}
-    outcome = _gate_single("checkin_habit", "checkin_habit",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_checkin_habit,
-                           automation_key=automation_key)
+    outcome = await _gate_single("checkin_habit", "checkin_habit",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_checkin_habit,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _checkin_habit_impl(**outcome.extra)
@@ -7520,10 +7585,10 @@ async def create_habit(name: str, goal: float = 1.0,
               "habit_type": str(habit_type).lower(), "repeat_rule": repeat_rule,
               "section": str(section).lower().lstrip("_"), "color": color,
               "icon": icon, "encouragement": encouragement}
-    outcome = _gate_single("create_habit", "create_habit",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_create_habit,
-                           automation_key=automation_key)
+    outcome = await _gate_single("create_habit", "create_habit",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_create_habit,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _create_habit_impl(**outcome.extra)
@@ -7646,10 +7711,10 @@ async def delete_habit(habit_name: str, habit_id: str, manifest_id: str = "",
         return ("🛑 Нужны И имя, И id привычки — удаление вслепую по одному id "
                 "не делаю (см. get_habits). Ничего не изменено.")
     params = {"habit_name": habit_name, "habit_id": habit_id}
-    outcome = _gate_single("delete_habit", "delete_habit",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_delete_habit,
-                           automation_key=automation_key)
+    outcome = await _gate_single("delete_habit", "delete_habit",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_delete_habit,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _delete_habit_impl(**outcome.extra)
@@ -7827,7 +7892,7 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
     err = _ensure_ready()
     if err:
         return err
-    outcome = _gate_batch(
+    outcome = await _gate_batch(
         "parent", "set_task_parent", tasks, summary, manifest_id, user_reply,
         lambda t: f"**«{t.get('title') or t.get('taskId')}»** → под «{parent_task_title or parent_task_id}»",
         extra={"parent_task_id": parent_task_id, "project_id": project_id,
@@ -8015,10 +8080,10 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
     params = {"task_title": task_title, "parent_task_title": parent_task_title,
               "task_id": task_id, "parent_task_id": parent_task_id,
               "project_id": project_id}
-    outcome = _gate_single("unset_task_parent", "unset_task_parent",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_unset_task_parent,
-                           automation_key=automation_key)
+    outcome = await _gate_single("unset_task_parent", "unset_task_parent",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_unset_task_parent,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _unset_task_parent_impl(**outcome.extra)
@@ -8153,7 +8218,7 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
         return (f"**«{t.get('title') or t.get('taskId')}»** → теги: "
                 + (", ".join(parts) or "(пусто)"))
 
-    outcome = _gate_batch(
+    outcome = await _gate_batch(
         "tags", "set_task_tags", tasks, summary, manifest_id, user_reply,
         _describe_tags)
     if not outcome.proceed:
@@ -8494,10 +8559,10 @@ async def create_project_group(name: str, manifest_id: str = "",
     if err:
         return err
     params = {"name": name}
-    outcome = _gate_single("create_project_group", "create_project_group",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_create_project_group,
-                           automation_key=automation_key)
+    outcome = await _gate_single("create_project_group", "create_project_group",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_create_project_group,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _create_project_group_impl(**outcome.extra)
@@ -8571,10 +8636,10 @@ async def delete_project_group(group_name: str, group_id: str,
     if err:
         return err
     params = {"group_name": group_name, "group_id": group_id}
-    outcome = _gate_single("delete_project_group", "delete_project_group",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_delete_project_group,
-                           automation_key=automation_key)
+    outcome = await _gate_single("delete_project_group", "delete_project_group",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_delete_project_group,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _delete_project_group_impl(**outcome.extra)
@@ -8656,10 +8721,10 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
     if err:
         return err
     params = {"project_name": project_name, "project_id": project_id, "group_id": group_id}
-    outcome = _gate_single("move_project_to_group", "move_project_to_group",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_move_project_to_group,
-                           automation_key=automation_key)
+    outcome = await _gate_single("move_project_to_group", "move_project_to_group",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_move_project_to_group,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _move_project_to_group_impl(**outcome.extra)
@@ -8791,10 +8856,10 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
         return err
     params = {"task_title": task_title, "text": text, "project_id": project_id,
               "task_id": task_id}
-    outcome = _gate_single("add_task_comment", "add_task_comment",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_add_task_comment,
-                           automation_key=automation_key)
+    outcome = await _gate_single("add_task_comment", "add_task_comment",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_add_task_comment,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _add_task_comment_impl(**outcome.extra)
@@ -8923,7 +8988,7 @@ async def restore_tasks(summary: str, tasks: List[Dict[str, str]] = None,
     err = _ensure_ready()
     if err:
         return err
-    outcome = _gate_batch(
+    outcome = await _gate_batch(
         "restore", "restore_tasks", tasks, summary, manifest_id, user_reply,
         lambda t: f"**«{t.get('title') or t.get('taskId')}»**",
         extra={"to_project_id": to_project_id})
@@ -9144,10 +9209,10 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
         return "Provide either a url or content_base64 for the file."
     params = {"task_title": task_title, "task_id": task_id, "project_id": project_id,
               "url": url, "content_base64": content_base64, "filename": filename}
-    outcome = _gate_single("attach_file_to_task", "attach_file_to_task",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_attach_file_to_task,
-                           automation_key=automation_key)
+    outcome = await _gate_single("attach_file_to_task", "attach_file_to_task",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_attach_file_to_task,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _attach_file_to_task_impl(**outcome.extra)
@@ -9527,12 +9592,12 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
                 f"максимум {ATTACHMENT_MAX_BYTES // (1024*1024)} МБ. Ссылку не делаю.")
     params = {"task_id": task_id, "project_id": project_id,
               "filename": filename, "ttl_minutes": ttl_minutes}
-    outcome = _gate_single("create_attachment_upload_url",
-                           "create_attachment_upload_url",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply,
-                           _describe_create_attachment_upload_url,
-                           automation_key=automation_key)
+    outcome = await _gate_single("create_attachment_upload_url",
+                                 "create_attachment_upload_url",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply,
+                                 _describe_create_attachment_upload_url,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _create_attachment_upload_url_impl(**outcome.extra)
@@ -9621,10 +9686,10 @@ async def create_tag(name: str, color: str = None, manifest_id: str = "",
     if err:
         return err
     params = {"name": name, "color": color}
-    outcome = _gate_single("create_tag", "create_tag",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_create_tag,
-                           automation_key=automation_key)
+    outcome = await _gate_single("create_tag", "create_tag",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_create_tag,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _create_tag_impl(**outcome.extra)
@@ -9758,7 +9823,7 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
                 # только код, живущий В ЭТОМ ЖЕ процессе (он читал `_MANIFESTS`
                 # напрямую) — ни один сетевой клиент так не может.
                 msg += "\n" + _plan_id_line(new_mid, "ничего ещё не тронуто")
-                return _maybe_tg_notify_plan("rename_tag", new_mid, msg)
+                return await _maybe_tg_notify_plan("rename_tag", new_mid, msg)
             if m is not None:
                 m["consumed"] = True  # one-shot
         return await _rename_tag_impl(old_name, new_name,
@@ -9830,10 +9895,10 @@ async def delete_tag(name: str, manifest_id: str = "", user_reply: str = "",
     if err:
         return err
     params = {"name": name}
-    outcome = _gate_single("delete_tag", "delete_tag",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_delete_tag,
-                           automation_key=automation_key)
+    outcome = await _gate_single("delete_tag", "delete_tag",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_delete_tag,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _delete_tag_impl(**outcome.extra)
@@ -9919,10 +9984,10 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None,
     if err:
         return err
     params = {"summary": summary, "task_id": task_id, "task_title": task_title}
-    outcome = _gate_single("abandon_task", "abandon_task",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_abandon_task,
-                           automation_key=automation_key)
+    outcome = await _gate_single("abandon_task", "abandon_task",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_abandon_task,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _abandon_task_impl(**outcome.extra)
@@ -10009,10 +10074,10 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
     if err:
         return err
     params = {"summary": summary, "task_id": task_id, "task_title": task_title}
-    outcome = _gate_single("duplicate_task", "duplicate_task",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_duplicate_task,
-                           automation_key=automation_key)
+    outcome = await _gate_single("duplicate_task", "duplicate_task",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_duplicate_task,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _duplicate_task_impl(**outcome.extra)
@@ -10111,10 +10176,10 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
         return err
     params = {"task_title": task_title, "text": text, "project_id": project_id,
               "task_id": task_id, "comment_id": comment_id}
-    outcome = _gate_single("update_task_comment", "update_task_comment",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_update_task_comment,
-                           automation_key=automation_key)
+    outcome = await _gate_single("update_task_comment", "update_task_comment",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_update_task_comment,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _update_task_comment_impl(**outcome.extra)
@@ -10192,10 +10257,10 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str,
         return err
     params = {"task_title": task_title, "project_id": project_id,
               "task_id": task_id, "comment_id": comment_id}
-    outcome = _gate_single("delete_task_comment", "delete_task_comment",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_delete_task_comment,
-                           automation_key=automation_key)
+    outcome = await _gate_single("delete_task_comment", "delete_task_comment",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_delete_task_comment,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _delete_task_comment_impl(**outcome.extra)
@@ -10308,10 +10373,10 @@ async def update_project(project_name: str, project_id: str, name: str = None,
             return "Invalid view_mode. Must be one of: list, kanban, timeline."
     params = {"project_name": project_name, "project_id": project_id,
               "name": name, "color": color, "view_mode": view_mode}
-    outcome = _gate_single("update_project", "update_project",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_update_project,
-                           automation_key=automation_key)
+    outcome = await _gate_single("update_project", "update_project",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_update_project,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _update_project_impl(**outcome.extra)
@@ -10416,10 +10481,10 @@ async def archive_project(project_name: str, project_id: str, archived: bool = T
         return err
     params = {"project_name": project_name, "project_id": project_id,
               "archived": archived}
-    outcome = _gate_single("archive_project", "archive_project",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_archive_project,
-                           automation_key=automation_key)
+    outcome = await _gate_single("archive_project", "archive_project",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_archive_project,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _archive_project_impl(**outcome.extra)
@@ -11142,10 +11207,10 @@ async def create_project_column(project_id: str, name: str,
     if err:
         return err
     params = {"project_id": project_id, "name": name, "project_name": project_name}
-    outcome = _gate_single("create_project_column", "create_project_column",
-                           params if not manifest_id else None,
-                           manifest_id, user_reply, _describe_create_project_column,
-                           automation_key=automation_key)
+    outcome = await _gate_single("create_project_column", "create_project_column",
+                                 params if not manifest_id else None,
+                                 manifest_id, user_reply, _describe_create_project_column,
+                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _create_project_column_impl(**outcome.extra)
@@ -11844,9 +11909,9 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         # и быть не должно: превью доставляется целиком, несколькими
         # сообщениями (см. снятый `_triage_tg_preview_refusal` выше).
 
-    outcome = _gate_batch("manual_triage", "manual_triage", enriched, summary,
-                          manifest_id, user_reply, _describe_triage_op,
-                          items_arg="operations", notes=notes)
+    outcome = await _gate_batch("manual_triage", "manual_triage", enriched, summary,
+                                manifest_id, user_reply, _describe_triage_op,
+                                items_arg="operations", notes=notes)
     if not outcome.proceed:
         return outcome.message
     return await _manual_triage_impl(outcome.summary, outcome.tasks)
@@ -13475,7 +13540,14 @@ async def _tg_auto_execute_poller_loop() -> None:
             # поллер AttributeError'ом — по умолчанию уборка включена.
             if getattr(_TG_CFG, "reap_enabled", True):
                 try:
-                    n = tg_approval.reap_expired(_TG_CFG)
+                    # В ПОТОК (2026-08-06, #115): уборка — это `DELETE …
+                    # RETURNING` в Postgres плюс ОТДЕЛЬНЫЙ синхронный
+                    # deleteMessage на КАЖДОЕ прибираемое сообщение (а у
+                    # длинного плана их несколько). Десяток просроченных
+                    # планов = десятки HTTP-вызовов подряд; вызванные прямо из
+                    # этой корутины, они морозили сервер ровно так же, как
+                    # отправка плана — просто раз в час, а не на каждый план.
+                    n = await _run_blocking(tg_approval.reap_expired, _TG_CFG)
                     if n:
                         logger.info("TG reaper: прибрано просроченных "
                                     f"подтверждений: {n}")

@@ -165,51 +165,57 @@ def test_require_consent_tool_not_in_allowlist_skips_tg_check(monkeypatch):
 # _maybe_tg_notify_plan — plan-phase hook
 # ===========================================================================
 
-def test_notify_plan_skipped_when_tool_not_enabled(monkeypatch):
+async def test_notify_plan_skipped_when_tool_not_enabled(monkeypatch):
     monkeypatch.setattr(s, "_TG_CFG", tg.TgApprovalConfig(
         enabled=False, bot_token="", owner_chat_id="", server="ticktick",
         tools_allowlist=None, ttl_s=3600))
     called = {"n": 0}
     monkeypatch.setattr(tg, "notify_plan", lambda *a, **k: called.__setitem__("n", called["n"] + 1) or (True, ""))
-    out = s._maybe_tg_notify_plan("delete_tasks", "m1", "### план")
+    out = await s._maybe_tg_notify_plan("delete_tasks", "m1", "### план")
     assert out == "### план"  # untouched
     assert called["n"] == 0
 
 
-def test_notify_plan_success_appends_telegram_note(monkeypatch):
+async def test_notify_plan_success_appends_telegram_note(monkeypatch):
     monkeypatch.setattr(s, "_TG_CFG", tg.TgApprovalConfig(
         enabled=True, bot_token="x", owner_chat_id="1", server="ticktick",
         tools_allowlist=None, ttl_s=3600))
     monkeypatch.setattr(tg, "notify_plan", lambda *a, **k: (True, ""))
-    out = s._maybe_tg_notify_plan("delete_tasks", "m1", "### план")
+    out = await s._maybe_tg_notify_plan("delete_tasks", "m1", "### план")
     assert "### план" in out
     assert "Telegram" in out
 
 
-def test_notify_plan_failure_invalidates_manifest_fail_closed(monkeypatch):
+async def test_notify_plan_failure_invalidates_manifest_fail_closed(monkeypatch):
     monkeypatch.setattr(s, "_TG_CFG", tg.TgApprovalConfig(
         enabled=True, bot_token="x", owner_chat_id="1", server="ticktick",
         tools_allowlist=None, ttl_s=3600))
     monkeypatch.setattr(tg, "notify_plan", lambda *a, **k: (False, "sendMessage failed"))
     s._MANIFESTS["m-fail-test"] = _fresh_manifest()
-    out = s._maybe_tg_notify_plan("delete_tasks", "m-fail-test", "### план")
+    out = await s._maybe_tg_notify_plan("delete_tasks", "m-fail-test", "### план")
     assert "🛑" in out
     assert "Не смог отправить" in out
     assert s._MANIFESTS["m-fail-test"]["consumed"] is True
 
 
 # ===========================================================================
-# Плановые тулы зовут этот хук ЧЕРЕЗ поток (_run_blocking)
+# Отправка плана не держит event loop
 # ===========================================================================
 
-def test_plan_tool_sends_the_telegram_plan_off_the_event_loop(monkeypatch):
+async def test_plan_tool_sends_the_telegram_plan_off_the_event_loop(monkeypatch):
     """Внутри notify_plan — синхронный requests, паузы между кусками и сон на
-    429 (до трёх минут на кусок в патологии). Прямой вызов из корутины держал
-    бы event loop всё это время: зависший /health и заткнувшиеся MCP-сессии.
-    Тест фиксирует, что хук уходит в поток через `_run_blocking`, и заодно
-    smoke-проверяет сам async-путь плана (тулы не покрыты вызовом больше нигде).
+    429 (до трёх минут на кусок в патологии). Прямой вызов из корутины держит
+    event loop всё это время: зависший /health и заткнувшиеся MCP-сессии.
+
+    Проверяется НАБЛЮДАЕМОЕ поведение, а не имя обёртки (до #115 тест ловил
+    факт вызова `_run_blocking` — и был слеп ровно к тому, что случилось:
+    обёртку вручную поставили три тула из двадцати двух, а тест этого не
+    видел). Здесь посторонняя корутина обязана крутиться, пока идёт отправка.
+    Полноценный сценарий с флуд-отказами Telegram — в
+    tests/test_plan_send_nonblocking.py.
     """
     import asyncio
+    import time as _time
 
     monkeypatch.setattr(s, "_TG_CFG", tg.TgApprovalConfig(
         enabled=True, bot_token="x", owner_chat_id="1", server="ticktick",
@@ -220,21 +226,26 @@ def test_plan_tool_sends_the_telegram_plan_off_the_event_loop(monkeypatch):
                                                     "projectId": "p1"}})
     monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Покупки"})
 
-    off_loop = {"used": False}
-    real_run_blocking = s._run_blocking
+    # Отправка занимает ощутимое время — как настоящая серия сообщений.
+    monkeypatch.setattr(tg, "notify_plan",
+                        lambda *a, **k: (_time.sleep(0.2), (True, ""))[1])
 
-    async def spy(func, *a, **kw):
-        if func is s._maybe_tg_notify_plan:
-            off_loop["used"] = True
-        return await real_run_blocking(func, *a, **kw)
+    beats = {"n": 0}
 
-    monkeypatch.setattr(s, "_run_blocking", spy)
-    monkeypatch.setattr(tg, "notify_plan", lambda *a, **k: (True, ""))
+    async def _beat():
+        while True:
+            await asyncio.sleep(0.01)
+            beats["n"] += 1
 
-    out = asyncio.run(s.plan_task_deletion(
-        "удалить одну", [{"taskId": "t1", "title": "Купить молоко"}]))
+    hb = asyncio.create_task(_beat())
+    try:
+        out = await s.plan_task_deletion(
+            "удалить одну", [{"taskId": "t1", "title": "Купить молоко"}])
+    finally:
+        hb.cancel()
 
-    assert off_loop["used"] is True, "хук обязан уходить в поток, а не в event loop"
+    assert beats["n"] >= 5, ("event loop стоял на время отправки плана "
+                             f"(посторонняя корутина провернулась {beats['n']} раз)")
     assert "План удаления" in out and "Telegram" in out
 
 

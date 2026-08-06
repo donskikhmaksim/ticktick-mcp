@@ -154,25 +154,25 @@ def test_wrong_automation_key_does_not_bypass():
 # shared helper directly, independent of any one wrapping tool.
 # ===========================================================================
 
-def test_gate_single_automation_key_bypasses_user_reply():
-    preview = s._gate_single("t_kind", "t_tool", {"x": 1}, "", "",
-                             lambda p: f"do {p['x']}")
+async def test_gate_single_automation_key_bypasses_user_reply():
+    preview = await s._gate_single("t_kind", "t_tool", {"x": 1}, "", "",
+                                   lambda p: f"do {p['x']}")
     assert preview.proceed is False
     mid = _extract_manifest_id(preview.message)
 
-    outcome = s._gate_single("t_kind", "t_tool", None, mid, "",
-                             lambda p: "", automation_key=s.SECRET)
+    outcome = await s._gate_single("t_kind", "t_tool", None, mid, "",
+                                   lambda p: "", automation_key=s.SECRET)
     assert outcome.proceed is True
     assert outcome.extra == {"x": 1}
 
 
-def test_gate_single_wrong_automation_key_still_refused():
-    preview = s._gate_single("t_kind2", "t_tool2", {"x": 1}, "", "",
-                             lambda p: f"do {p['x']}")
+async def test_gate_single_wrong_automation_key_still_refused():
+    preview = await s._gate_single("t_kind2", "t_tool2", {"x": 1}, "", "",
+                                   lambda p: f"do {p['x']}")
     mid = _extract_manifest_id(preview.message)
 
-    outcome = s._gate_single("t_kind2", "t_tool2", None, mid, "",
-                             lambda p: "", automation_key="not-the-real-secret")
+    outcome = await s._gate_single("t_kind2", "t_tool2", None, mid, "",
+                                   lambda p: "", automation_key="not-the-real-secret")
     assert outcome.proceed is False
     assert "🛑" in outcome.message
 
