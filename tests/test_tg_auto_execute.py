@@ -12,8 +12,14 @@ Covers:
     (_tg_auto_execute_tick, end to end with fake TickTick clients)
 
 No real network, no real Postgres — tg_approval's Postgres-backed functions
-(check_approval/get_tg_approval/notify_plan) and the Telegram HTTP call are
-monkeypatched throughout, same convention as test_tg_approval.py."""
+(get_tg_approvals/check_approval/get_tg_approval/notify_plan) and the Telegram
+HTTP call are monkeypatched throughout, same convention as test_tg_approval.py.
+
+2026-08-06: поллер больше НЕ читает статусы поштучно (check_approval на каждый
+живой манифест + ещё get_tg_approval на одобренный) — он делает ОДИН пакетный
+запрос tg_approval.get_tg_approvals(ids) на весь проход. Поэтому тесты поллера
+здесь патчат именно её (хелпер `_approvals` ниже), а не check_approval;
+одиночные функции остались нетронуты и продолжают обслуживать чат-путь."""
 import time
 
 import pytest
@@ -229,6 +235,33 @@ def _fake_report_sinks(monkeypatch):
     return group, private
 
 
+_DB_STATUS = {"approved": "APPROVED", "pending": "PENDING", "rejected": "REJECTED"}
+
+
+def _approvals(monkeypatch, status_of, chat_id="c1", message_id=None,
+               extra_message_ids=None):
+    """Подменяет ПАКЕТНОЕ чтение статусов (единственный путь поллера в базу).
+    `status_of(mid)` возвращает "approved"/"pending"/"rejected"/"none"; "none"
+    = строки в tg_approvals нет вовсе, поэтому ключ в словарь не попадает.
+
+    `extra_message_ids` — id ПРЕДЫДУЩИХ кусков длинного плана. Поле обязано
+    быть в фейке ровно потому же, почему оно есть в настоящем
+    get_tg_approvals: без него уборка сирот в личке (_cleanup_plan_leftovers)
+    была бы «зелёной» в тестах и мёртвой в проде."""
+    def _fake(mids):
+        out = {}
+        for mid in mids:
+            st = status_of(mid)
+            if st == "none":
+                continue
+            out[mid] = {"status": _DB_STATUS[st],
+                        "expires_at": tg._now_ms() + 3_600_000,
+                        "chat_id": chat_id, "message_id": message_id,
+                        "extra_message_ids": list(extra_message_ids or [])}
+        return out
+    monkeypatch.setattr(tg, "get_tg_approvals", _fake)
+
+
 def test_find_candidates_empty_when_tg_disabled(monkeypatch):
     monkeypatch.setattr(s, "_TG_CFG", tg.TgApprovalConfig(
         enabled=False, bot_token="", owner_chat_id="", server="ticktick",
@@ -236,7 +269,7 @@ def test_find_candidates_empty_when_tg_disabled(monkeypatch):
     now = time.monotonic()
     s._MANIFESTS["cand1"] = {"kind": "delete", "consumed": False, "created": now,
                              "items": [{"taskId": "t1", "title": "X"}]}
-    monkeypatch.setattr(tg, "check_approval", lambda mid: "approved")
+    _approvals(monkeypatch, lambda mid: "approved")
     assert s._find_tg_auto_execute_candidates() == []
 
 
@@ -245,7 +278,7 @@ def test_find_candidates_skips_unapproved(monkeypatch):
     now = time.monotonic()
     s._MANIFESTS["cand2"] = {"kind": "delete", "consumed": False, "created": now,
                              "items": [{"taskId": "t1", "title": "X"}]}
-    monkeypatch.setattr(tg, "check_approval", lambda mid: "pending")
+    _approvals(monkeypatch, lambda mid: "pending")
     assert s._find_tg_auto_execute_candidates() == []
 
 
@@ -263,7 +296,7 @@ def test_find_candidates_skips_consumed(monkeypatch):
     # another test would otherwise also read as approved and, since it's not
     # actually gated (store_ready() is False in this process), trip a real
     # tg_approval.get_tg_approval() Postgres call.
-    monkeypatch.setattr(tg, "check_approval", lambda mid: "approved" if mid == "cand3" else "none")
+    _approvals(monkeypatch, lambda mid: "approved" if mid == "cand3" else "none")
     ids = {c["manifest_id"] for c in s._find_tg_auto_execute_candidates()}
     assert "cand3" not in ids
 
@@ -271,8 +304,15 @@ def test_find_candidates_skips_consumed(monkeypatch):
 def test_find_candidates_skips_kind_with_no_registered_tool(monkeypatch):
     _enable_tg(monkeypatch)
     now = time.monotonic()
-    s._MANIFESTS["cand4"] = {"kind": "create", "consumed": False, "created": now}
-    monkeypatch.setattr(tg, "check_approval", lambda mid: "approved" if mid == "cand4" else "none")
+    # Раньше здесь стоял kind="create" как пример НЕ проведённого через
+    # Telegram вида манифеста. С 2026-08-06 создание задач проведено
+    # (_AUTO_EXECUTE_TOOL_FOR_KIND["create"] = "create_tasks"), поэтому
+    # берём kind, у которого авто-исполнителя действительно нет:
+    # "delete_project" — его план в Telegram уходит, но по кнопке сервер сам
+    # ничего не удаляет, модель обязана повторить вызов тула.
+    s._MANIFESTS["cand4"] = {"kind": "delete_project", "consumed": False,
+                             "created": now}
+    _approvals(monkeypatch, lambda mid: "approved" if mid == "cand4" else "none")
     ids = {c["manifest_id"] for c in s._find_tg_auto_execute_candidates()}
     assert "cand4" not in ids
 
@@ -282,7 +322,7 @@ def test_find_candidates_respects_allowlist(monkeypatch):
     now = time.monotonic()
     s._MANIFESTS["cand5"] = {"kind": "delete", "consumed": False, "created": now,
                              "items": [{"taskId": "t1", "title": "X"}]}
-    monkeypatch.setattr(tg, "check_approval", lambda mid: "approved" if mid == "cand5" else "none")
+    _approvals(monkeypatch, lambda mid: "approved" if mid == "cand5" else "none")
     ids = {c["manifest_id"] for c in s._find_tg_auto_execute_candidates()}
     assert "cand5" not in ids  # delete_tasks not in allowlist
 
@@ -292,9 +332,7 @@ def test_find_candidates_finds_approved_delete(monkeypatch):
     now = time.monotonic()
     s._MANIFESTS["cand6"] = {"kind": "delete", "consumed": False, "created": now,
                              "items": [{"taskId": "t1", "title": "X"}]}
-    monkeypatch.setattr(tg, "check_approval", lambda mid: "approved")
-    monkeypatch.setattr(tg, "get_tg_approval",
-                        lambda mid: {"chat_id": "c1", "message_id": 99})
+    _approvals(monkeypatch, lambda mid: "approved", message_id=99)
     out = [c for c in s._find_tg_auto_execute_candidates() if c["manifest_id"] == "cand6"]
     assert len(out) == 1
     assert out[0]["tool"] == "delete_tasks"
@@ -312,11 +350,8 @@ def test_find_candidates_carries_extra_plan_chunk_ids(monkeypatch):
     s._MANIFESTS["cand7"] = {"kind": "delete", "consumed": False,
                              "created": time.monotonic(),
                              "items": [{"taskId": "t1", "title": "X"}]}
-    monkeypatch.setattr(tg, "check_approval",
-                        lambda mid: "approved" if mid == "cand7" else "none")
-    monkeypatch.setattr(tg, "get_tg_approval",
-                        lambda mid: {"chat_id": "c1", "message_id": 99,
-                                     "extra_message_ids": [96, 97, 98]})
+    _approvals(monkeypatch, lambda mid: "approved" if mid == "cand7" else "none",
+               message_id=99, extra_message_ids=[96, 97, 98])
     out = [c for c in s._find_tg_auto_execute_candidates()
            if c["manifest_id"] == "cand7"]
     assert out[0]["extra_message_ids"] == [96, 97, 98]
@@ -362,9 +397,9 @@ def test_tick_auto_executes_approved_delete_and_reports(monkeypatch):
             "project": "Покупки", "snapshot": {},
         }],
     }
-    monkeypatch.setattr(tg, "check_approval", lambda m: "approved" if m == mid else "none")
-    monkeypatch.setattr(tg, "get_tg_approval",
-                        lambda m: {"chat_id": "c1", "message_id": 7})
+    # Пакетное чтение статусов (единственный путь поллера в базу с 2026-08-06)
+    # + ДВА получателя итога: группа-архив (полный отчёт) и личка (сводка).
+    _approvals(monkeypatch, lambda m: "approved" if m == mid else "none", message_id=7)
     group, private = _fake_report_sinks(monkeypatch)
 
     asyncio.run(s._tg_auto_execute_tick())
@@ -386,7 +421,7 @@ def test_tick_auto_executes_approved_delete_and_reports(monkeypatch):
 def test_tick_skips_when_no_candidates(monkeypatch):
     import asyncio
     _enable_tg(monkeypatch)
-    monkeypatch.setattr(tg, "check_approval", lambda m: "none")
+    _approvals(monkeypatch, lambda m: "none")
     group, private = _fake_report_sinks(monkeypatch)
     asyncio.run(s._tg_auto_execute_tick())
     assert group == [] and private == []
@@ -405,9 +440,7 @@ def test_tick_reports_error_without_crashing(monkeypatch):
             "snapshot": {},
         }],
     }
-    monkeypatch.setattr(tg, "check_approval", lambda m: "approved" if m == mid else "none")
-    monkeypatch.setattr(tg, "get_tg_approval",
-                        lambda m: {"chat_id": "c1", "message_id": 7})
+    _approvals(monkeypatch, lambda m: "approved" if m == mid else "none", message_id=7)
 
     async def boom(manifest_id, m):
         raise RuntimeError("kaboom")

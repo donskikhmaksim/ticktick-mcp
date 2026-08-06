@@ -539,3 +539,20 @@ def test_manifest_affected_count():
     assert s._manifest_affected_count({"items": [1, 2, 3]}) == 3
     assert s._manifest_affected_count({"kind": "delete"}) is None
     assert s._manifest_affected_count(None) is None
+
+
+def test_manifest_affected_count_knows_every_gate_shape():
+    """С 2026-08-06 кнопка есть у 22 тулов, и их манифесты имеют РАЗНУЮ
+    форму. Если счётчик знает только `items` (форму удаления), строка
+    «Затронуто объектов» молча исчезает у всех новых исполнителей —
+    незаметная потеря, которую этот тест и ловит."""
+    # _gate_batch: complete_tasks / move_tasks / set_task_tags / restore_tasks…
+    assert s._manifest_affected_count(
+        {"_gate": "batch", "kind": "complete", "tasks": [1, 2]}) == 2
+    # plan_task_creation → create_tasks
+    assert s._manifest_affected_count({"_gate": "create", "raw": [1, 2, 3, 4]}) == 4
+    # _gate_single: ровно один объект по конструкции гейта
+    assert s._manifest_affected_count(
+        {"_gate": "single", "kind": "create_tag", "params": {"name": "x"}}) == 1
+    # незнакомая форма — по-прежнему None, а не выдуманное число
+    assert s._manifest_affected_count({"_gate": "batch", "kind": "complete"}) is None

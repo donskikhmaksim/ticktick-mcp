@@ -38,15 +38,39 @@ def _extract_manifest_id(preview: str) -> str:
 class _FakeV2:
     """Minimal fake covering every v2 batch call the 6 gated tools use,
     mutating a shared `live` dict (and an optional `trash` dict for
-    restore_tasks) so post-verify's fresh re-read reflects the change."""
+    restore_tasks) so post-verify's fresh re-read reflects the change.
 
-    def __init__(self, live, trash=None):
+    `tags` is the fake account tag list (list of {"name","label"} dicts) that
+    backs get_tags()/get_state()/create_tag() — set_task_tags auto-registers
+    not-yet-existing tags through create_tag before touching any task (see
+    tests/test_set_task_tags_orphans.py for the dedicated coverage of that
+    path); this fake just needs to not blow up with AttributeError when it's
+    called incidentally by the other gate-cycle tests in this file."""
+
+    def __init__(self, live, trash=None, tags=None):
         self.live = live
         self.trash = trash or {}
         self.calls = []
+        self.tags = tags if tags is not None else []
 
     def invalidate_cache(self):
         pass
+
+    def get_state(self, force=False):
+        # Read-only — deliberately NOT appended to self.calls, which this
+        # file's tests treat as a mutation log (`fake.calls == []` after a
+        # preview-only call #1 asserts "nothing was mutated", not "nothing
+        # was read").
+        return {"tags": self.tags}
+
+    def get_tags(self):
+        return self.tags
+
+    def create_tag(self, name, color=None):
+        self.calls.append(("create_tag", name))
+        self.tags.append({"name": name.lstrip("#").lower(), "label": name,
+                          "color": color})
+        return {}
 
     def batch_update_tasks(self, changes):
         self.calls.append(("update", changes))
@@ -125,13 +149,13 @@ class _FakeOfficial:
         return {"id": task_id}
 
 
-def _wire(monkeypatch, live, names=None, trash=None, ensure="official"):
+def _wire(monkeypatch, live, names=None, trash=None, ensure="official", tags=None):
     if ensure == "official":
         monkeypatch.setattr(s, "_ensure_official", lambda: None)
     monkeypatch.setattr(s, "_ensure_ready", lambda: None)
     monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: dict(live))
     monkeypatch.setattr(s, "_v2_project_names", lambda: names or {"p1": "Работа"})
-    fake = _FakeV2(live, trash)
+    fake = _FakeV2(live, trash, tags)
     monkeypatch.setattr(s, "ticktick_v2", fake)
     official = _FakeOfficial(live)
     monkeypatch.setattr(s, "ticktick", official)
@@ -215,6 +239,42 @@ async def test_update_tasks_batch_path_uses_v2(monkeypatch):
     assert fake.calls  # v2 batch_update_tasks ran, not the official client
     assert live["t1"]["priority"] == 3 and live["t2"]["priority"] == 5
     assert "🛑" not in result
+
+
+async def test_update_tasks_one_shot_holds_without_identity_guard(monkeypatch):
+    """Proves _gate_batch is a REAL one-shot (flips `consumed`) rather than
+    "accidentally" one-shot via the identity-guard tripping on a changed
+    title (that's what test_update_tasks_manifest_is_one_shot above actually
+    exercises — its retry fails identity-guard because title went A -> B, so
+    it would pass even on the old buggy _gate_batch that never sets
+    `consumed`). Here only `priority` changes and `title`/`projectId` stay
+    identical to live state on every call, so the identity-guard (which only
+    compares title + project) would happily approve a REPLAY too — the only
+    thing that can catch a replay here is the `consumed` flag itself.
+
+    A single-task update goes through the OFFICIAL client (see
+    _update_tasks_impl: `len(tasks) == 1` branch), not v2 batch — verified by
+    reading the code, not assumed — so the mutation counter here is
+    official.calls, unlike test_update_tasks_batch_path_uses_v2 (2 tasks ->
+    v2 batch -> fake.calls)."""
+    live = {"t1": {"id": "t1", "title": "A", "projectId": "p1", "priority": 0}}
+    fake, official = _wire(monkeypatch, live)
+    preview = await s.update_tasks("тест", [
+        {"taskId": "t1", "projectId": "p1", "title": "A", "priority": 3}])
+    mid = _extract_manifest_id(preview)
+
+    first = await s.update_tasks("тест", manifest_id=mid, user_reply="да")
+    assert "🛑" not in first
+    assert live["t1"]["priority"] == 3
+    calls_after_first = len(official.calls)
+    assert fake.calls == []  # confirms this went through the official path
+
+    second = await s.update_tasks("тест", manifest_id=mid, user_reply="да")
+    assert "🛑" in second
+    # The real assertion: no NEW mutation happened on the replay. On the old
+    # buggy _gate_batch (never sets consumed=True on success), the identity
+    # guard alone would have let this through again, growing official.calls.
+    assert len(official.calls) == calls_after_first
 
 
 # ===========================================================================

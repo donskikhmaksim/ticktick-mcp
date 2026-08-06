@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import collections
 import hashlib
 import hmac
 import json
@@ -560,6 +561,57 @@ def _open_by_id(fresh: bool = False) -> Optional[Dict[str, Dict]]:
         return None
 
 
+# TickTick's own apps hard-cap nested subtasks at 5 total levels (root task =
+# level 1, subtask = level 2, sub-subtask = level 3, … down to level 5) —
+# confirmed 2026-08-06 against TickTick's official help center, "Multilevel
+# Tasks" article, FAQ "Does multi-level task support unlimited splitting?":
+# «At present, we only allow up to 5 levels of nested tasks. If the limit is
+# exceeded, you cannot continue to add.» That cap lives in TickTick's own
+# apps' UI, NOT in the v2 API this server calls directly — so a tree built
+# here could silently exceed what TickTick's own apps can display or let you
+# edit further. We enforce the same real cap here instead, fail-closed,
+# always from LIVE parentId chains (never from what a caller merely claims).
+MAX_TASK_NEST_LEVELS = 5
+
+
+def _task_level(task_id: str, by_id: Dict[str, Dict]) -> int:
+    """1-based nesting level of an EXISTING task from its live parentId chain
+    (a root task with no parent = level 1). Cycle-safe: a corrupt/circular
+    chain stops counting instead of looping forever."""
+    level = 1
+    seen = {task_id}
+    cur = (by_id.get(task_id) or {}).get("parentId")
+    while cur and cur not in seen:
+        level += 1
+        seen.add(cur)
+        cur = (by_id.get(cur) or {}).get("parentId")
+    return level
+
+
+def _children_index(by_id: Dict[str, Dict]) -> Dict[str, List[str]]:
+    """{parentId: [childId, …]} built once from the live open-task map, for
+    walking a task's DOWNWARD subtree (depth-adding checks)."""
+    idx: Dict[str, List[str]] = {}
+    for tid, t in by_id.items():
+        pid = t.get("parentId")
+        if pid:
+            idx.setdefault(pid, []).append(tid)
+    return idx
+
+
+def _subtree_height(task_id: str, children_of: Dict[str, List[str]],
+                    _seen: Optional[set] = None) -> int:
+    """How many levels task_id's OWN live subtree already spans (a leaf task
+    counts as 1). A task being re-parented may already have descendants of
+    its own — moving it deeper drags them along, so the depth check must be
+    against what it would ADD below the new parent, not just its own level."""
+    _seen = (_seen or set()) | {task_id}
+    kids = [k for k in (children_of.get(task_id) or []) if k not in _seen]
+    if not kids:
+        return 1
+    return 1 + max(_subtree_height(k, children_of, _seen) for k in kids)
+
+
 # Zero-width / variation-selector chars that can silently differ between two
 # otherwise-identical titles (emoji VS16, ZWJ, ZWSP, BOM).
 _INVISIBLE = ("️", "‍", "​", "﻿", "‎", "‏")
@@ -1014,14 +1066,34 @@ def _build_v2_task_obj(node: Dict, project_id: str, task_id: str,
     return obj
 
 
+def _requested_tree_depth(node: Dict) -> int:
+    """Depth (in levels, the node itself counted as 1) of a task/subtask dict
+    tree AS REQUESTED by the caller — a pure function over the payload, no
+    I/O. String subtasks are leaves (they can't carry their own `subtasks`
+    field); dict subtasks recurse. Used to fail-closed BEFORE building
+    anything when a request would exceed MAX_TASK_NEST_LEVELS, instead of
+    silently truncating deep branches after the fact."""
+    subtasks = node.get("subtasks") or []
+    if not subtasks:
+        return 1
+    return 1 + max(
+        (_requested_tree_depth(s) if isinstance(s, dict) else 1) for s in subtasks
+    )
+
+
 def _flatten_task_tree(node: Dict, project_id: str, parent_id: str = None,
-                       level: int = 0, max_level: int = 3):
+                       level: int = 0, max_level: int = MAX_TASK_NEST_LEVELS - 1):
     """Recursively flatten a nested task tree.
     Returns (tasks, relations) where:
       tasks     — list of v2 task objects WITHOUT parentId (TickTick ignores it in batch/task)
       relations — list of {"parentId","taskId","projectId"} for batch/taskParent call
     IDs are pre-generated so both calls can be built before any HTTP request.
-    max_level=3 means task + 3 levels of nesting (4 levels total)."""
+    max_level (default MAX_TASK_NEST_LEVELS-1=4) means task + 4 levels of
+    nesting (5 levels total — TickTick's own real cap, see
+    MAX_TASK_NEST_LEVELS above). This is a defense-in-depth backstop only:
+    callers are expected to refuse oversized requests via
+    _requested_tree_depth() BEFORE reaching this function, so in practice the
+    cutoff below should never actually trigger and silently drop a branch."""
     import uuid as _uuid
     task_id = _uuid.uuid4().hex[:24]
     obj = _build_v2_task_obj(node, project_id, task_id, parent_id=None)
@@ -1049,7 +1121,9 @@ async def create_tasks(
 ) -> str:
     """
     Create one or more tasks in TickTick with full nested subtask support
-    (up to 4 levels: task → subtask → sub-subtask → sub-sub-subtask).
+    (up to 5 levels: task → subtask → sub-subtask → sub-sub-subtask →
+    sub-sub-sub-subtask — TickTick's own real cap; requests that would nest
+    deeper are refused outright, nothing partial gets created).
 
     ⛔ INTERACTIVE ASSISTANTS: this tool will REFUSE your call. Use
     plan_task_creation (read-only) → reprint its echo VERBATIM → get the
@@ -1079,7 +1153,7 @@ async def create_tasks(
       parent_id (existing task ID to attach root as a subtask; requires v2),
       repeat_flag (RRULE; root task only via official API; use build_recurrence_rule),
       reminders (list of triggers; root task only via official API; use build_reminder),
-      subtasks (list of strings OR list of full task objects — recursive, up to 3 levels deep)
+      subtasks (list of strings OR list of full task objects — recursive, up to 4 levels deep)
 
     Dates: use "YYYY-MM-DD" for all-day; full ISO "YYYY-MM-DDThh:mm:ss+0000"
     only when the user specified an exact time. Do NOT invent a time.
@@ -1102,13 +1176,14 @@ async def create_tasks(
       [{"title": "Epic", "project_id": "x",
         "subtasks": ["Step 1", "Step 2", "Step 3"]}]
 
-    Nested structure with full params (up to 4 levels):
+    Nested structure with full params (up to 5 levels):
       [{"title": "Q3 Launch", "project_id": "x", "priority": 5,
         "subtasks": [
           {"title": "Design", "due_date": "2026-07-15", "priority": 3,
            "subtasks": [
              {"title": "Mockups", "due_date": "2026-07-10",
-              "subtasks": [{"title": "Mobile screens"}]}
+              "subtasks": [{"title": "Mobile screens",
+                            "subtasks": [{"title": "Icon set"}]}]}
            ]},
           {"title": "Dev", "due_date": "2026-07-20",
            "subtasks": [{"title": "Backend"}, {"title": "Frontend"}]}
@@ -1125,6 +1200,16 @@ async def create_tasks(
         A formatted summary. Each successfully-created root task line ends with
         the created task's id as `(id:<id>)` so callers can link it without a
         follow-up title search.
+
+    TELEGRAM CONFIRMATION LAYER (optional, off by default): "create_tasks" is
+    also the NAME this server announces creation plans under in Telegram —
+    plan_task_creation sends the owner a message with [✅ Подтвердить]/
+    [🛑 Отклонить] buttons itself, and pressing "Подтвердить" makes the server
+    perform the creation on its own (background poller), reporting back into
+    that same message. It is the server doing this, not some external relay
+    on top of MCP. This direct entry point stays automation-only and is NOT
+    part of that flow: `automation_key` bypasses the interactive gate
+    entirely, so no button and no `user_reply` are involved here.
     """
     if not (SECRET and automation_key and hmac.compare_digest(automation_key, SECRET)):
         return ("🛑 Прямое создание — только для автоматики. Интерактивный флоу: "
@@ -1149,6 +1234,21 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
 
     to_verify = []  # (title, id, expected_pid, expected_col) — checked at the end
     sub_verify = []  # (title, id) of created SUBTASKS — existence re-checked too
+    _depth_by_id = None  # lazily-fetched live state, only if some task attaches to an existing parent
+
+    # Один сброс кэша на весь вызов (не на каждую задачу): официальный API
+    # создания молча перекладывает задачу в Inbox, если переданный projectId
+    # не резолвится в ЖИВОЙ проект (битый/устаревший/удалённый id) — при
+    # этом приходит 200 с id задачи, то есть внешне это выглядит успехом,
+    # если не поймать это ЗДЕСЬ, до записи. Один invalidate + первый вызов
+    # _guard_project ниже форсируют один реальный перезапрос; остальные
+    # элементы того же батча переиспользуют это свежее состояние (оно ещё
+    # в пределах своего короткого TTL) вместо перезапроса на каждую задачу.
+    if ticktick_v2:
+        try:
+            ticktick_v2.invalidate_cache()
+        except Exception:
+            pass
 
     for i, t in enumerate(tasks):
         # Idempotent: a no-op if plan_task_creation already resolved these
@@ -1159,17 +1259,46 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
         if not title or not project_id:
             failed.append(f"#{i+1}: missing title or project_id")
             continue
-        # Destination guard: when the caller names the project, verify the id
-        # actually IS that project — a wrong id would file the task somewhere
-        # else entirely (the create-side twin of «не та задача»).
+        # Guard назначения, FAIL-CLOSED: project_id ОБЯЗАН резолвиться в
+        # живой проект — require_known=True отказывает, даже если вызывающий
+        # не передал project_name для сверки (обычный случай). Без этого
+        # нерезолвящийся id уходил прямиком в вызов создания, и бэкенд
+        # TickTick молча сбрасывал задачу в Inbox — баг доставки, который
+        # читается как чистый «✓ создано».
         exp_proj = t.get("project_name") or t.get("projectName") or ""
-        refuse = _guard_project(project_id, exp_proj)
+        refuse = _guard_project(project_id, exp_proj, require_known=True)
         if refuse:
             failed.append(f"#{i+1} «{title}»: {refuse}")
             continue
         priority = t.get("priority", 0)
         if priority not in [0, 1, 3, 5]:
             failed.append(f"#{i+1} «{title}»: неверный приоритет")
+            continue
+
+        # Depth guard: TickTick supports at most MAX_TASK_NEST_LEVELS total
+        # levels counting from the root task — see MAX_TASK_NEST_LEVELS
+        # above. The requested tree's own depth comes straight from the
+        # payload (nothing is live yet); if it attaches under an EXISTING
+        # task (parent_id), that task's LIVE depth is added on top — a
+        # caller's own claim about how deep it already sits is never
+        # trusted. Refused up front, fail-closed — nothing in this task is
+        # created, not even the levels that would have fit.
+        ext_parent_id = t.get("parent_id")
+        base_level = 0
+        if ext_parent_id:
+            if _depth_by_id is None:
+                _depth_by_id = _open_by_id(fresh=True)
+            if _depth_by_id is None:
+                failed.append(f"#{i+1} «{title}»: {_STATE_UNAVAILABLE_MSG}")
+                continue
+            base_level = _task_level(ext_parent_id, _depth_by_id)
+        total_depth = base_level + _requested_tree_depth(t)
+        if total_depth > MAX_TASK_NEST_LEVELS:
+            failed.append(
+                f"#{i+1} «{title}»: 🛑 запрошенная вложенность даёт "
+                f"{total_depth} уровней вместо {MAX_TASK_NEST_LEVELS} "
+                "поддерживаемых TickTick (считая от корневой задачи) — "
+                "задача НЕ создана целиком.")
             continue
 
         has_nested = any(
@@ -1456,6 +1585,24 @@ def _suggest_destinations(titles: List[str], names: Dict[str, str]) -> List[Dict
         return []
 
 
+def _create_object_hash(raw: List[Dict[str, Any]]) -> str:
+    """Binding-хэш для манифеста СОЗДАНИЯ (kind="create"). У остальных
+    манифестов (delete/declutter) объекты уже существуют, и `object_hash`
+    считается по их id — у создаваемых задач id ещё нет по определению,
+    поэтому хэшируется само НОРМАЛИЗОВАННОЕ содержимое каждой задачи
+    (json.dumps с sort_keys — порядок ключей в dict не должен влиять).
+
+    Одна-единственная формула на оба места, где хэш нужен: фаза плана
+    (plan_task_creation) и пересчёт при авто-исполнении по кнопке
+    (_rehash_create_manifest). Не «две одинаковые реализации», а буквально
+    один вызов — иначе побайтовое совпадение держалось бы на честном слове,
+    а разошедшийся хэш беззвучно превратил бы кнопку в «ничего не делает»."""
+    return _manifest_object_hash(
+        "create",
+        [json.dumps(t, sort_keys=True, ensure_ascii=False, default=str)
+         for t in raw])
+
+
 @mcp.tool(annotations=READONLY)
 async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
                              max_items: int = 50) -> str:
@@ -1480,6 +1627,17 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     as every other mutating tool on this server (Maksim, 2026-08-05: no more
     tier exemption for "it's just a create/reversible edit" — ALL write tools
     go through plan→execute, without exception).
+
+    TELEGRAM CONFIRMATION LAYER (optional, off by default): when it is on,
+    THIS SERVER itself also sends the plan to the owner as a Telegram message
+    carrying [✅ Подтвердить]/[🛑 Отклонить] buttons — this is not an external
+    relay bolted on top of MCP, it is the server's own out-of-band second
+    factor. Pressing "Подтвердить" makes the server execute the creation
+    ITSELF (a background poller does it) and rewrites the report into that
+    same Telegram message — no second tool call is needed for it to happen.
+    In that mode the text path is CLOSED: execute_task_creation refuses ANY
+    `user_reply`, before the press and after it alike. Do not call it — show
+    the plan and let the owner tap the button.
 
     Args:
         summary: one-line human sentence describing the batch
@@ -1512,8 +1670,16 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
             pending.append((i, t))
             continue
         pname = names.get(pid)
-        if names and pname is None:
-            refused.append(f"#{i} «{title}»: проект {pid} не найден")
+        if pname is None:
+            # FAIL-CLOSED: отказ всегда, когда id не резолвится в живой
+            # проект — в том числе когда сама карта `names` пустая (v2
+            # недоступен И v1-фолбэк тоже не сработал). Старое условие
+            # `if names and pname is None` пропускало эту проверку целиком
+            # на пустой карте — битый/устаревший project_id проходил план
+            # непроверенным и на execute уходил в Inbox без единого отказа.
+            reason = ("проект по id не найден" if names else
+                      "список проектов сейчас недоступен — сверить id нельзя")
+            refused.append(f"#{i} «{title}»: {pid} — {reason}")
             continue
         exp_name = t.get("project_name") or t.get("projectName") or ""
         if exp_name and pname and not _names_agree(exp_name, pname):
@@ -1544,9 +1710,22 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
 
     mid = uuid.uuid4().hex[:12]
     now = time.monotonic()
-    _MANIFESTS[mid] = {"kind": "create", "raw": [t for t, _, _ in good],
+    raw_items = [t for t, _, _ in good]
+    _MANIFESTS[mid] = {"kind": "create", "raw": raw_items,
                        "created": now, "plan_shown_at": now,
-                       "summary": summary, "consumed": False}
+                       "summary": summary, "consumed": False,
+                       # `tool` — под каким именем этот план анонсируется в
+                       # Telegram (оно же ключ в TG_APPROVAL_TOOLS и в
+                       # _AUTO_EXECUTORS); `_gate` — метка формы распаковки
+                       # для авто-исполнителя, чтобы он не принял за «свой»
+                       # чужой манифест с таким же kind.
+                       "tool": "create_tasks", "_gate": "create",
+                       # Binding: до 2026-08-06 манифест создания вообще не
+                       # имел object_hash — между планом и нажатием кнопки
+                       # содержимое `raw` можно было подменить, и ни
+                       # _require_consent, ни try_auto_execute этого не
+                       # заметили бы (оба сверяют хэш только `if stored_hash`).
+                       "object_hash": _create_object_hash(raw_items)}
     lines = [f"### 📋 План создания — {len(good)}",
              f"_Манифест `{mid}` · ничего ещё не создано_", ""]
     for i, (t, pname, sug) in enumerate(good, 1):
@@ -1579,7 +1758,13 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
                  f"`execute_task_creation(manifest_id=\"{mid}\", "
                  "user_reply=\"<дословная реплика пользователя>\")` · "
                  f"действует {_manifest_ttl_phrase()}, одноразово.")
-    return "\n".join(lines)
+    # Опциональный ТГ-фактор. При выключенном слое (дефолт) возвращает текст
+    # плана БЕЗ единого изменения; при включённом — шлёт план кнопкой и
+    # помечает манифест `tg_notified`, из-за чего execute-фаза начинает
+    # требовать нажатие. Fail-closed: не смогли отправить — манифест гаснет,
+    # наружу уходит текст ошибки вместо плана.
+    return await _run_blocking(_maybe_tg_notify_plan, "create_tasks", mid,
+                               "\n".join(lines))
 
 
 @mcp.tool()
@@ -1588,14 +1773,30 @@ async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
     Phase 2: create exactly what plan_task_creation planned and the user
     approved. Runs the normal creation engine (id echo, destination
     post-verify, operation_report record). One-shot. Gated 🟡
-    (docs/DESIGN_approval_gate.md): user_reply is HARD-enforced — an empty,
-    negative, or fabricated-looking reply is refused and nothing is created.
+    (docs/DESIGN_approval_gate.md): user_reply is HARD-enforced — refused, and
+    nothing is created, when the reply is empty, a negation (anywhere in the
+    sentence), an echo of the server's own manifest jargon, a partial "yes"
+    carrying a caveat/exclusion («ок, кроме последней» — the manifest can only
+    be applied whole), or a paraphrase of the user rather than their words
+    («пользователь: да»). The server CANNOT tell a genuine «да» from one a
+    model made up — the only real out-of-band factor is the Telegram button
+    confirmation, when that layer is enabled (TG_APPROVAL_ENABLED).
+
+    TELEGRAM CONFIRMATION LAYER (optional, off by default): when plan_task_
+    creation announced this plan in Telegram, THIS SERVER sent the owner a
+    message with [✅ Подтвердить]/[🛑 Отклонить] buttons itself. Pressing
+    "Подтвердить" makes the server run the creation on its own (background
+    poller) and write the report back into that same message — you do not
+    have to call this tool again for it to happen. For such a plan the text
+    path is CLOSED: this call is refused whatever `user_reply` says, both
+    before the press ("⏳ ждём кнопку", plan stays alive) and after it
+    ("✅ сервер уже исполняет"). Calling it again changes nothing.
 
     Args:
         manifest_id: id from plan_task_creation
         user_reply: the user's literal reply approving the plan — REQUIRED,
-            must be a genuine affirmative («да»/«ok»/…), verbatim, not
-            invented
+            must be a genuine affirmative («да»/«ok»/…), quoted verbatim, not
+            paraphrased and not made up
     """
     err = _ensure_official()
     if err:
@@ -1603,10 +1804,18 @@ async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
     _prune_manifests()
     m = _MANIFESTS.get(manifest_id)
     if not m or m.get("kind") != "create":
-        return (f"🛑 Манифест создания {manifest_id} не найден/истёк/уже "
-                "исполнен. Сначала plan_task_creation.")
+        return _manifest_gone_msg(
+            manifest_id,
+            f"🛑 Манифест создания {manifest_id} не найден/истёк/уже "
+            "исполнен. Сначала plan_task_creation.")
+    # `tool=`/`manifest_id=` передаются ОБЯЗАТЕЛЬНО (2026-08-06): именно их
+    # отсутствие в execute_task_deletion делало ТГ-гейт недетерминированным
+    # (см. tests/test_gate_tg_determinism.py). Имя тула здесь — то же, под
+    # которым план анонсируется в Telegram («create_tasks»), оно же ключ в
+    # TG_APPROVAL_TOOLS и в _AUTO_EXECUTORS.
     cr = _require_consent(action="create", tier=1, manifest=m,
-                          user_reply=user_reply)
+                          user_reply=user_reply, tool="create_tasks",
+                          manifest_id=manifest_id)
     if not cr.ok:
         return cr.reason
     m["consumed"] = True
@@ -1676,6 +1885,15 @@ async def update_tasks(
         tasks: List of task change objects — required on call #1, ignored on call #2
         manifest_id: from call #1's response — pass on call #2 to actually update
         user_reply: the user's literal reply approving the plan — required on call #2
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_official()
     if err:
@@ -1838,9 +2056,9 @@ async def _update_tasks_impl(
                 if fresh is None:
                     line = f"✏️ «{shown_title}» отправлено, но {_UNVERIFIED_MSG}"
                 else:
-                    verdict = _verify_item("update", item, fresh,
-                                           _v2_project_names())
-                    if "✅" in verdict[:8]:
+                    status, verdict = _verify_item("update", item, fresh,
+                                                   _v2_project_names())
+                    if status == "ok":
                         line = f"✏️ «{shown_title}» обновлено (проверено)"
                     else:
                         line = (f"❌ «{shown_title}» — изменения НЕ видны в "
@@ -1932,8 +2150,8 @@ async def _update_tasks_impl(
                             f"«{label_of.get(it['taskId'], it['title'])}» — "
                             f"TickTick отклонил: {api_fail[it['taskId']]}")
                         continue
-                    verdict = _verify_item("update", it, fresh, names)
-                    if "✅" in verdict[:8]:
+                    status, verdict = _verify_item("update", it, fresh, names)
+                    if status == "ok":
                         updated.append(label_of.get(it["taskId"], it["title"]))
                     else:
                         not_applied.append(verdict.lstrip("- "))
@@ -1994,6 +2212,15 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]] = None,
             call #1, ignored on call #2
         manifest_id: from call #1's response — pass on call #2 to actually complete
         user_reply: the user's literal reply approving the plan — required on call #2
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_official()
     if err:
@@ -2166,8 +2393,10 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
     if manifest_id:
         m = _MANIFESTS.get(manifest_id)
         if not m or m.get("kind") != "delete":
-            return (f"🛑 Манифест удаления {manifest_id} не найден/истёк/уже "
-                    "исполнен. Начни заново: delete_tasks(summary, tasks).")
+            return _manifest_gone_msg(
+                manifest_id,
+                f"🛑 Манифест удаления {manifest_id} не найден/истёк/уже "
+                "исполнен. Начни заново: delete_tasks(summary, tasks).")
         cr = _require_consent(action="delete", tier=2, manifest=m,
                               user_reply=user_reply,
                               object_ids=[it["taskId"] for it in m["items"]],
@@ -2362,6 +2591,49 @@ def _manifest_ttl_phrase() -> str:
 # handing control back to a human. Weak but free; env-tunable per tier.
 _MIN_CONSENT_GAP = float(os.environ.get("MIN_CONSENT_GAP", "2.0"))
 
+# ===========================================================================
+# === CONSENT-REPLY CLASSIFIER — BEGIN =====================================
+# ===========================================================================
+# ПЕРЕНОСИМЫЙ БЛОК: копировать ОТ СИХ ДО СИХ (до маркера
+# "CONSENT-REPLY CLASSIFIER — END"). Внешних зависимостей у блока нет — только
+# собственные словари/регулярки, стандартный `re` и typing-алиасы
+# (Optional/List). Он НИЧЕГО не знает про манифесты, клиента TickTick,
+# настройки, Telegram и прочее состояние сервера; это проверяется
+# автоматически тестом `tests/test_consent_strict_protocol.py`
+# (`test_classifier_block_has_no_server_dependencies`) — если кто-то привяжет
+# классификатор к серверному объекту, тест покраснеет.
+#
+# ⚠ ЭТО КОПИЯ В ШЕСТИ МЕСТАХ. Тот же блок живёт в ticktick-mcp и в пяти
+# Google-MCP серверах владельца (gmail / drive / calendar / docs / sheets).
+# Правишь здесь — СИНХРОНИЗИРУЙ остальные пять в тот же заход. Иначе через
+# месяц будет шесть разошедшихся версий и никто не будет знать, где дыра
+# закрыта, а где нет.
+#
+# ⚠ ЧЕСТНАЯ ГРАНИЦА ПРИМЕНИМОСТИ (не переписывать в маркетинговую сторону):
+# сервер физически НЕ отличает сочинённое моделью «да» от настоящего ответа
+# человека — по проводу приходит одна и та же строка. Классификатор ловит
+# ФОРМУЛИРОВКИ, а не намерение: он сужает то, что модель может безнаказанно
+# подставить, и заставляет промахи (пересказ, оговорку, расширение плана)
+# падать в отказ. Единственный настоящий ВНЕПОЛОСНЫЙ фактор — подтверждение
+# КНОПКОЙ в Telegram (`tg_approval.py`), где сигнал приходит от человека по
+# другому каналу. Если на принимающем сервере кнопки нет, перенос этого блока
+# нельзя подавать как «дыру закрыли» — это УМЕНЬШЕНИЕ ПОВЕРХНОСТИ, а не
+# устранение.
+# ---------------------------------------------------------------------------
+# ПРИНЦИП (смена курса 2026-08-06, fail-closed): подтверждение необратимой
+# операции — это УЗКИЙ ПРОТОКОЛ, а не свободный диалог. Согласием считается
+# только ответ, ЦЕЛИКОМ состоящий из понятных нам элементов (слово согласия +
+# безобидные наполнители). Любая сложная структура — условие, уточнение,
+# перечисление, рассуждение, незнакомое слово — НЕ согласие.
+#
+# Почему так, а не «перечислим слова-ограничители»: словарную гонку не выиграть.
+# «ок, но только те, что просрочены» ловилось, а «делай, я передумал насчёт
+# третьей» — нет, потому что «делай» есть в словаре согласий, а «передумал
+# насчёт третьей» не подходило ни под один маркер. Нельзя ошибиться в разборе
+# того, что не разбираешь: всё непонятное отправляется в отказ с просьбой
+# ответить однозначно («да» или «нет»).
+# ---------------------------------------------------------------------------
+
 # Server-side yes/no vocabulary (§4.3.3). Deliberately NOT anything that
 # looks like the old deterministic password ("DELETE 5"), a tool name, or
 # JSON — those are what a self-confirming model would fabricate, not what a
@@ -2370,12 +2642,79 @@ _CONSENT_AFFIRMATIVE_WORDS = {
     "да", "ага", "угу", "ок", "окей", "окай", "подтверждаю", "подтверждено",
     "удаляй", "удали", "давай", "го", "погнали", "делай", "применяй",
     "применить", "применяем", "конечно", "точно",
+    # 2026-08-06: добавлены по итогам аудита — обычные человеческие «да»,
+    # которые раньше молча давали ОТКАЗ (владелец пишет их регулярно). Взяты
+    # ТОЛЬКО однозначные: «ладно»/«ну ладно»/«наверное да»/«думаю да» намеренно
+    # НЕ добавлены — это неуверенность, а не согласие (fail-closed).
+    "хорошо", "договорились", "принято", "валяй",
     "yes", "yep", "yeah", "sure", "confirm", "confirmed", "ok", "okay",
-    "approve", "approved", "go", "+", "+1",
+    "approve", "approved", "go", "+", "+1", "agreed", "proceed",
+    # 2026-08-06 (fail-closed): при переходе на «согласие = ВСЕ токены
+    # понятны» словарь обязан покрывать обычные живые подтверждения целиком —
+    # иначе нормальный ответ владельца («да, всё верно», «подтверждаю,
+    # действуй») молча станет отказом, а это ХУЖЕ закрываемой дыры. Сюда
+    # берутся только слова, которые НЕ меняют набор объектов плана: чистые
+    # согласия и императивы «делай то, что показал».
+    "согласен", "согласна", "согласны", "действуй", "действуйте",
+    "поехали", "вперёд", "вперед", "верно", "правильно", "именно",
+    "утверждаю", "одобряю", "одобрено", "безусловно", "однозначно",
+    "продолжай", "продолжаем", "запускай", "жми", "стартуй", "выполняй",
+    # императивы конкретных операций — ровно те, что печатает человек в ответ
+    # на показанный план («да, удаляй», «да, сливай», «да, отметь»)
+    "сливай", "слей", "создавай", "создай", "обновляй", "обнови",
+    "отметь", "отмечай", "перемещай", "перемести", "восстанавливай",
+    "восстанови", "завершай", "заверши", "архивируй", "ставь", "поставь",
+    "сделай", "сделайте", "сделаем", "стартуем",
+    "right", "correct", "exactly", "absolutely", "definitely", "affirmative",
+    "alright", "fine", "deal", "certainly", "do", "accept", "accepted", "good",
 }
+# Безобидные наполнители: сами по себе НЕ согласие, но и не меняют ни набор
+# объектов, ни степень уверенности. Нужны, чтобы «да, только быстрее» /
+# «давай, пожалуйста» / «ну давай» оставались согласием при правиле «все
+# токены должны быть понятны».
+#
+# Чего здесь СОЗНАТЕЛЬНО нет: «и», «но», «ещё», «сначала», «я», «ты», «если»,
+# «всё». Именно они несут расширение плана («да, и заодно удали ещё вон ту»),
+# условие («ок, если ты уверен»), отсрочку («да, но сначала покажи») или
+# неявное «удали всё» — то есть ровно то, что обязано уходить в отказ.
+_CONSENT_MANNER_WORDS = {
+    "быстрее", "побыстрее", "быстро", "скорее", "поскорее", "аккуратно",
+    "аккуратнее", "осторожно", "осторожнее", "внимательно", "внимательнее",
+    "тихо", "медленно", "спокойно", "пожалуйста", "давай", "давайте",
+}
+_CONSENT_FILLER_WORDS = _CONSENT_MANNER_WORDS | {
+    # «только» безопасно: опасное «только <объект>» уже отсечено
+    # _CONSENT_CAVEAT_RE ДО этой проверки, сюда доходит лишь «только
+    # <наречие темпа/манеры>» («да, только быстрее»).
+    "только",
+    "ну", "же", "уж", "уже", "тогда", "сразу", "сейчас", "спасибо",
+    "плиз", "please", "thanks", "thank", "you", "now", "ahead", "it",
+    "sounds",
+    # названия самой операции — «подтверждаю удаление», «ок, создание»: они
+    # НЕ сужают и НЕ расширяют набор объектов, просто повторяют, о чём план
+    "удаление", "создание", "изменение", "обновление", "перемещение",
+    "завершение", "слияние", "восстановление",
+}
+# Устойчивые обороты, которые схлопываются в одно уже известное слово. Нужны
+# там, где отдельное слово оборота само по себе опасно пускать в наполнители:
+# «всё» как токен означало бы, что «удали всё» — согласие (а это расширение
+# плана), зато «да, всё верно» — обычное человеческое подтверждение.
+_CONSENT_SET_PHRASES = (
+    (re.compile(r"\bвс[её]\s+(верно|правильно|так)\b"), r"верно"),
+    (re.compile(r"\bтак\s+точно\b"), "точно"),
+    (re.compile(r"\bбез\s+(проблем|вопросов|базара|разговоров|сомнений)\b"),
+     "ок"),
+    (re.compile(r"\b(go|move)\s+ahead\b"), "go"),
+    (re.compile(r"\bof\s+course\b"), "конечно"),
+)
+# Страховка от абсурдно длинной фразы, целиком собранной из «понятных» слов:
+# протокол подтверждения короткий по смыслу, длинное рассуждение — повод
+# переспросить, а не исполнять.
+_CONSENT_MAX_TOKENS = 8
 _CONSENT_NEGATIVE_WORDS = {
     "нет", "неа", "не", "стоп", "отмена", "отмени", "погоди", "подожди",
     "отбой", "не надо", "cancel", "no", "nope", "stop", "wait", "don't",
+    "not", "nah", "abort", "отставить", "нельзя",
 }
 # A reply that merely echoes the server's OWN manifest jargon back is not a
 # human "yes" — it's exactly what a model that fabricates consent would type
@@ -2384,6 +2723,139 @@ _CONSENT_ECHO_ARTIFACT_RE = re.compile(
     r'^(delete|create|declutter)\s*\d+$|manifest_id|execute_\w+\s*\(|plan_\w+\s*\(|^\{.*\}$',
     re.IGNORECASE | re.DOTALL,
 )
+
+# ---------------------------------------------------------------------------
+# Аудит 2026-08-06: три дыры В САМОМ классификаторе ответа. Они опаснее любой
+# отдельно взятой дыры в отдельном туле, потому что гейт согласия расширяется
+# с 2 тулов на ~25 — дефект классификатора тиражируется на все сразу.
+# ---------------------------------------------------------------------------
+
+# (A) ЧАСТИЧНОЕ согласие исполнялось как полное. Манифест исполняется ТОЛЬКО
+# целиком — частичного режима у сервера физически нет, — поэтому ответ вида
+# «ок, кроме последней» / «удали первые три, а последнюю не надо» раньше
+# приводил к удалению В ТОМ ЧИСЛЕ того, что человек явно исключил. Любой
+# маркер оговорки/исключения ⇒ это НЕ полное согласие.
+#
+# Про слово «только» — fail-closed с узким белым списком. «Только» по умолчанию
+# считается оговоркой («ок, только молоко», «да, только вторую»), потому что по
+# свободному тексту нельзя надёжно понять, сузил человек набор или нет, а цена
+# ошибки несимметрична: ложный отказ стоит человеку одной лишней фразы, ложное
+# согласие — удалённых данных. Исключение сделано ровно для наречий ТЕМПА и
+# МАНЕРЫ («да, только быстрее», «ок, только аккуратно») — они не про объекты
+# плана, а про то, как его исполнить, и это частая живая формулировка.
+#
+# Собирается из `_CONSENT_MANNER_WORDS` (один источник правды: те же слова
+# работают и как исключение для «только», и как безобидные наполнители).
+# Сортировка по убыванию длины — чтобы «быстро» не примерялось раньше
+# «быстрее».
+_CONSENT_MANNER_ADVERBS = "|".join(
+    sorted(_CONSENT_MANNER_WORDS, key=lambda w: (-len(w), w))
+)
+_CONSENT_CAVEAT_RE = re.compile(
+    r"\b(?:"
+    r"кроме|исключая|исключи\w*|за\s+исключением|"
+    r"но\s+не|а\s+не|"
+    r"не\s+(?:надо|нужно|трогай|трогая|удаляй|удали|включай|бери|берём|стоит)|"
+    r"оставь\w*|оставить|оставим|оставляем|оставляя|"
+    r"пропусти\w*|пропустить|пропустим|пропуская|"
+    r"только(?!\s+(?:" + _CONSENT_MANNER_ADVERBS + r")\b)|"
+    r"без\s+(?!проблем|вопросов|базара|разговоров|сомнений|задержек|"
+    r"проволочек|лишних)\w+|"
+    r"except|excluding|exclude|apart\s+from|other\s+than|but\s+not|"
+    r"all\s+but|everything\s+but|skip"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# (C) Пересказ ответа человека моделью («Пользователь: да», «он сказал да»,
+# «yes (по словам пользователя)») проходил как дословная реплика. Докстринги
+# требуют ДОСЛОВНУЮ последнюю реплику — пересказ это самый частый честный
+# промах модели, и отличить его от подделки сервер не может, поэтому отказ.
+_CONSENT_PARAPHRASE_RE = re.compile(
+    r"^(?:пользователь|юзер|человек|владелец|хозяин|user|the\s+user)\s*[:\-—]|"
+    r"^(?:пользователь|юзер|человек|владелец|он|она|user)\s+"
+    r"(?:сказал|сказала|ответил|ответила|подтвердил|подтвердила|говорит|"
+    r"пишет|написал|написала)\b|"
+    r"^(?:the\s+user|he|she|they)\s+(?:said|says|replied|confirmed|approved)\b|"
+    r"\b(?:по|согласно)\s+словам\s+(?:пользователя|юзера|человека|владельца)\b|"
+    r"\bсо\s+слов\s+(?:пользователя|юзера|человека|владельца)\b|"
+    r"\bas\s+(?:the\s+)?user\s+said\b|\baccording\s+to\s+the\s+user\b",
+    re.IGNORECASE,
+)
+
+# Неуверенность и безразличие — «наверное да», «думаю да», «делай что хочешь»,
+# «мне всё равно». Формально там есть утвердительное слово («да», «делай»), но
+# согласия человек не давал: он либо колеблется, либо самоустраняется. Для
+# необратимой операции это не «да» (то же основание, по которому «ну ладно» не
+# попало в словарь согласий).
+_CONSENT_HEDGE_RE = re.compile(
+    r"\b(?:наверн(?:ое|о)|возможно|может\s+быть|думаю|кажется|вроде(?:\s+бы)?|"
+    r"не\s+уверен\w*|сомневаюсь|"
+    r"как\s+(?:хочешь|хотите|знаешь|знаете|сам\w*)|"
+    r"что\s+(?:хочешь|хотите)|всё\s+равно|все\s+равно|пофиг|"
+    r"maybe|probably|i\s+guess|i\s+think|whatever|up\s+to\s+you|"
+    r"not\s+sure|dunno"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_CONSENT_REFUSAL_REASONS = {
+    "echo": (
+        "🛑 Ответ повторяет служебный жаргон самого сервера (манифест-id, имя "
+        "инструмента, JSON, «DELETE 5»), а не человеческую реплику. Это ровно "
+        "то, что печатает модель, подтверждающая саму себя. Ничего не сделано, "
+        "план ещё активен: спроси человека и передай его ответ дословно."
+    ),
+    "paraphrase": (
+        "🛑 Похоже на ПЕРЕСКАЗ ответа человека, а не на его дословную реплику "
+        "(«Пользователь: да», «он сказал да», «yes (по словам пользователя)»). "
+        "Нужна последняя реплика человека БУКВАЛЬНО, как он её написал, без "
+        "твоих слов вокруг. Ничего не сделано, план ещё активен — спроси "
+        "человека и передай его ответ дословно."
+    ),
+    "caveat": (
+        "🛑 В ответе есть оговорка/исключение — это ЧАСТИЧНОЕ согласие, а "
+        "сервер не умеет исполнять план частично: манифест применяется только "
+        "целиком, включая то, что человек исключил. Ничего не сделано, план "
+        "аннулирован. Построй план ЗАНОВО — уже под уточнённый набор "
+        "объектов, — покажи его человеку и спроси подтверждение ещё раз."
+    ),
+    "negative": (
+        "🛑 В ответе есть отрицание — это НЕ согласие, где бы оно ни стояло в "
+        "фразе. Ничего не сделано, план аннулирован. Если человек хотел другой "
+        "набор объектов — построй план заново и спроси подтверждение ещё раз."
+    ),
+    "hedge": (
+        "🛑 Ответ выражает неуверенность или безразличие («наверное да», "
+        "«делай что хочешь»), а не согласие. Для необратимой операции этого "
+        "недостаточно. Ничего не сделано, план ещё активен: переспроси "
+        "человека прямо — нужно однозначное «да» или «нет»."
+    ),
+    "ambiguous": (
+        "🛑 Ответ не является ОДНОЗНАЧНЫМ согласием: в нём есть условие, "
+        "уточнение, перечисление или рассуждение, а подтверждение необратимой "
+        "операции — узкий протокол, а не свободный диалог. Сервер сознательно "
+        "НЕ пытается угадать, что имелось в виду: угадав неверно, он удалит "
+        "не то. Ничего не сделано, план ещё активен. Переспроси человека и "
+        "попроси ответить одним словом: «да» или «нет» (если он хочет другой "
+        "набор объектов — построй план заново)."
+    ),
+}
+
+
+class ConsentReplyVerdict:
+    """Разбор ответа человека одним проходом: `kind` — что это за ответ
+    ("affirmative" | "caveat" | "negative" | "paraphrase" | "hedge" | "echo" |
+    "empty" | "ambiguous"), `reason` — готовый обучающий текст отказа ("" для
+    affirmative и для случаев, где вызывающий подставляет свой дефолт).
+
+    "ambiguous" — сборный вид для ВСЕГО, что не разобрано однозначно (бывший
+    "unrecognized" плюс всё сложное, что раньше проскакивало в согласие)."""
+    __slots__ = ("kind", "reason")
+
+    def __init__(self, kind: str, reason: str = ""):
+        self.kind = kind
+        self.reason = reason
 
 
 def _normalize_consent_reply(reply: Optional[str]) -> str:
@@ -2394,31 +2866,108 @@ def _consent_tokens(norm: str) -> List[str]:
     # Strip PER-WORD punctuation too ("да," / "го!") — _normalize_consent_reply
     # only trims the ends of the whole string, and a real chat reply like
     # "да, удаляй" or "да, сливай" commonly punctuates mid-sentence.
-    return [t.strip('.,!?;:') for t in norm.split()]
+    return [t.strip('.,!?;:') for t in norm.split() if t.strip('.,!?;:')]
+
+
+def _collapse_consent_set_phrases(norm: str) -> str:
+    """Схлопывает устойчивые обороты подтверждения в одно известное слово
+    («да, всё верно» → «да, верно»). Применяется ТОЛЬКО в финальной проверке
+    согласия — раньше по тексту уже прошли отрицание/оговорка/неуверенность,
+    и подменять им входные данные нельзя."""
+    for rx, repl in _CONSENT_SET_PHRASES:
+        norm = rx.sub(repl, norm)
+    return norm
+
+
+def _classify_consent_reply(reply: Optional[str]) -> ConsentReplyVerdict:
+    """Единственное место, где решается, что означает ответ человека. Порядок
+    проверок — от «ответа человека вообще нет» к «ответ есть, но он не полное
+    согласие»; всё, что не распознано однозначно как согласие, — отказ
+    (fail-closed)."""
+    norm = _normalize_consent_reply(reply)
+    if not norm:
+        return ConsentReplyVerdict("empty")
+    if _CONSENT_ECHO_ARTIFACT_RE.search(norm):
+        return ConsentReplyVerdict("echo", _CONSENT_REFUSAL_REASONS["echo"])
+    # Пересказ проверяем ДО оговорки и отрицания: если реплики человека тут
+    # вообще нет, план губить незачем — модели надо просто переспросить.
+    if _CONSENT_PARAPHRASE_RE.search(norm):
+        return ConsentReplyVerdict("paraphrase",
+                                   _CONSENT_REFUSAL_REASONS["paraphrase"])
+    # Целая фраза-отказ («не надо») — это отказ, а не оговорка: проверяем до
+    # маркеров оговорки, иначе «не надо» уехало бы в caveat из-за «не + надо».
+    if norm in _CONSENT_NEGATIVE_WORDS:
+        return ConsentReplyVerdict("negative",
+                                   _CONSENT_REFUSAL_REASONS["negative"])
+    if _CONSENT_CAVEAT_RE.search(norm):
+        return ConsentReplyVerdict("caveat", _CONSENT_REFUSAL_REASONS["caveat"])
+    tokens = _consent_tokens(norm)
+    # (B) Отрицание ищем по ВСЕМ токенам, а не в окне первых четырёх: именно
+    # из-за окна «да, всё верно, но подожди с третьей» считалось согласием,
+    # хотя докстринг обещал обратное. Согласие по-прежнему ищем в первых 4
+    # токенах, чтобы «да, и ещё сделай X» продолжало работать.
+    if any(t in _CONSENT_NEGATIVE_WORDS for t in tokens) or \
+            norm in _CONSENT_NEGATIVE_WORDS:
+        return ConsentReplyVerdict("negative",
+                                   _CONSENT_REFUSAL_REASONS["negative"])
+    if _CONSENT_HEDGE_RE.search(norm):
+        return ConsentReplyVerdict("hedge", _CONSENT_REFUSAL_REASONS["hedge"])
+    # (D) СМЕНА ПРИНЦИПА 2026-08-06 — fail-closed вместо fail-open.
+    # Было: «есть утвердительное слово среди первых четырёх токенов и не
+    # поймали маркер отказа ⇒ согласие». Из-за этого «делай, я передумал
+    # насчёт третьей» исполнялось: «делай» в словаре, а «передумал насчёт
+    # третьей» не подходит ни под один маркер. Гонку «перечислим все
+    # слова-ограничители» выиграть нельзя — ограничитель всегда можно
+    # сформулировать иначе.
+    # Стало: согласие ⇔ ВЕСЬ ответ состоит из понятных нам элементов —
+    # минимум одно слово согласия, всё остальное из безобидных наполнителей,
+    # и фраза короткая. Встретили хоть один незнакомый токен ⇒ не согласие
+    # (kind="ambiguous"): нельзя ошибиться в разборе того, что не разбираешь.
+    core = _consent_tokens(_collapse_consent_set_phrases(norm))
+    if (core and len(core) <= _CONSENT_MAX_TOKENS
+            and any(t in _CONSENT_AFFIRMATIVE_WORDS for t in core)
+            and all(t in _CONSENT_AFFIRMATIVE_WORDS or t in _CONSENT_FILLER_WORDS
+                    for t in core)):
+        return ConsentReplyVerdict("affirmative")
+    return ConsentReplyVerdict("ambiguous",
+                               _CONSENT_REFUSAL_REASONS["ambiguous"])
+
+
+def _consent_refusal_reason(reply: Optional[str]) -> str:
+    """Конкретное объяснение, ПОЧЕМУ ответ не принят за согласие ("" — если
+    принят, либо если объяснять нечего и подойдёт общий `_NO_REPLY_INSTRUCTION`
+    вызывающего)."""
+    return _classify_consent_reply(reply).reason
 
 
 def _is_negative_reply(reply: Optional[str]) -> bool:
-    norm = _normalize_consent_reply(reply)
-    if not norm:
-        return False
-    tokens = _consent_tokens(norm)
-    return any(t in _CONSENT_NEGATIVE_WORDS for t in tokens[:4]) or norm in _CONSENT_NEGATIVE_WORDS
+    """«Ответ есть, и он НЕ согласие, причём план надо аннулировать» — прямое
+    отрицание в любом месте фразы ИЛИ частичное согласие с оговоркой (в обоих
+    случаях исполнять показанный план целиком нельзя, его надо перестроить).
+    Пересказ, эхо и неоднозначный ответ ("ambiguous") сюда НЕ входят: там
+    внятной реплики человека попросту нет, план остаётся валидным и вызов
+    можно повторить с дословным однозначным ответом."""
+    return _classify_consent_reply(reply).kind in ("negative", "caveat")
 
 
 def _is_affirmative_reply(reply: Optional[str]) -> bool:
     """True only for a real human-shaped "yes" — see docs/DESIGN_approval_gate.md
-    §4.3.3. Fail-closed: empty, negative, or manifest-echo-shaped replies are
-    NEVER affirmative, even if they also happen to contain a "да" substring
-    inside a longer sentence that also negates."""
-    norm = _normalize_consent_reply(reply)
-    if not norm or _CONSENT_ECHO_ARTIFACT_RE.search(norm):
-        return False
-    if _is_negative_reply(reply):
-        return False
-    if norm in _CONSENT_AFFIRMATIVE_WORDS:
-        return True
-    tokens = _consent_tokens(norm)
-    return any(t in _CONSENT_AFFIRMATIVE_WORDS for t in tokens[:4])
+    §4.3.3. Fail-closed по построению: согласием считается ТОЛЬКО ответ,
+    целиком собранный из понятных слов (слово согласия + безобидные
+    наполнители, короткая фраза). Всё остальное — пустое, отрицание, эхо
+    манифеста, пересказ («пользователь: да»), оговорка («ок, кроме
+    последней»), неуверенность («наверное да») и любая сложная фраза («делай,
+    я передумал насчёт третьей», «да, и заодно удали ещё вон ту») — НЕ
+    согласие. Отрицание в любом месте фразы перевешивает: окна нет."""
+    return _classify_consent_reply(reply).kind == "affirmative"
+
+
+# ===========================================================================
+# === CONSENT-REPLY CLASSIFIER — END =======================================
+# ===========================================================================
+# Конец переносимого блока (см. маркер BEGIN выше): всё, что ниже, уже завязано
+# на состояние конкретного сервера (манифесты, клиент, Telegram) и НЕ копируется
+# вместе с классификатором.
 
 
 def _manifest_object_hash(action: str, ids: List[str]) -> str:
@@ -2427,6 +2976,21 @@ def _manifest_object_hash(action: str, ids: List[str]) -> str:
     plan time, so a manifest whose stored items were somehow mutated between
     plan and execute is caught rather than silently applied."""
     payload = action + "|" + ",".join(sorted(str(i) for i in ids))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _manifest_params_hash(action: str, params: Dict) -> str:
+    """Аналог _manifest_object_hash для _gate_single-манифестов, у которых нет
+    списка id объектов — привязывает манифест к точному набору параметров.
+
+    Нужен из-за TG-кнопки: авто-исполнение по кнопке (try_auto_execute)
+    сверяет `object_hash` перед тем, как что-то сделать, и БЕЗ сохранённого
+    хэша эта сверка просто пропускается — кнопка оказалась бы слабее
+    чат-подтверждения. Чат-путь при этом не меняется: `_require_consent`
+    трогает `object_hash` только когда ему передали `object_ids`, а
+    `_gate_single` их не передаёт."""
+    payload = action + "|" + json.dumps(params or {}, sort_keys=True,
+                                        ensure_ascii=False, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -2459,9 +3023,89 @@ def _maybe_tg_notify_plan(tool: str, manifest_id: str, preview_text: str) -> str
         return (f"🛑 Не смог отправить запрос подтверждения в Telegram ({err}). "
                 "Действие НЕ запланировано, ничего не изменено. Проверьте "
                 "бота/настройки Telegram-подтверждения и попробуйте снова.")
+    # УСПЕШНО отправлено → ПОМЕЧАЕМ САМ МАНИФЕСТ (2026-08-06, фикс
+    # недетерминированного гейта). До этой правки факт «план ушёл в Telegram»
+    # нигде не сохранялся: execute-фаза заново решала, нужен ли ТГ-фактор, по
+    # аргументу `tool`, который один путь передавал (delete_tasks), а другой
+    # (execute_task_deletion) — забывал, из-за чего ОДНА И ТА ЖЕ операция на
+    # одном сервере то требовала кнопку, то нет. Флаг переносит решение туда,
+    # где оно фактически принято — в фазу плана; execute-фаза больше не
+    # угадывает. Fail-closed: если план ушёл в TG, «да» в чате БЕЗ approved-
+    # строки не проходит НИКОГДА, чем бы ни был вызов execute.
+    m = _MANIFESTS.get(manifest_id)
+    if m is not None:
+        m["tg_notified"] = True
+        m["_tg_tool"] = tool
+        m["_tg_manifest_id"] = manifest_id
+    else:
+        # Не должно случаться (все вызывающие создают манифест ДО отправки).
+        # Не fail-closed-отказ: кнопка в TG всё равно ни к чему не приведёт —
+        # ни поллер, ни execute не найдут манифеста, — но это ошибка порядка
+        # вызовов, и она должна быть видна в логе.
+        logger.warning(f"TG approval: план {manifest_id} отправлен в Telegram, "
+                       f"но манифест не найден в _MANIFESTS (tool={tool})")
+    # Приписка честно отражает, что произойдёт ДАЛЬШЕ, а не то, что было
+    # написано здесь до 2026-08-06 («…затем ответьте «да» здесь»). Для планов,
+    # которые сервер умеет исполнить сам по нажатию (есть авто-исполнитель),
+    # текстовый путь ЗАКРЫТ (см. `_tg_button_only`), и звать инструмент второй
+    # раз не нужно — прежняя формулировка подталкивала и владельца, и модель
+    # ровно к тому действию, которое теперь отвергается. Для двух планов без
+    # авто-исполнителя (delete_project / rename_tag-слияние) повторный вызов
+    # ПО-ПРЕЖНЕМУ нужен — им нельзя обещать «выполнится само».
+    if _resolve_auto_executor(_auto_execute_tool_of(m or {}), m or {}) is not None:
+        return (preview_text + "\n\n_⏳ Запрос на подтверждение отправлен в "
+                "Telegram. Подтвердите кнопкой ✅ в боте — операция выполнится "
+                "автоматически: короткая сводка придёт в то же сообщение, "
+                "полный отчёт — в группу-архив «MCP Отчёты». Повторно "
+                "вызывать этот инструмент НЕ нужно, текстовое «да» для этого "
+                "плана не принимается._")
     return (preview_text + "\n\n_⏳ Запрос на подтверждение отправлен в "
-            "Telegram — подтвердите кнопкой в боте, затем ответьте «да» "
-            "здесь._")
+            "Telegram. Подтвердите кнопкой ✅ в боте — этот план сервер сам не "
+            "исполняет, после нажатия повторите вызов инструмента._")
+
+
+_TG_BUTTON_ONLY_PENDING_MSG = (
+    "⏳ Этот план подтверждается ТОЛЬКО кнопкой в Telegram — текстовое "
+    "подтверждение для него отключено, что бы пользователь ни написал в чате. "
+    "Нажмите ✅ в боте: операция выполнится сама, отчёт придёт в то же "
+    "сообщение с кнопками. Повторно вызывать этот инструмент НЕ нужно — "
+    "просто скажи пользователю, что ждёшь его нажатия. План активен."
+)
+
+_TG_BUTTON_ONLY_APPROVED_MSG = (
+    "✅ Уже подтверждено кнопкой в Telegram — сервер исполняет эту операцию "
+    "САМ (фоновый поллер, обычно в течение ~10 секунд). Ничего повторять не "
+    "надо и этот инструмент больше звать не надо: результат будет вписан в то "
+    "же сообщение Telegram, где были кнопки."
+)
+
+
+def _tg_button_only(manifest: Optional[Dict]) -> bool:
+    """Закрыт ли для ЭТОГО плана текстовый путь исполнения (2026-08-06).
+
+    Два условия, оба обязательны:
+      1. План реально ушёл в Telegram — пометку `tg_notified` ставит ТОЛЬКО
+         `_maybe_tg_notify_plan`, и только при УСПЕШНОЙ отправке сообщения с
+         кнопками. Решение принимается по СОСТОЯНИЮ МАНИФЕСТА, а не по
+         текущему значению `TG_APPROVAL_ENABLED`: выключить настройку между
+         планом и исполнением и тем «растворить» требование кнопки нельзя.
+      2. У плана есть авто-исполнитель (`_resolve_auto_executor`), то есть
+         нажатие кнопки действительно приведёт к исполнению фоновым поллером.
+         Без этого условия закрытие текстового пути означало бы, что
+         операцию нельзя выполнить ВООБЩЕ никак. Сегодня мимо проходят ровно
+         два плана — `delete_project` и слияние в `rename_tag` (их манифесты
+         помечены собственными `_gate`, поллер их не исполняет; так и написано
+         в их докстрингах). Для них остаётся прежняя двухфакторная схема:
+         кнопка ОБЯЗАТЕЛЬНА, но исполняет повторный вызов инструмента. Как
+         только у такого плана появится авто-исполнитель, он автоматически
+         перейдёт в button-only — отдельного списка тулов здесь намеренно нет.
+
+    Возвращает False для всего остального (слой выключен, план в Telegram не
+    уходил, вызов без манифеста) → путь через chat-«да» работает как раньше.
+    """
+    if not (manifest or {}).get("tg_notified"):
+        return False
+    return _resolve_auto_executor(_auto_execute_tool_of(manifest), manifest) is not None
 
 
 _NO_REPLY_INSTRUCTION = (
@@ -2498,8 +3142,14 @@ def _require_consent(
 
     if manifest is not None:
         if manifest.get("consumed"):
-            return ConsentResult(False, "🛑 Манифест уже исполнен (one-shot) — "
-                                  "план протух. Вызови plan_* заново.")
+            # `_manifest_gone_msg` различает «погашен поллером по кнопке» и
+            # «просто протух»: без него модель, позвавшая execute сразу после
+            # нажатия кнопки (пока `_prune_manifests` ещё не выбросил запись),
+            # получала безликое «протух» и не понимала, исполнено ли что-то.
+            return ConsentResult(False, _manifest_gone_msg(
+                manifest_id or manifest.get("_tg_manifest_id", ""),
+                "🛑 Манифест уже исполнен (one-shot) — план протух. Вызови "
+                "plan_* заново."))
         created = manifest.get("created")
         if created is not None and time.monotonic() - created > _MANIFEST_TTL:
             manifest["consumed"] = True
@@ -2513,23 +3163,105 @@ def _require_consent(
                                       "планом и подтверждением) — вызови "
                                       "plan_* заново.")
 
+    # Текст отказа — КОНКРЕТНЫЙ, а не общий: `_consent_refusal_reason` знает,
+    # ЧЕМ именно ответ не является согласием (прямое отрицание / оговорка вида
+    # «ок, кроме последней» / пересказ вместо дословной реплики / неуверенность
+    # / эхо манифестного жаргона) и объясняет модели, что делать дальше. Без
+    # этой подстановки классификатор различал бы случаи внутри себя, а наружу
+    # отдавал одно и то же безликое «не подтвердил» — и модель, получив отказ
+    # на «ок, кроме последней», не понимала бы, что от неё хотят перепланировать
+    # набор, а не переспросить то же самое. Пустая строка (объяснять нечего) →
+    # прежние общие формулировки, поведение не меняется.
     if _is_negative_reply(user_reply):
         if manifest is not None:
             manifest["consumed"] = True
-        return ConsentResult(False, "🛑 Пользователь НЕ подтвердил (ответ похож "
-                              "на отказ/отмену) — ничего не сделано. План "
-                              "аннулирован, при необходимости перепланируй.")
+        detail = _consent_refusal_reason(user_reply)
+        # Ведущая фраза «Пользователь НЕ подтвердил» сохранена дословно: на неё
+        # опираются существующие тесты и, возможно, внешние интеграции, читающие
+        # ответ гейта. Конкретика классификатора идёт ПОСЛЕ неё, а не вместо.
+        return ConsentResult(False, "🛑 Пользователь НЕ подтвердил — ничего не "
+                             "сделано, план аннулирован. " + (
+                                 detail.lstrip("🛑 ") if detail else
+                                 "Ответ похож на отказ/отмену; при необходимости "
+                                 "перепланируй."))
+
+    # ─────────── BUTTON-ONLY: текстовый путь исполнения ЗАКРЫТ ───────────
+    # Максим, 2026-08-06: «зачем вообще ждать текстовое да? нужно убрать для
+    # Клода возможность видеть и тыкать методы экзекют».
+    #
+    # Почему это не «ещё одна проверка формулировок», а закрытие класса дыр:
+    # сервер физически НЕ может отличить сочинённое моделью «да» от реального
+    # ответа человека — он видит только строку. Всю ночь до этого затыкались
+    # формулировки («делай, я передумал насчёт третьей» регуляркой не
+    # ловится). Если план УЖЕ ушёл в Telegram и сервер умеет исполнить его сам
+    # по нажатию, то текстовому пути исполнения просто нечего здесь делать:
+    # исполняет фоновый поллер по факту нажатия, а любой вызов execute с
+    # текстом отвергается — независимо от того, что в этом тексте написано.
+    # Дыра не уменьшается, а исчезает: способа исполнить операцию текстом
+    # больше не существует.
+    #
+    # Стоит ДО проверки `_is_affirmative_reply` намеренно: для такого плана
+    # содержание реплики уже ни на что не влияет, и требовать «пришли
+    # дословное да» (`_NO_REPLY_INSTRUCTION`) было бы враньём — модель пошла
+    # бы добывать текст, который всё равно ничего не откроет. Проверка
+    # ОТРИЦАНИЯ выше при этом сохранена: «нет» в чате по-прежнему гасит план,
+    # не дожидаясь кнопки.
+    if _tg_button_only(manifest):
+        mid_for_lookup = manifest_id or (manifest or {}).get("_tg_manifest_id", "")
+        approval = tg_approval.check_approval(mid_for_lookup)
+        if approval == "approved":
+            # Кнопка нажата, поллер ещё не добрался (интервал ~10 c). НЕ
+            # исполняем здесь и НЕ гасим манифест — иначе поллер найдёт его
+            # уже погашенным и операция не произойдёт вовсе.
+            return ConsentResult(False, _TG_BUTTON_ONLY_APPROVED_MSG)
+        if approval == "rejected":
+            if manifest is not None:
+                manifest["consumed"] = True
+            return ConsentResult(False, "🛑 Отклонено кнопкой в Telegram. План отменён, "
+                                  "ничего не сделано. Чтобы повторить — построй план заново.")
+        if approval == "none":
+            return ConsentResult(False, "🛑 Запрос подтверждения в Telegram не найден или "
+                                  "истёк по TTL. Построй план заново.")
+        return ConsentResult(False, _TG_BUTTON_ONLY_PENDING_MSG)
 
     if not _is_affirmative_reply(user_reply):
-        return ConsentResult(False, _NO_REPLY_INSTRUCTION)
+        return ConsentResult(False,
+                             _consent_refusal_reason(user_reply) or _NO_REPLY_INSTRUCTION)
 
     # Опциональный внеполосный ТГ-фактор (см. tg_approval.py) — ВЫКЛ по
-    # умолчанию (TG_APPROVAL_ENABLED=false) и НЕ задействуется вовсе, если
-    # вызывающий код не передал `tool` (пустая строка = совместимость
-    # побайтово с поведением до этой правки). Встаёт ПОСЛЕ дешёвой проверки
+    # умолчанию (TG_APPROVAL_ENABLED=false). Встаёт ПОСЛЕ дешёвой проверки
     # user_reply, ПЕРЕД таймером/consume — та же позиция, что в gmail-mcp's
     # requireConsent.
-    if tool and tg_approval.enabled_for(_TG_CFG, tool):
+    #
+    # ДВА независимых основания требовать кнопку (2026-08-06):
+    #   (а) манифест ПОМЕЧЕН `tg_notified` — план этой самой операции реально
+    #       ушёл в Telegram (пометку ставит `_maybe_tg_notify_plan` и только
+    #       он). Это ЖЁСТКОЕ, приоритетное основание: оно не зависит от того,
+    #       передал ли конкретный execute-путь аргумент `tool`, — именно
+    #       забытый `tool=` в `execute_task_deletion` делал самую опасную
+    #       операцию недетерминированной (chat-«да» без кнопки исполнял
+    #       удаление по-настоящему);
+    #   (б) старое основание `tool and enabled_for(tool)` — сохранено для
+    #       путей БЕЗ манифеста (inline-🔴), где помечать нечего.
+    # Обратная совместимость: без `TG_APPROVAL_ENABLED=true` пометка не
+    # ставится НИКОГДА и `enabled_for` всегда False → поведение побайтово
+    # прежнее. Пути, чей план в Telegram не уходит (_gate_batch/_gate_single),
+    # намеренно НЕ передают `tool`: иначе `check_approval` вернул бы "none"
+    # (строки-то нет) и тулы отказывали бы навсегда даже на честное «да».
+    #
+    # ЧТО СЮДА ЕЩЁ ДОХОДИТ ПОСЛЕ button-only (блок выше). Планы, у которых
+    # есть авто-исполнитель, до этой строки не добираются вовсе — им текстовый
+    # путь закрыт целиком. Здесь остаются:
+    #   • `delete_project` и слияние в `rename_tag` — помеченные, но НЕ
+    #     авто-исполняемые: кнопка обязательна (иначе "pending"/"none"), а
+    #     исполняет повторный вызов инструмента с «да». Единственные, для кого
+    #     ниже возможен проход при approved;
+    #   • непомеченные манифесты с переданным `tool` (план в Telegram не
+    #     уходил — слой был выключен или тул вне allowlist): здесь
+    #     `check_approval` вернёт "none", то есть отказ, ровно как и раньше.
+    tg_required = bool((manifest or {}).get("tg_notified")) or bool(
+        tool and tg_approval.enabled_for(_TG_CFG, tool))
+    if tg_required:
         approval = tg_approval.check_approval(manifest_id or (manifest or {}).get("_tg_manifest_id", ""))
         if approval == "pending":
             return ConsentResult(False, "⏳ Подтвердите кнопкой в Telegram-боте, затем "
@@ -2608,6 +3340,39 @@ def _prune_manifests() -> None:
         _MANIFESTS.pop(mid, None)
 
 
+# «Надгробия» (tombstones) исполненных манифестов — крошечная память о том,
+# ПОЧЕМУ манифеста больше нет. Нужна ровно для одного человеческого случая:
+# Максим нажал кнопку в Telegram, фоновый поллер (_tg_auto_execute_tick) уже
+# всё исполнил и погасил манифест, а модель следом честно зовёт
+# execute_task_deletion — и раньше получала неотличимое «не найден/истёк/уже
+# исполнен», из которого нельзя понять, удалено ли что-то на самом деле.
+# Хранится только id + причина + время, без содержимого плана; кап на размер,
+# чтобы это не превращалось в утечку памяти.
+_MANIFEST_TOMBSTONES: "collections.OrderedDict[str, Dict]" = collections.OrderedDict()
+_MANIFEST_TOMBSTONE_CAP = 200
+
+
+def _tombstone_manifest(manifest_id: str, reason: str) -> None:
+    _MANIFEST_TOMBSTONES.pop(manifest_id, None)
+    _MANIFEST_TOMBSTONES[manifest_id] = {
+        "reason": reason, "ts": datetime.now(timezone.utc).isoformat()}
+    while len(_MANIFEST_TOMBSTONES) > _MANIFEST_TOMBSTONE_CAP:
+        _MANIFEST_TOMBSTONES.popitem(last=False)
+
+
+def _manifest_gone_msg(manifest_id: str, default: str) -> str:
+    """Внятный ответ вместо общего «не найден/истёк»: различает «уже исполнено
+    по кнопке в Telegram» и «истёк/не существовал»."""
+    t = _MANIFEST_TOMBSTONES.get(manifest_id)
+    if t and t.get("reason") == "tg_auto_executed":
+        return (f"✅ Этот план ({manifest_id}) УЖЕ исполнен — вы подтвердили его "
+                "кнопкой в Telegram, и сервер выполнил его сам "
+                f"({t.get('ts')}). Повторять нечего, ничего не потеряно: отчёт "
+                "об исполнении вписан в то же сообщение Telegram, где были "
+                "кнопки. Для новой операции построй план заново.")
+    return default
+
+
 # ---------------------------------------------------------------------------
 # Shared tier-🟡 gate for the batch-mutation tools (update_tasks/
 # complete_tasks/move_tasks/set_task_parent/set_task_tags/restore_tasks) —
@@ -2647,18 +3412,30 @@ def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
     if manifest_id:
         m = _MANIFESTS.get(manifest_id)
         if not m or m.get("kind") != kind:
-            return _GateOutcome(False, message=(
+            return _GateOutcome(False, message=_manifest_gone_msg(manifest_id, (
                 f"🛑 Манифест {manifest_id} не найден/истёк/уже исполнен. "
                 f"Начни заново: {tool_name}(summary, tasks, ...) без "
-                "manifest_id."))
+                "manifest_id.")))
         stored = m.get("tasks") or []
         ids = [str(t.get("taskId") or t.get("task_id") or "") for t in stored]
         # tier-🟡 per docs/DESIGN_approval_gate.md §5: no anti-duplet gap —
         # only 🔴 tools time-gate plan vs. execute.
+        # `tool=` здесь НАМЕРЕННО не передаётся, хотя с 2026-08-06 план ЭТИХ
+        # тулов тоже уходит в Telegram (см. _maybe_tg_notify_plan в конце
+        # ветки call #1). Причина прежняя: `tool=` включал бы ТГ-проверку
+        # БЕЗУСЛОВНО — в том числе для манифестов, чей план в Telegram по
+        # какой-то причине НЕ ушёл (тул вне TG_APPROVAL_TOOLS, слой выключен),
+        # и тогда check_approval вернул бы "none" → вечный отказ даже на
+        # честное «да». Решает пометка `tg_notified` в САМОМ манифесте: она
+        # стоит тогда и только тогда, когда сообщение с кнопками реально
+        # отправлено — то есть требование кнопки включается ровно вместе с
+        # существованием кнопки.
         cr = _require_consent(action=kind, tier=1, manifest=m,
-                              user_reply=user_reply, object_ids=ids, min_gap=0)
+                              user_reply=user_reply, object_ids=ids, min_gap=0,
+                              manifest_id=manifest_id)
         if not cr.ok:
             return _GateOutcome(False, message=cr.reason)
+        m["consumed"] = True
         return _GateOutcome(True, tasks=stored, summary=m.get("summary") or summary,
                             extra=m.get("extra") or {})
 
@@ -2667,7 +3444,12 @@ def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
     mid = uuid.uuid4().hex[:12]
     now = time.monotonic()
     ids = [str(t.get("taskId") or t.get("task_id") or "") for t in tasks]
-    _MANIFESTS[mid] = {"kind": kind, "tasks": tasks, "summary": summary,
+    # `tool`/`_gate` (2026-08-06) — то, что нужно фоновому TG-поллеру, чтобы
+    # ИСПОЛНИТЬ этот план по нажатию кнопки, не заводя по ручной регистрации
+    # на каждый тул: `tool` даёт имя `_<tool>_impl`, `_gate` — форму вызова
+    # (batch: impl(summary, tasks, **extra)). См. _generic_gate_auto_execute.
+    _MANIFESTS[mid] = {"kind": kind, "tool": tool_name, "_gate": "batch",
+                       "tasks": tasks, "summary": summary,
                        "created": now, "plan_shown_at": now, "consumed": False,
                        "object_hash": _manifest_object_hash(kind, ids),
                        "extra": extra or {}}
@@ -2684,7 +3466,8 @@ def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
         "— НЕ в этом же ходе (сам список tasks можно повторить как есть, на "
         "2-м вызове он игнорируется — используются данные из манифеста). "
         f"Манифест одноразовый, действует {_manifest_ttl_phrase()}.")
-    return _GateOutcome(False, message="\n".join(lines))
+    return _GateOutcome(False, message=_maybe_tg_notify_plan(
+        tool_name, mid, "\n".join(lines)))
 
 
 # ---------------------------------------------------------------------------
@@ -2708,27 +3491,35 @@ def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
     same headless-bypass contract as create_tasks/_gate_batch — see
     references/automation-secrets.md §8), then the STORED params (never call
     #2's own arguments) are handed back via `.extra` — same no-swap contract
-    as _gate_batch. No object_hash/binding here (mirrors plan_task_creation,
-    which also skips it
-    for brand-new objects that don't exist yet to re-hash against).
+    as _gate_batch. The stored `object_hash` here is a hash of the PARAMS
+    (_manifest_params_hash) — there is no list of object ids to bind to (many
+    of these tools create brand-new objects that don't exist yet). It is NOT
+    consulted on the chat path: _require_consent only compares object_hash
+    when the caller passes `object_ids`, and this gate never does. It exists
+    for the Telegram-button path, whose auto-executor re-hashes the manifest
+    before touching anything and would otherwise skip that check entirely.
 
-    NOTE on one-shot: unlike _gate_batch (which relies on _require_consent
-    alone and — a pre-existing gap found while building this — never actually
-    flips `consumed` to True on the SUCCESS path, so a batch tool's manifest
-    is only "accidentally" one-shot when a retry happens to also trip its
-    identity-guard), this function marks `consumed = True` itself right here,
-    matching docs/DESIGN_approval_gate.md §4.3.3 item 4 ("after success,
-    consumed = True") literally."""
+    NOTE on one-shot: this function marks `consumed = True` itself right
+    here on the SUCCESS path, matching docs/DESIGN_approval_gate.md §4.3.3
+    item 4 ("after success, consumed = True") literally. _gate_batch does
+    the same — see its own SUCCESS-path branch — so both functions are
+    genuinely one-shot on their own, not just "accidentally" so via a retry
+    that happens to also trip the identity-guard."""
     _prune_manifests()
     if manifest_id:
         m = _MANIFESTS.get(manifest_id)
         if not m or m.get("kind") != kind:
-            return _GateOutcome(False, message=(
+            return _GateOutcome(False, message=_manifest_gone_msg(manifest_id, (
                 f"🛑 Манифест {manifest_id} не найден/истёк/уже исполнен. "
-                f"Начни заново: {tool_name}(...) без manifest_id."))
+                f"Начни заново: {tool_name}(...) без manifest_id.")))
+        # `tool=` не передаётся по той же причине, что и в _gate_batch выше:
+        # ТГ-фактор включает пометка `tg_notified` в самом манифесте (её
+        # ставит _maybe_tg_notify_plan только при реально отправленном
+        # сообщении с кнопками), а не аргумент этого вызова.
         cr = _require_consent(action=kind, tier=1, manifest=m,
                               user_reply=user_reply, min_gap=0,
-                              automation_key=automation_key)
+                              automation_key=automation_key,
+                              manifest_id=manifest_id)
         if not cr.ok:
             return _GateOutcome(False, message=cr.reason)
         m["consumed"] = True
@@ -2738,8 +3529,17 @@ def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
         return _GateOutcome(False, message="Нечего делать — пустые параметры.")
     mid = uuid.uuid4().hex[:12]
     now = time.monotonic()
-    _MANIFESTS[mid] = {"kind": kind, "params": params, "created": now,
-                       "plan_shown_at": now, "consumed": False}
+    # `tool`/`_gate` — см. тот же комментарий в _gate_batch (single:
+    # impl(**params)). `object_hash` здесь считается по ПАРАМЕТРАМ
+    # (_manifest_params_hash): у single-плана нет списка id объектов, но
+    # авто-исполнению по TG-кнопке всё равно нужна привязка к тому, ЧТО
+    # именно было показано человеку. На чат-путь это не влияет —
+    # `_require_consent` сверяет object_hash только когда ему передан
+    # `object_ids`, а этот гейт его не передаёт.
+    _MANIFESTS[mid] = {"kind": kind, "tool": tool_name, "_gate": "single",
+                       "params": params, "created": now,
+                       "plan_shown_at": now, "consumed": False,
+                       "object_hash": _manifest_params_hash(kind, params)}
     lines = [f"### 📋 План — {describe_fn(params)}",
              f"_Манифест `{mid}` · ничего ещё не изменено_", "",
              "Покажи это пользователю дословно и ДОЖДИСЬ его отдельного "
@@ -2750,7 +3550,8 @@ def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
              "повторить как есть, на 2-м вызове они игнорируются — "
              "используются данные из манифеста). Манифест одноразовый, "
              f"действует {_manifest_ttl_phrase()}."]
-    return _GateOutcome(False, message="\n".join(lines))
+    return _GateOutcome(False, message=_maybe_tg_notify_plan(
+        tool_name, mid, "\n".join(lines)))
 
 
 @mcp.tool(annotations=READONLY)
@@ -2782,6 +3583,12 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
     independent outcome check.
 
     Nothing is deleted by this tool. Manifests are one-shot and expire in 1 h.
+
+    TELEGRAM CONFIRMATION LAYER (optional, off by default): when it is on this
+    plan ALSO goes to the owner as a message with ✅/🛑 buttons, and ✅ makes
+    the SERVER delete on its own (background poller), reporting into that same
+    message. Then do NOT call execute_task_deletion at all — for such a plan
+    the text path is closed and every call is refused.
 
     Args:
         summary: one-line human sentence (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
@@ -2893,12 +3700,22 @@ async def execute_task_deletion(manifest_id: str, user_reply: str = "") -> str:
     user's VERBATIM last chat message, given ONLY after they actually saw the
     plan and replied — do not paraphrase, summarize, or invent it, and do not
     call this in the same turn where you printed the plan. The server checks
-    it's a genuine affirmative reply (not a negation, not empty, not you
-    echoing back manifest jargon), enforces a minimum gap since the plan was
-    shown, and consumes the manifest once. Every item is also re-verified
+    the reply looks like a human affirmative — not empty, no negation anywhere
+    in the sentence, not manifest jargon echoed back, not a partial "yes" with
+    a caveat («ок, кроме последней»: the manifest is applied whole or not at
+    all), not a paraphrase of the user («пользователь: да») — enforces a
+    minimum gap since the plan was shown, and consumes the manifest once. It
+    cannot tell a genuine «да» from a made-up one; the only out-of-band factor
+    is the Telegram button, when enabled. Every item is also re-verified
     against live state (renamed since planning → skipped); full task
     snapshots are appended to the deletion journal before the delete; the
     effect is post-verified against fresh state.
+
+    TELEGRAM CONFIRMATION LAYER (optional, off by default): when the plan was
+    announced there, the text path is CLOSED for it — this call is refused
+    whatever `user_reply` says. Pressing ✅ makes the SERVER delete on its own
+    (background poller) and write the report into that same message; there is
+    nothing for you to do afterwards.
 
     Args:
         manifest_id: id returned by plan_task_deletion
@@ -2910,11 +3727,20 @@ async def execute_task_deletion(manifest_id: str, user_reply: str = "") -> str:
     _prune_manifests()
     m = _MANIFESTS.get(manifest_id)
     if not m or m.get("kind") != "delete":
-        return (f"🛑 Манифест удаления {manifest_id} не найден/истёк/уже "
-                "исполнен. Сначала plan_task_deletion.")
+        return _manifest_gone_msg(
+            manifest_id,
+            f"🛑 Манифест удаления {manifest_id} не найден/истёк/уже "
+            "исполнен. Сначала plan_task_deletion.")
+    # tool=/manifest_id= ОБЯЗАТЕЛЬНЫ здесь (2026-08-06): без них
+    # `_require_consent` молча пропускал ТГ-фактор целиком, и то же самое
+    # удаление, что через `delete_tasks` требовало кнопку, здесь исполнялось
+    # по одному лишь chat-«да». Имя тула — то, под которым план анонсирован в
+    # Telegram (`plan_task_deletion` шлёт его как "delete_tasks", тот же ключ
+    # в `_AUTO_EXECUTORS`/`TG_APPROVAL_TOOLS`), а не имя этой функции.
     cr = _require_consent(action="delete", tier=2, manifest=m,
                           user_reply=user_reply,
-                          object_ids=[it["taskId"] for it in m["items"]])
+                          object_ids=[it["taskId"] for it in m["items"]],
+                          tool="delete_tasks", manifest_id=manifest_id)
     if not cr.ok:
         return cr.reason
     return await _execute_task_deletion_impl(manifest_id, m)
@@ -3035,8 +3861,16 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
 
 
 def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
-                 names: Dict) -> str:
-    """One verdict line for one journaled item, judged from CURRENT live state."""
+                 names: Dict) -> Tuple[str, str]:
+    """Один вердикт по одной записи из журнала, по ТЕКУЩЕМУ живому состоянию.
+
+    Возвращает (status, line): status — строго одно из "ok"/"warn"/"bad", и
+    ЭТО ЕДИНСТВЕННОЕ, по чему вызывающий код имеет право считать статистику
+    (см. _build_operation_report). Статус НИКОГДА не восстанавливается заново
+    парсингом эмодзи в начале `line` — именно так раньше терялись расхождения
+    с пометкой ⚠️ (баг «расхождений: 0» при 4 напечатанных пунктах). Каждый
+    return ниже явно указывает статус рядом со строкой, к которой он относится.
+    """
     tid = item.get("taskId")
     title = item.get("title") or (item.get("snapshot") or {}).get("title") \
         or f"[task {str(tid)[:8]}…]"
@@ -3044,16 +3878,30 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
     exp = item.get("expect") or {}
 
     if op == "delete":
-        return (f"- ❌ **«{title}»** — ВСЁ ЕЩЁ существует (удаление не состоялось "
-                "или восстановлена)" if live else f"- ✅ **«{title}»** — удалена")
+        return (("bad", f"- ❌ **«{title}»** — ВСЁ ЕЩЁ существует (удаление не "
+                 "состоялось или восстановлена)") if live else
+                ("ok", f"- ✅ **«{title}»** — удалена"))
     if op == "restore":
-        return (f"- ✅ **«{title}»** — снова среди открытых" if live else
-                f"- ❌ **«{title}»** — НЕ появилась среди открытых "
-                "(восстановление не подтвердилось)")
+        # Сведение двух правок (fix/qa-c-report + fix/qa-e-restore):
+        # C перевёл ВСЕ ветки на явный кортеж (status, line) — статус больше
+        # никогда не восстанавливается парсингом эмодзи; E добавил сюда
+        # сверку проекта назначения (задача может вернуться из корзины, но
+        # не в тот список). Проверка E сохранена целиком, в контракте C:
+        # «вернулась, но не туда» — это именно ⚠️/"warn", то самое
+        # расхождение, потеря которого и была багом «расхождений: 0».
+        if not live:
+            return ("bad", f"- ❌ **«{title}»** — НЕ появилась среди открытых "
+                    "(восстановление не подтвердилось)")
+        want_pid = exp.get("projectId")
+        if want_pid and live.get("projectId") != want_pid:
+            return ("warn", f"- ⚠️ **«{title}»** — среди открытых, но в «"
+                    f"{names.get(live.get('projectId'), live.get('projectId'))}»"
+                    f", а не в «{names.get(want_pid, want_pid)}» (не тот список)")
+        return ("ok", f"- ✅ **«{title}»** — снова среди открытых, в нужном списке")
     if op in ("complete", "abandon"):
         verb = "закрыта" if op == "complete" else "отмечена «не буду делать»"
-        return (f"- ❌ **«{title}»** — всё ещё среди открытых" if live
-                else f"- ✅ **«{title}»** — {verb} (ушла из открытых)")
+        return (("bad", f"- ❌ **«{title}»** — всё ещё среди открытых") if live
+                else ("ok", f"- ✅ **«{title}»** — {verb} (ушла из открытых)"))
     if op == "delete_project":
         # tid here is the PROJECT id, not a task id. Re-fetch fresh via the
         # None-distinguishing helper rather than trusting the `names` dict
@@ -3061,15 +3909,16 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         # "project confirmed deleted".
         fresh_names = _v2_project_names_or_none()
         if fresh_names is None:
-            return (f"- ⚠️ **«{title}»** — проект: проверка не удалась (не "
-                    "получилось перечитать список проектов), исход НЕ "
+            return ("warn", f"- ⚠️ **«{title}»** — проект: проверка не удалась "
+                    "(не получилось перечитать список проектов), исход НЕ "
                     "ПОДТВЕРЖДЁН")
         still = fresh_names.get(tid)
-        return (f"- ❌ **«{title}»** — проект ВСЁ ЕЩЁ существует (удаление не "
-                "подтвердилось)" if still else
-                f"- ✅ **«{title}»** — проект удалён")
+        return (("bad", f"- ❌ **«{title}»** — проект ВСЁ ЕЩЁ существует "
+                 "(удаление не подтвердилось)") if still else
+                ("ok", f"- ✅ **«{title}»** — проект удалён"))
     if live is None:
-        return f"- ❌ **«{title}»** — не найдена среди открытых (ожидалась живой)"
+        return ("bad", f"- ❌ **«{title}»** — не найдена среди открытых "
+                "(ожидалась живой)")
     if op == "create":
         probs = []
         want_pid = exp.get("projectId")
@@ -3079,7 +3928,8 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         if exp.get("columnId") and live.get("columnId") != exp.get("columnId"):
             probs.append("раздел не применился")
         if probs:
-            return f"- ⚠️ **«{title}»** — создана, но: " + "; ".join(probs)
+            return ("warn", f"- ⚠️ **«{title}»** — создана, но: "
+                    + "; ".join(probs))
         # State the FACTS, not agreement-with-intent: the reader must SEE where
         # it landed, so a wrong-but-consistent request is still visible.
         facts = [f"в «{names.get(live.get('projectId'), live.get('projectId'))}»"]
@@ -3089,29 +3939,30 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
             facts.append(f"срок {str(live['dueDate'])[:10]}")
         if live.get("priority"):
             facts.append(f"приоритет {PRIORITY_MAP.get(live['priority'], live['priority'])}")
-        return f"- ✅ **«{title}»** — создана {', '.join(facts)}"
+        return ("ok", f"- ✅ **«{title}»** — создана {', '.join(facts)}")
     if op == "move":
         want = exp.get("projectId")
-        return (f"- ✅ **«{title}»** — в **«{names.get(want, want)}»**"
+        return (("ok", f"- ✅ **«{title}»** — в **«{names.get(want, want)}»**")
                 if live.get("projectId") == want else
-                f"- ❌ **«{title}»** — осталась в «{names.get(live.get('projectId'), '?')}»")
+                ("bad", f"- ❌ **«{title}»** — осталась в «{names.get(live.get('projectId'), '?')}»"))
     if op == "tags":
         want = set(exp.get("tags") or [])
         got = set(live.get("tags") or [])
-        return (f"- ✅ **«{title}»** — теги {sorted(got)}" if want == got else
-                f"- ❌ **«{title}»** — теги {sorted(got)}, ожидались {sorted(want)}")
+        return (("ok", f"- ✅ **«{title}»** — теги {sorted(got)}") if want == got
+                else ("bad", f"- ❌ **«{title}»** — теги {sorted(got)}, "
+                      f"ожидались {sorted(want)}"))
     if op == "parent":
         want = exp.get("parentId")  # None = detached
         got = live.get("parentId")
         # A parentId "applied" toward a parent that is NOT itself alive among
         # open tasks is an orphaning, not a success — check the parent too.
         if want and want not in live_map:
-            return (f"- ❌ **«{title}»** — родитель {str(want)[:8]}… НЕ среди "
-                    "открытых задач (вложение под несуществующего/закрытого "
-                    "родителя)")
+            return ("bad", f"- ❌ **«{title}»** — родитель {str(want)[:8]}… НЕ "
+                    "среди открытых задач (вложение под несуществующего/"
+                    "закрытого родителя)")
         ok = (got == want) if want else not got
-        return (f"- ✅ **«{title}»** — родитель применён" if ok else
-                f"- ❌ **«{title}»** — parentId={got!r}, ожидался {want!r}")
+        return (("ok", f"- ✅ **«{title}»** — родитель применён") if ok else
+                ("bad", f"- ❌ **«{title}»** — parentId={got!r}, ожидался {want!r}"))
     if op == "update":
         changes = exp.get("changes") or {}
         diffs = []
@@ -3126,9 +3977,15 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
                     diffs.append(f"tags: {got} ≠ {want}")
             elif got != want:
                 diffs.append(f"{field}: {got!r} ≠ {want!r}")
-        return (f"- ❌ **«{title}»** — не применилось: " + "; ".join(diffs)) if diffs \
-            else f"- ✅ **«{title}»** — все изменения на месте"
-    return f"- ✓ **«{title}»** — записана в журнал (тип {op} не проверяется автоматически)"
+        return (("bad", f"- ❌ **«{title}»** — не применилось: " + "; ".join(diffs))
+                if diffs else ("ok", f"- ✅ **«{title}»** — все изменения на месте"))
+    # Тип операции без выделенного проверятеля: автоматически НЕ проверяется —
+    # это предупреждение, а не молчаливый успех, и должно считаться как такое.
+    # Также: ASCII-символ "✓" запрещён как статусный маркер замороженной
+    # легендой (output-format.md §7.2) — используем ⚠️, как и в остальных
+    # случаях «не проверено».
+    return ("warn", f"- ⚠️ **«{title}»** — записана в журнал (тип {op} не "
+            "проверяется автоматически)")
 
 
 @mcp.tool(annotations=READONLY)
@@ -3194,7 +4051,16 @@ def _build_operation_report(record_id: str) -> str:
             pass
         lines = [f"### 🧾 Независимый отчёт — `{record_id}`",
                  f"_{when} · журнал операции ⇄ живое состояние TickTick_", ""]
-        ok = bad = 0
+        # Единый источник истины: каждый вердикт сначала собирается сюда, в
+        # виде пары (status, напечатанная_строка). И строки, печатаемые ниже,
+        # и итоговый подсчёт дальше — оба выведены из ЭТОГО ЖЕ списка, а не
+        # из отдельного счётчика, заново распознающего эмодзи в тексте. Это
+        # структурно исключает расхождение между напечатанными пунктами и
+        # строкой «Итог» (именно так раньше получалось «0 расхождений» рядом
+        # с 4 явными пунктами ⚠️ — эти пункты начинались с ⚠️, а старый
+        # счётчик по первым символам строки его не распознавал, поэтому
+        # пункт печатался, но никогда не учитывался).
+        verdicts: List[Tuple[str, str]] = []
         for rec in records:
             op = rec.get("op") or "delete"
             items = rec.get("items") or [
@@ -3202,17 +4068,23 @@ def _build_operation_report(record_id: str) -> str:
                 for s in rec.get("deleted", [])
             ]
             for item in items:
-                line = _verify_item(op, item, live, names)
-                lines.append(line)
-                # Verdict lines are markdown bullets ("- ✅ **«…»**"), so match
-                # the mark anywhere in the prefix, not at line start.
-                head = line[:8]
-                if "✅" in head:
-                    ok += 1
-                elif "❌" in head:
-                    bad += 1
+                verdicts.append(_verify_item(op, item, live, names))
+        lines.extend(line for _, line in verdicts)
+        ok = sum(1 for status, _ in verdicts if status == "ok")
+        warn = sum(1 for status, _ in verdicts if status == "warn")
+        bad = sum(1 for status, _ in verdicts if status == "bad")
         lines.append("")
-        lines.append(f"**Итог: ✅ {ok} подтверждено, ❌ {bad} расхождений.**")
+        lines.append(f"**Итог: ✅ {ok} подтверждено, ⚠️ {warn} не проверено, "
+                      f"❌ {bad} расхождений.**")
+        # Явный, однозначный общий вердикт для headless/программных
+        # потребителей (например, бота tg-ai-assistant) — они не должны
+        # прочитать отчёт с хотя бы одним расхождением или непроверенным
+        # пунктом как успех.
+        overall = "❌" if bad else ("⚠️" if warn else "✅")
+        tail = ("есть расхождения — это НЕ успех." if bad else
+                "есть непроверенные пункты — это НЕ полный успех." if warn else
+                "всё подтверждено.")
+        lines.append(f"**Статус операции: {overall}** — {tail}")
         lines.append("[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО — "
                      "это серверная проверка, не заменяй её своим пересказом]")
         return "\n".join(lines)
@@ -4780,6 +5652,15 @@ async def create_project(
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_official()
     if err:
@@ -4838,6 +5719,28 @@ async def _create_project_impl(name: str, color: str = "#F18181",
 _PROJECT_DELETE_SAMPLE_CAP = 20  # preview lines shown before the confirm echo
 
 
+def _find_live_inline_manifest(kind: str, key: str) -> Tuple[str, Optional[Dict]]:
+    """Самый свежий ЖИВОЙ манифест данного `kind` с совпадающим `key`.
+
+    Нужна тулам, которые исторически были ОДНОХОДОВЫМИ (delete_project,
+    rename_tag): у них нет параметра `manifest_id`, который можно было бы
+    вернуть модели и получить обратно вторым вызовом, — публичная сигнатура
+    менялась бы, а старые вызовы ломались. Поэтому «план» и «исполнение»
+    здесь по-прежнему различаются наличием `user_reply`, а связь между двумя
+    вызовами держится на естественном ключе объекта (id проекта / пара имён
+    тега). Возвращает ("", None), когда живого плана нет, — тогда вызывающий
+    ведёт себя ровно как до появления манифестов (manifest=None).
+    """
+    _prune_manifests()
+    best_id, best = "", None
+    for mid, m in _MANIFESTS.items():
+        if m.get("kind") != kind or m.get("consumed") or m.get("key") != key:
+            continue
+        if best is None or (m.get("created") or 0) > (best.get("created") or 0):
+            best_id, best = mid, m
+    return best_id, best
+
+
 @mcp.tool()
 async def delete_project(project_name: str, project_id: str, user_reply: str = "") -> str:
     """
@@ -4854,6 +5757,15 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
     The count is re-read fresh on EVERY call (nothing cached from the first
     call), so the project having changed in between is naturally reflected
     rather than deleting against a stale count.
+
+    TELEGRAM CONFIRMATION LAYER (optional, off by default): with it on, the
+    1st call ALSO makes this server send the plan to the owner as a Telegram
+    message with [✅ Подтвердить]/[🛑 Отклонить] buttons — the server's own
+    out-of-band second factor, not an external relay. In that mode the TEXT
+    path is CLOSED: the 2nd call is refused however genuine `user_reply` is,
+    before the press and after it alike. Pressing ✅ makes the SERVER delete
+    the project on its own (background poller) and report into that same
+    message; a press of "🛑 Отклонить" kills the plan outright.
 
     Args:
         project_name: Name of the project (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
@@ -4888,8 +5800,39 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
     tasks = data.get('tasks') or []
     count = len(tasks)
 
-    cr = _require_consent(action="delete_project", tier=2, manifest=None,
-                          user_reply=user_reply)
+    # Двухфазность через МАНИФЕСТ (2026-08-06). Раньше здесь стояло
+    # `manifest=None` и не передавался `tool=` — то есть удаление ЦЕЛОГО
+    # проекта (самая крупная воронка на сервере: каскадом уходят все его
+    # задачи) было единственной 🔴-операцией ВНЕ Telegram-контура: план
+    # владельцу не уходил, кнопка не требовалась. Просто дописать `tool=`
+    # было нельзя — без отправленного плана строки в `tg_approvals` не
+    # существует, `check_approval` вернул бы "none", и тул отказывал бы
+    # ВСЕГДА при включённом слое. Поэтому фаза плана теперь заводит
+    # настоящий манифест и зовёт `_maybe_tg_notify_plan`, а фаза исполнения
+    # сверяется с ним; `tool=` намеренно НЕ передаётся — основанием требовать
+    # кнопку служит пометка `tg_notified` на самом манифесте, которая
+    # появляется ровно тогда, когда план реально ушёл.
+    #
+    # Публичная сигнатура тула не изменилась: фазы по-прежнему различаются
+    # наличием `user_reply`, связь между вызовами — по id проекта.
+    mid, m = _find_live_inline_manifest("delete_project", project_id)
+    cr = _require_consent(action="delete_project", tier=2, manifest=m,
+                          user_reply=user_reply,
+                          object_ids=[project_id] if m is not None else None,
+                          manifest_id=mid,
+                          # min_gap=0 — сознательно: до появления манифеста
+                          # этот тул анти-дуплетного таймера не имел, и
+                          # включать его заодно значило бы менять поведение
+                          # при выключенном ТГ-слое (запрещено).
+                          min_gap=0)
+    if cr.ok and m is None and tg_approval.enabled_for(_TG_CFG, "delete_project"):
+        # Дыра, которую иначе оставила бы связка «нет манифеста → manifest=
+        # None → ТГ-фактор не требуется»: модель могла позвать тул СРАЗУ с
+        # user_reply="да", без первой фазы, и удалить проект в обход кнопки
+        # при формально включённом слое. Лечится не отказом (это был бы тот
+        # самый «отказывает всегда»), а откатом к ФАЗЕ ПЛАНА: ниже строится
+        # манифест и уходит сообщение с кнопками.
+        cr = ConsentResult(False, "")
     if not cr.ok:
         lines = [f"⚠️ Проект «{live_name}» содержит {count} задач(и) — при "
                  "удалении проекта TickTick удалит их ВМЕСТЕ с ним, "
@@ -4900,22 +5843,60 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
             if count > _PROJECT_DELETE_SAMPLE_CAP:
                 lines.append(f"... и ещё {count - _PROJECT_DELETE_SAMPLE_CAP}.")
             lines.append("")
-        if _is_negative_reply(user_reply):
+        if _is_negative_reply(user_reply) or m is not None:
+            # Отказ человека — план и так аннулирован внутри _require_consent.
+            # m is not None — план УЖЕ существует (и, возможно, уже отправлен
+            # в Telegram): второй раз слать то же самое сообщение нельзя,
+            # показываем причину отказа поверх свежего пересчёта.
             lines.append(cr.reason)
-        else:
-            lines.append(
-                "Ничего не удалено. Покажи это пользователю дословно и "
-                "ДОЖДИСЬ его отдельного ответа (не отвечай за него). Когда "
-                "он явно согласится, вызови "
-                f'delete_project(project_name="{live_name}", '
-                f'project_id="{project_id}", '
-                'user_reply="<дословная реплика пользователя>") — НЕ в этом '
-                'же ходе.')
-        return "\n".join(lines)
+            return "\n".join(lines)
+        lines.append(
+            "Ничего не удалено. Покажи это пользователю дословно и "
+            "ДОЖДИСЬ его отдельного ответа (не отвечай за него). Когда "
+            "он явно согласится, вызови "
+            f'delete_project(project_name="{live_name}", '
+            f'project_id="{project_id}", '
+            'user_reply="<дословная реплика пользователя>") — НЕ в этом '
+            'же ходе.')
+        new_mid = uuid.uuid4().hex[:12]
+        now = time.monotonic()
+        _MANIFESTS[new_mid] = {
+            "kind": "delete_project", "key": project_id,
+            "project_id": project_id, "project_name": live_name,
+            "count": count, "created": now, "plan_shown_at": now,
+            "summary": f"Удаление проекта «{live_name}» ({count} задач)",
+            "consumed": False, "tool": "delete_project",
+            "_gate": "delete_project",
+            "object_hash": _manifest_object_hash("delete_project", [project_id])}
+        return _maybe_tg_notify_plan("delete_project", new_mid, "\n".join(lines))
 
-    # Confirmed — journal a pre-delete snapshot of the project AND every
-    # contained task BEFORE the actual delete call, same convention as
-    # delete_tasks/execute_task_deletion (snapshot first, mutate second).
+    if m is not None:
+        m["consumed"] = True  # one-shot: план сгорел вместе с исполнением
+
+    return await _delete_project_impl(project_id, live_name, tasks)
+
+
+async def _delete_project_impl(project_id: str, project_name: str,
+                               tasks: List[Dict[str, Any]]) -> str:
+    """Само удаление проекта, БЕЗ гейта — согласие к этому моменту уже
+    получено вызывающим (`delete_project` после `_require_consent`, либо
+    фоновый поллер по нажатой кнопке через `_auto_execute_delete_project`).
+
+    Вынесена 2026-08-06 вместе с button-only: до этого тело мутации жило
+    прямо в теле тула, из-за чего нажатие кнопки на плане удаления ПРОЕКТА
+    не приводило ни к чему (поллеру нечего было позвать), и операцию можно
+    было завершить только вторым текстовым вызовом. С закрытым текстовым
+    путём это означало бы «кнопка есть, а исполнить нечем» — поэтому обе
+    половины (исполнитель + регистрация) едут вместе.
+
+    `tasks` — содержимое проекта, прочитанное вызывающим (нужно для журнала
+    и для счётчика в отчёте); функция сама в TickTick за ним не ходит, чтобы
+    оба пути журналировали ровно то, что было показано человеку/поллеру."""
+    live_name = project_name
+    count = len(tasks)
+    # Journal a pre-delete snapshot of the project AND every contained task
+    # BEFORE the actual delete call, same convention as delete_tasks/
+    # execute_task_deletion (snapshot first, mutate second).
     record_id = "delete_project-" + uuid.uuid4().hex[:8]
     snap_fields = ("title", "content", "desc", "dueDate", "startDate",
                    "priority", "tags", "parentId", "isAllDay")
@@ -5571,6 +6552,15 @@ async def create_subtask(
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_official()
     if err:
@@ -5597,9 +6587,14 @@ async def _create_subtask_impl(parent_task_title: str, subtask_title: str,
                                content: str = None, priority: int = 0) -> str:
     """Pure mutation logic for create_subtask — no consent gate. Called only
     by the gated create_subtask() above once the plan is approved."""
+    # Fetch live state ONCE — reused for the identity guard AND the depth
+    # check below (both must see the same snapshot).
+    by_id = _open_by_id(fresh=True)
+    if by_id is None:
+        return _STATE_UNAVAILABLE_MSG
     # Identity guard on the PARENT: a stale parent_task_id would attach the new
     # subtask under a different task (or a dead one) while reporting success.
-    g = _guard_task(parent_task_id, parent_task_title or "", project_id)
+    g = _guard_task(parent_task_id, parent_task_title or "", project_id, by_id=by_id)
     if g.status == "unavailable":
         return g.message
     if g.status == "mismatch":
@@ -5608,6 +6603,18 @@ async def _create_subtask_impl(parent_task_title: str, subtask_title: str,
     if g.status == "missing":
         return (f"🛑 НЕ создал подзадачу — родитель «{parent_task_title}» не "
                 "среди открытых задач (завершён/удалён/неверный id). Ничего не тронул.")
+    # Depth guard: TickTick supports at most MAX_TASK_NEST_LEVELS total levels
+    # counting from the root task — see MAX_TASK_NEST_LEVELS above for the
+    # source. Computed from the LIVE parentId chain, not from anything the
+    # caller claims.
+    parent_level = _task_level(parent_task_id, by_id)
+    new_level = parent_level + 1
+    if new_level > MAX_TASK_NEST_LEVELS:
+        return (f"🛑 НЕ создал подзадачу — «{g.title or parent_task_title}» "
+                f"уже на уровне {parent_level} из {MAX_TASK_NEST_LEVELS} "
+                "(считая от корневой задачи), новая подзадача оказалась бы "
+                f"на уровне {new_level}. TickTick не поддерживает вложенность "
+                f"глубже {MAX_TASK_NEST_LEVELS} уровней. Ничего не тронул.")
     # The subtask must live in the parent's REAL project.
     project_id = g.project_id or project_id
     try:
@@ -5775,6 +6782,15 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]] = None,
         to_project_name: Destination list name (shown in the dialog)
         manifest_id: from call #1's response — pass on call #2 to actually move
         user_reply: the user's literal reply approving the plan — required on call #2
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -5945,6 +6961,15 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
         manifest_id: from call #1's response — pass on call #2 to actually record
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -6155,6 +7180,15 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
         parent_task_title: Title of the parent (shown in the dialog)
         manifest_id: from call #1's response — pass on call #2 to actually nest
         user_reply: the user's literal reply approving the plan — required on call #2
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -6206,8 +7240,14 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
         while cur and cur not in ancestors:
             ancestors.add(cur)
             cur = (by_id.get(cur) or {}).get("parentId")
+        # Depth guard: the parent's own live level (root = 1) plus however
+        # many levels the task being nested ALREADY spans below itself (it
+        # may already have its own subtasks, which move with it) must not
+        # exceed TickTick's real cap — see MAX_TASK_NEST_LEVELS above.
+        parent_level = len(ancestors)
+        children_of = _children_index(by_id)
         found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
-        rows, cycle_refused, cross_refused = [], [], []
+        rows, cycle_refused, cross_refused, depth_refused = [], [], [], []
         ok_items = []
         for f in found:
             if f["taskId"] in ancestors:
@@ -6216,6 +7256,15 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
             if f["projectId"] and f["projectId"] != parent_pid:
                 cross_refused.append(
                     f"«{f['title']}» (в «{_v2_project_names().get(f['projectId'], f['projectId'])}»)")
+                continue
+            height = _subtree_height(f["taskId"], children_of)
+            resulting_level = parent_level + height
+            if resulting_level > MAX_TASK_NEST_LEVELS:
+                extra = (f" (у неё уже есть свои подзадачи на {height - 1} "
+                         "уровень(ей) вниз)" if height > 1 else "")
+                depth_refused.append(
+                    f"«{f['title']}»{extra}: получилось бы "
+                    f"{resulting_level} из {MAX_TASK_NEST_LEVELS} уровней")
                 continue
             # Each child's OWN live projectId — never stamp the parent's onto
             # a row TickTick would reject or corrupt.
@@ -6254,6 +7303,11 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
             lines.append(f"🛑 НЕ вложено {len(cross_refused)} — задачи в ДРУГОМ "
                          f"проекте, а родитель в «{_v2_project_names().get(parent_pid, parent_pid)}». "
                          "Сначала перенеси move_tasks: " + ", ".join(cross_refused))
+        if depth_refused:
+            lines.append(f"🛑 НЕ вложено {len(depth_refused)} — TickTick не "
+                         f"поддерживает вложенность глубже {MAX_TASK_NEST_LEVELS} "
+                         "уровней (считая от корневой задачи): "
+                         + "; ".join(depth_refused))
         if failed:
             extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
             lines.append(f"❌ НЕ вложено {len(failed)} (parentId не применился"
@@ -6311,6 +7365,15 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
         manifest_id: from call #1's response — pass on call #2 to actually detach
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -6385,6 +7448,12 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
 
     Call #1 (manifest_id omitted): builds a one-shot manifest from `tasks`
     and returns a preview of the new tags per task — nothing is changed yet.
+    Any tag that doesn't exist in the account yet is flagged in the preview
+    as "будет создан" (will be created): TickTick keeps tags in two places —
+    the account's own tag list and a raw label on the task — so a brand-new
+    name is registered in the account's tag list FIRST (same path as
+    create_tag), then applied to the task(s). This avoids creating an orphan
+    tag that's invisible to list_tags and undeletable via delete_tag.
     Call #2 (after the user actually replied): repeat the call with
     manifest_id=<id from call #1> and user_reply=<the user's literal last
     message> — `tasks` is ignored on this call (the manifest's own stored
@@ -6404,13 +7473,55 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
             #1, ignored on call #2
         manifest_id: from call #1's response — pass on call #2 to actually retag
         user_reply: the user's literal reply approving the plan — required on call #2
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
         return err
+    # Preview-time only (call #1, non-empty tasks): flag tags that don't
+    # exist yet, so the user sees "will be created" BEFORE approving, not
+    # just after the fact. Skipped on call #2 and on an empty/missing
+    # `tasks` — _gate_batch refuses those without needing a tag lookup.
+    #
+    # Чтение живого списка тегов здесь — best-effort, и ронять фазу ПЛАНА оно
+    # не имеет права: план обязан строиться, даже когда живое состояние
+    # недоступно (клиент не поднят, сеть легла). Это НЕ ослабление
+    # fail-closed: пометка «тег будет создан» — информационная, а настоящая
+    # защита от тега-сироты стоит в _set_task_tags_impl, где отсутствующий
+    # тег регистрируется в аккаунте ПЕРЕД записью на задачу — и там
+    # недоступность состояния уже честно останавливает операцию.
+    existing_tags: set = set()
+    if not manifest_id and tasks:
+        try:
+            existing_tags = set(await _live_tag_names(force=True))
+        except Exception as e:
+            logger.warning(f"set_task_tags: не удалось прочитать список тегов "
+                           f"для превью плана ({e}) — пометка «будет создан» "
+                           "в этом плане не показывается")
+
+    def _describe_tags(t: Dict) -> str:
+        wanted = t.get("tags") or []
+        parts = []
+        for tag in wanted:
+            bare = tag.lstrip("#").lower()
+            if bare and bare not in existing_tags:
+                parts.append(f"{tag} (тег не существует — будет создан)")
+            else:
+                parts.append(tag)
+        return (f"**«{t.get('title') or t.get('taskId')}»** → теги: "
+                + (", ".join(parts) or "(пусто)"))
+
     outcome = _gate_batch(
         "tags", "set_task_tags", tasks, summary, manifest_id, user_reply,
-        lambda t: f"**«{t.get('title') or t.get('taskId')}»** → теги: {', '.join(t.get('tags') or []) or '(пусто)'}")
+        _describe_tags)
     if not outcome.proceed:
         return outcome.message
     return await _set_task_tags_impl(outcome.summary, outcome.tasks)
@@ -6434,12 +7545,60 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                     "tags": [x.lstrip("#").lower() for x in (t.get("tags") or [])]}
                    for t in tasks
                    if (t.get("taskId") or t.get("task_id")) in ok]
+
+        # TickTick keeps tags in TWO places: the account's tag list
+        # (/batch/tag — what list_tags/create_tag/delete_tag see) and a raw
+        # label string on each task (/batch/task). Writing a brand-new label
+        # straight onto a task WITHOUT registering it in the account tag list
+        # first creates an ORPHAN tag: invisible to list_tags, undeletable via
+        # delete_tag, but still attached to the task. So: register every
+        # not-yet-existing tag through the same account-level path create_tag
+        # uses, BEFORE touching any task — and post-verify the registration
+        # itself, not just assume the 200 meant it worked.
+        requested = sorted({t for c in changes for t in c["tags"] if t})
+        # force=False: _open_by_id(fresh=True) just above already forced a
+        # fresh sync-state fetch (tags included) within the TTL window — no
+        # need for a second network round-trip for the same snapshot.
+        existing_tags = set(await _live_tag_names(force=False))
+        to_register = [t for t in requested if t not in existing_tags]
+        for tag_name in to_register:
+            try:
+                await _run_blocking(lambda tn=tag_name: ticktick_v2.create_tag(tn))
+            except Exception as e:
+                logger.error(
+                    f"set_task_tags: auto-registration of tag '{tag_name}' "
+                    f"raised: {e}")
+        after_create = (set(await _live_tag_names(force=True))
+                        if to_register else existing_tags)
+        registered = [t for t in to_register if t in after_create]
+        failed_register = [t for t in to_register if t not in after_create]
+
+        # Fail closed for exactly the tags that couldn't be registered: drop
+        # the WHOLE per-task change rather than send a truncated tag list —
+        # set_task_tags REPLACES all tags on a task, so silently stripping
+        # just the bad tag from a change could wipe tags the user never
+        # asked to touch. The task is left completely untouched instead.
+        skipped_tasks = []
+        if failed_register:
+            bad_set = set(failed_register)
+            kept = []
+            for c in changes:
+                bad = set(c["tags"]) & bad_set
+                if bad:
+                    skipped_tasks.append((ok[c["taskId"]]["title"], sorted(bad)))
+                else:
+                    kept.append(c)
+            changes = kept
+
         api_fail = {}
         if changes:
             resp = await _run_blocking(
                 lambda: ticktick_v2.batch_update_tasks(changes))
             api_fail = id2error_failures(resp, [c["taskId"] for c in changes])
-        # Inline post-verify: live tags must equal the requested set.
+        # Inline post-verify: live tags must equal the requested set, AND any
+        # newly-registered tag must be visible in the account's own tag list
+        # (list_tags) — this is the proof that (b) actually closed the
+        # orphan hole, not just moved it.
         tags_by_id = {c["taskId"]: c["tags"] for c in changes}
         applied, failed = [], []
         unverified = False
@@ -6449,6 +7608,8 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                 unverified = True
             else:
                 for f in found:
+                    if f["taskId"] not in tags_by_id:
+                        continue  # skipped above — never sent, don't verify
                     want = set(tags_by_id.get(f["taskId"], []))
                     got = set((fresh.get(f["taskId"]) or {}).get("tags") or [])
                     ok_item = want == got and f["taskId"] not in api_fail
@@ -6457,6 +7618,22 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
         if applied:
             lines.append(f"🏷 Теги обновлены у {len(applied)} (проверено): "
                          + ", ".join(f"«{t}»" for t in applied))
+        if registered:
+            lines.append(
+                f"🆕 Новые теги зарегистрированы в аккаунте (проверено — видны "
+                f"в list_tags, удаляются delete_tag), {len(registered)}: "
+                + ", ".join(f"«{t}»" for t in registered))
+        if failed_register:
+            lines.append(
+                f"⚠️ Не удалось зарегистрировать в аккаунте {len(failed_register)} "
+                "тег(ов) — они НЕ проставлены ни на одну задачу (во избежание "
+                "тега-сироты): " + ", ".join(f"«{t}»" for t in failed_register))
+        if skipped_tasks:
+            parts = "; ".join(
+                f"«{title}» (тег{'и' if len(bad) > 1 else ''} "
+                + ", ".join(f"«{b}»" for b in bad) + ")"
+                for title, bad in skipped_tasks)
+            lines.append(f"🛑 Пропущено, задачи НЕ тронуты, {len(skipped_tasks)}: " + parts)
         if unverified:
             lines.append(f"Отправлено {len(changes)}, но {_UNVERIFIED_MSG}")
         if failed:
@@ -6473,7 +7650,7 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
             rid = _op_journal("tags", [
                 {"taskId": f["taskId"], "title": f["title"],
                  "expect": {"tags": tags_by_id.get(f["taskId"], [])}}
-                for f in found], summary)
+                for f in found if f["taskId"] in tags_by_id], summary)
             lines.append(_report_line(rid))
         return "\n".join(lines) if lines else "Ничего не изменено."
     except Exception as e:
@@ -6619,6 +7796,15 @@ async def create_project_group(name: str, manifest_id: str = "",
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -6687,6 +7873,15 @@ async def delete_project_group(group_name: str, group_id: str,
         manifest_id: from call #1's response — pass on call #2 to actually delete
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -6763,6 +7958,15 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
         manifest_id: from call #1's response — pass on call #2 to actually move
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -6888,6 +8092,15 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
         manifest_id: from call #1's response — pass on call #2 to actually add
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -7006,9 +8219,22 @@ async def restore_tasks(summary: str, tasks: List[Dict[str, str]] = None,
             on call #1, ignored on call #2. Get IDs/titles from get_trash.
         to_project_id: Optional destination list for all tasks; defaults to
             each task's original list — required (if used) on call #1,
-            ignored on call #2
+            ignored on call #2. Either way, the destination is verified
+            against the live task after restoring (TickTick's restore call
+            can silently drop it to Inbox) and auto-corrected with one
+            follow-up move if it missed; a mismatch that survives that is
+            reported, never hidden as success.
         manifest_id: from call #1's response — pass on call #2 to actually restore
         user_reply: the user's literal reply approving the plan — required on call #2
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -7055,7 +8281,17 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
             if not _names_agree(exp, real):
                 mismatch.append(f"«{exp}» → в корзине по этому id «{real}»")
                 continue
-            ok_items.append({"taskId": tid, "title": exp or real})
+            # Ожидаемый пункт назначения: явный override побеждает; иначе —
+            # СОБСТВЕННЫЙ исходный список задачи из записи в корзине (то, что
+            # обещает докстринг: «defaults to each task's original list»).
+            # Считаем это ЗДЕСЬ, из уже имеющегося снимка корзины, чтобы
+            # post-verify ниже реально мог это сверить, а не слепо доверять,
+            # что вызов восстановления сам всё сделал правильно.
+            orig_pid = (entry.get("projectId") or entry.get("projectID")
+                       or entry.get("listId"))
+            want_pid = to_project_id or orig_pid
+            ok_items.append({"taskId": tid, "title": exp or real,
+                             "want_pid": want_pid})
         if mismatch:
             return ("🛑 НЕ восстановил — id НЕ совпал с названием в корзине "
                     "(защита от «не той задачи»): " + "; ".join(mismatch)
@@ -7065,25 +8301,87 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
             resp = await _run_blocking(lambda: ticktick_v2.batch_restore_tasks(
                 [i["taskId"] for i in ok_items], to_project_id))
             api_fail = id2error_failures(resp, [i["taskId"] for i in ok_items])
-        # Post-verify: restored tasks must reappear among OPEN tasks.
-        restored, failed = [], []
+        # Post-verify: восстановленные задачи ДОЛЖНЫ снова появиться среди
+        # ОТКРЫТЫХ и ДОЛЖНЫ оказаться в ожидаемом проекте. Замечено, что
+        # /trash/restore у TickTick теряет пункт назначения и кидает задачу
+        # в Inbox независимо от переданного projectId — поэтому «снова среди
+        # открытых» САМО ПО СЕБЕ не доказательство того, что обещание
+        # докстринга («original list») выполнилось. Проект сверяется явно,
+        # и если он не совпал — чинится одним явным дополнительным
+        # перемещением (тем же вызовом, что использует move_tasks), прежде
+        # чем результат уходит в отчёт. Расхождение, пережившее и этот
+        # фикс, идёт в вывод как расхождение — никогда молча как успех.
+        names = _v2_project_names()
+        restored, unknown_dest, failed = [], [], []
+        wrong_project = []  # [(title, want_pid, got_pid)] — так и не туда даже после фикса
         unverified = False
         if ok_items:
             fresh = _open_by_id(fresh=True)
             if fresh is None:
                 unverified = True
             else:
+                to_fix = []
                 for i in ok_items:
-                    ok = i["taskId"] in fresh and i["taskId"] not in api_fail
-                    (restored if ok else failed).append(i["title"])
+                    live = fresh.get(i["taskId"])
+                    if live is None or i["taskId"] in api_fail:
+                        failed.append(i["title"])
+                    elif not i["want_pid"]:
+                        # Не удалось определить исходный список из записи в
+                        # корзине — честно сказать об этом, а не молча
+                        # засчитать как успех, который на деле не проверен.
+                        unknown_dest.append(i["title"])
+                    elif live.get("projectId") != i["want_pid"]:
+                        to_fix.append(i)
+                    else:
+                        restored.append(i["title"])
+                if to_fix:
+                    fix_by_pid: Dict[str, List[str]] = {}
+                    for i in to_fix:
+                        fix_by_pid.setdefault(i["want_pid"], []).append(i["taskId"])
+                    fix_api_fail: Dict[str, str] = {}
+                    for pid, ids in fix_by_pid.items():
+                        try:
+                            mresp = await _run_blocking(
+                                lambda pid=pid, ids=ids:
+                                    ticktick_v2.batch_move_tasks(ids, pid))
+                            fix_api_fail.update(id2error_failures(mresp, ids))
+                        except Exception as e:
+                            logger.error("restore_tasks: corrective move to "
+                                        f"{pid} failed: {e}")
+                            for tid2 in ids:
+                                fix_api_fail.setdefault(tid2, str(e))
+                    fresh2 = _open_by_id(fresh=True)
+                    for i in to_fix:
+                        live2 = (fresh2 or {}).get(i["taskId"])
+                        if (fresh2 is not None and live2 is not None
+                                and i["taskId"] not in fix_api_fail
+                                and live2.get("projectId") == i["want_pid"]):
+                            restored.append(i["title"])
+                        elif fresh2 is None:
+                            unverified = True
+                        else:
+                            got = (live2 or {}).get("projectId")
+                            wrong_project.append((i["title"], i["want_pid"], got))
         lines = []
         if restored:
             lines.append(f"↩ Восстановлено из корзины {len(restored)} "
-                         "(проверено — снова среди открытых): "
-                         + ", ".join(f"«{t}»" for t in restored))
+                         "(проверено — снова среди открытых, в нужном "
+                         "списке): " + ", ".join(f"«{t}»" for t in restored))
         if unverified:
             lines.append(f"Восстановление {len(ok_items)} отправлено, но "
                          f"{_UNVERIFIED_MSG}")
+        if wrong_project:
+            parts = [f"«{t}» — попала в «{names.get(got, got)}», а не в "
+                    f"«{names.get(want, want)}» (восстановилась не туда, и "
+                    "попытка переместить в нужный список не помогла)"
+                    for t, want, got in wrong_project]
+            lines.append("⚠️ Восстановлено НЕ в исходный/запрошенный список "
+                        f"{len(wrong_project)}: " + "; ".join(parts))
+        if unknown_dest:
+            lines.append(f"⚠️ Восстановлено {len(unknown_dest)}, но исходный "
+                        "список не удалось определить из записи в корзине — "
+                        "куда реально попали, не проверено: "
+                        + ", ".join(f"«{t}»" for t in unknown_dest))
         if failed:
             extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
             lines.append(f"❌ НЕ восстановлено {len(failed)} (не появились среди "
@@ -7093,7 +8391,10 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
             lines.append(f"↷ Не найдены в корзине {len(absent)}: "
                          + ", ".join(f"«{t}»" for t in absent))
         if ok_items:
-            rid = _op_journal("restore", ok_items, summary)
+            rid = _op_journal("restore", [
+                {"taskId": i["taskId"], "title": i["title"],
+                 "expect": {"projectId": i["want_pid"]}} for i in ok_items
+            ], summary)
             lines.append(_report_line(rid))
         return "\n".join(lines) if lines else "Ничего не восстановлено."
     except Exception as e:
@@ -7142,6 +8443,15 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
         manifest_id: from call #1's response — pass on call #2 to actually attach
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -7438,16 +8748,55 @@ async def get_attachment_download_url(task_id: str, project_id: str = None,
         return f"Error building download link: {str(e)}"
 
 
+def _describe_create_attachment_upload_url(p: Dict) -> str:
+    # НИ ОДНОГО фрагмента будущей ссылки/токена здесь быть не может: токен
+    # подписывается только в `_impl`, уже ПОСЛЕ подтверждения. Иначе пропуск
+    # утёк бы в превью (и в сообщение Telegram) ещё до согласия человека.
+    name = p.get("filename") or "файл без имени"
+    return (f'Выдаю ссылку на загрузку «{name}» в задачу {p.get("task_id")} '
+            f'(действует {_clamp_link_ttl(p.get("ttl_minutes"))} мин; по ней '
+            'кто угодно сможет положить файл в аккаунт)')
+
+
+# ГЕЙТОВАН (аудит 2026-08-06, пересмотр прежнего «намеренно без гейта»). Гейт
+# стоит не за то, что тул ДЕЛАЕТ, а за то, что он ВРУЧАЕТ: маршрут PUT
+# /ul/{token} публичен и проверяет ровно одно — подпись токена
+# (_verify_attachment_token), ни заголовка, ни куки, ни MCP_SECRET предъявлять
+# не нужно, а пишет в TickTick сам сервер сессией владельца. Токен при этом
+# многоразовый (ни nonce, ни реестра использованных) и живёт до
+# ATTACHMENT_LINK_TTL_MAX_MIN=120 минут, то есть это предъявительский пропуск
+# на запись в аккаунт. Прежний довод «модель не может сделать raw PUT»
+# ограничивает интерфейс, а не возможности: агент с оболочкой шлёт обычный
+# HTTP-запрос, а сам тул печатает готовую команду curl. Выдача ссылки —
+# единственный момент, когда сервер вообще способен спросить человека.
 @mcp.tool()
 async def create_attachment_upload_url(task_id: str, project_id: str = None,
                                        filename: str = None,
                                        size_bytes: int = None,
-                                       ttl_minutes: int = 15) -> str:
+                                       ttl_minutes: int = 15,
+                                       manifest_id: str = "", user_reply: str = "",
+                                       automation_key: str = "") -> str:
     """
     Create a temporary upload LINK that puts a file onto a task (requires v2
     API) without the file passing through this conversation. Counterpart of
     get_attachment_download_url; use it when the file is large or simply not in
-    Claude's hands — e.g. it sits on the user's phone or on a server.
+    Claude's hands — e.g. it sits on the user's phone or on a server. Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — NO link is
+    handed out on call #1 (the link is a bearer write-capability into the
+    owner's account, so it is minted only after the approval).
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — no token is signed yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
 
     HONEST LIMITATION: an MCP client (Claude) cannot use this link itself — it
     cannot make raw PUT requests. The link is for a HUMAN with a browser/phone
@@ -7468,6 +8817,18 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
         size_bytes: Expected file size, if known (checked against the 20 MB cap
             up front so the user isn't told "too big" only after uploading)
         ttl_minutes: How long the link stays valid, 1-120 (default 15)
+        manifest_id: from call #1's response — pass on call #2 to actually get the link
+        user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -7480,6 +8841,28 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
     if size_bytes and size_bytes > ATTACHMENT_MAX_BYTES:
         return (f"Файл {size_bytes // (1024*1024)} МБ — TickTick принимает "
                 f"максимум {ATTACHMENT_MAX_BYTES // (1024*1024)} МБ. Ссылку не делаю.")
+    params = {"task_id": task_id, "project_id": project_id,
+              "filename": filename, "ttl_minutes": ttl_minutes}
+    outcome = _gate_single("create_attachment_upload_url",
+                           "create_attachment_upload_url",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply,
+                           _describe_create_attachment_upload_url,
+                           automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _create_attachment_upload_url_impl(**outcome.extra)
+
+
+async def _create_attachment_upload_url_impl(task_id: str, project_id: str = None,
+                                             filename: str = None,
+                                             ttl_minutes: int = 15) -> str:
+    """Mints the actual bearer upload link — no consent gate. Called only by
+    the gated create_attachment_upload_url() above once the plan is approved
+    (or by the Telegram-button auto-executor, which replays the same params)."""
+    base = _public_base_url()
+    if not base:
+        return _NO_PUBLIC_URL_MSG
     try:
         pid = project_id or _resolve_project_id(task_id, project_id)
         if not pid:
@@ -7540,6 +8923,15 @@ async def create_tag(name: str, color: str = None, manifest_id: str = "",
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -7592,6 +8984,17 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
     judgement, without user_reply, is NOT sufficient — don't fabricate the
     reply.
 
+    TELEGRAM CONFIRMATION LAYER (optional, off by default) — merge branch
+    only: the refusal that describes the merge is ALSO sent by this server to
+    the owner in Telegram, as a message with [✅ Подтвердить]/[🛑 Отклонить]
+    buttons; that is the server's own second factor, not an external relay
+    wrapped around MCP. In that mode the TEXT path is CLOSED: repeating the
+    call with allow_merge=true and a genuine `user_reply` is refused whether
+    or not the button was pressed. Pressing ✅ makes the SERVER merge the tags
+    on its own (background poller) and report into that same message. The
+    plain-rename branch (no existing target tag) is not gated at all and never
+    notifies.
+
     Args:
         old_name: current tag name
         new_name: new tag name
@@ -7612,38 +9015,139 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
                     f"(возможно опечатка; похожие: {near}). Ничего не тронул.")
         will_merge = new_name.lower() in existing
         if will_merge:
+            # Тот же перевод на манифест, что у delete_project (2026-08-06):
+            # раньше здесь стоял inline-🔴 (`manifest=None`) без `tool=`, и
+            # необратимое слияние тегов оставалось вне Telegram-контура.
+            # Дописать один `tool=` было нельзя — плана в Telegram нет,
+            # `check_approval` вернул бы "none" и тул отказывал бы ВСЕГДА при
+            # включённом слое. Ключ связи двух вызовов — пара имён тегов;
+            # публичная сигнатура не тронута.
+            key = f"{old_name.lower()}→{new_name.lower()}"
+            mid, m = _find_live_inline_manifest("rename_tag_merge", key)
             cr = _require_consent(action="rename_tag_merge", tier=2,
-                                  manifest=None, user_reply=user_reply)
+                                  manifest=m, user_reply=user_reply,
+                                  object_ids=([old_name.lower(), new_name.lower()]
+                                              if m is not None else None),
+                                  manifest_id=mid,
+                                  # см. delete_project: анти-дуплетного
+                                  # таймера у этой ветки не было — не вводим
+                                  # его вместе с манифестом.
+                                  min_gap=0)
+            if cr.ok and m is None and tg_approval.enabled_for(_TG_CFG, "rename_tag"):
+                # см. тот же комментарий в delete_project: без этого вызов
+                # сразу с allow_merge=true + user_reply="да" слил бы теги в
+                # обход кнопки при включённом слое. Откатываемся к фазе
+                # плана, а не отказываем навсегда.
+                cr = ConsentResult(False, "")
             if not (allow_merge and cr.ok):
-                return (f"🛑 Тег «{new_name}» уже существует — это будет СЛИЯНИЕ "
-                        f"тегов «{old_name}» и «{new_name}» (необратимо: какие "
-                        "задачи носили какой тег — потеряется). Покажи это "
-                        "пользователю дословно и, ТОЛЬКО после его явного "
-                        "согласия, повтори с allow_merge=true и "
-                        "user_reply=<дословная реплика пользователя>. Ничего "
-                        "не тронул." + ("" if cr.ok else f" ({cr.reason})"))
-        await _run_blocking(lambda: ticktick_v2.rename_tag(old_name, new_name))
-        # Post-verify against a fresh tag list.
-        after = await _live_tag_names()
-        if old_name.lower() in after:
-            return (f"❌ Тег «{old_name}» ВСЁ ЕЩЁ существует — переименование "
-                    "не сработало.")
-        if new_name.lower() not in after:
-            return (f"❌ Тега «{new_name}» нет после переименования — исход "
-                    "не подтверждён, проверь вручную.")
-        merged = " (слито с существующим)" if allow_merge and new_name.lower() in existing else ""
-        return f"Tag '{old_name}' renamed to '{new_name}' (проверено){merged}."
+                msg = (f"🛑 Тег «{new_name}» уже существует — это будет СЛИЯНИЕ "
+                       f"тегов «{old_name}» и «{new_name}» (необратимо: какие "
+                       "задачи носили какой тег — потеряется). Покажи это "
+                       "пользователю дословно и, ТОЛЬКО после его явного "
+                       "согласия, повтори с allow_merge=true и "
+                       "user_reply=<дословная реплика пользователя>. Ничего "
+                       "не тронул." + (f" ({cr.reason})"
+                                       if (not cr.ok and cr.reason) else ""))
+                if m is not None or _is_negative_reply(user_reply):
+                    # План уже есть (возможно, уже висит кнопкой в Telegram)
+                    # либо человек отказался — второй раз не шлём.
+                    return msg
+                new_mid = uuid.uuid4().hex[:12]
+                now = time.monotonic()
+                _MANIFESTS[new_mid] = {
+                    "kind": "rename_tag_merge", "key": key,
+                    "old_name": old_name, "new_name": new_name,
+                    "created": now, "plan_shown_at": now,
+                    "summary": f"Слияние тегов «{old_name}» → «{new_name}»",
+                    "consumed": False, "tool": "rename_tag",
+                    "_gate": "rename_tag_merge",
+                    "object_hash": _manifest_object_hash(
+                        "rename_tag_merge",
+                        [old_name.lower(), new_name.lower()])}
+                return _maybe_tg_notify_plan("rename_tag", new_mid, msg)
+            if m is not None:
+                m["consumed"] = True  # one-shot
+        return await _rename_tag_impl(old_name, new_name,
+                                      merged=bool(allow_merge and will_merge))
     except Exception as e:
         logger.error(f"Error in rename_tag: {e}")
         return f"Error renaming tag: {str(e)}"
 
 
+async def _rename_tag_impl(old_name: str, new_name: str,
+                           merged: bool = False) -> str:
+    """Само переименование/слияние тега, БЕЗ гейта — согласие уже получено
+    вызывающим (`rename_tag` после `_require_consent` в merge-ветке, обычное
+    переименование гейта не имеет вовсе, либо фоновый поллер по нажатой
+    кнопке через `_auto_execute_rename_tag`).
+
+    Вынесена 2026-08-06 по той же причине, что и `_delete_project_impl`: без
+    неё нажатие кнопки на плане СЛИЯНИЯ тегов не приводило ни к чему."""
+    await _run_blocking(lambda: ticktick_v2.rename_tag(old_name, new_name))
+    # Post-verify against a fresh tag list.
+    after = await _live_tag_names()
+    if old_name.lower() in after:
+        return (f"❌ Тег «{old_name}» ВСЁ ЕЩЁ существует — переименование "
+                "не сработало.")
+    if new_name.lower() not in after:
+        return (f"❌ Тега «{new_name}» нет после переименования — исход "
+                "не подтверждён, проверь вручную.")
+    note = " (слито с существующим)" if merged else ""
+    return f"Tag '{old_name}' renamed to '{new_name}' (проверено){note}."
+
+
+# Конфликт слияния 2026-08-06, разрешён сохранением ОБЕИХ сторон: эта ветка
+# добавляла сюда `_rename_tag_impl` (исполнитель для кнопки), а пришедшая из
+# #12 — `_describe_delete_tag` (описатель плана удаления тега). Обе нужны и
+# друг с другом никак не связаны — совпало только место вставки, сразу после
+# `rename_tag`.
+def _describe_delete_tag(p: Dict) -> str:
+    return f'Удаляю тег «{p.get("name")}»'
+
+
 @mcp.tool()
-async def delete_tag(name: str) -> str:
-    """Delete a tag (requires v2 API). Tasks keep existing; they just lose the tag."""
+async def delete_tag(name: str, manifest_id: str = "", user_reply: str = "",
+                     automation_key: str = "") -> str:
+    """
+    Delete a tag (requires v2 API). Tasks keep existing; they just lose the
+    tag. Gated 🟡 (docs/DESIGN_approval_gate.md): two calls, same tool name —
+    nothing is deleted on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is deleted yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — name is ignored on this
+    call (the manifest's own stored value is used). Do NOT make call #2 in
+    the same turn as call #1.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
+    Args:
+        name: Tag name (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
+        manifest_id: from call #1's response — pass on call #2 to actually delete
+        user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+    """
     err = _ensure_ready()
     if err:
         return err
+    params = {"name": name}
+    outcome = _gate_single("delete_tag", "delete_tag",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_delete_tag,
+                           automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _delete_tag_impl(**outcome.extra)
+
+
+async def _delete_tag_impl(name: str) -> str:
+    """Pure mutation logic for delete_tag — no consent gate. Called only by
+    the gated delete_tag() above once the plan is approved."""
     try:
         existing = await _live_tag_names()
         if name.lower() not in existing:
@@ -7670,10 +9174,40 @@ async def delete_tag(name: str) -> str:
 # Won't-do / duplicate (v2)
 # ---------------------------------------------------------------------------
 
+def _describe_abandon_task(p: Dict) -> str:
+    return p.get("summary") or (
+        f'Отмечаю «не буду делать» задачу «{p.get("task_title") or p.get("task_id")}»')
+
+
 @mcp.tool()
-async def abandon_task(summary: str, task_id: str, task_title: str = None) -> str:
+async def abandon_task(summary: str, task_id: str, task_title: str = None,
+                       manifest_id: str = "", user_reply: str = "",
+                       automation_key: str = "") -> str:
     """
-    Mark a task as 'Won't do' (requires v2 API).
+    Mark a task as 'Won't do' (requires v2 API). Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    marked on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is changed yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
+
+    When this server's Telegram approval layer is enabled, call #1 ALSO sends
+    the plan to the owner as a Telegram message carrying «✅ Подтвердить» /
+    «🛑 Отклонить» buttons, and pressing «✅ Подтвердить» makes THIS server
+    run the operation itself (a background poller executes the stored
+    manifest and reports back into the same Telegram message) — no external
+    relay is involved. In that mode a text user_reply alone is NOT enough:
+    without the button press call #2 is refused and nothing is changed.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
     at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Отмечаю «не буду делать»
@@ -7683,10 +9217,27 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None) -> st
         summary: Human-readable confirmation line (see above)
         task_id: ID of the task
         task_title: Title of the task (optional but recommended)
+        manifest_id: from call #1's response — pass on call #2 to actually mark it
+        user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
         return err
+    params = {"summary": summary, "task_id": task_id, "task_title": task_title}
+    outcome = _gate_single("abandon_task", "abandon_task",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_abandon_task,
+                           automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _abandon_task_impl(**outcome.extra)
+
+
+async def _abandon_task_impl(summary: str, task_id: str,
+                             task_title: str = None) -> str:
+    """Pure mutation logic for abandon_task — no consent gate. Called only by
+    the gated abandon_task() above once the plan is approved."""
     title = task_title or _lookup_task_title(task_id)
     g = _guard_task(task_id, task_title or "")
     if g.status == "unavailable":
@@ -7750,6 +9301,15 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
         manifest_id: from call #1's response — pass on call #2 to actually duplicate
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -7842,6 +9402,15 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
         manifest_id: from call #1's response — pass on call #2 to actually edit
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -7889,20 +9458,59 @@ async def _update_task_comment_impl(task_title: str, text: str, project_id: str,
         return f"Error updating comment: {str(e)}"
 
 
+def _describe_delete_task_comment(p: Dict) -> str:
+    return f'Удаляю комментарий на «{p.get("task_title")}»'
+
+
 @mcp.tool()
-async def delete_task_comment(task_title: str, project_id: str, task_id: str, comment_id: str) -> str:
+async def delete_task_comment(task_title: str, project_id: str, task_id: str,
+                              comment_id: str, manifest_id: str = "",
+                              user_reply: str = "", automation_key: str = "") -> str:
     """
-    Delete a task comment (requires v2 API).
+    Delete a task comment (requires v2 API). Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    deleted on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is deleted yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
 
     Args:
         task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         project_id: ID of the project
         task_id: ID of the task
         comment_id: ID of the comment to delete
+        manifest_id: from call #1's response — pass on call #2 to actually delete
+        user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
         return err
+    params = {"task_title": task_title, "project_id": project_id,
+              "task_id": task_id, "comment_id": comment_id}
+    outcome = _gate_single("delete_task_comment", "delete_task_comment",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_delete_task_comment,
+                           automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _delete_task_comment_impl(**outcome.extra)
+
+
+async def _delete_task_comment_impl(task_title: str, project_id: str,
+                                    task_id: str, comment_id: str) -> str:
+    """Pure mutation logic for delete_task_comment — no consent gate. Called
+    only by the gated delete_task_comment() above once the plan is approved."""
     try:
         g = _guard_task(task_id, task_title or "", project_id)
         if g.status == "unavailable":
@@ -7934,11 +9542,48 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str, co
 # Project update / archive
 # ---------------------------------------------------------------------------
 
+def _describe_update_project(p: Dict) -> str:
+    changes = []
+    if p.get("name") is not None:
+        changes.append(f'имя → «{p.get("name")}»')
+    if p.get("color") is not None:
+        changes.append(f'цвет → {p.get("color")}')
+    if p.get("view_mode") is not None:
+        changes.append(f'вид → {p.get("view_mode")}')
+    return (f'Обновляю проект «{p.get("project_name")}»: '
+            + (", ".join(changes) or "без изменений"))
+
+
 @mcp.tool()
 async def update_project(project_name: str, project_id: str, name: str = None,
-                         color: str = None, view_mode: str = None) -> str:
+                         color: str = None, view_mode: str = None,
+                         manifest_id: str = "", user_reply: str = "",
+                         automation_key: str = "") -> str:
     """
     Update a project's name, color, or view mode (uses the official API).
+    Gated 🟡 (docs/DESIGN_approval_gate.md): two calls, same tool name —
+    nothing is updated on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is changed yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
+
+    When this server's Telegram approval layer is enabled, call #1 ALSO sends
+    the plan to the owner as a Telegram message carrying «✅ Подтвердить» /
+    «🛑 Отклонить» buttons, and pressing «✅ Подтвердить» makes THIS server
+    run the operation itself (a background poller executes the stored
+    manifest and reports back into the same Telegram message) — no external
+    relay is involved. In that mode a text user_reply alone is NOT enough:
+    without the button press call #2 is refused and nothing is changed.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
 
     Args:
         project_name: Current name of the project (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
@@ -7946,20 +9591,43 @@ async def update_project(project_name: str, project_id: str, name: str = None,
         name: New name (optional)
         color: New color hex like '#F18181' (optional)
         view_mode: 'list', 'kanban', or 'timeline' (optional)
+        manifest_id: from call #1's response — pass on call #2 to actually update
+        user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_official()
     if err:
         return err
-    if name is None and color is None and view_mode is None:
-        return ("🛑 Нечего менять — все поля (name/color/view_mode) пусты. "
-                "Ничего не тронул.")
-    for label, val in (("name", name), ("color", color), ("view_mode", view_mode)):
-        if val is not None and not str(val).strip():
-            return (f"🛑 Пустая строка в поле {label} — клиент молча выбросил бы "
-                    "её и изменение не применилось бы. Передай значение или "
-                    "убери поле. Ничего не тронул.")
-    if view_mode is not None and view_mode not in ("list", "kanban", "timeline"):
-        return "Invalid view_mode. Must be one of: list, kanban, timeline."
+    if not manifest_id:
+        # Cheap, purely local sanity checks — kept BEFORE the gate so an
+        # obviously broken request is refused without ever building a plan.
+        # (They only look at the arguments; no network.)
+        if name is None and color is None and view_mode is None:
+            return ("🛑 Нечего менять — все поля (name/color/view_mode) пусты. "
+                    "Ничего не тронул.")
+        for label, val in (("name", name), ("color", color), ("view_mode", view_mode)):
+            if val is not None and not str(val).strip():
+                return (f"🛑 Пустая строка в поле {label} — клиент молча выбросил бы "
+                        "её и изменение не применилось бы. Передай значение или "
+                        "убери поле. Ничего не тронул.")
+        if view_mode is not None and view_mode not in ("list", "kanban", "timeline"):
+            return "Invalid view_mode. Must be one of: list, kanban, timeline."
+    params = {"project_name": project_name, "project_id": project_id,
+              "name": name, "color": color, "view_mode": view_mode}
+    outcome = _gate_single("update_project", "update_project",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_update_project,
+                           automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _update_project_impl(**outcome.extra)
+
+
+async def _update_project_impl(project_name: str, project_id: str,
+                               name: str = None, color: str = None,
+                               view_mode: str = None) -> str:
+    """Pure mutation logic for update_project — no consent gate. Called only
+    by the gated update_project() above once the plan is approved."""
     refuse = _guard_project(project_id, project_name, fresh=True,
                             require_known=True)
     if refuse:
@@ -8006,19 +9674,67 @@ async def update_project(project_name: str, project_id: str, name: str = None,
                 f"⚠️ {_UNVERIFIED_MSG} ({e})")
 
 
+def _describe_archive_project(p: Dict) -> str:
+    verb = "Архивирую" if p.get("archived", True) else "Разархивирую"
+    return f'{verb} проект «{p.get("project_name")}»'
+
+
 @mcp.tool()
-async def archive_project(project_name: str, project_id: str, archived: bool = True) -> str:
+async def archive_project(project_name: str, project_id: str, archived: bool = True,
+                          manifest_id: str = "", user_reply: str = "",
+                          automation_key: str = "") -> str:
     """
-    Archive (close) or unarchive a project (requires v2 API).
+    Archive (close) or unarchive a project (requires v2 API). Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    archived on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is changed yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
+
+    When this server's Telegram approval layer is enabled, call #1 ALSO sends
+    the plan to the owner as a Telegram message carrying «✅ Подтвердить» /
+    «🛑 Отклонить» buttons, and pressing «✅ Подтвердить» makes THIS server
+    run the operation itself (a background poller executes the stored
+    manifest and reports back into the same Telegram message) — no external
+    relay is involved. In that mode a text user_reply alone is NOT enough:
+    without the button press call #2 is refused and nothing is changed.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
 
     Args:
         project_name: Name of the project (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         project_id: ID of the project
         archived: True to archive, False to restore it to active
+        manifest_id: from call #1's response — pass on call #2 to actually archive
+        user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
         return err
+    params = {"project_name": project_name, "project_id": project_id,
+              "archived": archived}
+    outcome = _gate_single("archive_project", "archive_project",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_archive_project,
+                           automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _archive_project_impl(**outcome.extra)
+
+
+async def _archive_project_impl(project_name: str, project_id: str,
+                                archived: bool = True) -> str:
+    """Pure mutation logic for archive_project — no consent gate. Called only
+    by the gated archive_project() above once the plan is approved."""
     if archived:
         # Archiving pulls the project out of the sync pool — destructive-
         # adjacent, so verify FRESH and fail closed on an unresolvable id.
@@ -8718,6 +10434,15 @@ async def create_project_column(project_id: str, name: str,
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -8776,8 +10501,10 @@ async def _create_project_column_impl(project_id: str, name: str,
 # runAutoExecutePoller. See tg_approval.py's block comment above
 # try_auto_execute() for the architectural difference (in-memory _MANIFESTS
 # here vs. one shared Postgres on the TS side) and why the candidate search
-# below (walk _MANIFESTS, ask tg_approval.check_approval per id) is a
-# per-item probe rather than a single SQL JOIN.
+# below cannot be one SQL JOIN: the manifests simply aren't in Postgres. It is
+# still ONE round-trip per pass, not one per manifest — the RAM walk collects
+# the live ids, and tg_approval.get_tg_approvals() reads all their approval
+# rows in a single `WHERE manifest_id = ANY(...)` query (2026-08-06).
 # ---------------------------------------------------------------------------
 
 class _AutoExecutorEntry:
@@ -8820,7 +10547,86 @@ async def _auto_execute_declutter(manifest_id: str, m: Dict) -> str:
     return await _execute_declutter_ram_impl(manifest_id, m)
 
 
+def _rehash_create_manifest(m: Dict) -> str:
+    """Пересчёт binding-хэша манифеста создания при нажатии кнопки. Зовёт
+    РОВНО ту же `_create_object_hash`, что и plan_task_creation, — не
+    «повторяет формулу», а буквально ту же функцию, поэтому побайтовое
+    совпадение гарантировано конструкцией, а не аккуратностью."""
+    return _create_object_hash(m.get("raw") or [])
+
+
+async def _auto_execute_create_tasks(manifest_id: str, m: Dict) -> str:
+    # Страховка от чужого манифеста с таким же kind: этот исполнитель умеет
+    # распаковывать ТОЛЬКО форму, которую кладёт plan_task_creation
+    # (summary + raw). Манифест на этот момент уже погашен вызывающим, так
+    # что «отказ» здесь — это отказ ИСПОЛНЯТЬ, а не тихое исполнение не того.
+    if m.get("_gate") != "create" or "raw" not in m:
+        return ("🛑 Автоисполнение отменено: манифест не в формате плана "
+                "создания задач (kind=create, но нет raw/_gate) — ничего не "
+                "создано. Построй план заново через plan_task_creation.")
+    return await _create_tasks_impl(m.get("summary") or "", m.get("raw") or [])
+
+
+def _rehash_delete_project_manifest(m: Dict) -> str:
+    """Та же формула, что в фазе плана delete_project (см. её `object_hash`)."""
+    return _manifest_object_hash("delete_project", [m.get("project_id") or ""])
+
+
+async def _auto_execute_delete_project(manifest_id: str, m: Dict) -> str:
+    """Исполнение плана удаления ПРОЕКТА по нажатой кнопке (2026-08-06).
+
+    Содержимое проекта перечитывается ЗАНОВО: журнал должен отражать то, что
+    удаляется сейчас, а не снимок часовой давности. Не смогли прочитать —
+    отказ, а не удаление вслепую (та же дисциплина, что на чат-пути)."""
+    project_id = m.get("project_id") or ""
+    name = m.get("project_name") or ""
+    if not project_id:
+        return ("🛑 Автоисполнение отменено: в манифесте нет id проекта — "
+                "ничего не удалено. Построй план заново.")
+    try:
+        data = await _run_blocking(lambda: ticktick.get_project_with_data(project_id))
+    except Exception as e:
+        return (f"🛑 Автоисполнение отменено: не смог прочитать содержимое "
+                f"проекта «{name}» ({e}) — не удаляю вслепую. Ничего не "
+                "изменено, построй план заново.")
+    if isinstance(data, dict) and data.get("error"):
+        return (f"🛑 Автоисполнение отменено: не смог прочитать содержимое "
+                f"проекта «{name}» ({data['error']}) — не удаляю вслепую. "
+                "Ничего не изменено, построй план заново.")
+    return await _delete_project_impl(project_id, name,
+                                      (data or {}).get("tasks") or [])
+
+
+def _rehash_rename_tag_manifest(m: Dict) -> str:
+    """Та же формула, что в merge-ветке rename_tag (её `object_hash`)."""
+    return _manifest_object_hash(
+        "rename_tag_merge",
+        [(m.get("old_name") or "").lower(), (m.get("new_name") or "").lower()])
+
+
+async def _auto_execute_rename_tag(manifest_id: str, m: Dict) -> str:
+    """Исполнение СЛИЯНИЯ тегов по нажатой кнопке (2026-08-06). Кнопка
+    существует только у merge-ветки — обычное переименование гейта не имеет и
+    манифеста не заводит, поэтому `merged=True` здесь всегда верно."""
+    old_name, new_name = m.get("old_name") or "", m.get("new_name") or ""
+    if not (old_name and new_name):
+        return ("🛑 Автоисполнение отменено: в манифесте нет пары имён тегов — "
+                "ничего не изменено. Построй план заново.")
+    return await _rename_tag_impl(old_name, new_name, merged=True)
+
+
 _register_auto_executor("delete_tasks", _rehash_delete_manifest, _auto_execute_delete_tasks)
+_register_auto_executor("create_tasks", _rehash_create_manifest, _auto_execute_create_tasks)
+# 2026-08-06 (button-only): без этих двух регистраций нажатие кнопки на плане
+# удаления ПРОЕКТА и на плане СЛИЯНИЯ тегов не приводило ни к чему — поллеру
+# нечего было позвать, а с закрытым текстовым путём операция стала бы
+# неисполнимой вообще. Их манифесты строятся своим путём (естественный ключ +
+# `_find_live_inline_manifest`), поэтому generic-исполнитель их не подхватывает
+# (он умеет только `_gate` in batch/single) — нужна явная регистрация.
+_register_auto_executor("delete_project", _rehash_delete_project_manifest,
+                        _auto_execute_delete_project)
+_register_auto_executor("rename_tag", _rehash_rename_tag_manifest,
+                        _auto_execute_rename_tag)
 # DISABLED 2026-08-04/05 together with the @mcp.tool() decorators above — the
 # TG-button auto-execute poller (_tg_auto_execute_tick) dispatches through
 # THIS registry directly, bypassing the MCP tool layer entirely. Commenting
@@ -8846,38 +10652,113 @@ _register_auto_executor("delete_tasks", _rehash_delete_manifest, _auto_execute_d
 # the ONE spot below that needs to go from "found a _MANIFESTS entry" to
 # "which _AUTO_EXECUTORS key" without re-deriving it from scratch. Extend
 # this (and _AUTO_EXECUTORS) together when a future kind gets TG wiring.
-_AUTO_EXECUTE_TOOL_FOR_KIND = {"delete": "delete_tasks", "declutter": "execute_declutter"}
+# NOTE: since 2026-08-06 this is only the FALLBACK — _gate_batch/_gate_single
+# manifests carry their own "tool" key, so they need no entry here at all. The
+# three kinds below are the ones whose manifests are built OUTSIDE those two
+# gates (plan_task_deletion / plan_task_creation / plan_declutter), so they
+# still resolve through this map; "create" additionally carries tool=
+# "create_tasks" on the manifest itself, making this entry belt-and-braces.
+_AUTO_EXECUTE_TOOL_FOR_KIND = {"delete": "delete_tasks", "declutter": "execute_declutter",
+                               "create": "create_tasks"}
 
 
-def _find_tg_auto_execute_candidates() -> List[Dict]:
-    """Candidates for auto-execution: this server's own (in-memory) manifests
-    that are AWAITING_CONSENT-equivalent (not consumed, not TTL-expired —
-    _prune_manifests already dropped anything past that) whose `kind` maps to
-    a registered tool AND whose Telegram approval row is already APPROVED.
-    Unlike the TS side's single SQL JOIN (both tables live in one Postgres),
-    this walks _MANIFESTS in RAM and asks tg_approval.check_approval(id) —
-    one Postgres round-trip PER live manifest — which is fine because the
-    number of concurrently AWAITING_CONSENT manifests is always small
-    (single-owner bot, human-paced approvals)."""
+# ───────────────── generic executor for the _gate_batch/_gate_single tools ──
+# 2026-08-06: instead of 19 hand-written _register_auto_executor() calls (one
+# per gated tool, each a copy of the same two lines and each a chance to get
+# the argument order wrong), ONE pair of functions covers every manifest that
+# _gate_batch/_gate_single created. That is possible because those two gates
+# store everything needed to replay the call: `tool` (→ the `_<tool>_impl`
+# function that the gated tool itself calls on the chat path — the SAME
+# executor, not a second implementation) and `_gate` (→ the call shape).
+
+async def _generic_gate_auto_execute(manifest_id: str, m: Dict) -> str:
+    """Replays a _gate_batch/_gate_single plan through the tool's own
+    `_<tool>_impl`, exactly as the gated tool would have after a chat «да»."""
+    tool = m.get("tool") or m.get("_tg_tool") or ""
+    impl = globals().get(f"_{tool}_impl")
+    if not callable(impl):
+        raise RuntimeError(f"нет исполнителя _{tool}_impl для манифеста {manifest_id}")
+    if m.get("_gate") == "single":
+        return await impl(**(m.get("params") or {}))
+    return await impl(m.get("summary") or "", m.get("tasks") or [],
+                      **(m.get("extra") or {}))
+
+
+def _generic_gate_rehash(m: Dict) -> str:
+    """MUST reproduce, byte for byte, the formula the hash was computed with
+    at plan time (_gate_batch: _manifest_object_hash(kind, ids) over the same
+    id-extraction expression; _gate_single: _manifest_params_hash(kind,
+    params)) — a mismatch here silently disables the binding check, i.e. the
+    button's protection against the plan drifting between show and press."""
+    if m.get("_gate") == "single":
+        return _manifest_params_hash(m.get("kind") or "", m.get("params") or {})
+    ids = [str(t.get("taskId") or t.get("task_id") or "") for t in (m.get("tasks") or [])]
+    return _manifest_object_hash(m.get("kind") or "", ids)
+
+
+_GENERIC_GATE_ENTRY = _AutoExecutorEntry(_generic_gate_rehash,
+                                         _generic_gate_auto_execute)
+
+
+def _resolve_auto_executor(tool: str, m: Dict) -> Optional[_AutoExecutorEntry]:
+    """Which executor runs this manifest: an explicitly registered one wins
+    (delete_tasks today — its manifest shape predates the shared gates), the
+    generic gate executor covers anything _gate_batch/_gate_single produced,
+    and everything else returns None (candidate skipped, nothing happens).
+    Deliberately does NOT resolve declutter: its registration stays commented
+    out above, and a declutter manifest has no `_gate` key, so it falls
+    through to None here too — both layers stay disabled together."""
+    if not tool:
+        return None
+    entry = _AUTO_EXECUTORS.get(tool)
+    if entry is not None:
+        return entry
+    if m.get("_gate") in ("batch", "single") and callable(
+            globals().get(f"_{tool}_impl")):
+        return _GENERIC_GATE_ENTRY
+    return None
+
+
+def _auto_execute_tool_of(m: Dict) -> str:
+    """Tool name a live manifest belongs to: the TG notification's own tag
+    first (set by _maybe_tg_notify_plan, the one place a button ever appears),
+    then the gate's stored `tool`, then the legacy kind→tool map."""
+    return (m.get("_tg_tool") or m.get("tool")
+            or _AUTO_EXECUTE_TOOL_FOR_KIND.get(m.get("kind") or "") or "")
+
+
+def _tg_auto_execute_pending() -> List[tuple]:
+    """RAM-часть поиска кандидатов: живые (не consumed, не просроченные)
+    манифесты, у которых есть авто-исполнитель и включён TG-гейт. НИ ОДНОГО
+    обращения к базе и к сети — специально, потому что это единственный кусок,
+    который трогает `_MANIFESTS`, и он обязан выполняться в event loop'е
+    (иначе `_prune_manifests()` итерировал бы dict, который другая корутина
+    в это же время пополняет → RuntimeError: dictionary changed size).
+    Возвращает [(manifest_id, tool), …]."""
     _prune_manifests()
-    out: List[Dict] = []
+    out: List[tuple] = []
     for mid, m in list(_MANIFESTS.items()):
         if m.get("consumed"):
             continue
-        tool = _AUTO_EXECUTE_TOOL_FOR_KIND.get(m.get("kind") or "")
-        if not tool or tool not in _AUTO_EXECUTORS:
+        tool = _auto_execute_tool_of(m)
+        if _resolve_auto_executor(tool, m) is None:
             continue
         if not tg_approval.enabled_for(_TG_CFG, tool):
             continue
-        try:
-            approval = tg_approval.check_approval(mid)
-        except Exception as e:
-            logger.warning(f"TG auto-execute: check_approval({mid}) failed: {e}")
-            continue
-        if approval != "approved":
-            continue
-        row = tg_approval.get_tg_approval(mid)
-        if not row:
+        out.append((mid, tool))
+    return out
+
+
+def _tg_auto_execute_approved(pending: List[tuple],
+                              rows: Dict[str, dict]) -> List[Dict]:
+    """Чистая (без БД и сети) вторая половина поиска: из списка живых
+    манифестов и УЖЕ прочитанных пачкой строк tg_approvals оставляет те, что
+    подтверждены кнопкой. Статус считает tg_approval.approval_status_of —
+    та же формула, что у одиночного check_approval на чат-пути."""
+    out: List[Dict] = []
+    for mid, tool in pending:
+        row = rows.get(mid)
+        if not row or tg_approval.approval_status_of(row) != "approved":
             continue
         out.append({"manifest_id": mid, "tool": tool,
                     "chat_id": row.get("chat_id"),
@@ -8889,6 +10770,44 @@ def _find_tg_auto_execute_candidates() -> List[Dict]:
                     # оставались бы в личном чате навсегда.
                     "extra_message_ids": list(row.get("extra_message_ids") or [])})
     return out
+
+
+def _find_tg_auto_execute_candidates() -> List[Dict]:
+    """Candidates for auto-execution: this server's own (in-memory) manifests
+    that are AWAITING_CONSENT-equivalent (not consumed, not TTL-expired —
+    _prune_manifests already dropped anything past that) that resolve to an
+    executor (_resolve_auto_executor: explicit registry, else the generic
+    _gate_batch/_gate_single replay) AND whose Telegram approval row is
+    already APPROVED.
+
+    ОДНО обращение к Postgres на весь проход, сколько бы живых планов ни было
+    (2026-08-06). До этого на КАЖДЫЙ живой манифест шли check_approval() и,
+    для одобренных, ещё get_tg_approval() — то есть 1–2 поездки на план. С 2
+    гейтованными тулами планов было единицы; с 22 их десятки, база ходит через
+    публичный прокси Railway, и проход переставал укладываться в 10-секундный
+    интервал — подтверждённое кнопкой действие ждало исполнения минутами.
+
+    Синхронная версия (её зовут тесты и любой не-async вызывающий); поллер
+    использует те же две половины напрямую, чтобы поездку в базу увести в
+    отдельный поток и не морозить event loop (см. _tg_auto_execute_tick)."""
+    pending = _tg_auto_execute_pending()
+    if not pending:
+        return []
+    try:
+        rows = tg_approval.get_tg_approvals([mid for mid, _ in pending])
+    except Exception as e:
+        logger.warning(f"TG auto-execute: get_tg_approvals failed: {e}")
+        return []
+    return _tg_auto_execute_approved(pending, rows)
+
+
+# Потолок на ОДНОГО кандидата: без него один зависший сетевой вызов к TickTick
+# держит очередь остальных подтверждённых планов бесконечно (манифест уже
+# погашен, повтора не будет — а человек так и сидит перед несработавшей
+# кнопкой). Щедрый по умолчанию: цель — не оборвать нормальную работу, а
+# гарантировать, что очередь ВСЕГДА двигается.
+_TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S = float(
+    os.environ.get("TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S", "120"))
 
 
 # ---------------------------------------------------------------------------
@@ -9135,13 +11054,27 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
 
 def _manifest_affected_count(m: Optional[Dict]) -> Optional[int]:
     """Сколько объектов затрагивал манифест — только для КОРОТКОЙ сводки в
-    личку («затронуто 5 задач»). Намеренно не лезет в структуры конкретных
-    типов планов кроме плоского `items` (что не знаем — просто None, и в
-    сводке этой строки не будет)."""
+    личку («затронуто 5 задач»). Что не знаем — просто None, и в сводке этой
+    строки не будет; врать числом здесь нельзя.
+
+    Форм манифеста несколько, и после 2026-08-06 (кнопка у 22 тулов) их надо
+    знать все, иначе строка молча пропадала бы у всех новых исполнителей:
+      * `items` — план удаления (plan_task_deletion / delete_tasks);
+      * `tasks` — общий пакетный гейт `_gate_batch` (complete_tasks,
+        move_tasks, set_task_tags, restore_tasks…);
+      * `raw`   — план создания (plan_task_creation / create_tasks);
+      * `_gate == "single"` — одиночный гейт (`_gate_single`): по определению
+        РОВНО один объект (create_tag, delete_project, rename_tag…), поэтому
+        1 — это факт из конструкции гейта, а не догадка."""
     if not isinstance(m, dict):
         return None
-    items = m.get("items")
-    return len(items) if isinstance(items, list) else None
+    for key in ("items", "tasks", "raw"):
+        value = m.get(key)
+        if isinstance(value, list):
+            return len(value)
+    if m.get("_gate") == "single":
+        return 1
+    return None
 
 
 def _short_auto_execute_summary(tool: str, verdict: str,
@@ -9320,6 +11253,18 @@ async def _tg_auto_execute_tick() -> None:
     Mirrors gmail-mcp's runAutoExecutePoller — errors from ONE candidate never
     abort the others.
 
+    Три вещи, за которые здесь отвечает именно ЭТА функция (2026-08-06):
+    1. Поиск кандидатов разделён: RAM-часть (_tg_auto_execute_pending) идёт в
+       event loop'е, а ЕДИНСТВЕННАЯ поездка в Postgres — через _run_blocking,
+       то есть в отдельном потоке. psycopg2 синхронный: вызов из корутины
+       напрямую морозил ВЕСЬ сервер (не только поллер — и обычные MCP-запросы
+       модели) на всё время запроса.
+    2. Перепроверка и публикация отчёта в Telegram (requests + сон на 429) —
+       тоже через _run_blocking, по той же причине.
+    3. `try_auto_execute` наоборот ОБЯЗАН остаться в event loop'е: его
+       атомарность («проверил consumed → выставил consumed» без await между)
+       держится ровно на однопоточности loop'а. В поток его выносить нельзя.
+
     Пункт 5 ТЗ («несколько параллельных подтверждений») архитектурно уже
     поддержан, и это НЕ случайность, а свойство четырёх мест сразу:
       * `_MANIFESTS` — СЛОВАРЬ манифестов, а не единственный слот: сколько
@@ -9335,9 +11280,18 @@ async def _tg_auto_execute_tick() -> None:
         манифест дважды.
     Отдельного «один pending за раз» в коде нет — при ревизии 2026-08-06 такое
     место не найдено."""
-    for c in _find_tg_auto_execute_candidates():
+    pending = _tg_auto_execute_pending()
+    if not pending:
+        return
+    try:
+        rows = await _run_blocking(tg_approval.get_tg_approvals,
+                                   [mid for mid, _ in pending])
+    except Exception as e:
+        logger.warning(f"TG auto-execute: get_tg_approvals failed: {e}")
+        return
+    for c in _tg_auto_execute_approved(pending, rows):
         mid, tool = c["manifest_id"], c["tool"]
-        entry = _AUTO_EXECUTORS.get(tool)
+        entry = _resolve_auto_executor(tool, _MANIFESTS.get(mid) or {})
         if entry is None:
             continue
         try:
@@ -9349,7 +11303,11 @@ async def _tg_auto_execute_tick() -> None:
             )
             if consumed is None:
                 continue  # race/drift/already consumed — not an error
-            report_text = await entry.execute(mid, consumed)
+            # Потолок на одного кандидата (main): зависший сетевой вызов не
+            # должен держать очередь остальных подтверждённых планов.
+            report_text = await asyncio.wait_for(
+                entry.execute(mid, consumed),
+                _TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S)
             # Слово «успешно» больше не принадлежит исполнителю: сначала
             # независимая перепроверка, только потом вердикт (пункт 3 ТЗ).
             #
@@ -9367,8 +11325,15 @@ async def _tg_auto_execute_tick() -> None:
                 _publish_auto_execute_outcome, c, tool, full_md, verdict,
                 _manifest_affected_count(consumed))
         except Exception as e:
+            if isinstance(e, asyncio.TimeoutError):
+                msg = (f"🛑 Автоисполнение «{tool}» не уложилось в "
+                       f"{_TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S:.0f} c и было "
+                       "прервано. План уже погашен — проверьте состояние в "
+                       "TickTick: часть операции могла успеть примениться.")
+            else:
+                msg = f"🛑 Ошибка при автоисполнении «{tool}»: {e}"
             logger.error(f"TG auto-execute: ошибка при исполнении "
-                        f"{tool}/{mid}: {e}")
+                        f"{tool}/{mid}: {e!r}")
             try:
                 # Ошибка исполнения идёт по ТОМУ ЖЕ пути: полный текст (с
                 # трассировкой смысла) — в группу как "failed", короткая
@@ -9377,6 +11342,13 @@ async def _tg_auto_execute_tick() -> None:
                 err_md = "\n".join([
                     f"### 🛑 Автоисполнение «{tool}» — ошибка исполнения",
                     f"_manifest: `{mid}`_",
+                    "",
+                    # `msg` уже различает обычное исключение и срабатывание
+                    # потолка на кандидата (asyncio.TimeoutError) — второй
+                    # случай обязан звучать иначе: план ПОГАШЕН, а операция
+                    # могла успеть примениться частично. Без этой строки
+                    # таймаут в архиве был бы неотличим от обычной ошибки.
+                    msg,
                     "",
                     f"Исключение: `{type(e).__name__}: {e}`",
                     "",
@@ -9400,6 +11372,10 @@ def _consume_manifest_for_auto_execute(manifest_id: str) -> Optional[Dict]:
     if m is None or m.get("consumed"):
         return None
     m["consumed"] = True
+    # Оставляем «надгробие» ДО исполнения: если модель следом честно позовёт
+    # execute_task_deletion по тому же id, она получит внятное «уже исполнено
+    # по кнопке», а не безликое «не найден/истёк» (см. _manifest_gone_msg).
+    _tombstone_manifest(manifest_id, "tg_auto_executed")
     return m
 
 
@@ -9430,11 +11406,20 @@ async def _tg_auto_execute_poller_loop() -> None:
     произойдёт. Если RAM-TTL сделать ДЛИННЕЕ: строка протухнет первой,
     `check_approval` вернёт "none", манифест доживёт в памяти бесполезным
     грузом до `_prune_manifests`. Тот же эффект, что и при рестарте процесса
-    между планом и нажатием: RAM пуста, а строка в Postgres жива."""
+    между планом и нажатием: RAM пуста, а строка в Postgres жива.
+
+    Интервал отсчитывается ОТ НАЧАЛА прохода (2026-08-06). Раньше `sleep`
+    стоял ПЕРЕД работой, то есть реальный период = интервал + длительность
+    прохода: медленный проход (десятки живых планов × поездка в базу каждый)
+    молча растягивал заявленные «каждые 10 секунд» в разы. Проходы при этом
+    не накладываются и сейчас: они последовательны внутри одной корутины, а
+    отрицательный остаток обрезается до нуля. Уборка (reaper) считается в тот
+    же бюджет прохода — она стоит перед замером `elapsed`, поэтому её время
+    не добавляется к интервалу сверху."""
     logger.info(f"TG auto-execute: poller started (every {_TG_AUTO_EXECUTE_INTERVAL_S:.0f}s)")
     last_reap = time.monotonic()
     while True:
-        await asyncio.sleep(_TG_AUTO_EXECUTE_INTERVAL_S)
+        started = time.monotonic()
         try:
             await _tg_auto_execute_tick()
         except Exception as e:
@@ -9459,6 +11444,12 @@ async def _tg_auto_execute_poller_loop() -> None:
                 except Exception as e:
                     logger.error(f"TG reaper: уборка упала (поллер продолжает "
                                  f"работать): {e}")
+        elapsed = time.monotonic() - started
+        if elapsed > _TG_AUTO_EXECUTE_INTERVAL_S:
+            logger.warning(
+                f"TG auto-execute: проход занял {elapsed:.1f} c — дольше "
+                f"интервала {_TG_AUTO_EXECUTE_INTERVAL_S:.0f} c")
+        await asyncio.sleep(max(0.0, _TG_AUTO_EXECUTE_INTERVAL_S - elapsed))
 
 
 def main():

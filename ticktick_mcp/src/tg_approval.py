@@ -50,7 +50,8 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, NamedTuple, Optional
+from typing import (Any, Callable, Dict, Iterable, List, NamedTuple,
+                    Optional)
 from zoneinfo import ZoneInfo
 
 import requests
@@ -647,6 +648,14 @@ def delete_message(cfg: TgApprovalConfig, chat_id: str, message_id: int) -> bool
 
 _pg_pool = None
 
+# Postgres живёт за ПУБЛИЧНЫМ прокси Railway: без явных таймаутов подвисшее
+# соединение/запрос ждёт дефолтный TCP-таймаут ОС — это минуты, ровно тот
+# масштаб задержки, который QA видел на живом проде. connect_timeout режет
+# зависание на установлении соединения, statement_timeout — на самом запросе
+# (значение с запасом на CREATE TABLE в _ensure_schema).
+_PG_CONNECT_TIMEOUT_S = int(os.environ.get("CONSENT_PG_CONNECT_TIMEOUT_S", "10"))
+_PG_STATEMENT_TIMEOUT_MS = int(os.environ.get("CONSENT_PG_STATEMENT_TIMEOUT_MS", "15000"))
+
 
 def init_store(database_url: str) -> None:
     """Ленивая инициализация — вызывается один раз при старте, если
@@ -656,7 +665,11 @@ def init_store(database_url: str) -> None:
     global _pg_pool
     import psycopg2.pool
 
-    _pg_pool = psycopg2.pool.SimpleConnectionPool(1, 5, dsn=database_url, sslmode="require")
+    _pg_pool = psycopg2.pool.SimpleConnectionPool(
+        1, 5, dsn=database_url, sslmode="require",
+        connect_timeout=_PG_CONNECT_TIMEOUT_S,
+        options=f"-c statement_timeout={_PG_STATEMENT_TIMEOUT_MS}",
+    )
     _ensure_schema()
 
 
@@ -852,6 +865,53 @@ def get_tg_approval(manifest_id: str) -> Optional[dict]:
             "extra_message_ids": list(row[4] or []) if len(row) > 4 else []}
 
 
+def get_tg_approvals(manifest_ids: Iterable[str]) -> Dict[str, dict]:
+    """ПАКЕТНОЕ чтение тех же строк, что и get_tg_approval, — ОДИН запрос в
+    Postgres на весь список вместо одной поездки на каждый id.
+
+    Зачем (2026-08-06): фоновый поллер авто-исполнения раньше на КАЖДЫЙ живой
+    манифест делал check_approval() (→ 1 поездка) и, если одобрен, ещё
+    get_tg_approval() (→ 2-я поездка). Пока кнопка была у 2 тулов, живых
+    планов было единицы; после расширения на 22 тула их десятки, а база
+    ходит через публичный прокси Railway (десятки-сотни мс на поездку) — один
+    проход переставал укладываться в 10-секундный интервал, и подтверждённая
+    кнопкой операция ждала исполнения минутами.
+
+    Возвращает {manifest_id: {"status","expires_at","chat_id","message_id",
+    "extra_message_ids"}} ТОЛЬКО для найденных строк; отсутствие ключа =
+    «строки нет» (это то же самое, что None у одиночной версии, т.е. статус
+    "none").
+    Фильтр server='ticktick' — ровно тот же, что у get_tg_approval: сервер не
+    читает чужие approval-строки.
+
+    Набор полей ОБЯЗАН совпадать с одиночным get_tg_approval: с 2026-08-06
+    поллер авто-исполнения читает строки только отсюда, и потерянный здесь
+    `extra_message_ids` тихо сломал бы уборку предыдущих кусков длинного плана
+    в личке (`_cleanup_plan_leftovers` в server.py) — они оставались бы в чате
+    навсегда."""
+    ids = [str(i) for i in manifest_ids]
+    if not ids or not store_ready():
+        return {}
+    conn = _pg_pool.getconn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT manifest_id, status, expires_at, chat_id, message_id, "
+                "extra_message_ids "
+                "FROM tg_approvals WHERE manifest_id = ANY(%s) AND server = 'ticktick'",
+                (ids,),
+            )
+            rows: List[tuple] = cur.fetchall()
+    finally:
+        _pg_pool.putconn(conn)
+    return {r[0]: {"status": r[1], "expires_at": r[2], "chat_id": r[3],
+                   "message_id": r[4],
+                   # Та же нормализация, что в get_tg_approval: NULL/старая
+                   # строка без колонки → пустой список, а не None.
+                   "extra_message_ids": list(r[5] or []) if len(r) > 5 else []}
+            for r in rows}
+
+
 # ───────────────────────── Публичное API для server.py ─────────────────────
 
 def notify_plan(cfg: TgApprovalConfig, manifest_id: str, preview_body: str,
@@ -915,13 +975,12 @@ def notify_plan(cfg: TgApprovalConfig, manifest_id: str, preview_body: str,
     return True, ""
 
 
-def check_approval(manifest_id: str) -> str:
-    """"approved" | "pending" | "rejected" | "none" — "none" покрывает и
-    «никогда не спрашивали», и «TTL истёк» (та же семантика, что checkApproval
-    в TS — фаза исполнения обрабатывает оба случая одинаково)."""
-    if not store_ready():
-        return "none"
-    row = get_tg_approval(manifest_id)
+def approval_status_of(row: Optional[dict]) -> str:
+    """Чистая (БЕЗ обращения к базе) классификация строки tg_approvals в тот
+    же словарь статусов, что отдаёт check_approval. Вынесена отдельно, чтобы
+    ОДНА формула обслуживала оба пути: одиночный (чат, _require_consent) и
+    пакетный (поллер, get_tg_approvals) — иначе они могли бы разойтись,
+    например в трактовке истёкшего TTL."""
     if not row:
         return "none"
     if row["status"] == "APPROVED":
@@ -931,6 +990,19 @@ def check_approval(manifest_id: str) -> str:
     if _now_ms() > row["expires_at"]:
         return "none"
     return "pending"
+
+
+def check_approval(manifest_id: str) -> str:
+    """"approved" | "pending" | "rejected" | "none" — "none" покрывает и
+    «никогда не спрашивали», и «TTL истёк» (та же семантика, что checkApproval
+    в TS — фаза исполнения обрабатывает оба случая одинаково).
+
+    Одиночная версия: её зовёт чат-путь (_require_consent) для ОДНОГО
+    манифеста. Поллер с 2026-08-06 её НЕ использует — он читает статусы всех
+    живых манифестов одним get_tg_approvals()."""
+    if not store_ready():
+        return "none"
+    return approval_status_of(get_tg_approval(manifest_id))
 
 
 # ───────────────────── Авто-исполнение по кнопке (2026-08-05) ─────────────────
@@ -1007,7 +1079,21 @@ def try_auto_execute(
     m = get_manifest(manifest_id)
     if m is None or m.get("consumed"):
         return None
-    if tool and m.get("_auto_tool", tool) != tool:
+    # Инвариант 2 (сверка тула). ДО 2026-08-06 читалось поле `_auto_tool`,
+    # которого не писал НИКТО: `m.get("_auto_tool", tool)` всегда отдавал
+    # дефолт `tool`, сравнение всегда было истинным — предохранитель не
+    # срабатывал ни разу за всё время жизни кода. Пока гейт с кнопкой был у
+    # одного тула (delete_tasks), это было безвредно; с расширением на 19
+    # тулов ошибка диспетчеризации в поллере уже означала бы исполнение ЧУЖОЙ
+    # операции по чужому подтверждению. Теперь сверяемся с полями, которые
+    # реально существуют: `_tg_tool` (ставит _maybe_tg_notify_plan в момент
+    # отправки кнопок — есть у любого манифеста, для которого кнопка вообще
+    # существует) и `tool` (кладут _gate_batch/_gate_single при постройке
+    # плана). `_auto_tool` оставлен последним в цепочке как явная ручная
+    # метка. Если метки нет ни одной — поведение прежнее (проверка
+    # пропускается), чтобы старые формы манифестов не перестали исполняться.
+    owner = m.get("_tg_tool") or m.get("tool") or m.get("_auto_tool")
+    if tool and owner and owner != tool:
         return None
     stored_hash = m.get("object_hash")
     if stored_hash:
