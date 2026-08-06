@@ -3389,9 +3389,22 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
                  "состоялось или восстановлена)") if live else
                 ("ok", f"- ✅ **«{title}»** — удалена"))
     if op == "restore":
-        return (("ok", f"- ✅ **«{title}»** — снова среди открытых") if live else
-                ("bad", f"- ❌ **«{title}»** — НЕ появилась среди открытых "
-                 "(восстановление не подтвердилось)"))
+        # Сведение двух правок (fix/qa-c-report + fix/qa-e-restore):
+        # C перевёл ВСЕ ветки на явный кортеж (status, line) — статус больше
+        # никогда не восстанавливается парсингом эмодзи; E добавил сюда
+        # сверку проекта назначения (задача может вернуться из корзины, но
+        # не в тот список). Проверка E сохранена целиком, в контракте C:
+        # «вернулась, но не туда» — это именно ⚠️/"warn", то самое
+        # расхождение, потеря которого и была багом «расхождений: 0».
+        if not live:
+            return ("bad", f"- ❌ **«{title}»** — НЕ появилась среди открытых "
+                    "(восстановление не подтвердилось)")
+        want_pid = exp.get("projectId")
+        if want_pid and live.get("projectId") != want_pid:
+            return ("warn", f"- ⚠️ **«{title}»** — среди открытых, но в «"
+                    f"{names.get(live.get('projectId'), live.get('projectId'))}»"
+                    f", а не в «{names.get(want_pid, want_pid)}» (не тот список)")
+        return ("ok", f"- ✅ **«{title}»** — снова среди открытых, в нужном списке")
     if op in ("complete", "abandon"):
         verb = "закрыта" if op == "complete" else "отмечена «не буду делать»"
         return (("bad", f"- ❌ **«{title}»** — всё ещё среди открытых") if live
@@ -7528,7 +7541,11 @@ async def restore_tasks(summary: str, tasks: List[Dict[str, str]] = None,
             on call #1, ignored on call #2. Get IDs/titles from get_trash.
         to_project_id: Optional destination list for all tasks; defaults to
             each task's original list — required (if used) on call #1,
-            ignored on call #2
+            ignored on call #2. Either way, the destination is verified
+            against the live task after restoring (TickTick's restore call
+            can silently drop it to Inbox) and auto-corrected with one
+            follow-up move if it missed; a mismatch that survives that is
+            reported, never hidden as success.
         manifest_id: from call #1's response — pass on call #2 to actually restore
         user_reply: the user's literal reply approving the plan — required on call #2
 
@@ -7584,7 +7601,17 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
             if not _names_agree(exp, real):
                 mismatch.append(f"«{exp}» → в корзине по этому id «{real}»")
                 continue
-            ok_items.append({"taskId": tid, "title": exp or real})
+            # Ожидаемый пункт назначения: явный override побеждает; иначе —
+            # СОБСТВЕННЫЙ исходный список задачи из записи в корзине (то, что
+            # обещает докстринг: «defaults to each task's original list»).
+            # Считаем это ЗДЕСЬ, из уже имеющегося снимка корзины, чтобы
+            # post-verify ниже реально мог это сверить, а не слепо доверять,
+            # что вызов восстановления сам всё сделал правильно.
+            orig_pid = (entry.get("projectId") or entry.get("projectID")
+                       or entry.get("listId"))
+            want_pid = to_project_id or orig_pid
+            ok_items.append({"taskId": tid, "title": exp or real,
+                             "want_pid": want_pid})
         if mismatch:
             return ("🛑 НЕ восстановил — id НЕ совпал с названием в корзине "
                     "(защита от «не той задачи»): " + "; ".join(mismatch)
@@ -7594,25 +7621,87 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
             resp = await _run_blocking(lambda: ticktick_v2.batch_restore_tasks(
                 [i["taskId"] for i in ok_items], to_project_id))
             api_fail = id2error_failures(resp, [i["taskId"] for i in ok_items])
-        # Post-verify: restored tasks must reappear among OPEN tasks.
-        restored, failed = [], []
+        # Post-verify: восстановленные задачи ДОЛЖНЫ снова появиться среди
+        # ОТКРЫТЫХ и ДОЛЖНЫ оказаться в ожидаемом проекте. Замечено, что
+        # /trash/restore у TickTick теряет пункт назначения и кидает задачу
+        # в Inbox независимо от переданного projectId — поэтому «снова среди
+        # открытых» САМО ПО СЕБЕ не доказательство того, что обещание
+        # докстринга («original list») выполнилось. Проект сверяется явно,
+        # и если он не совпал — чинится одним явным дополнительным
+        # перемещением (тем же вызовом, что использует move_tasks), прежде
+        # чем результат уходит в отчёт. Расхождение, пережившее и этот
+        # фикс, идёт в вывод как расхождение — никогда молча как успех.
+        names = _v2_project_names()
+        restored, unknown_dest, failed = [], [], []
+        wrong_project = []  # [(title, want_pid, got_pid)] — так и не туда даже после фикса
         unverified = False
         if ok_items:
             fresh = _open_by_id(fresh=True)
             if fresh is None:
                 unverified = True
             else:
+                to_fix = []
                 for i in ok_items:
-                    ok = i["taskId"] in fresh and i["taskId"] not in api_fail
-                    (restored if ok else failed).append(i["title"])
+                    live = fresh.get(i["taskId"])
+                    if live is None or i["taskId"] in api_fail:
+                        failed.append(i["title"])
+                    elif not i["want_pid"]:
+                        # Не удалось определить исходный список из записи в
+                        # корзине — честно сказать об этом, а не молча
+                        # засчитать как успех, который на деле не проверен.
+                        unknown_dest.append(i["title"])
+                    elif live.get("projectId") != i["want_pid"]:
+                        to_fix.append(i)
+                    else:
+                        restored.append(i["title"])
+                if to_fix:
+                    fix_by_pid: Dict[str, List[str]] = {}
+                    for i in to_fix:
+                        fix_by_pid.setdefault(i["want_pid"], []).append(i["taskId"])
+                    fix_api_fail: Dict[str, str] = {}
+                    for pid, ids in fix_by_pid.items():
+                        try:
+                            mresp = await _run_blocking(
+                                lambda pid=pid, ids=ids:
+                                    ticktick_v2.batch_move_tasks(ids, pid))
+                            fix_api_fail.update(id2error_failures(mresp, ids))
+                        except Exception as e:
+                            logger.error("restore_tasks: corrective move to "
+                                        f"{pid} failed: {e}")
+                            for tid2 in ids:
+                                fix_api_fail.setdefault(tid2, str(e))
+                    fresh2 = _open_by_id(fresh=True)
+                    for i in to_fix:
+                        live2 = (fresh2 or {}).get(i["taskId"])
+                        if (fresh2 is not None and live2 is not None
+                                and i["taskId"] not in fix_api_fail
+                                and live2.get("projectId") == i["want_pid"]):
+                            restored.append(i["title"])
+                        elif fresh2 is None:
+                            unverified = True
+                        else:
+                            got = (live2 or {}).get("projectId")
+                            wrong_project.append((i["title"], i["want_pid"], got))
         lines = []
         if restored:
             lines.append(f"↩ Восстановлено из корзины {len(restored)} "
-                         "(проверено — снова среди открытых): "
-                         + ", ".join(f"«{t}»" for t in restored))
+                         "(проверено — снова среди открытых, в нужном "
+                         "списке): " + ", ".join(f"«{t}»" for t in restored))
         if unverified:
             lines.append(f"Восстановление {len(ok_items)} отправлено, но "
                          f"{_UNVERIFIED_MSG}")
+        if wrong_project:
+            parts = [f"«{t}» — попала в «{names.get(got, got)}», а не в "
+                    f"«{names.get(want, want)}» (восстановилась не туда, и "
+                    "попытка переместить в нужный список не помогла)"
+                    for t, want, got in wrong_project]
+            lines.append("⚠️ Восстановлено НЕ в исходный/запрошенный список "
+                        f"{len(wrong_project)}: " + "; ".join(parts))
+        if unknown_dest:
+            lines.append(f"⚠️ Восстановлено {len(unknown_dest)}, но исходный "
+                        "список не удалось определить из записи в корзине — "
+                        "куда реально попали, не проверено: "
+                        + ", ".join(f"«{t}»" for t in unknown_dest))
         if failed:
             extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
             lines.append(f"❌ НЕ восстановлено {len(failed)} (не появились среди "
@@ -7622,7 +7711,10 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
             lines.append(f"↷ Не найдены в корзине {len(absent)}: "
                          + ", ".join(f"«{t}»" for t in absent))
         if ok_items:
-            rid = _op_journal("restore", ok_items, summary)
+            rid = _op_journal("restore", [
+                {"taskId": i["taskId"], "title": i["title"],
+                 "expect": {"projectId": i["want_pid"]}} for i in ok_items
+            ], summary)
             lines.append(_report_line(rid))
         return "\n".join(lines) if lines else "Ничего не восстановлено."
     except Exception as e:
