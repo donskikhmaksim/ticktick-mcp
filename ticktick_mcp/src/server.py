@@ -7048,6 +7048,12 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
 
     Call #1 (manifest_id omitted): builds a one-shot manifest from `tasks`
     and returns a preview of the new tags per task — nothing is changed yet.
+    Any tag that doesn't exist in the account yet is flagged in the preview
+    as "будет создан" (will be created): TickTick keeps tags in two places —
+    the account's own tag list and a raw label on the task — so a brand-new
+    name is registered in the account's tag list FIRST (same path as
+    create_tag), then applied to the task(s). This avoids creating an orphan
+    tag that's invisible to list_tags and undeletable via delete_tag.
     Call #2 (after the user actually replied): repeat the call with
     manifest_id=<id from call #1> and user_reply=<the user's literal last
     message> — `tasks` is ignored on this call (the manifest's own stored
@@ -7078,9 +7084,28 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
     err = _ensure_ready()
     if err:
         return err
+    # Preview-time only (call #1, non-empty tasks): flag tags that don't
+    # exist yet, so the user sees "will be created" BEFORE approving, not
+    # just after the fact. Skipped on call #2 and on an empty/missing
+    # `tasks` — _gate_batch refuses those without needing a tag lookup.
+    existing_tags = (set(await _live_tag_names(force=True))
+                     if not manifest_id and tasks else set())
+
+    def _describe_tags(t: Dict) -> str:
+        wanted = t.get("tags") or []
+        parts = []
+        for tag in wanted:
+            bare = tag.lstrip("#").lower()
+            if bare and bare not in existing_tags:
+                parts.append(f"{tag} (тег не существует — будет создан)")
+            else:
+                parts.append(tag)
+        return (f"**«{t.get('title') or t.get('taskId')}»** → теги: "
+                + (", ".join(parts) or "(пусто)"))
+
     outcome = _gate_batch(
         "tags", "set_task_tags", tasks, summary, manifest_id, user_reply,
-        lambda t: f"**«{t.get('title') or t.get('taskId')}»** → теги: {', '.join(t.get('tags') or []) or '(пусто)'}")
+        _describe_tags)
     if not outcome.proceed:
         return outcome.message
     return await _set_task_tags_impl(outcome.summary, outcome.tasks)
@@ -7104,12 +7129,60 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                     "tags": [x.lstrip("#").lower() for x in (t.get("tags") or [])]}
                    for t in tasks
                    if (t.get("taskId") or t.get("task_id")) in ok]
+
+        # TickTick keeps tags in TWO places: the account's tag list
+        # (/batch/tag — what list_tags/create_tag/delete_tag see) and a raw
+        # label string on each task (/batch/task). Writing a brand-new label
+        # straight onto a task WITHOUT registering it in the account tag list
+        # first creates an ORPHAN tag: invisible to list_tags, undeletable via
+        # delete_tag, but still attached to the task. So: register every
+        # not-yet-existing tag through the same account-level path create_tag
+        # uses, BEFORE touching any task — and post-verify the registration
+        # itself, not just assume the 200 meant it worked.
+        requested = sorted({t for c in changes for t in c["tags"] if t})
+        # force=False: _open_by_id(fresh=True) just above already forced a
+        # fresh sync-state fetch (tags included) within the TTL window — no
+        # need for a second network round-trip for the same snapshot.
+        existing_tags = set(await _live_tag_names(force=False))
+        to_register = [t for t in requested if t not in existing_tags]
+        for tag_name in to_register:
+            try:
+                await _run_blocking(lambda tn=tag_name: ticktick_v2.create_tag(tn))
+            except Exception as e:
+                logger.error(
+                    f"set_task_tags: auto-registration of tag '{tag_name}' "
+                    f"raised: {e}")
+        after_create = (set(await _live_tag_names(force=True))
+                        if to_register else existing_tags)
+        registered = [t for t in to_register if t in after_create]
+        failed_register = [t for t in to_register if t not in after_create]
+
+        # Fail closed for exactly the tags that couldn't be registered: drop
+        # the WHOLE per-task change rather than send a truncated tag list —
+        # set_task_tags REPLACES all tags on a task, so silently stripping
+        # just the bad tag from a change could wipe tags the user never
+        # asked to touch. The task is left completely untouched instead.
+        skipped_tasks = []
+        if failed_register:
+            bad_set = set(failed_register)
+            kept = []
+            for c in changes:
+                bad = set(c["tags"]) & bad_set
+                if bad:
+                    skipped_tasks.append((ok[c["taskId"]]["title"], sorted(bad)))
+                else:
+                    kept.append(c)
+            changes = kept
+
         api_fail = {}
         if changes:
             resp = await _run_blocking(
                 lambda: ticktick_v2.batch_update_tasks(changes))
             api_fail = id2error_failures(resp, [c["taskId"] for c in changes])
-        # Inline post-verify: live tags must equal the requested set.
+        # Inline post-verify: live tags must equal the requested set, AND any
+        # newly-registered tag must be visible in the account's own tag list
+        # (list_tags) — this is the proof that (b) actually closed the
+        # orphan hole, not just moved it.
         tags_by_id = {c["taskId"]: c["tags"] for c in changes}
         applied, failed = [], []
         unverified = False
@@ -7119,6 +7192,8 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                 unverified = True
             else:
                 for f in found:
+                    if f["taskId"] not in tags_by_id:
+                        continue  # skipped above — never sent, don't verify
                     want = set(tags_by_id.get(f["taskId"], []))
                     got = set((fresh.get(f["taskId"]) or {}).get("tags") or [])
                     ok_item = want == got and f["taskId"] not in api_fail
@@ -7127,6 +7202,22 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
         if applied:
             lines.append(f"🏷 Теги обновлены у {len(applied)} (проверено): "
                          + ", ".join(f"«{t}»" for t in applied))
+        if registered:
+            lines.append(
+                f"🆕 Новые теги зарегистрированы в аккаунте (проверено — видны "
+                f"в list_tags, удаляются delete_tag), {len(registered)}: "
+                + ", ".join(f"«{t}»" for t in registered))
+        if failed_register:
+            lines.append(
+                f"⚠️ Не удалось зарегистрировать в аккаунте {len(failed_register)} "
+                "тег(ов) — они НЕ проставлены ни на одну задачу (во избежание "
+                "тега-сироты): " + ", ".join(f"«{t}»" for t in failed_register))
+        if skipped_tasks:
+            parts = "; ".join(
+                f"«{title}» (тег{'и' if len(bad) > 1 else ''} "
+                + ", ".join(f"«{b}»" for b in bad) + ")"
+                for title, bad in skipped_tasks)
+            lines.append(f"🛑 Пропущено, задачи НЕ тронуты, {len(skipped_tasks)}: " + parts)
         if unverified:
             lines.append(f"Отправлено {len(changes)}, но {_UNVERIFIED_MSG}")
         if failed:
@@ -7143,7 +7234,7 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
             rid = _op_journal("tags", [
                 {"taskId": f["taskId"], "title": f["title"],
                  "expect": {"tags": tags_by_id.get(f["taskId"], [])}}
-                for f in found], summary)
+                for f in found if f["taskId"] in tags_by_id], summary)
             lines.append(_report_line(rid))
         return "\n".join(lines) if lines else "Ничего не изменено."
     except Exception as e:
