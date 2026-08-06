@@ -196,3 +196,43 @@ def test_notify_plan_failure_invalidates_manifest_fail_closed(monkeypatch):
     assert "🛑" in out
     assert "Не смог отправить" in out
     assert s._MANIFESTS["m-fail-test"]["consumed"] is True
+
+
+# ===========================================================================
+# Плановые тулы зовут этот хук ЧЕРЕЗ поток (_run_blocking)
+# ===========================================================================
+
+def test_plan_tool_sends_the_telegram_plan_off_the_event_loop(monkeypatch):
+    """Внутри notify_plan — синхронный requests, паузы между кусками и сон на
+    429 (до трёх минут на кусок в патологии). Прямой вызов из корутины держал
+    бы event loop всё это время: зависший /health и заткнувшиеся MCP-сессии.
+    Тест фиксирует, что хук уходит в поток через `_run_blocking`, и заодно
+    smoke-проверяет сам async-путь плана (тулы не покрыты вызовом больше нигде).
+    """
+    import asyncio
+
+    monkeypatch.setattr(s, "_TG_CFG", tg.TgApprovalConfig(
+        enabled=True, bot_token="x", owner_chat_id="1", server="ticktick",
+        tools_allowlist=None, ttl_s=3600))
+    monkeypatch.setattr(s, "_ensure_ready", lambda: None)
+    monkeypatch.setattr(s, "_open_by_id",
+                        lambda fresh=False: {"t1": {"id": "t1", "title": "Купить молоко",
+                                                    "projectId": "p1"}})
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Покупки"})
+
+    off_loop = {"used": False}
+    real_run_blocking = s._run_blocking
+
+    async def spy(func, *a, **kw):
+        if func is s._maybe_tg_notify_plan:
+            off_loop["used"] = True
+        return await real_run_blocking(func, *a, **kw)
+
+    monkeypatch.setattr(s, "_run_blocking", spy)
+    monkeypatch.setattr(tg, "notify_plan", lambda *a, **k: (True, ""))
+
+    out = asyncio.run(s.plan_task_deletion(
+        "удалить одну", [{"taskId": "t1", "title": "Купить молоко"}]))
+
+    assert off_loop["used"] is True, "хук обязан уходить в поток, а не в event loop"
+    assert "План удаления" in out and "Telegram" in out

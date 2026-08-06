@@ -2246,7 +2246,14 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
                        f"`delete_tasks(summary=\"{summary}\", manifest_id=\"{mid}\", "
                        "user_reply=\"<дословная реплика пользователя>\")` — "
                        "НЕ в этом же ходе. Манифест одноразовый, действует 1 час.")
-        return _maybe_tg_notify_plan("delete_tasks", mid, "\n".join(preview))
+        # Через поток, а не напрямую: внутри синхронный requests и сон на 429
+        # (до _MAX_SEND_WAIT_S на КАЖДЫЙ кусок), а длинный план — это до
+        # десятка сообщений подряд с профилактическими паузами между ними.
+        # Вызванное прямо из корутины, это держит event loop на всё время
+        # отправки — то есть зависший /health и заткнувшиеся MCP-сессии. Тот
+        # же приём, которым уже вынесены публикация отчёта и перепроверка.
+        return await _run_blocking(_maybe_tg_notify_plan, "delete_tasks", mid,
+                                   "\n".join(preview))
     except Exception as e:
         logger.error(f"Error in delete_tasks: {e}")
         return f"Error deleting tasks: {str(e)}"
@@ -2802,7 +2809,10 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
                  f"`execute_task_deletion(manifest_id=\"{mid}\", "
                  "user_reply=\"<дословная реплика пользователя>\")` — НЕ в "
                  "этом же ходе. Манифест одноразовый, действует 1 час.")
-    return _maybe_tg_notify_plan("delete_tasks", mid, "\n".join(lines))
+    # В поток по той же причине, что и в delete_tasks выше: синхронная
+    # отправка нескольких сообщений с паузами не должна держать event loop.
+    return await _run_blocking(_maybe_tg_notify_plan, "delete_tasks", mid,
+                               "\n".join(lines))
 
 
 @mcp.tool()
