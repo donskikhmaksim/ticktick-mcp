@@ -405,26 +405,67 @@ def format_task(task: Dict) -> str:
     formatted += f"(id: {task.get('id', '?')} | project: {task.get('projectId', '?')})\n"
     return formatted
 
+def _format_folder_line(project: Dict, group_names: Optional[Dict] = None) -> str:
+    """The "Folder:" line of format_project().
+
+    Every read tool used to drop `groupId` on the floor, so a project's folder
+    was invisible even though both clients return the field (official v1
+    GET /project, v2 projectProfiles) and the server itself relies on it
+    internally (move_project_to_group's post-verify). The four states are kept
+    distinct on purpose — "no folder" must never look the same as "couldn't
+    look the name up":
+
+      Folder: Личное (id: g1)          — in a folder, name resolved
+      Folder: (none)                   — genuinely not in any folder
+      Folder: (unknown group) (id: g9) — has a groupId no live folder matches
+      Folder: (name unavailable) (id: g9) — folder list couldn't be read at all
+
+    `group_names` lets a caller formatting many projects resolve the folder
+    map once instead of per project; None means "look it up yourself".
+    """
+    gid = project.get('groupId')
+    # TickTick uses the literal string "NONE" to mean "ungroup" on writes and
+    # may echo it back; treat it as "no folder", same as null/missing.
+    if not gid or gid == "NONE":
+        return "Folder: (none)\n"
+    names = _v2_group_names() if group_names is None else group_names
+    if names is None:
+        return f"Folder: (name unavailable) (id: {gid})\n"
+    name = names.get(gid)
+    if not name:
+        return f"Folder: (unknown group) (id: {gid})\n"
+    return f"Folder: {name} (id: {gid})\n"
+
+
 # Format a project object from TickTick for better display
-def format_project(project: Dict) -> str:
-    """Format a project into a human-readable string (name first, id at the end)."""
+def format_project(project: Dict, group_names: Optional[Dict] = None) -> str:
+    """Format a project into a human-readable string (name first, id at the end).
+
+    group_names: optional pre-resolved {groupId: name} map (see
+    _format_folder_line) so a caller looping over many projects resolves the
+    folder list once; omit it and the folder name is looked up per call.
+    """
     formatted = f"Name: {project.get('name', 'No name')}\n"
 
     # Add color if available
     if project.get('color'):
         formatted += f"Color: {project.get('color')}\n"
-    
+
     # Add view mode if available
     if project.get('viewMode'):
         formatted += f"View Mode: {project.get('viewMode')}\n"
-    
+
     # Add closed status if available
     if 'closed' in project:
         formatted += f"Closed: {'Yes' if project.get('closed') else 'No'}\n"
-    
+
     # Add kind if available
     if project.get('kind'):
         formatted += f"Kind: {project.get('kind')}\n"
+
+    # Which folder (project group) the project sits in — always printed, so
+    # "not in any folder" is visible instead of being an absent line.
+    formatted += _format_folder_line(project, group_names)
 
     # Id last — needed for follow-up calls, but not the headline.
     formatted += f"(id: {project.get('id', '?')})\n"
@@ -501,6 +542,29 @@ def _v2_project_names() -> Dict:
         except Exception:
             pass
     return {}
+
+
+def _v2_group_names() -> Optional[Dict]:
+    """Map groupId -> folder name from the cached v2 state, or None when the
+    folder list could not be read at all.
+
+    There is no v1 fallback on purpose: the official Open API exposes a
+    project's `groupId` but has no endpoint listing the groups themselves, so
+    without v2 the name is genuinely unknowable — and None ("couldn't check")
+    must stay distinguishable from {} ("there are no folders"), exactly like
+    _v2_project_names_or_none() vs _v2_project_names(). Deleted groups are
+    dropped so a project pointing at one reads as "unknown group", not as a
+    live folder.
+    """
+    if not ticktick_v2:
+        return None
+    try:
+        st = ticktick_v2.get_state()
+        return {g["id"]: g.get("name")
+                for g in (st.get("projectGroups") or [])
+                if g.get("id") and not g.get("deleted")}
+    except Exception:
+        return None
 
 
 def _lookup_task_title(task_id: str) -> str:
@@ -942,7 +1006,8 @@ async def _run_blocking(func, *args, **kwargs):
 
 @mcp.tool(annotations=READONLY)
 async def get_projects() -> str:
-    """Get all projects from TickTick."""
+    """Get all projects from TickTick, each with the folder (project group)
+    it sits in — "Folder: (none)" when it sits in none."""
     err = _ensure_official()
     if err:
         return err
@@ -951,14 +1016,16 @@ async def get_projects() -> str:
         projects = await _run_blocking(lambda: ticktick.get_projects())
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
-        
+
         if not projects:
             return "No projects found."
-        
+
+        # Resolve the folder map once for the whole listing, not per project.
+        group_names = await _run_blocking(_v2_group_names)
         result = f"Found {len(projects)} projects:\n\n"
         for i, project in enumerate(projects, 1):
-            result += f"Project {i}:\n" + format_project(project) + "\n"
-        
+            result += f"Project {i}:\n" + format_project(project, group_names) + "\n"
+
         return result
     except Exception as e:
         logger.error(f"Error in get_projects: {e}")
@@ -967,8 +1034,9 @@ async def get_projects() -> str:
 @mcp.tool(annotations=READONLY)
 async def get_project(project_id: str) -> str:
     """
-    Get details about a specific project.
-    
+    Get details about a specific project, including the folder (project
+    group) it sits in — "Folder: (none)" when it sits in none.
+
     Args:
         project_id: ID of the project
     """
@@ -980,8 +1048,11 @@ async def get_project(project_id: str) -> str:
         project = await _run_blocking(lambda: ticktick.get_project(project_id))
         if 'error' in project:
             return f"Error fetching project: {project['error']}"
-        
-        return format_project(project)
+
+        # Folder name comes from the v2 state — resolve it off the event loop
+        # instead of letting format_project() do it inline.
+        group_names = await _run_blocking(_v2_group_names)
+        return format_project(project, group_names)
     except Exception as e:
         logger.error(f"Error in get_project: {e}")
         return f"Error retrieving project: {str(e)}"
@@ -6103,6 +6174,8 @@ def _get_project_tasks_by_filter(filter_func, filter_name: str) -> str:
         return "No projects found."
 
     result = f"Found {len(projects)} projects:\n\n"
+    # Folder map resolved once for the whole listing, not per project.
+    group_names = _v2_group_names()
 
     for i, project in enumerate(projects, 1):
         if project.get('closed'):
@@ -6111,16 +6184,16 @@ def _get_project_tasks_by_filter(filter_func, filter_name: str) -> str:
         project_id = project.get('id', 'No ID')
         project_data = ticktick.get_project_with_data(project_id)
         tasks = project_data.get('tasks', [])
-        
+
         if not tasks:
-            result += f"Project {i}:\n{format_project(project)}"
+            result += f"Project {i}:\n{format_project(project, group_names)}"
             result += f"With 0 tasks that are to be '{filter_name}' in this project :\n\n\n"
             continue
-        
+
         # Filter tasks using the provided function
         filtered_tasks = [(t, task) for t, task in enumerate(tasks, 1) if filter_func(task)]
-        
-        result += f"Project {i}:\n{format_project(project)}"
+
+        result += f"Project {i}:\n{format_project(project, group_names)}"
         result += f"With {len(filtered_tasks)} tasks that are to be '{filter_name}' in this project :\n"
         
         for t, task in filtered_tasks:
@@ -7659,19 +7732,69 @@ async def run_filter(filter: str) -> str:
 # Project groups / folders (v2)
 # ---------------------------------------------------------------------------
 
+_GROUP_MEMBERS_CAP = 12  # project names listed per folder before "+N more"
+
+
+def _group_members_suffix(projects_in_group: List[str]) -> str:
+    """" — 2 projects: Дом, Финансы" / " — empty" for one folder line."""
+    if not projects_in_group:
+        return " — empty"
+    shown = projects_in_group[:_GROUP_MEMBERS_CAP]
+    extra = len(projects_in_group) - len(shown)
+    tail = f", +{extra} more" if extra else ""
+    word = "project" if len(projects_in_group) == 1 else "projects"
+    return f" — {len(projects_in_group)} {word}: " + ", ".join(shown) + tail
+
+
 @mcp.tool(annotations=READONLY)
 async def list_project_groups() -> str:
-    """List project groups (folders) (requires v2 API)."""
+    """List project groups (folders) with the projects inside each one, plus
+    a count of the projects that are in no folder (requires v2 API).
+
+    Both lists come from the same cached v2 sync snapshot, so showing the
+    contents costs no extra network request.
+    """
     err = _ensure_ready()
     if err:
         return err
     try:
         groups = await _run_blocking(lambda: ticktick_v2.list_project_groups())
         groups = [g for g in groups if not g.get("deleted")]
+        live_ids = {g.get("id") for g in groups}
+        # Membership comes from the same cached snapshot the groups just came
+        # from — no extra fetch. If it can't be read, the folder list itself
+        # still renders (degraded, without contents) rather than erroring out.
+        members: Dict[str, List[str]] = {}
+        ungrouped = orphaned = 0
+        have_members = True
+        try:
+            projects = await _run_blocking(lambda: ticktick_v2.list_projects())
+            for p in (projects or []):
+                if p.get("deleted"):
+                    continue
+                gid = p.get("groupId")
+                if not gid or gid == "NONE":
+                    ungrouped += 1
+                elif gid in live_ids:
+                    members.setdefault(gid, []).append(p.get("name") or "?")
+                else:
+                    orphaned += 1  # points at a folder that no longer exists
+        except Exception as e:
+            logger.warning(f"list_project_groups: membership unavailable: {e}")
+            have_members = False
         if not groups:
             return "No project groups found."
-        return f"Project groups ({len(groups)}):\n\n" + "\n".join(
-            f"- {g.get('name','?')}  (id: {g.get('id')})" for g in groups)
+        lines = [f"- {g.get('name','?')}  (id: {g.get('id')})"
+                 + (_group_members_suffix(members.get(g.get("id"), []))
+                    if have_members else "")
+                 for g in groups]
+        out = f"Project groups ({len(groups)}):\n\n" + "\n".join(lines)
+        if have_members:
+            out += f"\n\n{ungrouped} project(s) in no folder."
+            if orphaned:
+                out += (f"\n{orphaned} project(s) point at a folder that no "
+                        "longer exists.")
+        return out
     except Exception as e:
         logger.error(f"Error in list_project_groups: {e}")
         return f"Error fetching project groups: {str(e)}"
