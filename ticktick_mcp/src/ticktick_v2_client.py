@@ -539,13 +539,26 @@ class TickTickV2Client:
     def move_project_to_group(self, project_id: str, group_id: str) -> Dict:
         """group_id='NONE' ungroups the project. Sends the FULL live project
         object (force-fresh) with only groupId changed, so no other field is
-        reverted to a stale value as a side effect of the move."""
+        reverted to a stale value as a side effect of the move.
+
+        РАЗГРУППИРОВКА (2026-08-06). До этой правки сентинел 'NONE' уходил в
+        TickTick БУКВАЛЬНОЙ строкой: `upd["groupId"] = "NONE"`. «Без папки» в
+        модели данных TickTick — это `groupId: null`, а не группа с именем
+        NONE, поэтому запрос «вынь проект из папки» не выполнялся никогда:
+        сервер получал ссылку на несуществующую группу. Контракт из этого же
+        докстринга («'NONE' ungroups») выполнял только тестовый фейк
+        (tests/test_tier0_gate_conversion.py сам переводил 'NONE' в None) — то
+        есть трансляции не было ровно в одном месте, в бою.
+
+        Пустая строка и None трактуются так же, как 'NONE': снаружи все три
+        означают «никакой группы», и молча превратить их в id группы ""
+        (ссылка в никуда) было бы тем же самым тихим отказом."""
         self.get_state(force=True)
         proj = next((p for p in self.list_projects() if p.get("id") == project_id), None)
         if not proj:
             raise ValueError(f"Project {project_id} not found.")
         upd = dict(proj)
-        upd["groupId"] = group_id
+        upd["groupId"] = None if group_id in ("NONE", "", None) else group_id
         resp = self._request("POST", "/batch/project",
                              json={"add": [], "delete": [], "update": [upd]})
         err = id2error_failures(resp, [project_id]).get(project_id)

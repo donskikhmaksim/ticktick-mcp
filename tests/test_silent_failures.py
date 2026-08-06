@@ -1,0 +1,415 @@
+"""Три ТИХИХ отказа — сервер отвечал так, будто всё хорошо, а действие не
+происходило (аудит 2026-08-06, находки #104 / #100 / #102).
+
+Общее у всех трёх: неудача не видна ни в логе, ни модели, ни человеку.
+Поэтому здесь проверяется не «функция вернула что-то», а именно ОТЛИЧИМОСТЬ
+неуспеха от успеха.
+
+  #104 — отметка «исполнено» ставилась ДО исполнения. Надгробие (tombstone)
+         манифеста писалось с причиной "tg_auto_executed" в момент ЗАХВАТА
+         плана поллером; упавшее следом исполнение ничего не переписывало, и
+         следующий вызов получал «✅ УЖЕ исполнен, ничего не потеряно» на
+         операцию, которой не было. Теперь три состояния различимы:
+         ждёт нажатия → захвачен (исход неизвестен) → выполнено / НЕ выполнено.
+
+  #100 — «вынуть проект из папки» не работало никогда: сентинел "NONE"
+         уходил в TickTick буквальной строкой вместо `groupId: null`.
+         Единственный тест, покрывавший цепочку, использовал фейк, который
+         сам переводил "NONE" в None (tests/test_tier0_gate_conversion.py) —
+         то есть делал за клиента ровно ту работу, которой в клиенте не было.
+
+  #102 — сверка `automation_key` падала на не-ASCII: `hmac.compare_digest`
+         с двумя `str` требует ASCII-only и иначе бросает TypeError. Русская
+         буква или эмодзи в присланном ключе рушили гейт вместо того, чтобы
+         дать по нему решение; не-ASCII в самом MCP_SECRET убивал headless-
+         автоматику целиком.
+
+Ни сети, ни Postgres: Telegram/Postgres-функции `tg_approval` и HTTP-слой
+v2-клиента подменяются, как в остальных тестах этого репозитория.
+"""
+import asyncio
+import re
+import time
+
+import pytest
+
+import ticktick_mcp.src.server as s
+import ticktick_mcp.src.tg_approval as tg
+from ticktick_mcp.src.ticktick_v2_client import TickTickV2Client
+
+
+_MID_RE = re.compile(r"Манифест `([0-9a-f]{6,})`")
+
+
+def _mid_of(text):
+    m = _MID_RE.search(text)
+    assert m, f"в превью нет id манифеста:\n{text}"
+    return m.group(1)
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    """Жёсткий запрет на живой TickTick из этого файла. `_ensure_official()`
+    /`_ensure_ready()` при незаполненном клиенте ЛЕНИВО зовут
+    `initialize_client()`, а тот реально ходит в api.ticktick.com — забыть
+    подменить один хелпер достаточно, чтобы юнит-тест начал стучаться в
+    боевой API. Здесь это падение теста, а не тихий сетевой вызов."""
+    def _forbidden():
+        raise AssertionError(
+            "тест попытался инициализировать живой TickTick-клиент — "
+            "подмени _ensure_official/_ensure_ready в самом тесте")
+    monkeypatch.setattr(s, "initialize_client", _forbidden)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_manifests():
+    """_MANIFESTS и _MANIFEST_TOMBSTONES — глобалы модуля, общие на всю
+    сессию тестов. Снимок/восстановление держит файл самодостаточным при
+    любом порядке запуска."""
+    before = dict(s._MANIFESTS)
+    tombs = dict(s._MANIFEST_TOMBSTONES)
+    s._MANIFESTS.clear()
+    s._MANIFEST_TOMBSTONES.clear()
+    yield
+    s._MANIFESTS.clear()
+    s._MANIFESTS.update(before)
+    s._MANIFEST_TOMBSTONES.clear()
+    s._MANIFEST_TOMBSTONES.update(tombs)
+
+
+def _tg_on(monkeypatch, allowlist=None):
+    monkeypatch.setattr(s, "_TG_CFG", tg.TgApprovalConfig(
+        enabled=True, bot_token="x", owner_chat_id="1", server="ticktick",
+        tools_allowlist=allowlist, ttl_s=3600))
+
+
+def _notify_ok(monkeypatch):
+    monkeypatch.setattr(tg, "notify_plan", lambda cfg, mid, preview, tool: (True, ""))
+
+
+def _approved(monkeypatch, mid, message_id=7):
+    """Пакетное чтение статусов (единственный путь поллера в базу): наш план
+    подтверждён кнопкой, чужие — «строки нет»."""
+    monkeypatch.setattr(tg, "get_tg_approvals", lambda ids: {
+        i: {"status": "APPROVED", "expires_at": tg._now_ms() + 3_600_000,
+            "chat_id": "c1", "message_id": message_id}
+        for i in ids if i == mid})
+    monkeypatch.setattr(tg, "check_approval",
+                        lambda i: "approved" if i == mid else "none")
+
+
+def _collect_reports(monkeypatch):
+    reports = []
+    monkeypatch.setattr(tg, "report_auto_execution_result",
+                        lambda cfg, chat_id, message_id, text: reports.append(text))
+    return reports
+
+
+def _plant_delete_manifest(mid="silent-104"):
+    s._MANIFESTS[mid] = {
+        "kind": "delete", "consumed": False, "created": time.monotonic(),
+        "object_hash": s._manifest_object_hash("delete", ["t1"]),
+        "summary": "test", "items": [{
+            "taskId": "t1", "projectId": "p1", "title": "Купить молоко",
+            "project": "Покупки", "snapshot": {},
+        }],
+    }
+    return mid
+
+
+def _reason(mid):
+    return (s._MANIFEST_TOMBSTONES.get(mid) or {}).get("reason")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #104 — «исполнено» пишется ТОЛЬКО после подтверждённого успеха
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_executor_raises_after_the_press_is_not_marked_executed(monkeypatch):
+    """САМЫЙ ВАЖНЫЙ сценарий находки: кнопка нажата, поллер забрал план,
+    исполнение УПАЛО. Отметка «исполнено» появляться не должна."""
+    _tg_on(monkeypatch)
+    mid = _plant_delete_manifest()
+    _approved(monkeypatch, mid)
+    reports = _collect_reports(monkeypatch)
+
+    async def boom(manifest_id, m):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(s._AUTO_EXECUTORS["delete_tasks"], "execute", boom)
+
+    asyncio.run(s._tg_auto_execute_tick())
+
+    assert _reason(mid) != s._TOMBSTONE_EXECUTED, (
+        "план помечен исполненным, хотя исполнение упало")
+    assert _reason(mid) == s._TOMBSTONE_FAILED
+    # и человеку/модели это видно словами, а не только статусом
+    msg = s._manifest_gone_msg(mid, "DEFAULT")
+    assert "УЖЕ исполнен" not in msg
+    assert "НЕ завершилось успехом" in msg
+    assert "kaboom" in msg
+    # отчёт в Telegram по-прежнему уходит и по-прежнему говорит об ошибке
+    assert len(reports) == 1 and "kaboom" in reports[0]
+
+
+def test_executor_refusing_with_a_string_is_not_marked_executed(monkeypatch):
+    """Исполнители умеют отказываться СТРОКОЙ, без исключения («🛑 Автоис-
+    полнение отменено: …»). Это тоже не исполнение."""
+    _tg_on(monkeypatch)
+    mid = _plant_delete_manifest("silent-104-refusal")
+    _approved(monkeypatch, mid)
+    _collect_reports(monkeypatch)
+
+    async def refuse(manifest_id, m):
+        return ("🛑 Автоисполнение отменено: манифест не в формате плана — "
+                "ничего не удалено.")
+
+    monkeypatch.setattr(s._AUTO_EXECUTORS["delete_tasks"], "execute", refuse)
+
+    asyncio.run(s._tg_auto_execute_tick())
+
+    assert _reason(mid) == s._TOMBSTONE_FAILED
+    assert "УЖЕ исполнен" not in s._manifest_gone_msg(mid, "DEFAULT")
+
+
+def test_executor_timeout_after_the_press_is_not_marked_executed(monkeypatch):
+    """Таймаут — тот же класс: нажато, но НЕ подтверждено, что выполнено."""
+    _tg_on(monkeypatch)
+    monkeypatch.setattr(s, "_TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S", 0.01)
+    mid = _plant_delete_manifest("silent-104-timeout")
+    _approved(monkeypatch, mid)
+    _collect_reports(monkeypatch)
+
+    async def slow(manifest_id, m):
+        await asyncio.sleep(5)
+        return "готово"
+
+    monkeypatch.setattr(s._AUTO_EXECUTORS["delete_tasks"], "execute", slow)
+
+    asyncio.run(s._tg_auto_execute_tick())
+
+    assert _reason(mid) == s._TOMBSTONE_FAILED
+    assert "УЖЕ исполнен" not in s._manifest_gone_msg(mid, "DEFAULT")
+
+
+def test_successful_execution_is_marked_executed(monkeypatch):
+    """Обратная сторона: настоящий успех обязан по-прежнему читаться как
+    «уже исполнено», иначе фикс просто ломает полезный ответ."""
+    _tg_on(monkeypatch)
+    mid = _plant_delete_manifest("silent-104-ok")
+    _approved(monkeypatch, mid)
+    reports = _collect_reports(monkeypatch)
+
+    async def ok(manifest_id, m):
+        return "### ✅ Удалено 1 задание (проверено)."
+
+    monkeypatch.setattr(s._AUTO_EXECUTORS["delete_tasks"], "execute", ok)
+
+    asyncio.run(s._tg_auto_execute_tick())
+
+    assert _reason(mid) == s._TOMBSTONE_EXECUTED
+    assert "УЖЕ исполнен" in s._manifest_gone_msg(mid, "DEFAULT")
+    assert len(reports) == 1
+
+
+def test_claimed_state_differs_from_both_waiting_and_executed():
+    """«Нажато, но ещё не выполнено» — самостоятельное состояние: не «ждёт
+    нажатия» (там надгробия нет вовсе) и не «выполнено»."""
+    mid = _plant_delete_manifest("silent-104-claimed")
+    waiting = s._manifest_gone_msg(mid, "DEFAULT")
+    assert waiting == "DEFAULT"          # ждёт нажатия: сказать нечего
+
+    assert s._consume_manifest_for_auto_execute(mid) is not None
+    claimed = s._manifest_gone_msg(mid, "DEFAULT")
+
+    assert _reason(mid) == s._TOMBSTONE_CLAIMED
+    assert claimed != waiting
+    assert "УЖЕ исполнен" not in claimed
+    assert "исполняется" in claimed
+
+
+async def test_model_calling_execute_after_a_failed_auto_run_is_not_told_done(
+        monkeypatch):
+    """Сквозной путь целиком, как это видит модель: план → кнопка → поллер
+    упал → модель честно зовёт тот же инструмент. Раньше здесь приходило
+    «✅ УЖЕ исполнен, ничего не потеряно» — то есть человеку сообщили бы
+    «сделано» про несделанное."""
+    monkeypatch.setattr(s, "_ensure_official", lambda: None)
+    monkeypatch.setattr(s, "_ensure_ready", lambda: None)
+    _tg_on(monkeypatch)
+    _notify_ok(monkeypatch)
+    _collect_reports(monkeypatch)
+
+    async def boom(summary, tasks, **extra):
+        raise RuntimeError("TickTick вернул 500")
+
+    monkeypatch.setattr(s, "_complete_tasks_impl", boom)
+
+    preview = await s.complete_tasks(
+        summary="Закрываю 1",
+        tasks=[{"taskId": "t1", "title": "A", "projectId": "p1"}])
+    mid = _mid_of(preview)
+    _approved(monkeypatch, mid)
+
+    await s._tg_auto_execute_tick()
+
+    out = await s.complete_tasks(
+        summary="Закрываю 1",
+        tasks=[{"taskId": "t1", "title": "A", "projectId": "p1"}],
+        manifest_id=mid, user_reply="да")
+
+    assert "УЖЕ исполнен" not in out, f"модели сказали «сделано»:\n{out}"
+    assert "НЕ завершилось успехом" in out
+    assert "500" in out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #100 — разгруппировка проекта реально доходит до TickTick
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _FakeTickTickHttp:
+    """Мини-подделка v2-эндпоинта, ведущая себя как валидирующий сервер:
+    `groupId: null` = «без папки» и принимается; ссылка на НЕсуществующую
+    группу игнорируется (проект остаётся там, где был) — ровно та ситуация,
+    в которой буквальная строка "NONE" превращалась в тихий отказ."""
+
+    def __init__(self):
+        self.projects = [{"id": "p1", "name": "Проект", "groupId": "g1"}]
+        self.groups = [{"id": "g1", "name": "Папка"}]
+        self.seen_updates = []
+
+    def request(self, method, path, **kwargs):
+        if method == "GET":
+            return {"projectProfiles": [dict(p) for p in self.projects],
+                    "projectGroups": [dict(g) for g in self.groups],
+                    "tags": [], "syncTaskBean": {"update": []}}
+        body = kwargs.get("json") or {}
+        for upd in body.get("update", []):
+            self.seen_updates.append(dict(upd))
+            live = next((p for p in self.projects if p["id"] == upd.get("id")), None)
+            if live is None:
+                continue
+            gid = upd.get("groupId")
+            if gid is None:
+                live["groupId"] = None
+            elif any(g["id"] == gid for g in self.groups):
+                live["groupId"] = gid
+            # иначе: ссылка в никуда — поле игнорируется, папка не меняется
+        return {}
+
+
+def _client_on(fake):
+    c = TickTickV2Client(token="t")
+    c._request = fake.request
+    return c
+
+
+def test_ungroup_sends_null_group_id_not_the_literal_sentinel():
+    fake = _FakeTickTickHttp()
+    c = _client_on(fake)
+
+    c.move_project_to_group("p1", "NONE")
+
+    assert fake.seen_updates, "запрос вообще не ушёл"
+    assert fake.seen_updates[-1]["groupId"] is None, (
+        "сентинел ушёл в TickTick как есть — разгруппировки не будет")
+    assert fake.projects[0]["groupId"] is None
+
+
+def test_empty_group_id_also_means_ungroup():
+    for empty in ("", None):
+        fake = _FakeTickTickHttp()
+        _client_on(fake).move_project_to_group("p1", empty)
+        assert fake.seen_updates[-1]["groupId"] is None, (
+            f"пустое значение {empty!r} не сработало как «без папки»")
+
+
+def test_real_group_id_still_moves_into_that_group():
+    fake = _FakeTickTickHttp()
+    fake.groups.append({"id": "g2", "name": "Другая"})
+    c = _client_on(fake)
+
+    c.move_project_to_group("p1", "g2")
+
+    assert fake.seen_updates[-1]["groupId"] == "g2"
+    assert fake.projects[0]["groupId"] == "g2"
+
+
+async def test_tool_level_ungroup_reports_success_only_when_it_happened(monkeypatch):
+    """Сквозь настоящий `_move_project_to_group_impl` и настоящий клиент —
+    подделан только HTTP. До фикса пост-проверка честно ловила, что проект
+    остался в папке, и тул отвечал «❌ НЕ переместился»: операция была
+    невыполнима в принципе."""
+    fake = _FakeTickTickHttp()
+    monkeypatch.setattr(s, "ticktick_v2", _client_on(fake))
+    monkeypatch.setattr(s, "_guard_project", lambda *a, **kw: None)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Проект"})
+
+    out = await s._move_project_to_group_impl("Проект", "p1", "NONE")
+
+    assert fake.projects[0]["groupId"] is None, "проект остался в папке"
+    assert "❌" not in out and "🛑" not in out, out
+    assert "без папки" in out and "проверено" in out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #102 — сверка ключа автоматизации переживает кириллицу и эмодзи
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_non_ascii_key_is_rejected_not_crashed():
+    """Кириллица/эмодзи в присланном ключе — это «ключ не подошёл», а не
+    исключение из гейта."""
+    for junk in ("ключ", "секрет🔑", "пароль-как-строка"):
+        assert s._automation_key_matches(junk) is False
+
+
+def test_non_ascii_secret_still_authenticates_automation(monkeypatch):
+    """И наоборот: если сам MCP_SECRET не-ASCII, автоматика обязана
+    проходить. Раньше падала ЛЮБАЯ проверка ключа на таком сервере."""
+    monkeypatch.setattr(s, "SECRET", "секретный-ключ-🔑")
+
+    assert s._automation_key_matches("секретный-ключ-🔑") is True
+    assert s._automation_key_matches("другой-ключ") is False
+    assert s._automation_key_matches("") is False
+
+
+def test_consent_gate_survives_a_non_ascii_key():
+    """Гейт должен ВЕРНУТЬ решение, а не бросить TypeError."""
+    m = {"kind": "delete", "consumed": False}
+    cr = s._require_consent(action="delete", tier=2, manifest=m,
+                            user_reply="", automation_key="ключ-🔑")
+    assert cr.ok is False
+
+
+def test_consent_gate_accepts_a_non_ascii_key_that_matches(monkeypatch):
+    monkeypatch.setattr(s, "SECRET", "секрет-🔑")
+    cr = s._require_consent(action="delete", tier=2, manifest=None,
+                            user_reply="", automation_key="секрет-🔑")
+    assert cr.ok is True and cr.reason == "automation_key"
+
+
+async def test_direct_create_with_non_ascii_key_answers_instead_of_raising(
+        monkeypatch):
+    """Сквозной путь тула: не-ASCII ключ даёт человеко-читаемый отказ, а не
+    исключение наружу."""
+    monkeypatch.setattr(s, "_ensure_official", lambda: None)
+    out = await s.create_tasks("Создаю", [{"title": "A", "projectId": "p1"}],
+                               automation_key="ключ-🔑")
+    assert out.startswith("🛑")
+    assert "автоматики" in out
+
+
+async def test_direct_create_with_matching_non_ascii_key_is_allowed(monkeypatch):
+    monkeypatch.setattr(s, "SECRET", "секрет-🔑")
+    called = []
+
+    async def _impl(summary, tasks):
+        called.append((summary, tasks))
+        return "### ✅ создано"
+
+    monkeypatch.setattr(s, "_create_tasks_impl", _impl)
+
+    out = await s.create_tasks("Создаю", [{"title": "A", "projectId": "p1"}],
+                               automation_key="секрет-🔑")
+
+    assert called, f"валидный не-ASCII ключ не пропустили: {out}"
