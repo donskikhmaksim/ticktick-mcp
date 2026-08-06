@@ -276,9 +276,13 @@ async def test_after_the_poller_ran_a_repeat_call_is_explicit_and_idempotent(
     _notify_ok(monkeypatch)
     _, mid = await c.plan()
 
-    # ровно то, что делает поллер: атомарно забирает манифест и оставляет
-    # «надгробие» — исполнение самой операции здесь неважно
+    # ровно то, что делает поллер по успешному проходу: атомарно забирает
+    # манифест и, ПОСЛЕ того как исполнитель вернулся успехом, помечает план
+    # исполненным. Второй шаг с 2026-08-06 обязателен: сам по себе захват
+    # больше не означает «исполнено» (см. tests/test_silent_failures.py —
+    # раньше упавшее исполнение оставляло отметку об успехе).
     assert s._consume_manifest_for_auto_execute(mid) is not None
+    s._tombstone_manifest(mid, s._TOMBSTONE_EXECUTED)
     s._prune_manifests()
     _verdict(monkeypatch, "approved")
 
@@ -298,6 +302,7 @@ async def test_tombstone_message_also_shown_before_pruning(
     _notify_ok(monkeypatch)
     _, mid = await c.plan()
     assert s._consume_manifest_for_auto_execute(mid) is not None
+    s._tombstone_manifest(mid, s._TOMBSTONE_EXECUTED)   # исполнение УДАЛОСЬ
     _verdict(monkeypatch, "approved")
 
     out = await c.execute(mid, "да")
@@ -438,9 +443,11 @@ async def test_wrong_automation_key_does_not_bypass_the_button(
     _, mid = await c.plan()
     _verdict(monkeypatch, "pending")
 
-    # ключ намеренно ASCII: `hmac.compare_digest` не умеет сравнивать строки
-    # с не-ASCII символами и бросает TypeError — отдельная (существовавшая до
-    # этой правки) шероховатость, к button-only отношения не имеющая.
+    # Не-ASCII ключ здесь тоже допустим (исправлено 2026-08-06: сверка идёт по
+    # sha256 от utf-8-байтов, а не через `hmac.compare_digest` двух `str`,
+    # который на кириллице/эмодзи бросал TypeError). Отдельно это закреплено в
+    # tests/test_silent_failures.py; здесь остаётся ASCII-ключ как самый
+    # обычный случай неверного ключа.
     out = await c.execute(mid, "да", automation_key="wrong-key")
 
     assert c.executed() == []

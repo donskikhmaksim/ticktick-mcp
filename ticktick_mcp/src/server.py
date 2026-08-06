@@ -52,6 +52,32 @@ PORT = int(os.getenv("PORT", os.getenv("MCP_PORT", "8000")))
 SECRET = os.getenv("MCP_SECRET", "").strip()
 STREAMABLE_PATH = f"/mcp/{SECRET}" if SECRET else "/mcp"
 
+
+def _automation_key_matches(provided: str) -> bool:
+    """Постоянное по времени сравнение `automation_key` с MCP_SECRET, которое
+    НЕ падает на не-ASCII (2026-08-06).
+
+    Было: `hmac.compare_digest(automation_key, SECRET)` с ДВУМЯ `str`. В этой
+    форме CPython требует, чтобы обе строки были ASCII-only, иначе бросает
+    `TypeError: comparing strings with non-ASCII characters is not supported`.
+    То есть достаточно одной кириллической буквы или эмодзи в присланном ключе
+    (модель прислала «ключ», клиент подставил осмысленную строку) — и вместо
+    честного «ключ не подошёл» из гейта вылетало исключение: у `create_tasks`
+    оно рвало вызов наружу, а внутри `_require_consent` — рушило гейт целиком,
+    вместо того чтобы принять по нему решение. Если не-ASCII оказывался в САМОМ
+    MCP_SECRET, автоматика ложилась вся и навсегда, при внешне корректном
+    ключе.
+
+    Сравниваем sha256-дайджесты utf-8-байтов: байты `compare_digest` принимает
+    любые, дайджест всегда 32 байта — значит не утекает и длина секрета
+    (у сравнения сырых байтов разной длины она видна по времени)."""
+    if not (SECRET and provided):
+        return False
+    return hmac.compare_digest(
+        hashlib.sha256(provided.encode("utf-8")).digest(),
+        hashlib.sha256(SECRET.encode("utf-8")).digest(),
+    )
+
 # Create FastMCP server
 mcp = FastMCP("ticktick", host=HOST, port=PORT, streamable_http_path=STREAMABLE_PATH)
 
@@ -1211,7 +1237,7 @@ async def create_tasks(
     part of that flow: `automation_key` bypasses the interactive gate
     entirely, so no button and no `user_reply` are involved here.
     """
-    if not (SECRET and automation_key and hmac.compare_digest(automation_key, SECRET)):
+    if not _automation_key_matches(automation_key):
         return ("🛑 Прямое создание — только для автоматики. Интерактивный флоу: "
                 "plan_task_creation (покажи эхо пользователю дословно) → явное "
                 "«да» → execute_task_creation(manifest_id, user_reply=<реплика>) "
@@ -3059,7 +3085,7 @@ def _require_consent(
     skipped (there is no plan_shown_at to compare against) but the
     affirmative-reply check still fully applies. Never mutates `manifest`
     except to invalidate it on an explicit "no"."""
-    if SECRET and automation_key and hmac.compare_digest(automation_key, SECRET):
+    if _automation_key_matches(automation_key):
         return ConsentResult(True, "automation_key")
     if tier <= 0:
         return ConsentResult(True, "tier0-no-gate")
@@ -3272,28 +3298,69 @@ def _prune_manifests() -> None:
 # исполнен», из которого нельзя понять, удалено ли что-то на самом деле.
 # Хранится только id + причина + время, без содержимого плана; кап на размер,
 # чтобы это не превращалось в утечку памяти.
+#
+# ТРИ РАЗЛИЧИМЫХ СОСТОЯНИЯ (2026-08-06). До этой правки надгробие ставилось
+# ОДНО и СРАЗУ при захвате манифеста, с причиной "tg_auto_executed" — то есть
+# «исполнено» писалось ДО самого исполнения. Если операция потом падала
+# (исключение, таймаут, отказ исполнителя строкой), надгробие оставалось
+# «исполнено», и следующий вызов получал бодрое «✅ УЖЕ исполнен, ничего не
+# потеряно» на операцию, которой не было. Теперь причина отражает фазу:
+#   • надгробия нет вовсе + манифест жив  → «ждёт нажатия» (кнопку не жали);
+#   • REASON_CLAIMED                      → «нажато, исполняется / исход
+#                                            неизвестен» (ставится при захвате);
+#   • REASON_FAILED                       → «нажато, НЕ выполнено» (падение,
+#                                            таймаут или отказ исполнителя);
+#   • REASON_EXECUTED                     → «выполнено» (ставится ТОЛЬКО после
+#                                            подтверждённого успеха).
 _MANIFEST_TOMBSTONES: "collections.OrderedDict[str, Dict]" = collections.OrderedDict()
 _MANIFEST_TOMBSTONE_CAP = 200
 
+_TOMBSTONE_CLAIMED = "tg_claimed"
+_TOMBSTONE_EXECUTED = "tg_auto_executed"
+_TOMBSTONE_FAILED = "tg_auto_execute_failed"
 
-def _tombstone_manifest(manifest_id: str, reason: str) -> None:
+
+def _tombstone_manifest(manifest_id: str, reason: str, detail: str = "") -> None:
     _MANIFEST_TOMBSTONES.pop(manifest_id, None)
     _MANIFEST_TOMBSTONES[manifest_id] = {
-        "reason": reason, "ts": datetime.now(timezone.utc).isoformat()}
+        "reason": reason, "ts": datetime.now(timezone.utc).isoformat(),
+        "detail": detail}
     while len(_MANIFEST_TOMBSTONES) > _MANIFEST_TOMBSTONE_CAP:
         _MANIFEST_TOMBSTONES.popitem(last=False)
 
 
 def _manifest_gone_msg(manifest_id: str, default: str) -> str:
-    """Внятный ответ вместо общего «не найден/истёк»: различает «уже исполнено
-    по кнопке в Telegram» и «истёк/не существовал»."""
+    """Внятный ответ вместо общего «не найден/истёк»: различает «исполнено по
+    кнопке», «взято в исполнение прямо сейчас», «нажато, но НЕ выполнено» и
+    «истёк/не существовал». Ни одно из трёх первых состояний не выдаётся за
+    другое — в частности, провалившееся исполнение больше не читается как
+    успех (см. блок про три состояния выше)."""
     t = _MANIFEST_TOMBSTONES.get(manifest_id)
-    if t and t.get("reason") == "tg_auto_executed":
+    reason = (t or {}).get("reason")
+    if reason == _TOMBSTONE_EXECUTED:
         return (f"✅ Этот план ({manifest_id}) УЖЕ исполнен — вы подтвердили его "
                 "кнопкой в Telegram, и сервер выполнил его сам "
                 f"({t.get('ts')}). Повторять нечего, ничего не потеряно: отчёт "
                 "об исполнении вписан в то же сообщение Telegram, где были "
                 "кнопки. Для новой операции построй план заново.")
+    if reason == _TOMBSTONE_CLAIMED:
+        return (f"⏳ Этот план ({manifest_id}) подтверждён кнопкой в Telegram и "
+                f"ПРЯМО СЕЙЧАС исполняется сервером (начато {t.get('ts')}). "
+                "Результат ещё не известен — он придёт в то же сообщение "
+                "Telegram, где были кнопки. Ничего не повторяй и этот "
+                "инструмент больше не зови: повторный запуск здесь ничего не "
+                "исполнит, а сообщить пользователю «сделано» сейчас нельзя — "
+                "это ещё не подтверждено.")
+    if reason == _TOMBSTONE_FAILED:
+        detail = (t.get("detail") or "").strip()
+        return (f"🛑 Этот план ({manifest_id}) был подтверждён кнопкой в "
+                f"Telegram, но исполнение НЕ завершилось успехом "
+                f"({t.get('ts')})"
+                + (f": {detail}" if detail else "") +
+                ". Считать операцию выполненной НЕЛЬЗЯ; часть изменений могла "
+                "успеть примениться — проверь реальное состояние в TickTick "
+                "(operation_report / чтение объектов) и, если нужно, построй "
+                "план заново. План одноразовый, он уже сгорел.")
     return default
 
 
@@ -10723,6 +10790,29 @@ _TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S = float(
     os.environ.get("TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S", "120"))
 
 
+# Маркеры, которыми исполнители этого сервера НАЧИНАЮТ отчёт, когда операция
+# НЕ состоялась: «🛑» — отказ до мутации («Автоисполнение отменено…», «НЕ
+# переместил…»), «❌» — мутация ушла, но пост-проверка показала, что её нет.
+# Оба означают одно: писать «исполнено» нельзя. Проверяется ТОЛЬКО начало
+# отчёта (после возможных «### » заголовка), потому что внутри успешного
+# многострочного отчёта «❌» может стоять у отдельного элемента пачки — это
+# частичный результат, а не провал целиком.
+_AUTO_EXECUTE_FAILURE_MARKS = ("🛑", "❌")
+
+
+def _first_line(text: str, cap: int = 200) -> str:
+    line = (text or "").strip().split("\n", 1)[0].strip()
+    return line if len(line) <= cap else line[:cap] + "…"
+
+
+def _auto_execute_report_is_failure(report_text: str) -> bool:
+    """Вернул ли авто-исполнитель ОТКАЗ строкой (без исключения). Нужно ровно
+    для одного решения: какое надгробие ставить — «выполнено» или «нажато, но
+    не выполнено»."""
+    head = (report_text or "").lstrip().lstrip("#").lstrip()
+    return head.startswith(_AUTO_EXECUTE_FAILURE_MARKS)
+
+
 async def _tg_auto_execute_tick() -> None:
     """One pass: find candidates, execute each via its registered executor,
     report the result back into the Telegram message. Mirrors gmail-mcp's
@@ -10765,6 +10855,16 @@ async def _tg_auto_execute_tick() -> None:
             report_text = await asyncio.wait_for(
                 entry.execute(mid, consumed),
                 _TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S)
+            # Отметка «исполнено» — ЗДЕСЬ и только здесь, после того как
+            # исполнитель реально вернулся, и только если он вернулся УСПЕХОМ.
+            # Отказ исполнителя строкой (`_auto_execute_*` умеют вернуть
+            # «🛑 Автоисполнение отменено…», не бросая исключение) — это НЕ
+            # исполнение, и надгробие для него — _TOMBSTONE_FAILED.
+            if _auto_execute_report_is_failure(report_text):
+                _tombstone_manifest(mid, _TOMBSTONE_FAILED,
+                                    _first_line(report_text))
+            else:
+                _tombstone_manifest(mid, _TOMBSTONE_EXECUTED)
             await _run_blocking(tg_approval.report_auto_execution_result,
                                 _TG_CFG, c["chat_id"], c["message_id"], report_text)
         except Exception as e:
@@ -10775,6 +10875,11 @@ async def _tg_auto_execute_tick() -> None:
                        "TickTick: часть операции могла успеть примениться.")
             else:
                 msg = f"🛑 Ошибка при автоисполнении «{tool}»: {e}"
+            # Падение ПОСЛЕ нажатия кнопки: состояние «нажато, но НЕ
+            # выполнено». Раньше здесь не менялось ничего, и надгробие,
+            # поставленное при захвате, продолжало утверждать «исполнено» —
+            # тихий отказ в чистом виде.
+            _tombstone_manifest(mid, _TOMBSTONE_FAILED, _first_line(msg))
             logger.error(f"TG auto-execute: ошибка при исполнении "
                         f"{tool}/{mid}: {e!r}")
             try:
@@ -10794,10 +10899,15 @@ def _consume_manifest_for_auto_execute(manifest_id: str) -> Optional[Dict]:
     if m is None or m.get("consumed"):
         return None
     m["consumed"] = True
-    # Оставляем «надгробие» ДО исполнения: если модель следом честно позовёт
-    # execute_task_deletion по тому же id, она получит внятное «уже исполнено
-    # по кнопке», а не безликое «не найден/истёк» (см. _manifest_gone_msg).
-    _tombstone_manifest(manifest_id, "tg_auto_executed")
+    # Надгробие ставится и здесь, ДО исполнения, — но со статусом «ЗАХВАЧЕН,
+    # исход неизвестен», а не «исполнен». Захват обязан фиксироваться сразу:
+    # `consumed` уже выставлен, второго шанса у плана нет, и модель, честно
+    # позвавшая execute_* по тому же id, должна получить внятный ответ, а не
+    # безликое «не найден/истёк». Но именно «исполнено» на этом месте было
+    # ВРАНЬЁМ (см. блок про три состояния над _tombstone_manifest): статус
+    # переписывается на _TOMBSTONE_EXECUTED / _TOMBSTONE_FAILED в
+    # `_tg_auto_execute_tick` — по факту исхода, а не по факту нажатия.
+    _tombstone_manifest(manifest_id, _TOMBSTONE_CLAIMED)
     return m
 
 

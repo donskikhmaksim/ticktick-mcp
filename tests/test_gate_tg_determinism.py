@@ -323,8 +323,12 @@ async def test_message_after_button_auto_execution_is_explicit(monkeypatch, tmp_
     _tg_on(monkeypatch)
     _plan_manifest("mid-auto", notified=True)
 
-    # то, что делает фоновый поллер по нажатию кнопки
+    # то, что делает фоновый поллер по нажатию кнопки: сначала атомарно
+    # забирает манифест, а «исполнено» проставляет ПОСЛЕ успеха (2026-08-06,
+    # см. tests/test_silent_failures.py — до этого отметка ставилась при
+    # захвате, и упавшее исполнение выдавалось за успешное)
     assert s._consume_manifest_for_auto_execute("mid-auto") is not None
+    s._tombstone_manifest("mid-auto", s._TOMBSTONE_EXECUTED)
     s._prune_manifests()
 
     out = await s.execute_task_deletion("mid-auto", user_reply="да")
