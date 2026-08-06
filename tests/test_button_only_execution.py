@@ -247,7 +247,7 @@ async def test_operation_is_not_lost_the_poller_still_executes_it(
     _verdict(monkeypatch, "approved")
     await c.execute(mid, "да")                          # текстом — отказ
 
-    monkeypatch.setattr(tg, "get_tg_approvals", lambda ids: {
+    monkeypatch.setattr(tg, "get_tg_approvals", lambda ids, lost_scan_since_ms=None: {
         i: {"status": "APPROVED", "expires_at": tg._now_ms() + 3_600_000,
             "chat_id": "c1", "message_id": 7} for i in ids if i == mid})
     found = [x for x in s._find_tg_auto_execute_candidates()
@@ -611,16 +611,24 @@ def _tools_that_send_a_button() -> set:
     же, как проехали delete_project и rename_tag (их расхождение нашёл только
     внешний разбор, потому что такой проверки не существовало).
 
-    Два источника, оба обязательны:
+    Три источника, все обязательны:
       • явные вызовы `_maybe_tg_notify_plan("<tool>", …)` — тулы со своим
-        манифестом (delete_tasks, create_tasks, delete_project, rename_tag…);
+        манифестом (delete_project, rename_tag…);
+      • та же отправка, но вынесенная в поток —
+        `_run_blocking(_maybe_tg_notify_plan, "<tool>", …)`: в async-тулах
+        (delete_tasks, plan_task_deletion, plan_task_creation) вызов
+        синхронный и на 429 спит, поэтому идёт через executor. Без этого
+        шаблона инвентаризация молча теряла бы именно те тулы, у которых
+        план самый длинный;
       • тулы, заведённые через общие гейты `_gate_batch`/`_gate_single` — их
         планы уходят в Telegram ИЗНУТРИ гейта, отдельного вызова в коде тула
-        нет, поэтому по первому источнику они не находятся вовсе.
+        нет, поэтому по первым двум источникам они не находятся вовсе.
     """
     import inspect as _inspect
     src = _inspect.getsource(s)
     tools = set(re.findall(r'_maybe_tg_notify_plan\(\s*"([a-z_]+)"', src))
+    tools |= set(re.findall(
+        r'_run_blocking\(\s*_maybe_tg_notify_plan\s*,\s*"([a-z_]+)"', src))
     tools |= set(re.findall(r'_gate_batch\(\s*"[a-z_]+",\s*"([a-z_]+)"', src))
     tools |= set(re.findall(r'_gate_single\(\s*"[a-z_]+",\s*"([a-z_]+)"', src))
     return tools

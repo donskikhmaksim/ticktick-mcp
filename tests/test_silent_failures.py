@@ -89,8 +89,16 @@ def _notify_ok(monkeypatch):
 
 def _approved(monkeypatch, mid, message_id=7):
     """Пакетное чтение статусов (единственный путь поллера в базу): наш план
-    подтверждён кнопкой, чужие — «строки нет»."""
-    monkeypatch.setattr(tg, "get_tg_approvals", lambda ids: {
+    подтверждён кнопкой, чужие — «строки нет».
+
+    Второй параметр (`lost_scan_since_ms`) появился вместе с поиском
+    ПОТЕРЯННЫХ планов — строк, решение по которым в базе есть, а манифеста в
+    памяти уже нет (перезапуск сервиса). Поллер теперь зовёт эту функцию с
+    двумя аргументами ВСЕГДА, поэтому заглушка обязана их принимать: с одним
+    она бросала TypeError, поллер ловил его как «база недоступна» и выходил
+    из прохода — тесты этого файла падали не по своей теме, а на обвязке.
+    Здесь потерянных планов нет, поэтому аргумент игнорируется."""
+    monkeypatch.setattr(tg, "get_tg_approvals", lambda ids, lost_scan_since_ms=None: {
         i: {"status": "APPROVED", "expires_at": tg._now_ms() + 3_600_000,
             "chat_id": "c1", "message_id": message_id}
         for i in ids if i == mid})
@@ -99,10 +107,33 @@ def _approved(monkeypatch, mid, message_id=7):
 
 
 def _collect_reports(monkeypatch):
+    """Перехват ИТОГА, который поллер публикует после исполнения.
+
+    Каналов публикации стало три (ветка отчётов в группу «MCP Отчёты»):
+    ПОЛНЫЙ отчёт уходит в группу-архив (`post_report_to_group`), при неудаче —
+    фолбэком в личку (`send_message_chunked`), а в исходное сообщение с
+    кнопками вписывается КОРОТКАЯ сводка (`summarize_in_owner_chat`).
+    Возвращает (сводки, архив): подробности (текст исключения, трассировку
+    смысла) теперь надо искать во ВТОРОМ, потому что в личку намеренно уходит
+    только «выполнено / не выполнено» без деталей — личный чат не захламляют.
+    Сетевые каналы подменяются все, иначе тест реально стучится в
+    api.telegram.org (это было видно в логах: «Not Found» от editMessageText).
+    """
     reports = []
+    archive = []
     monkeypatch.setattr(tg, "report_auto_execution_result",
                         lambda cfg, chat_id, message_id, text: reports.append(text))
-    return reports
+    monkeypatch.setattr(tg, "summarize_in_owner_chat",
+                        lambda cfg, chat_id, message_id, text:
+                        reports.append(text) or True, raising=False)
+    monkeypatch.setattr(tg, "post_report_to_group",
+                        lambda cfg, mid, md, *, tool, verdict:
+                        archive.append(md)
+                        or tg.ReportDelivery([2], 1, 1, True), raising=False)
+    monkeypatch.setattr(tg, "send_message_chunked",
+                        lambda cfg, chat, md, **kw: tg.SendResult(True, [1], "", 1),
+                        raising=False)
+    return reports, archive
 
 
 def _plant_delete_manifest(mid="silent-104"):
@@ -131,7 +162,7 @@ def test_executor_raises_after_the_press_is_not_marked_executed(monkeypatch):
     _tg_on(monkeypatch)
     mid = _plant_delete_manifest()
     _approved(monkeypatch, mid)
-    reports = _collect_reports(monkeypatch)
+    reports, archive = _collect_reports(monkeypatch)
 
     async def boom(manifest_id, m):
         raise RuntimeError("kaboom")
@@ -148,8 +179,14 @@ def test_executor_raises_after_the_press_is_not_marked_executed(monkeypatch):
     assert "УЖЕ исполнен" not in msg
     assert "НЕ завершилось успехом" in msg
     assert "kaboom" in msg
-    # отчёт в Telegram по-прежнему уходит и по-прежнему говорит об ошибке
-    assert len(reports) == 1 and "kaboom" in reports[0]
+    # Отчёт в Telegram по-прежнему уходит и по-прежнему говорит об ошибке —
+    # но с появлением группы «MCP Отчёты» он РАЗДЕЛЁН на два канала: в личку
+    # владельцу идёт короткое «не выполнено» (личный чат намеренно не
+    # захламляют деталями), а полный текст с самим исключением ложится в
+    # архив. Проверяем оба, иначе «где-то же написано» осталось бы
+    # непроверенным ровно в том канале, который для разбора и предназначен.
+    assert len(reports) == 1 and "не выполнено" in reports[0]
+    assert len(archive) == 1 and "kaboom" in archive[0]
 
 
 def test_executor_refusing_with_a_string_is_not_marked_executed(monkeypatch):
@@ -158,7 +195,7 @@ def test_executor_refusing_with_a_string_is_not_marked_executed(monkeypatch):
     _tg_on(monkeypatch)
     mid = _plant_delete_manifest("silent-104-refusal")
     _approved(monkeypatch, mid)
-    _collect_reports(monkeypatch)
+    _collect_reports(monkeypatch)   # каналы публикации замолчали, содержимое не проверяем
 
     async def refuse(manifest_id, m):
         return ("🛑 Автоисполнение отменено: манифест не в формате плана — "
@@ -178,7 +215,7 @@ def test_executor_timeout_after_the_press_is_not_marked_executed(monkeypatch):
     monkeypatch.setattr(s, "_TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S", 0.01)
     mid = _plant_delete_manifest("silent-104-timeout")
     _approved(monkeypatch, mid)
-    _collect_reports(monkeypatch)
+    _collect_reports(monkeypatch)   # каналы публикации замолчали, содержимое не проверяем
 
     async def slow(manifest_id, m):
         await asyncio.sleep(5)
@@ -198,7 +235,7 @@ def test_successful_execution_is_marked_executed(monkeypatch):
     _tg_on(monkeypatch)
     mid = _plant_delete_manifest("silent-104-ok")
     _approved(monkeypatch, mid)
-    reports = _collect_reports(monkeypatch)
+    reports, archive = _collect_reports(monkeypatch)
 
     async def ok(manifest_id, m):
         return "### ✅ Удалено 1 задание (проверено)."
@@ -238,7 +275,7 @@ async def test_model_calling_execute_after_a_failed_auto_run_is_not_told_done(
     monkeypatch.setattr(s, "_ensure_ready", lambda: None)
     _tg_on(monkeypatch)
     _notify_ok(monkeypatch)
-    _collect_reports(monkeypatch)
+    _collect_reports(monkeypatch)   # каналы публикации замолчали, содержимое не проверяем
 
     async def boom(summary, tasks, **extra):
         raise RuntimeError("TickTick вернул 500")

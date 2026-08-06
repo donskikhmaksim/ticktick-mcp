@@ -79,6 +79,52 @@ is requested but the sheet is unreachable (missing creds, no network),
 `plan_declutter` REFUSES explicitly rather than silently falling back to RAM
 — durability is the entire point of that mode.
 
+### Optional Telegram approval layer (set `TG_APPROVAL_ENABLED`)
+
+By default, every mutating tool is gated by a plan → chat-confirmation →
+execute flow: the model shows you a plan, you type something affirmative
+back in the same conversation, and only then does it execute. Set
+`TG_APPROVAL_ENABLED=true` to add a **second, out-of-band factor** (a
+confirmation channel independent from the chat itself) on top of that: the
+plan also has to be confirmed with a button tap in Telegram, so a chat reply
+that was fabricated or misread by the model can no longer execute anything
+on its own.
+
+How it works, end to end:
+1. When the model plans a mutating action, the plan is sent to you in a
+   private Telegram DM with **✅ Confirm** / **🛑 Reject** buttons. A long
+   plan is split across several Telegram messages automatically — the
+   buttons live on the last one.
+2. Tapping a button doesn't hit this server directly. The **webhook**
+   (the HTTP endpoint Telegram calls when you tap something) lives in the
+   neighboring **gmail-mcp** service, which writes your decision into the
+   shared `tg_approvals` table. ticktick-mcp itself never registers a
+   webhook for this.
+3. A background **poller** (a job that periodically checks for new state
+   instead of being pushed to) in ticktick-mcp, running every
+   `TG_AUTO_EXECUTE_INTERVAL_S` seconds, sees the approval and executes the
+   action itself — the model does not need to call the tool a second time.
+4. After executing, the server independently re-reads the result to verify
+   it (a real re-check by reading live state, not an "assume it worked"
+   report), then posts the **full** report to the "MCP Отчёты" ("MCP
+   Reports") group chat as an archive, while only a short summary is sent
+   back to your DM.
+5. If neither button is ever tapped, a **reaper** (background cleanup job)
+   running every `TG_REAP_INTERVAL_S` seconds (toggle: `TG_REAP_ENABLED`)
+   deletes the plan message and everything tied to it once
+   `TG_APPROVAL_TTL_S` seconds have passed — the whole message is removed,
+   not just its buttons.
+
+`TG_APPROVAL_ENABLED=false` (the default) keeps this server byte-for-byte
+identical to before this layer existed — no network calls, no Postgres
+access, and chat confirmation alone remains the only gate.
+
+> ⚠️ `tg_approvals` is a table **shared with gmail-mcp** (and
+> sheets/calendar/docs/drive-mcp, all backed by the same Postgres). Its
+> schema is treated as frozen: don't change its columns or status semantics
+> unilaterally from this repo — every other server reading/writing that
+> table depends on the current shape.
+
 ## Two TickTick APIs, and what breaks if the unofficial one goes down
 
 This server talks to TickTick over two very different APIs. It's worth
@@ -161,6 +207,16 @@ maintaining a second codebase that covers a fraction of the functionality.
 | `TICKTICK_V2_TOKEN` | optional | the `t` cookie — enables the v2 API |
 | `CLAUDE_CLI_URL` / `CLAUDE_CLI_TOKEN` / `CLAUDE_CLI_MODEL` | optional | LLM judge for declutter dedup/SMART-rewrite + destination suggestions — see above |
 | `DECLUTTER_SHEET_ID` / `GSHEETS_SA_JSON` | optional | sheet-backed declutter manifest (`plan_declutter(persist="sheet")`) — see below |
+| `TG_APPROVAL_ENABLED` | optional | enables the Telegram approval layer (2nd factor on top of chat confirmation) — see above; `false` (default) = no network calls, behaves exactly as before |
+| `TG_BOT_TOKEN` | if `TG_APPROVAL_ENABLED=true` | Telegram bot token for the approval bot |
+| `TG_OWNER_CHAT_ID` | if `TG_APPROVAL_ENABLED=true` | your personal Telegram chat id — where the plan with buttons is sent |
+| `TG_REPORTS_CHAT_ID` | optional (default: `TG_OWNER_CHAT_ID`) | group chat id for the auto-execution report archive (e.g. the real "MCP Отчёты" group: `-1004357150083`); unset sends reports to your DM instead |
+| `TG_APPROVAL_TOOLS` | optional | comma-separated tool names to gate with TG approval; empty (default) = all gated tools |
+| `TG_APPROVAL_TTL_S` | optional (default `3600`) | seconds an approval request stays alive; on expiry the plan message is deleted entirely, not just its buttons |
+| `TG_AUTO_EXECUTE_INTERVAL_S` | optional (default `10`) | poll interval, in seconds, for the background poller that executes button-approved actions |
+| `TG_REAP_INTERVAL_S` | optional (default `60`) | poll interval, in seconds, for the reaper that cleans up expired approval requests |
+| `TG_REAP_ENABLED` | optional (default `true`) | kill switch for the reaper — `false` disables TTL-based message deletion |
+| `CONSENT_DATABASE_URL` | if `TG_APPROVAL_ENABLED=true` | DSN (connection string) of the shared Postgres — the same one gmail/sheets/calendar/docs/drive-mcp use — holding the `tg_approvals` table |
 | `MCP_TRANSPORT` | for remote | `streamable-http` (default `stdio`) |
 | `MCP_SECRET` | strongly recommended | secret appended to URL path: `/mcp/<secret>` — lightweight auth for the public endpoint; also the root of the attachment-link signing key |
 | `PUBLIC_BASE_URL` | optional | public base URL of this server (e.g. `https://<app>.up.railway.app`), used to build attachment transfer links; falls back to Railway's `RAILWAY_PUBLIC_DOMAIN` |

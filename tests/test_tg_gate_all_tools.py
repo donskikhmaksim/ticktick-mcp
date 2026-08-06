@@ -499,10 +499,30 @@ def _approved(monkeypatch, mids):
     проход) вместо check_approval+get_tg_approval на каждый живой манифест —
     подменяем именно пакетную функцию. Одиночные никуда не делись, их всё так
     же зовёт чат-путь (_require_consent), см. тесты выше в этом файле."""
-    monkeypatch.setattr(tg, "get_tg_approvals", lambda ids: {
+    monkeypatch.setattr(tg, "get_tg_approvals", lambda ids, lost_scan_since_ms=None: {
         mid: {"status": "APPROVED", "expires_at": tg._now_ms() + 3_600_000,
-              "chat_id": "c1", "message_id": 7}
+              "chat_id": "c1", "message_id": 7, "extra_message_ids": []}
         for mid in ids if mid in mids})
+
+
+def _report_sinks(monkeypatch):
+    """Перехватывает ОБОИХ получателей итога автоисполнения (2026-08-06):
+    группу-архив с полным markdown и личку владельца с короткой сводкой.
+    Возвращает (group, private) — списки, которые тесты и проверяют."""
+    group, private = [], []
+
+    def _post(cfg, manifest_id, report_md, *, tool, verdict):
+        group.append({"manifest_id": manifest_id, "report_md": report_md,
+                      "tool": tool, "verdict": verdict})
+        return tg.ReportDelivery([1001], 1, 1, True)
+
+    def _summarize(cfg, chat_id, message_id, short_md):
+        private.append((chat_id, message_id, short_md))
+        return True
+
+    monkeypatch.setattr(tg, "post_report_to_group", _post)
+    monkeypatch.setattr(tg, "summarize_in_owner_chat", _summarize)
+    return group, private
 
 
 @pytest.mark.parametrize("tool", ["complete_tasks", "move_tasks", "create_tag",
@@ -527,7 +547,7 @@ async def test_poller_ignores_pending_gate_manifests(tool, monkeypatch):
     _tg_on(monkeypatch)
     _notify_ok(monkeypatch)
     _, mid = await _plan(tool, monkeypatch)
-    monkeypatch.setattr(tg, "get_tg_approvals", lambda ids: {
+    monkeypatch.setattr(tg, "get_tg_approvals", lambda ids, lost_scan_since_ms=None: {
         mid: {"status": "PENDING", "expires_at": tg._now_ms() + 3_600_000,
               "chat_id": "c1", "message_id": 7} for mid in ids})
 
@@ -546,17 +566,18 @@ async def test_tick_executes_and_reports_back_into_the_message(tool, monkeypatch
     rec = _stub_impl(monkeypatch, tool, [])
     _, mid = await _plan(tool, monkeypatch)
     _approved(monkeypatch, {mid})
-    reports = []
-    monkeypatch.setattr(tg, "report_auto_execution_result",
-                        lambda cfg, chat_id, message_id, text: reports.append((chat_id, message_id, text)))
+    # Итог с 2026-08-06 разъезжается по ДВУМ адресам: полный markdown — в
+    # группу-архив, короткая сводка — в то же личное сообщение с кнопками.
+    group, private = _report_sinks(monkeypatch)
 
     await s._tg_auto_execute_tick()
 
     assert len(rec) == 1, f"тик не исполнил {tool}"
     assert s._MANIFESTS[mid]["consumed"] is True
-    assert len(reports) == 1
-    assert reports[0][0] == "c1" and reports[0][1] == 7
-    assert "🛑" not in reports[0][2]
+    assert len(group) == 1 and group[0]["tool"] == tool
+    assert len(private) == 1
+    assert private[0][0] == "c1" and private[0][1] == 7
+    assert "🛑" not in private[0][2]
     # Модель, позвавшая execute следом, получает внятное «уже исполнено», а не
     # безликое «не найден/истёк».
     s._prune_manifests()
@@ -634,15 +655,13 @@ async def test_tick_with_a_misdispatched_tool_executes_nothing(monkeypatch):
     _approved(monkeypatch, {mid})
     # симулируем ровно ошибку диспетчеризации
     monkeypatch.setattr(s, "_auto_execute_tool_of", lambda m: "create_project_group")
-    reports = []
-    monkeypatch.setattr(tg, "report_auto_execution_result",
-                        lambda cfg, chat_id, message_id, text: reports.append(text))
+    group, private = _report_sinks(monkeypatch)
 
     await s._tg_auto_execute_tick()
 
     assert rec_tag == [] and rec_other == []
     assert s._MANIFESTS[mid]["consumed"] is False
-    assert reports == []
+    assert group == [] and private == []
 
 
 # ═══════ 9. Регресс-страховка по сигнатурам ═══════

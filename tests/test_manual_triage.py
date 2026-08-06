@@ -1253,13 +1253,17 @@ async def test_changes_invisible_in_the_open_list_are_reported_as_unchecked(
     assert "не проверить" in out
 
 
-# ═══════ 12. Telegram-кнопка не имеет права подтверждать ОБРЕЗАННЫЙ план ════
-# `tg_approval._clip` режет превью по PREVIEW_CAP перед отправкой, а кнопка ✅
-# исполняет ВЕСЬ манифест: план на 50 операций доезжает до владельца двумя
-# десятками строк, а подтверждается целиком. Кнопка — единственный внеполосный
-# фактор согласия, поэтому здесь fail-closed на своей стороне: такой план не
-# строится вовсе. Общий слой `tg_approval.py` при этом НЕ трогаем (его
-# параллельно переделывает другая ветка).
+# ═══════ 12. Кнопка подтверждает РОВНО ТО, что владелец увидел ═════════════
+# Требование прежнее и неизменное: кнопка ✅ — единственный внеполосный фактор
+# согласия, и подтверждать ею строки, которых не было в сообщении, нельзя.
+# Изменился СПОСОБ его выполнения. Раньше общий слой резал превью по
+# искусственному PREVIEW_CAP и слал обрезок, поэтому здесь стоял fail-closed
+# отказ строить длинный план (мера, помеченная автором как временная: «общий
+# слой параллельно переделывает другая ветка»). Та ветка приехала и обрезку
+# убрала — план доставляется ЦЕЛИКОМ, разбитый на несколько сообщений
+# (split_for_telegram / send_message_chunked). Отказ вместе с его причиной
+# снят, а тесты ниже держат новое: длинный план строится и доезжает полностью.
+# Предел разового ущерба по-прежнему на _TRIAGE_HARD_CAP (50 операций).
 
 def _tg_on(monkeypatch, allowlist=None):
     monkeypatch.setattr(s, "_TG_CFG", tg.TgApprovalConfig(
@@ -1301,29 +1305,47 @@ def _long_plan(n=50):
     return live, ops
 
 
-async def test_plan_too_long_for_telegram_is_refused_and_builds_no_manifest(
+async def test_long_plan_reaches_telegram_whole_instead_of_being_refused(
         monkeypatch, tmp_path):
+    """ПЕРЕПИСАН ПРИ СЛИЯНИИ 2026-08-06. Здесь стояло обратное утверждение:
+    план на 50 операций ОТВЕРГАЛСЯ, потому что общий слой резал превью по
+    искусственному `PREVIEW_CAP` и слал обрезок, а кнопка ✅ исполняла весь
+    манифест — человек подтверждал строки, которых не видел.
+
+    Ветка отчётов в группу убрала обрезку по прямому требованию Максима
+    («нельзя молча резать, надо доставить целиком, разбив на несколько
+    сообщений»). Причина отказа исчезла, а сам отказ стал вредным — он
+    запрещал бы законный длинный разбор. Теперь проверяется НОВОЕ поведение:
+    план строится, уходит целиком и его текст НЕ обрезан."""
     live, ops = _long_plan(50)
     _wire(monkeypatch, live, tmp_path)
-    calls = _stub_sub_impls(monkeypatch, live)
     _tg_on(monkeypatch)
     seen = _notify_recorder(monkeypatch)
 
-    out = await s.manual_triage("Разбираю входящие", ops)
+    preview = await s.manual_triage("Разбираю входящие", ops)
 
-    assert "🛑" in out and "не помещается" in out
-    assert "Манифест" not in out, "отказ не имеет права строить план"
-    assert s._MANIFESTS == {}, "манифест пережил отказ — его можно было бы дожать"
-    assert seen == [], "в Telegram ушёл план, который там не поместится"
-    assert calls == []
-    # Текст отказа обязан быть действенным: сколько передали, сколько влезает.
-    assert "50" in out and "Разбей разбор на части" in out
+    assert "🛑" not in preview
+    assert "не помещается" not in preview
+    m = s._MANIFESTS[_mid(preview)]
+    assert len(m["tasks"]) == 50
+    assert len(seen) == 1 and seen[0]["tool"] == "manual_triage"
+    # Превью длиннее ОДНОГО телеграмного сообщения — и всё равно уходит
+    # целиком: разбиение на части живёт в слое отправки, а не в обрезке.
+    assert len(preview) > tg.TELEGRAM_TEXT_LIMIT, len(preview)
+    # В Telegram уходит САМ план; возвращаемый моделью текст — это он же плюс
+    # приписка «ждём нажатия кнопки», которую дописывает `_maybe_tg_notify_plan`
+    # уже ПОСЛЕ отправки. Поэтому сверяем вхождением, а не равенством: важно
+    # ровно одно — план ушёл целиком, без «…» на конце.
+    sent = seen[0]["preview"]
+    assert sent in preview, "в Telegram ушёл не тот текст, что показан модели"
+    assert len(sent) > tg.TELEGRAM_TEXT_LIMIT, "план ушёл в Telegram усечённым"
+    assert not sent.rstrip().endswith("…"), "план обрезали многоточием"
 
 
 async def test_the_same_long_plan_is_fine_when_telegram_layer_is_off(
         monkeypatch, tmp_path):
-    """Зеркало предыдущего: ограничение — следствие ЛИМИТА TELEGRAM, а не
-    самоцель. Без этого слоя длинный план виден в чате целиком и строится."""
+    """Зеркало предыдущего со стороны выключенного слоя: длина плана вообще ни
+    на что не влияет — ни с Telegram, ни без него."""
     live, ops = _long_plan(50)
     _wire(monkeypatch, live, tmp_path)
     _tg_off(monkeypatch)
@@ -1333,14 +1355,12 @@ async def test_the_same_long_plan_is_fine_when_telegram_layer_is_off(
     assert "🛑" not in preview
     m = s._MANIFESTS[_mid(preview)]
     assert len(m["tasks"]) == 50
-    # …и он ДЕЙСТВИТЕЛЬНО длиннее телеграмного лимита — иначе тест выше
-    # проверял бы несуществующий сценарий.
-    assert len(preview) > tg.PREVIEW_CAP, len(preview)
+    assert len(preview) > tg.TELEGRAM_TEXT_LIMIT, len(preview)
 
 
 async def test_short_plan_still_goes_to_telegram_untouched(monkeypatch, tmp_path):
-    """Проверка на переусердствование: обычный разбор из пяти операций слоем
-    длины не задет и уходит в Telegram как раньше."""
+    """Проверка на переусердствование: обычный разбор из пяти операций уходит
+    в Telegram как есть, одним сообщением."""
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     _tg_on(monkeypatch)
@@ -1349,7 +1369,7 @@ async def test_short_plan_still_goes_to_telegram_untouched(monkeypatch, tmp_path
     preview = await s.manual_triage("Разбираю входящие", _mixed_ops())
 
     assert len(seen) == 1 and seen[0]["tool"] == "manual_triage"
-    assert len(seen[0]["preview"]) <= tg.PREVIEW_CAP
+    assert len(seen[0]["preview"]) <= tg.TELEGRAM_TEXT_LIMIT
     assert s._MANIFESTS[_mid(preview)]["tg_notified"] is True
 
 

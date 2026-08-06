@@ -70,12 +70,16 @@ def _count_db_reads(monkeypatch) -> dict:
     """Счётчик ВСЕХ путей чтения статусов из Postgres — и пакетного, и двух
     одиночных. Считать нужно все три: иначе возврат к поштучному чтению
     (check_approval/get_tg_approval в цикле) тест бы не заметил."""
-    calls = {"batch": 0, "single": 0, "ids": 0}
+    calls = {"batch": 0, "single": 0, "ids": 0, "lost_scan": 0}
 
-    def _batch(ids):
+    def _batch(ids, lost_scan_since_ms=None):
         ids = list(ids)
         calls["batch"] += 1
         calls["ids"] += len(ids)
+        # Поиск потерянных планов («подтверждено, а исполнять нечего») обязан
+        # ехать ВТОРОЙ веткой ТОГО ЖЕ запроса, а не отдельной поездкой.
+        if lost_scan_since_ms is not None:
+            calls["lost_scan"] += 1
         return {mid: _row() for mid in ids}
 
     def _check(mid):
@@ -108,13 +112,27 @@ def _noop_executor(monkeypatch, record=None, delay=0.0, boom_on=None):
 
 
 def _silent_report(monkeypatch, sink=None, sleep_s=0.0):
-    def _rep(cfg, chat_id, message_id, text):
+    """Подменяет ОБОИХ получателей итога автоисполнения.
+
+    С 2026-08-06 итог уходит двумя разными вызовами, а не одним: ПОЛНЫЙ
+    markdown — в группу-архив (`post_report_to_group`), КОРОТКАЯ сводка — в то
+    же личное сообщение с кнопками (`summarize_in_owner_chat`). Оба
+    синхронные (requests + сон на 429), поэтому `sleep_s` вешается на
+    групповую отправку — именно её вынос в поток и проверяет тест про
+    незамороженный event loop. В `sink` кладётся полный текст отчёта: тесты
+    ниже ищут в нём маркеры провала («🛑», «kaboom», «не уложилось»)."""
+    def _post(cfg, manifest_id, report_md, *, tool, verdict):
         if sleep_s:
             time.sleep(sleep_s)      # синхронный, как настоящий requests.post
         if sink is not None:
-            sink.append(text)
+            sink.append(report_md)
+        return tg.ReportDelivery([1001], 1, 1, True)
 
-    monkeypatch.setattr(tg, "report_auto_execution_result", _rep)
+    def _summarize(cfg, chat_id, message_id, short_md):
+        return True
+
+    monkeypatch.setattr(tg, "post_report_to_group", _post)
+    monkeypatch.setattr(tg, "summarize_in_owner_chat", _summarize)
 
 
 # ═══════════ 1. Поездок в базу за проход — константа, не O(планов) ═══════════
@@ -159,15 +177,28 @@ async def test_db_roundtrips_identical_for_1_and_25_plans(monkeypatch):
     assert total_one == total_many == 1
 
 
-async def test_no_db_read_at_all_when_nothing_is_pending(monkeypatch):
-    """Пустой список живых манифестов — в базу не ходим вовсе (типичное
-    состояние: поллер тикает круглосуточно, планов почти всегда нет)."""
+async def test_empty_memory_still_costs_exactly_one_db_read(monkeypatch):
+    """РАНЬШЕ этот тест требовал ОБРАТНОГО: пустая память — в базу не ходим
+    вовсе. Требование снято сознательно 2026-08-06, и вот почему.
+
+    Пустая память — это состояние сервиса СРАЗУ ПОСЛЕ ПЕРЕЗАПУСКА, то есть
+    ровно то, в котором обнаруживаются планы, потерянные из-за деплоя:
+    владелец нажал ✅, строка в Postgres стала APPROVED, а исполнять уже
+    нечего. Прежний ранний выход делал такую потерю НЕНАБЛЮДАЕМОЙ по
+    построению — поллер молчал, сообщение с кнопками висело вечно.
+
+    Что тест защищает теперь: цена этого — РОВНО ОДИН запрос на проход (а не
+    два: «статусы живых» + «поиск потерянных» отдельно), и он же несёт
+    параметр сканирования потерь."""
     _enable_tg(monkeypatch)
     calls = _count_db_reads(monkeypatch)
 
     await s._tg_auto_execute_tick()
 
-    assert calls == {"batch": 0, "single": 0, "ids": 0}
+    assert calls["batch"] == 1 and calls["single"] == 0
+    assert calls["ids"] == 0, "живых манифестов нет — список id пуст"
+    assert calls["lost_scan"] == 1, ("проход обязан искать потерянные планы в "
+                                     "том же запросе")
 
 
 # ═══════════ 2. Проход поллера не морозит event loop ═══════════
@@ -200,7 +231,7 @@ async def test_slow_db_read_does_not_block_the_event_loop(monkeypatch):
     _silent_report(monkeypatch)
     ids = _plant(3)
 
-    def _slow_batch(mids):
+    def _slow_batch(mids, lost_scan_since_ms=None):
         time.sleep(0.2)
         return {mid: _row() for mid in mids}
 
@@ -220,7 +251,8 @@ async def test_slow_telegram_report_does_not_block_the_event_loop(monkeypatch):
     _noop_executor(monkeypatch)
     _silent_report(monkeypatch, sleep_s=0.2)
     monkeypatch.setattr(tg, "get_tg_approvals",
-                        lambda mids: {mid: _row() for mid in mids})
+                        lambda mids, lost_scan_since_ms=None: {
+                            mid: _row() for mid in mids})
     _plant(1)
 
     beats = await _heartbeat_during(s._tg_auto_execute_tick())
@@ -234,7 +266,8 @@ async def test_slow_telegram_report_does_not_block_the_event_loop(monkeypatch):
 async def test_failing_candidate_does_not_stop_the_others(monkeypatch):
     _enable_tg(monkeypatch)
     monkeypatch.setattr(tg, "get_tg_approvals",
-                        lambda mids: {mid: _row() for mid in mids})
+                        lambda mids, lost_scan_since_ms=None: {
+                            mid: _row() for mid in mids})
     done, reports = [], []
     _plant(3, "mix")
     _noop_executor(monkeypatch, record=done, boom_on="mix-0")
@@ -254,7 +287,8 @@ async def test_hung_candidate_is_cut_off_and_queue_moves_on(monkeypatch):
     _enable_tg(monkeypatch)
     monkeypatch.setattr(s, "_TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S", 0.05)
     monkeypatch.setattr(tg, "get_tg_approvals",
-                        lambda mids: {mid: _row() for mid in mids})
+                        lambda mids, lost_scan_since_ms=None: {
+                            mid: _row() for mid in mids})
     done, reports = [], []
     _plant(2, "hang")
     _silent_report(monkeypatch, sink=reports)
@@ -340,7 +374,12 @@ async def test_disabled_layer_touches_neither_db_nor_network(monkeypatch):
 
     for name in ("get_tg_approvals", "check_approval", "get_tg_approval",
                  "_tg_call", "report_auto_execution_result", "notify_plan",
-                 "create_tg_approval"):
+                 "create_tg_approval",
+                 # Новые получатели итога (2026-08-06) — их тоже надо
+                 # заминировать, иначе выключенный слой мог бы пойти в сеть
+                 # мимо старого имени и тест этого не заметил бы.
+                 "post_report_to_group", "summarize_in_owner_chat",
+                 "reap_expired"):
         monkeypatch.setattr(tg, name, _explode)
     _noop_executor(monkeypatch)
     _plant(5, "off")

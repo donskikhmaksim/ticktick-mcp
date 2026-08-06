@@ -403,21 +403,48 @@ def _plan_sites():
     """Все места в server.py, где план УХОДИТ наружу (через
     `_maybe_tg_notify_plan` — единственную общую воронку фазы плана).
     Возвращает (константные имена тулов, имена функций с неконстантным
-    аргументом)."""
+    аргументом).
+
+    Учитываются ДВЕ формы вызова, и это не педантизм — на второй ловушка уже
+    один раз ослепла (слияние 2026-08-06):
+
+      1. прямой вызов        `_maybe_tg_notify_plan("delete_tasks", mid, …)`
+      2. косвенный, через    `await _run_blocking(_maybe_tg_notify_plan,
+                              "delete_tasks", mid, …)`
+
+    Вторая появилась, когда отправку плана унесли в отдельный поток (она
+    синхронная и ходит в сеть — из корутины она морозила event loop). Для AST
+    это уже НЕ вызов `_maybe_tg_notify_plan`, а передача функции аргументом,
+    поэтому прежняя проверка перестала видеть сразу три точки
+    (`create_tasks`, оба `delete_tasks`) и молча сообщала, что они «исчезли».
+    Смысл ловушки при этом обратный: план там уходит как уходил, и покрытие
+    для него обязано сохраняться."""
     src = pathlib.Path(s.__file__).read_text(encoding="utf-8")
     tree = ast.parse(src)
     const_tools, dynamic_in = set(), set()
+
+    def _account(args, fn_name):
+        if not args:
+            return
+        first = args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            const_tools.add(first.value)
+        else:
+            dynamic_in.add(fn_name)
+
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         for node in ast.walk(fn):
-            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                    and node.func.id == "_maybe_tg_notify_plan" and node.args):
-                first = node.args[0]
-                if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                    const_tools.add(first.value)
-                else:
-                    dynamic_in.add(fn.name)
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id == "_maybe_tg_notify_plan":
+                _account(node.args, fn.name)
+            elif (node.func.id == "_run_blocking" and node.args
+                  and isinstance(node.args[0], ast.Name)
+                  and node.args[0].id == "_maybe_tg_notify_plan"):
+                # `_run_blocking(fn, *args)` — имя тула здесь ВТОРОЙ аргумент.
+                _account(node.args[1:], fn.name)
     return const_tools, dynamic_in
 
 

@@ -196,3 +196,208 @@ def test_notify_plan_failure_invalidates_manifest_fail_closed(monkeypatch):
     assert "🛑" in out
     assert "Не смог отправить" in out
     assert s._MANIFESTS["m-fail-test"]["consumed"] is True
+
+
+# ===========================================================================
+# Плановые тулы зовут этот хук ЧЕРЕЗ поток (_run_blocking)
+# ===========================================================================
+
+def test_plan_tool_sends_the_telegram_plan_off_the_event_loop(monkeypatch):
+    """Внутри notify_plan — синхронный requests, паузы между кусками и сон на
+    429 (до трёх минут на кусок в патологии). Прямой вызов из корутины держал
+    бы event loop всё это время: зависший /health и заткнувшиеся MCP-сессии.
+    Тест фиксирует, что хук уходит в поток через `_run_blocking`, и заодно
+    smoke-проверяет сам async-путь плана (тулы не покрыты вызовом больше нигде).
+    """
+    import asyncio
+
+    monkeypatch.setattr(s, "_TG_CFG", tg.TgApprovalConfig(
+        enabled=True, bot_token="x", owner_chat_id="1", server="ticktick",
+        tools_allowlist=None, ttl_s=3600))
+    monkeypatch.setattr(s, "_ensure_ready", lambda: None)
+    monkeypatch.setattr(s, "_open_by_id",
+                        lambda fresh=False: {"t1": {"id": "t1", "title": "Купить молоко",
+                                                    "projectId": "p1"}})
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Покупки"})
+
+    off_loop = {"used": False}
+    real_run_blocking = s._run_blocking
+
+    async def spy(func, *a, **kw):
+        if func is s._maybe_tg_notify_plan:
+            off_loop["used"] = True
+        return await real_run_blocking(func, *a, **kw)
+
+    monkeypatch.setattr(s, "_run_blocking", spy)
+    monkeypatch.setattr(tg, "notify_plan", lambda *a, **k: (True, ""))
+
+    out = asyncio.run(s.plan_task_deletion(
+        "удалить одну", [{"taskId": "t1", "title": "Купить молоко"}]))
+
+    assert off_loop["used"] is True, "хук обязан уходить в поток, а не в event loop"
+    assert "План удаления" in out and "Telegram" in out
+
+
+# ===========================================================================
+# Поиск потерянных планов на уровне SQL (2026-08-06)
+# ===========================================================================
+#
+# Postgres здесь фальшивый — проверяется не база, а ТЕКСТ запроса: что вторая
+# ветка WHERE («подтверждено, но про потерю ещё не сообщали») действительно
+# добавляется в ТОТ ЖЕ запрос, а не превращается во второй проход по базе, и
+# что захват права сообщить — это одиночный атомарный UPDATE, а не «прочитал →
+# отправил → пометил» (последнее при двух процессах на выкатке дало бы два
+# одинаковых сообщения владельцу).
+
+class _FakeCursor:
+    def __init__(self, sink, rows):
+        self.sink, self._rows = sink, rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self.sink.append((" ".join(sql.split()), params))
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class _FakeConn:
+    def __init__(self, sink, rows):
+        self.sink, self._rows = sink, rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def cursor(self):
+        return _FakeCursor(self.sink, self._rows)
+
+
+class _FakePool:
+    def __init__(self, sink, rows):
+        self.sink, self._rows = sink, rows
+
+    def getconn(self):
+        return _FakeConn(self.sink, self._rows)
+
+    def putconn(self, conn):
+        pass
+
+
+@pytest.fixture
+def _fake_store(monkeypatch):
+    sink, rows = [], []
+
+    def _install(result_rows):
+        rows[:] = result_rows
+        monkeypatch.setattr(tg, "_pg_pool", _FakePool(sink, rows))
+        return sink
+
+    return _install
+
+
+def test_batch_read_without_lost_scan_keeps_the_old_where(_fake_store):
+    """Обычный проход поллера (сканирование потерь не запрошено) обязан
+    остаться прежним запросом по списку id — иначе фича меняла бы горячий
+    путь, который сейчас под приёмкой."""
+    sink = _fake_store([])
+    tg.get_tg_approvals(["a", "b"])
+    sql, params = sink[0]
+    assert "manifest_id = ANY(%s)" in sql
+    assert "lost_notified_at IS NULL" not in sql
+    assert params == (["a", "b"],)
+
+
+def test_batch_read_with_lost_scan_adds_the_second_branch(_fake_store):
+    """Строку, у которой манифеста в памяти НЕТ, поиск «от памяти» не увидит
+    никогда — её id просто неоткуда взять. Поэтому вторая ветка WHERE и
+    существует; и она обязана быть в ТОМ ЖЕ запросе (одно обращение к
+    Postgres на проход)."""
+    sink = _fake_store([])
+    tg.get_tg_approvals(["a"], 1_700_000_000_000)
+    assert len(sink) == 1, "второго прохода по базе быть не должно"
+    sql, params = sink[0]
+    assert "status = 'APPROVED'" in sql and "lost_notified_at IS NULL" in sql
+    assert "expires_at > %s" in sql
+    assert params == (["a"], 1_700_000_000_000)
+
+
+def test_batch_read_scans_for_losses_even_with_no_live_manifests(_fake_store):
+    """Пустая память — это состояние СРАЗУ ПОСЛЕ ПЕРЕЗАПУСКА, то есть ровно
+    тогда, когда потерянные планы и появляются. Ранний выход по пустому
+    списку id сделал бы потерю ненаблюдаемой."""
+    sink = _fake_store([])
+    tg.get_tg_approvals([], 1_700_000_000_000)
+    assert len(sink) == 1
+
+
+def test_batch_read_without_ids_and_without_scan_touches_nothing(_fake_store):
+    sink = _fake_store([])
+    assert tg.get_tg_approvals([]) == {}
+    assert sink == []
+
+
+def test_batch_read_exposes_the_fields_the_loss_detector_needs(_fake_store):
+    _fake_store([("m1", "APPROVED", 111, "c1", 42, [7], 100, 105, [], None)])
+    row = tg.get_tg_approvals(["m1"], 1)["m1"]
+    assert row["decided_at"] == 105 and row["created_at"] == 100
+    assert row["report_message_ids"] == [] and row["lost_notified_at"] is None
+    # прежние поля на месте — их читает горячий путь автоисполнения
+    assert row["status"] == "APPROVED" and row["message_id"] == 42
+    assert row["extra_message_ids"] == [7]
+
+
+def test_claim_lost_manifests_is_one_atomic_update(_fake_store):
+    sink = _fake_store([("m1",)])
+    assert tg.claim_lost_manifests(["m1", "m2"]) == ["m1"]
+    sql, params = sink[0]
+    assert sql.startswith("UPDATE tg_approvals SET lost_notified_at")
+    assert "lost_notified_at IS NULL" in sql and "status = 'APPROVED'" in sql
+    assert "server = 'ticktick'" in sql and "RETURNING manifest_id" in sql
+    assert params[1] == ["m1", "m2"]
+
+
+def test_claim_lost_manifests_without_store_is_silent(monkeypatch):
+    monkeypatch.setattr(tg, "_pg_pool", None)
+    assert tg.claim_lost_manifests(["m1"]) == []
+    assert tg.claim_lost_manifests([]) == []
+
+
+def test_clear_inline_keyboard_keeps_the_plan_text(monkeypatch):
+    """Кнопки убираем, ТЕКСТ ПЛАНА оставляем: когда исполнять было нечего,
+    план — единственное, что осталось у владельца от его же просьбы, и по
+    нему он решает, что повторять."""
+    calls = []
+    monkeypatch.setattr(tg, "_tg_call",
+                        lambda cfg, method, body: calls.append((method, body))
+                        or {"ok": True})
+    cfg = tg.TgApprovalConfig(enabled=True, bot_token="x", owner_chat_id="1",
+                              server="ticktick", tools_allowlist=None, ttl_s=60)
+    assert tg.clear_inline_keyboard(cfg, "c1", 42) is True
+    method, body = calls[0]
+    assert method == "editMessageReplyMarkup"
+    assert "text" not in body
+    assert body["reply_markup"] == {"inline_keyboard": []}
+
+
+def test_clear_inline_keyboard_without_message_id_is_a_noop(monkeypatch):
+    calls = []
+    monkeypatch.setattr(tg, "_tg_call",
+                        lambda cfg, method, body: calls.append(1) or {"ok": True})
+    cfg = tg.TgApprovalConfig(enabled=True, bot_token="x", owner_chat_id="1",
+                              server="ticktick", tools_allowlist=None, ttl_s=60)
+    assert tg.clear_inline_keyboard(cfg, "c1", None) is False
+    assert calls == []
+
+
+def test_owner_time_str_is_readable_and_never_raises():
+    assert "время неизвестно" == tg.owner_time_str(None)
+    assert "время неизвестно" == tg.owner_time_str("не число")
+    assert tg.owner_time_str(1_700_000_000_000).startswith("2023-")
