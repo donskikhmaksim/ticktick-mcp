@@ -20,14 +20,20 @@
   5. Отправка в Telegram упала → fail-closed: манифест инвалидирован.
   6. `_generic_gate_rehash` побайтово воспроизводит формулу, по которой хэш
      считался при планировании (иначе binding-проверка кнопки — фикция).
-  7. Для КАЖДОГО из 19 тулов кнопочный путь зовёт ТУ ЖЕ `_<tool>_impl` с ТЕМИ
-     ЖЕ аргументами, что и обычный чат-путь.
+  7. Для КАЖДОГО гейтованного тула кнопочный путь зовёт ТУ ЖЕ `_<tool>_impl`
+     с ТЕМИ ЖЕ аргументами, что и обычный чат-путь.
   8. Поллер видит такие манифесты (approved) и не видит их при pending.
   9. Регресс-страховка через inspect.signature: `_<tool>_impl` существует и
      его обязательные параметры покрыты тем, что лежит в манифесте.
 
 Ни сети, ни Postgres: `tg_approval`-функции и все `_<tool>_impl`
 монкейпатчатся, как в test_gate_tg_determinism.py / test_tg_auto_execute.py.
+
+2026-08-06 (позже в тот же день): к таблице добавлен 20-й тул —
+`create_attachment_upload_url`. Он ничего не пишет сам, но ВЫДАЁТ
+предъявительскую ссылку на запись в аккаунт владельца (публичный маршрут
+PUT /ul/{token}, многоразовый токен до 120 минут), поэтому подтверждение
+нужно ровно в момент выдачи — см. комментарий над тулом в server.py.
 """
 import inspect
 import re
@@ -89,22 +95,35 @@ SINGLE_TOOLS = {
     "update_task_comment": dict(task_title="A", text="новый текст", project_id="p1",
                                 task_id="t1", comment_id="c1"),
     "create_project_column": dict(project_id="p1", name="Колонка", project_name="Проект"),
+    "create_attachment_upload_url": dict(task_id="t1", project_id="p1",
+                                         filename="scan.png", ttl_minutes=15),
 }
 
 ALL_TOOLS = {**BATCH_TOOLS, **SINGLE_TOOLS}
 GATE_OF = {**{t: "batch" for t in BATCH_TOOLS}, **{t: "single" for t in SINGLE_TOOLS}}
 
 
-def test_the_table_covers_exactly_twenty_tools():
+def test_the_table_covers_exactly_twenty_one_tools():
     """Если кто-то добавит/уберёт гейтованный тул, эта таблица обязана
     поехать вместе с ним — иначе новый тул молча останется без кнопки.
-    19 → 20 (2026-08-06): +1 = `manual_triage`."""
+    19 → 21 (2026-08-06): +1 batch = `manual_triage`, +1 single =
+    `create_attachment_upload_url` (пришёл из feat/tg-button-...)."""
     assert len(BATCH_TOOLS) == 7
-    assert len(SINGLE_TOOLS) == 13
-    assert len(ALL_TOOLS) == 20
+    assert len(SINGLE_TOOLS) == 14
+    assert len(ALL_TOOLS) == 21
 
 
 # ───────────────────────── обвязка ─────────────────────────
+
+@pytest.fixture(autouse=True)
+def _public_base_url(monkeypatch):
+    """`create_attachment_upload_url` отказывает ДО гейта, если сервер не знает
+    своего публичного адреса (проверка конфигурации, а не согласия). Здесь
+    проверяется гейт, поэтому адрес задан — иначе call #1 вернул бы не план,
+    а «задайте PUBLIC_BASE_URL». Остальным 20 тулам эта переменная безразлична."""
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://tt.example.com")
+    monkeypatch.delenv("RAILWAY_PUBLIC_DOMAIN", raising=False)
+
 
 @pytest.fixture(autouse=True)
 def _isolate_manifests():
@@ -137,7 +156,7 @@ def _tg_off(monkeypatch):
 # Детерминированное «живое состояние» для тулов, которые сверяют переданные
 # id ДО гейта (сегодня это только manual_triage — его identity guard обязан
 # работать на фазе плана, иначе человек увидел бы план по несуществующим
-# задачам). Остальные 19 тулов сюда не заглядывают вовсе.
+# задачам). Остальные 20 тулов сюда не заглядывают вовсе.
 _LIVE_TASKS = {"t1": {"id": "t1", "title": "A", "projectId": "p1"}}
 _LIVE_PROJECTS = {"p1": "Проект-1", "p2": "Проект-2"}
 
@@ -273,7 +292,7 @@ async def test_rejected_button_kills_the_plan(tool, monkeypatch):
 
 async def test_approved_button_plus_chat_yes_executes(monkeypatch):
     """Зеркало теста 3: с нажатой кнопкой обычный execute проходит — иначе
-    фикс превратил бы все 19 тулов в вечный отказ."""
+    фикс превратил бы все 21 тул в вечный отказ."""
     _no_client_checks(monkeypatch)
     _tg_on(monkeypatch)
     _notify_ok(monkeypatch)
@@ -408,10 +427,14 @@ async def test_generic_auto_execute_refuses_a_manifest_without_impl(monkeypatch)
 # ═══════ 8. Поллер видит новые манифесты ═══════
 
 def _approved(monkeypatch, mids):
-    monkeypatch.setattr(tg, "check_approval",
-                        lambda mid: "approved" if mid in mids else "none")
-    monkeypatch.setattr(tg, "get_tg_approval",
-                        lambda mid: {"chat_id": "c1", "message_id": 7})
+    """С 2026-08-06 поллер читает статусы ПАЧКОЙ (один get_tg_approvals на
+    проход) вместо check_approval+get_tg_approval на каждый живой манифест —
+    подменяем именно пакетную функцию. Одиночные никуда не делись, их всё так
+    же зовёт чат-путь (_require_consent), см. тесты выше в этом файле."""
+    monkeypatch.setattr(tg, "get_tg_approvals", lambda ids: {
+        mid: {"status": "APPROVED", "expires_at": tg._now_ms() + 3_600_000,
+              "chat_id": "c1", "message_id": 7}
+        for mid in ids if mid in mids})
 
 
 @pytest.mark.parametrize("tool", ["complete_tasks", "move_tasks", "create_tag",
@@ -436,7 +459,9 @@ async def test_poller_ignores_pending_gate_manifests(tool, monkeypatch):
     _tg_on(monkeypatch)
     _notify_ok(monkeypatch)
     _, mid = await _plan(tool, monkeypatch)
-    monkeypatch.setattr(tg, "check_approval", lambda m: "pending")
+    monkeypatch.setattr(tg, "get_tg_approvals", lambda ids: {
+        mid: {"status": "PENDING", "expires_at": tg._now_ms() + 3_600_000,
+              "chat_id": "c1", "message_id": 7} for mid in ids})
 
     ids = {c["manifest_id"] for c in s._find_tg_auto_execute_candidates()}
 
@@ -491,7 +516,7 @@ async def test_tick_does_not_touch_declutter_manifests(monkeypatch):
 # Предохранитель «инвариант 2» в tg_approval.try_auto_execute читал поле
 # `_auto_tool`, которого не писал НИКТО (см. комментарий там же) — то есть не
 # срабатывал никогда. Пока кнопка была у одного тула, это было безвредно; с
-# 19 тулами ошибка диспетчеризации означала бы исполнение ЧУЖОЙ операции по
+# 21 тулом ошибка диспетчеризации означала бы исполнение ЧУЖОЙ операции по
 # чужому подтверждению. Тестов на это не было — потому дыра и не всплыла.
 
 async def test_manifest_is_not_executable_under_another_tools_name(monkeypatch):

@@ -7983,30 +7983,55 @@ async def get_attachment_download_url(task_id: str, project_id: str = None,
         return f"Error building download link: {str(e)}"
 
 
-# DELIBERATELY NOT GATED (audit 2026-08-06). It looks like a mutator ("create
-# ...") but calling it changes NOTHING in TickTick: the whole body is local —
-# _public_base_url()/SECRET checks, _resolve_project_id() (a READ of cached
-# state), new_attachment_id() (a client-side uuid4 hex, see
-# ticktick_v2_client.py) and _sign_attachment_token() (an in-memory HMAC, kept
-# in no registry). There is not a single write call to ticktick/ticktick_v2 on
-# this path. The actual mutation happens later, in the separate PUT /ul/{token}
-# custom route, when a HUMAN (or their script) uploads bytes — which this MCP
-# client provably cannot do itself (no raw PUT). Wrapping it in a plan→confirm
-# gate would therefore make the user approve twice for one act of uploading and
-# would gate a call with no side effects — a UX regression, not a safety win.
-# What it DOES hand out is a short-lived (≤120 min) write capability, so the
-# docstring's "treat the link like a one-off secret" warning is the real
-# control here.
+def _describe_create_attachment_upload_url(p: Dict) -> str:
+    # НИ ОДНОГО фрагмента будущей ссылки/токена здесь быть не может: токен
+    # подписывается только в `_impl`, уже ПОСЛЕ подтверждения. Иначе пропуск
+    # утёк бы в превью (и в сообщение Telegram) ещё до согласия человека.
+    name = p.get("filename") or "файл без имени"
+    return (f'Выдаю ссылку на загрузку «{name}» в задачу {p.get("task_id")} '
+            f'(действует {_clamp_link_ttl(p.get("ttl_minutes"))} мин; по ней '
+            'кто угодно сможет положить файл в аккаунт)')
+
+
+# ГЕЙТОВАН (аудит 2026-08-06, пересмотр прежнего «намеренно без гейта»). Гейт
+# стоит не за то, что тул ДЕЛАЕТ, а за то, что он ВРУЧАЕТ: маршрут PUT
+# /ul/{token} публичен и проверяет ровно одно — подпись токена
+# (_verify_attachment_token), ни заголовка, ни куки, ни MCP_SECRET предъявлять
+# не нужно, а пишет в TickTick сам сервер сессией владельца. Токен при этом
+# многоразовый (ни nonce, ни реестра использованных) и живёт до
+# ATTACHMENT_LINK_TTL_MAX_MIN=120 минут, то есть это предъявительский пропуск
+# на запись в аккаунт. Прежний довод «модель не может сделать raw PUT»
+# ограничивает интерфейс, а не возможности: агент с оболочкой шлёт обычный
+# HTTP-запрос, а сам тул печатает готовую команду curl. Выдача ссылки —
+# единственный момент, когда сервер вообще способен спросить человека.
 @mcp.tool()
 async def create_attachment_upload_url(task_id: str, project_id: str = None,
                                        filename: str = None,
                                        size_bytes: int = None,
-                                       ttl_minutes: int = 15) -> str:
+                                       ttl_minutes: int = 15,
+                                       manifest_id: str = "", user_reply: str = "",
+                                       automation_key: str = "") -> str:
     """
     Create a temporary upload LINK that puts a file onto a task (requires v2
     API) without the file passing through this conversation. Counterpart of
     get_attachment_download_url; use it when the file is large or simply not in
-    Claude's hands — e.g. it sits on the user's phone or on a server.
+    Claude's hands — e.g. it sits on the user's phone or on a server. Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — NO link is
+    handed out on call #1 (the link is a bearer write-capability into the
+    owner's account, so it is minted only after the approval).
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — no token is signed yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
 
     HONEST LIMITATION: an MCP client (Claude) cannot use this link itself — it
     cannot make raw PUT requests. The link is for a HUMAN with a browser/phone
@@ -8027,6 +8052,16 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
         size_bytes: Expected file size, if known (checked against the 20 MB cap
             up front so the user isn't told "too big" only after uploading)
         ttl_minutes: How long the link stays valid, 1-120 (default 15)
+        manifest_id: from call #1's response — pass on call #2 to actually get the link
+        user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_ready()
     if err:
@@ -8039,6 +8074,28 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
     if size_bytes and size_bytes > ATTACHMENT_MAX_BYTES:
         return (f"Файл {size_bytes // (1024*1024)} МБ — TickTick принимает "
                 f"максимум {ATTACHMENT_MAX_BYTES // (1024*1024)} МБ. Ссылку не делаю.")
+    params = {"task_id": task_id, "project_id": project_id,
+              "filename": filename, "ttl_minutes": ttl_minutes}
+    outcome = _gate_single("create_attachment_upload_url",
+                           "create_attachment_upload_url",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply,
+                           _describe_create_attachment_upload_url,
+                           automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _create_attachment_upload_url_impl(**outcome.extra)
+
+
+async def _create_attachment_upload_url_impl(task_id: str, project_id: str = None,
+                                             filename: str = None,
+                                             ttl_minutes: int = 15) -> str:
+    """Mints the actual bearer upload link — no consent gate. Called only by
+    the gated create_attachment_upload_url() above once the plan is approved
+    (or by the Telegram-button auto-executor, which replays the same params)."""
+    base = _public_base_url()
+    if not base:
+        return _NO_PUBLIC_URL_MSG
     try:
         pid = project_id or _resolve_project_id(task_id, project_id)
         if not pid:
@@ -10435,8 +10492,10 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict]) -> str:
 # runAutoExecutePoller. See tg_approval.py's block comment above
 # try_auto_execute() for the architectural difference (in-memory _MANIFESTS
 # here vs. one shared Postgres on the TS side) and why the candidate search
-# below (walk _MANIFESTS, ask tg_approval.check_approval per id) is a
-# per-item probe rather than a single SQL JOIN.
+# below cannot be one SQL JOIN: the manifests simply aren't in Postgres. It is
+# still ONE round-trip per pass, not one per manifest — the RAM walk collects
+# the live ids, and tg_approval.get_tg_approvals() reads all their approval
+# rows in a single `WHERE manifest_id = ANY(...)` query (2026-08-06).
 # ---------------------------------------------------------------------------
 
 class _AutoExecutorEntry:
@@ -10601,20 +10660,16 @@ def _auto_execute_tool_of(m: Dict) -> str:
             or _AUTO_EXECUTE_TOOL_FOR_KIND.get(m.get("kind") or "") or "")
 
 
-def _find_tg_auto_execute_candidates() -> List[Dict]:
-    """Candidates for auto-execution: this server's own (in-memory) manifests
-    that are AWAITING_CONSENT-equivalent (not consumed, not TTL-expired —
-    _prune_manifests already dropped anything past that) that resolve to an
-    executor (_resolve_auto_executor: explicit registry, else the generic
-    _gate_batch/_gate_single replay) AND whose Telegram approval row is
-    already APPROVED.
-    Unlike the TS side's single SQL JOIN (both tables live in one Postgres),
-    this walks _MANIFESTS in RAM and asks tg_approval.check_approval(id) —
-    one Postgres round-trip PER live manifest — which is fine because the
-    number of concurrently AWAITING_CONSENT manifests is always small
-    (single-owner bot, human-paced approvals)."""
+def _tg_auto_execute_pending() -> List[tuple]:
+    """RAM-часть поиска кандидатов: живые (не consumed, не просроченные)
+    манифесты, у которых есть авто-исполнитель и включён TG-гейт. НИ ОДНОГО
+    обращения к базе и к сети — специально, потому что это единственный кусок,
+    который трогает `_MANIFESTS`, и он обязан выполняться в event loop'е
+    (иначе `_prune_manifests()` итерировал бы dict, который другая корутина
+    в это же время пополняет → RuntimeError: dictionary changed size).
+    Возвращает [(manifest_id, tool), …]."""
     _prune_manifests()
-    out: List[Dict] = []
+    out: List[tuple] = []
     for mid, m in list(_MANIFESTS.items()):
         if m.get("consumed"):
             continue
@@ -10623,26 +10678,90 @@ def _find_tg_auto_execute_candidates() -> List[Dict]:
             continue
         if not tg_approval.enabled_for(_TG_CFG, tool):
             continue
-        try:
-            approval = tg_approval.check_approval(mid)
-        except Exception as e:
-            logger.warning(f"TG auto-execute: check_approval({mid}) failed: {e}")
-            continue
-        if approval != "approved":
-            continue
-        row = tg_approval.get_tg_approval(mid)
-        if not row:
+        out.append((mid, tool))
+    return out
+
+
+def _tg_auto_execute_approved(pending: List[tuple],
+                              rows: Dict[str, dict]) -> List[Dict]:
+    """Чистая (без БД и сети) вторая половина поиска: из списка живых
+    манифестов и УЖЕ прочитанных пачкой строк tg_approvals оставляет те, что
+    подтверждены кнопкой. Статус считает tg_approval.approval_status_of —
+    та же формула, что у одиночного check_approval на чат-пути."""
+    out: List[Dict] = []
+    for mid, tool in pending:
+        row = rows.get(mid)
+        if not row or tg_approval.approval_status_of(row) != "approved":
             continue
         out.append({"manifest_id": mid, "tool": tool,
                     "chat_id": row.get("chat_id"), "message_id": row.get("message_id")})
     return out
 
 
+def _find_tg_auto_execute_candidates() -> List[Dict]:
+    """Candidates for auto-execution: this server's own (in-memory) manifests
+    that are AWAITING_CONSENT-equivalent (not consumed, not TTL-expired —
+    _prune_manifests already dropped anything past that) that resolve to an
+    executor (_resolve_auto_executor: explicit registry, else the generic
+    _gate_batch/_gate_single replay) AND whose Telegram approval row is
+    already APPROVED.
+
+    ОДНО обращение к Postgres на весь проход, сколько бы живых планов ни было
+    (2026-08-06). До этого на КАЖДЫЙ живой манифест шли check_approval() и,
+    для одобренных, ещё get_tg_approval() — то есть 1–2 поездки на план. С 2
+    гейтованными тулами планов было единицы; с 22 их десятки, база ходит через
+    публичный прокси Railway, и проход переставал укладываться в 10-секундный
+    интервал — подтверждённое кнопкой действие ждало исполнения минутами.
+
+    Синхронная версия (её зовут тесты и любой не-async вызывающий); поллер
+    использует те же две половины напрямую, чтобы поездку в базу увести в
+    отдельный поток и не морозить event loop (см. _tg_auto_execute_tick)."""
+    pending = _tg_auto_execute_pending()
+    if not pending:
+        return []
+    try:
+        rows = tg_approval.get_tg_approvals([mid for mid, _ in pending])
+    except Exception as e:
+        logger.warning(f"TG auto-execute: get_tg_approvals failed: {e}")
+        return []
+    return _tg_auto_execute_approved(pending, rows)
+
+
+# Потолок на ОДНОГО кандидата: без него один зависший сетевой вызов к TickTick
+# держит очередь остальных подтверждённых планов бесконечно (манифест уже
+# погашен, повтора не будет — а человек так и сидит перед несработавшей
+# кнопкой). Щедрый по умолчанию: цель — не оборвать нормальную работу, а
+# гарантировать, что очередь ВСЕГДА двигается.
+_TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S = float(
+    os.environ.get("TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S", "120"))
+
+
 async def _tg_auto_execute_tick() -> None:
     """One pass: find candidates, execute each via its registered executor,
     report the result back into the Telegram message. Mirrors gmail-mcp's
-    runAutoExecutePoller — errors from ONE candidate never abort the others."""
-    for c in _find_tg_auto_execute_candidates():
+    runAutoExecutePoller — errors from ONE candidate never abort the others.
+
+    Три вещи, за которые здесь отвечает именно ЭТА функция (2026-08-06):
+    1. Поиск кандидатов разделён: RAM-часть (_tg_auto_execute_pending) идёт в
+       event loop'е, а ЕДИНСТВЕННАЯ поездка в Postgres — через _run_blocking,
+       то есть в отдельном потоке. psycopg2 синхронный: вызов из корутины
+       напрямую морозил ВЕСЬ сервер (не только поллер — и обычные MCP-запросы
+       модели) на всё время запроса.
+    2. Отчёт в Telegram (requests, timeout 8 c) — тоже через _run_blocking, по
+       той же причине.
+    3. `try_auto_execute` наоборот ОБЯЗАН остаться в event loop'е: его
+       атомарность («проверил consumed → выставил consumed» без await между)
+       держится ровно на однопоточности loop'а. В поток его выносить нельзя."""
+    pending = _tg_auto_execute_pending()
+    if not pending:
+        return
+    try:
+        rows = await _run_blocking(tg_approval.get_tg_approvals,
+                                   [mid for mid, _ in pending])
+    except Exception as e:
+        logger.warning(f"TG auto-execute: get_tg_approvals failed: {e}")
+        return
+    for c in _tg_auto_execute_approved(pending, rows):
         mid, tool = c["manifest_id"], c["tool"]
         entry = _resolve_auto_executor(tool, _MANIFESTS.get(mid) or {})
         if entry is None:
@@ -10656,16 +10775,24 @@ async def _tg_auto_execute_tick() -> None:
             )
             if consumed is None:
                 continue  # race/drift/already consumed — not an error
-            report_text = await entry.execute(mid, consumed)
-            tg_approval.report_auto_execution_result(
-                _TG_CFG, c["chat_id"], c["message_id"], report_text)
+            report_text = await asyncio.wait_for(
+                entry.execute(mid, consumed),
+                _TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S)
+            await _run_blocking(tg_approval.report_auto_execution_result,
+                                _TG_CFG, c["chat_id"], c["message_id"], report_text)
         except Exception as e:
+            if isinstance(e, asyncio.TimeoutError):
+                msg = (f"🛑 Автоисполнение «{tool}» не уложилось в "
+                       f"{_TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S:.0f} c и было "
+                       "прервано. План уже погашен — проверьте состояние в "
+                       "TickTick: часть операции могла успеть примениться.")
+            else:
+                msg = f"🛑 Ошибка при автоисполнении «{tool}»: {e}"
             logger.error(f"TG auto-execute: ошибка при исполнении "
-                        f"{tool}/{mid}: {e}")
+                        f"{tool}/{mid}: {e!r}")
             try:
-                tg_approval.report_auto_execution_result(
-                    _TG_CFG, c["chat_id"], c["message_id"],
-                    f"🛑 Ошибка при автоисполнении «{tool}»: {e}")
+                await _run_blocking(tg_approval.report_auto_execution_result,
+                                    _TG_CFG, c["chat_id"], c["message_id"], msg)
             except Exception:
                 pass
 
@@ -10694,14 +10821,27 @@ async def _tg_auto_execute_poller_loop() -> None:
     """Background loop started from main() (see _run_server() below) only
     when TG_APPROVAL_ENABLED — every ~10s (env-tunable), forever, for the
     life of the process. A single tick's exception must never kill the loop
-    (Maksim would then lose auto-execute silently until the next deploy)."""
+    (Maksim would then lose auto-execute silently until the next deploy).
+
+    Интервал отсчитывается ОТ НАЧАЛА прохода (2026-08-06). Раньше `sleep`
+    стоял ПЕРЕД работой, то есть реальный период = интервал + длительность
+    прохода: медленный проход (десятки живых планов × поездка в базу каждый)
+    молча растягивал заявленные «каждые 10 секунд» в разы. Проходы при этом
+    не накладываются и сейчас: они последовательны внутри одной корутины, а
+    отрицательный остаток обрезается до нуля."""
     logger.info(f"TG auto-execute: poller started (every {_TG_AUTO_EXECUTE_INTERVAL_S:.0f}s)")
     while True:
-        await asyncio.sleep(_TG_AUTO_EXECUTE_INTERVAL_S)
+        started = time.monotonic()
         try:
             await _tg_auto_execute_tick()
         except Exception as e:
             logger.error(f"TG auto-execute poller: unhandled error: {e}")
+        elapsed = time.monotonic() - started
+        if elapsed > _TG_AUTO_EXECUTE_INTERVAL_S:
+            logger.warning(
+                f"TG auto-execute: проход занял {elapsed:.1f} c — дольше "
+                f"интервала {_TG_AUTO_EXECUTE_INTERVAL_S:.0f} c")
+        await asyncio.sleep(max(0.0, _TG_AUTO_EXECUTE_INTERVAL_S - elapsed))
 
 
 def main():
