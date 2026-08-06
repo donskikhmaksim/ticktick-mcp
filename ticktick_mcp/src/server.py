@@ -1727,7 +1727,7 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
                        # заметили бы (оба сверяют хэш только `if stored_hash`).
                        "object_hash": _create_object_hash(raw_items)}
     lines = [f"### 📋 План создания — {len(good)}",
-             f"_Манифест `{mid}` · ничего ещё не создано_", ""]
+             _plan_id_line(mid, "ничего ещё не создано"), ""]
     for i, (t, pname, sug) in enumerate(good, 1):
         bits = [f"{i}. **«{t.get('title')}»** → **{pname}**"]
         if sug:
@@ -2463,7 +2463,7 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
                            "object_hash": obj_hash,
                            "summary": summary, "consumed": False}
         preview = [f"### 📋 Готов удалить — {len(items)}",
-                  f"_Манифест `{mid}` · ничего ещё не удалено_", ""]
+                  _plan_id_line(mid, "ничего ещё не удалено"), ""]
         for i, it in enumerate(items, 1):
             preview.append(f"{i}. **«{it['title']}»** — {it['project']} (`{it['taskId']}`)")
         preview.extend(lines)
@@ -2493,6 +2493,33 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
 _MANIFESTS: Dict[str, Dict] = {}
 _MANIFEST_TTL = 3600.0  # seconds; a stale plan must be re-planned
 _JOURNAL_DIR = os.environ.get("TICKTICK_DATA_DIR", "/data")
+
+
+def _plan_id_line(manifest_id: str, tail: str = "ничего ещё не изменено") -> str:
+    """ЕДИНСТВЕННАЯ формула строки «вот идентификатор этого плана».
+
+    Зачем отдельной функцией (2026-08-06): идентификатор плана — не
+    украшение превью, а ЕДИНСТВЕННЫЙ способ адресовать план снаружи. Он же
+    PRIMARY KEY строки в `tg_approvals`, он же `callback_data` кнопок
+    ✅/🛑 в Telegram (`tg_approval.notify_plan`), он же то, что клиент
+    передаёт вторым вызовом в `manifest_id=`. Клиент MCP видит ТОЛЬКО текст
+    ответа: ни `_MANIFESTS` (in-memory dict этого процесса), ни базы у него
+    нет. Не напечатали id — план физически нечем назвать, и остаётся только
+    угадывание («сниму список ожидающих до вызова и после, и если новая
+    строка ровно одна — считаю её своей»), которое ломается на любом
+    параллельном плане.
+
+    Ровно это и случилось с `delete_project` и merge-веткой `rename_tag`:
+    оба строили план ЧЕРЕЗ манифест, но id в ответ не клали (они исторически
+    одноходовые, `manifest_id` в сигнатуре нет — см.
+    `_find_live_inline_manifest`), из-за чего снаружи их планы были
+    безымянными. Формат ниже не новый: ровно так печатали свои планы
+    остальные тулы с самого начала — слово «Манифест», сам id в обратных
+    кавычках, затем хвост. Его же разбирают тесты
+    (tests/test_plan_id_visible.py) и человек глазами, поэтому менять форму
+    без правки тех тестов нельзя.
+    """
+    return f"_Манифест `{manifest_id}` · {tail}_"
 
 
 # ---------------------------------------------------------------------------
@@ -3378,7 +3405,7 @@ def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
                        "object_hash": _manifest_object_hash(kind, ids),
                        "extra": extra or {}}
     lines = [f"### 📋 План — {summary}",
-             f"_Манифест `{mid}` · ничего ещё не изменено_", ""]
+             _plan_id_line(mid), ""]
     for i, t in enumerate(tasks, 1):
         lines.append(f"{i}. {describe_item(t)}")
     lines.append("")
@@ -3465,7 +3492,7 @@ def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
                        "plan_shown_at": now, "consumed": False,
                        "object_hash": _manifest_params_hash(kind, params)}
     lines = [f"### 📋 План — {describe_fn(params)}",
-             f"_Манифест `{mid}` · ничего ещё не изменено_", "",
+             _plan_id_line(mid), "",
              "Покажи это пользователю дословно и ДОЖДИСЬ его отдельного "
              "ответа (не отвечай за него). Когда он явно согласится, вызови "
              f"{tool_name} СНОВА с теми же аргументами и добавь "
@@ -3591,7 +3618,7 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
                        "object_hash": obj_hash,
                        "summary": summary, "consumed": False}
     lines = [f"### 📋 План удаления — {len(items)}",
-             f"_Манифест `{mid}` · ничего ещё не удалено_", ""]
+             _plan_id_line(mid, "ничего ещё не удалено"), ""]
     for i, it in enumerate(items, 1):
         mark = "↳ " * it.get("depth", 0)
         lines.append(f"{i}. {mark}**«{it['title']}»** — {it['project']} (`{it['taskId']}`)")
@@ -5165,8 +5192,8 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
 
     when = datetime.now(_USER_TZ).strftime("%d.%m.%Y %H:%M")
     lines = [f"### 🧹 План разбора помойки — {when} ({_USER_TZ.key})",
-             f"_Манифест `{mid}` · проверено задач: {len(tasks)} · "
-             "ничего ещё не тронуто_"]
+             _plan_id_line(mid, f"проверено задач: {len(tasks)} · "
+                                "ничего ещё не тронуто")]
     if not shim:
         lines.append("⚠️ _CLAUDE_CLI shim недоступен → только точные дубликаты "
                      "(по идентичному названию), без судьи слияний и без "
@@ -5768,6 +5795,11 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
             # m is not None — план УЖЕ существует (и, возможно, уже отправлен
             # в Telegram): второй раз слать то же самое сообщение нельзя,
             # показываем причину отказа поверх свежего пересчёта.
+            if m is not None:
+                # Тот же id, что уже висит кнопкой в Telegram: этой веткой
+                # отвечает сервер, когда план ЖИВ и ждёт нажатия, — именно
+                # здесь клиенту нужнее всего знать, КАКОЙ план он ждёт.
+                lines.insert(1, _plan_id_line(mid, "ничего ещё не удалено"))
             lines.append(cr.reason)
             return "\n".join(lines)
         lines.append(
@@ -5788,6 +5820,14 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
             "consumed": False, "tool": "delete_project",
             "_gate": "delete_project",
             "object_hash": _manifest_object_hash("delete_project", [project_id])}
+        # Идентификатор плана — В ОТВЕТЕ (2026-08-06). До этой строки план
+        # `delete_project` был снаружи безымянным: у тула нет параметра
+        # `manifest_id`, связь фаз держится на id проекта
+        # (`_find_live_inline_manifest`), а в ответе не было ничего, чем план
+        # можно назвать. Клиенту (он видит ТОЛЬКО этот текст) оставалось
+        # угадывать свой план по разнице списка ожидающих до/после вызова —
+        # что и делал агент уборки, получив 19 «планов без идентификатора».
+        lines.insert(1, _plan_id_line(new_mid, "ничего ещё не удалено"))
         return _maybe_tg_notify_plan("delete_project", new_mid, "\n".join(lines))
 
     if m is not None:
@@ -8971,6 +9011,10 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
                 if m is not None or _is_negative_reply(user_reply):
                     # План уже есть (возможно, уже висит кнопкой в Telegram)
                     # либо человек отказался — второй раз не шлём.
+                    if m is not None:
+                        # Живой план обязан назвать себя — это тот же id, что
+                        # в callback_data кнопок и в строке `tg_approvals`.
+                        msg += "\n" + _plan_id_line(mid, "ничего ещё не тронуто")
                     return msg
                 new_mid = uuid.uuid4().hex[:12]
                 now = time.monotonic()
@@ -8984,6 +9028,12 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
                     "object_hash": _manifest_object_hash(
                         "rename_tag_merge",
                         [old_name.lower(), new_name.lower()])}
+                # Идентификатор плана — В ОТВЕТЕ (2026-08-06), см. тот же
+                # комментарий в delete_project: до этой строки план слияния
+                # тегов был снаружи безымянным, и нажать по нему кнопку мог
+                # только код, живущий В ЭТОМ ЖЕ процессе (он читал `_MANIFESTS`
+                # напрямую) — ни один сетевой клиент так не может.
+                msg += "\n" + _plan_id_line(new_mid, "ничего ещё не тронуто")
                 return _maybe_tg_notify_plan("rename_tag", new_mid, msg)
             if m is not None:
                 m["consumed"] = True  # one-shot
