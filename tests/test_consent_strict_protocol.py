@@ -49,6 +49,42 @@ def test_ordinary_human_yes_is_still_accepted(reply):
     assert s._consent_refusal_reason(reply) == "", reply
 
 
+# Живые формулировки сверх эталонного набора — найдены при проверке фикса и
+# зафиксированы, чтобы будущее ужесточение их не съело.
+MORE_LIVE_YES = [
+    "сделай", "ок, сделай", "да, сделай", "ок, спасибо", "давай уже",
+    "ок, стартуем", "да, конечно", "конечно, давай", "ок, поехали",
+    "да, вперёд", "ок, го", "верно, удаляй", "да, всё так",
+    "подтверждаю удаление", "yes please", "do it", "go ahead", "sounds good",
+    "ок, только аккуратно", "да, без проблем", "ну давай",
+]
+
+
+@pytest.mark.parametrize("reply", MORE_LIVE_YES)
+def test_more_live_phrasings_are_accepted(reply):
+    assert s._is_affirmative_reply(reply) is True, reply
+
+
+# Осознанная ЦЕНА строгости: эти ответы человек воспринимает как согласие, а
+# сервер — нет. Тест фиксирует цену явно, чтобы её не «починили» случайно:
+# каждая из фраз либо откладывает исполнение («но сначала»), либо указывает на
+# ПОДМНОЖЕСТВО плана («эти», «первые три»), а частичного режима у сервера нет.
+KNOWN_COST_OF_STRICTNESS = [
+    "ок, но быстро",
+    "да, удали эти",
+    "удали первые три",
+    "да, всё",
+]
+
+
+@pytest.mark.parametrize("reply", KNOWN_COST_OF_STRICTNESS)
+def test_known_false_refusals_are_deliberate(reply):
+    assert s._is_affirmative_reply(reply) is False, reply
+    # Цена ограничена одной лишней фразой: план не сгорает, достаточно
+    # переспросить и получить однозначное «да».
+    assert s._is_negative_reply(reply) is False, reply
+
+
 @pytest.mark.parametrize("reply", GENUINE_YES)
 def test_ordinary_human_yes_passes_the_real_gate(reply):
     """Сквозная проверка: согласие проходит гейт и сжигает манифест штатно
