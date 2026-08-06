@@ -613,13 +613,13 @@ def _tools_that_send_a_button() -> set:
 
     Три источника, все обязательны:
       • явные вызовы `_maybe_tg_notify_plan("<tool>", …)` — тулы со своим
-        манифестом (delete_project, rename_tag…);
-      • та же отправка, но вынесенная в поток —
-        `_run_blocking(_maybe_tg_notify_plan, "<tool>", …)`: в async-тулах
-        (delete_tasks, plan_task_deletion, plan_task_creation) вызов
-        синхронный и на 429 спит, поэтому идёт через executor. Без этого
-        шаблона инвентаризация молча теряла бы именно те тулы, у которых
-        план самый длинный;
+        манифестом (delete_project, rename_tag, delete_tasks…). С #115 хук
+        сам корутина и сам уводит сетевую часть в поток, поэтому у ВСЕХ
+        таких тулов вызов выглядит одинаково: `await _maybe_tg_notify_plan(…)`;
+      • историческая форма `_run_blocking(_maybe_tg_notify_plan, "<tool>", …)`
+        — так три тула заказывали поток вручную, пока вынос не переехал
+        внутрь хука. В коде её больше нет; шаблон оставлен страховкой, чтобы
+        инвентаризация не ослепла, если кто-то напишет так снова;
       • тулы, заведённые через общие гейты `_gate_batch`/`_gate_single` — их
         планы уходят в Telegram ИЗНУТРИ гейта, отдельного вызова в коде тула
         нет, поэтому по первым двум источникам они не находятся вовсе.
@@ -697,7 +697,7 @@ async def test_plan_note_no_longer_asks_for_a_text_yes(monkeypatch, tmp_path):
     assert "НЕ нужно" in preview
 
 
-def test_plan_note_for_a_non_auto_executed_plan_asks_to_repeat(monkeypatch):
+async def test_plan_note_for_a_non_auto_executed_plan_asks_to_repeat(monkeypatch):
     """Зеркально: если у плана исполнителя НЕТ, приписка обязана честно
     просить повторить вызов после нажатия — обещать «выполнится само» там
     нельзя. Сегодня единственный такой случай — намеренно выключенный
@@ -708,7 +708,7 @@ def test_plan_note_for_a_non_auto_executed_plan_asks_to_repeat(monkeypatch):
     s._MANIFESTS["m-dc"] = {"kind": "declutter", "consumed": False,
                             "created": 0.0}
 
-    out = s._maybe_tg_notify_plan("execute_declutter", "m-dc", "### план")
+    out = await s._maybe_tg_notify_plan("execute_declutter", "m-dc", "### план")
 
     assert "повторите вызов" in out
     assert "автоматически" not in out

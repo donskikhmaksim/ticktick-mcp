@@ -217,22 +217,22 @@ async def test_delete_tasks_and_execute_task_deletion_agree_under_tg(
 
 # ═══════ 3. Юнит-уровень: пометка манифеста, а не аргумент вызова ═══════
 
-def test_notify_plan_marks_the_manifest(monkeypatch):
+async def test_notify_plan_marks_the_manifest(monkeypatch):
     _tg_on(monkeypatch)
     monkeypatch.setattr(tg, "notify_plan", lambda *a, **k: (True, ""))
     m = _plan_manifest("mid-mark")
 
-    s._maybe_tg_notify_plan("delete_tasks", "mid-mark", "### план")
+    await s._maybe_tg_notify_plan("delete_tasks", "mid-mark", "### план")
 
     assert m["tg_notified"] is True
     assert m["_tg_tool"] == "delete_tasks"
     assert m["_tg_manifest_id"] == "mid-mark"
 
 
-def test_notify_plan_does_not_mark_when_layer_off(monkeypatch):
+async def test_notify_plan_does_not_mark_when_layer_off(monkeypatch):
     _tg_off(monkeypatch)
     m = _plan_manifest("mid-nomark")
-    s._maybe_tg_notify_plan("delete_tasks", "mid-nomark", "### план")
+    await s._maybe_tg_notify_plan("delete_tasks", "mid-nomark", "### план")
     assert "tg_notified" not in m
 
 
@@ -293,7 +293,7 @@ async def test_tool_outside_the_allowlist_does_not_break_execute(
     assert "Купить молоко" in out
 
 
-def test_unnotified_manifest_still_passes_on_plain_yes(monkeypatch):
+async def test_unnotified_manifest_still_passes_on_plain_yes(monkeypatch):
     """Манифесты, чей план в Telegram НЕ уходил (_gate_batch/_gate_single/
     create), обязаны продолжать работать по chat-«да» даже когда слой
     глобально включён — иначе фикс превратил бы batch-тулы в вечный отказ
@@ -308,8 +308,8 @@ def test_unnotified_manifest_still_passes_on_plain_yes(monkeypatch):
          "object_hash": s._manifest_object_hash("complete", ["t1"])}
     s._MANIFESTS["mid-batch"] = m
 
-    out = s._gate_batch("complete", "complete_tasks", None, "s", "mid-batch",
-                        "да", lambda t: "x")
+    out = await s._gate_batch("complete", "complete_tasks", None, "s", "mid-batch",
+                              "да", lambda t: "x")
 
     assert out.proceed is True
     assert calls["n"] == 0

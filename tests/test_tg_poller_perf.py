@@ -387,3 +387,62 @@ async def test_disabled_layer_touches_neither_db_nor_network(monkeypatch):
     await s._tg_auto_execute_tick()               # не должно бросить
     assert s._find_tg_auto_execute_candidates() == []
     assert not any(s._MANIFESTS[m].get("consumed") for m in s._MANIFESTS)
+
+
+# ═══════════ 6. Уборка просроченных планов — тоже вне event loop ═══════════
+
+async def test_slow_reaper_does_not_block_the_event_loop(monkeypatch):
+    """Третий горячий путь того же семейства (найден при разборе #115).
+
+    `reap_expired` — это `DELETE … RETURNING` в Postgres ПЛЮС отдельный
+    синхронный `deleteMessage` на КАЖДОЕ прибираемое сообщение, а у длинного
+    плана их несколько. Десяток просроченных планов = десятки HTTP-вызовов
+    подряд; вызванные прямо из корутины поллера, они морозили сервер ровно
+    так же, как отправка плана — просто раз в час, а не на каждый план.
+    Снять `_run_blocking` вокруг уборки — и счётчик проворотов упадёт в ноль.
+    """
+    _enable_tg(monkeypatch)
+    # Уборка — на КАЖДОМ проходе, проходы — часто: тест не должен ждать минуту.
+    monkeypatch.setattr(s, "_TG_REAP_INTERVAL_S", 0.0)
+    monkeypatch.setattr(s, "_TG_AUTO_EXECUTE_INTERVAL_S", 0.01)
+
+    async def _noop_tick():
+        return None
+
+    monkeypatch.setattr(s, "_tg_auto_execute_tick", _noop_tick)
+
+    reaped = {"n": 0}
+
+    def _slow_reap(cfg):
+        # Долгой делаем ТОЛЬКО первую уборку — иначе последующие проходы
+        # смазали бы замер, и тест перестал бы отличать «loop свободен» от
+        # «loop успевает между блокировками».
+        if reaped["n"] == 0:
+            time.sleep(0.3)
+        reaped["n"] += 1
+        return 0
+
+    monkeypatch.setattr(tg, "reap_expired", _slow_reap)
+
+    beats = {"n": 0}
+
+    async def _beat():
+        while True:
+            await asyncio.sleep(0.01)
+            beats["n"] += 1
+
+    hb = asyncio.create_task(_beat())
+    loop_task = asyncio.create_task(s._tg_auto_execute_poller_loop())
+    try:
+        deadline = time.monotonic() + 5.0
+        while reaped["n"] < 1:
+            assert time.monotonic() < deadline, "уборка так и не запустилась"
+            await asyncio.sleep(0.005)
+        during_first_reap = beats["n"]
+    finally:
+        loop_task.cancel()
+        hb.cancel()
+
+    assert during_first_reap >= 5, (
+        f"event loop стоял во время уборки просроченных планов "
+        f"(посторонняя корутина провернулась {during_first_reap} раз)")
