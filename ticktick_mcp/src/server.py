@@ -8806,10 +8806,264 @@ def _find_tg_auto_execute_candidates() -> List[Dict]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Честная пост-верификация автоисполнения (2026-08-06)
+# ---------------------------------------------------------------------------
+# ПОЧЕМУ это вообще появилось: до этой правки поллер брал ровно то, что вернул
+# исполнитель (`entry.execute(...)`), и публиковал как ИТОГ. То есть словом
+# «успешно» распоряжался тот же код, который мутацию и делал, — судья и
+# подсудимый в одном лице. Теперь после исполнения обязательно делается
+# НЕЗАВИСИМАЯ перепроверка живым чтением (`_build_operation_report`, который
+# читает журнал мутаций и заново тянет состояние TickTick через
+# `_open_by_id(fresh=True)`), и вердикт выносится ПО ЕЁ ФАКТАМ, а не по
+# самоотчёту исполнителя.
+#
+# Ключевой принцип (Максим, пункт 3 ТЗ): «не удалось доказать» ≠ «получилось».
+# Поэтому вердиктов ЧЕТЫРЕ, а не два: помимо ok/failed есть "partial" (часть
+# подтвердилась, часть нет) и "unverified" (мутация, возможно, прошла, но мы
+# этого НЕ ДОКАЗАЛИ — журнал пуст, живое чтение недоступно, формат итога не
+# распознан, исключение). "unverified" НИКОГДА не выдаётся за "ok".
+#
+# ЧЕСТНОЕ ОГРАНИЧЕНИЕ: `_build_operation_report` умеет выносить вердикт не для
+# всех типов операций. Для незнакомого `op` его построчный `_verify_item()`
+# пишет «тип … не проверяется автоматически» и ставит галку «✓», которая
+# СПЕЦИАЛЬНО не считается ни в ✅, ни в ❌ — итог тогда «✅ 0 подтверждено,
+# ❌ 0 расхождений». Такой случай здесь трактуется как "unverified"
+# (подтверждать было нечем), а не как "ok" — см. `_verdict_from_totals`.
+
+# Итоговая строка независимого отчёта: «**Итог: ✅ 3 подтверждено, ❌ 1
+# расхождений.**». Разбираем регуляркой, но НЕ доверяем ей слепо: если формат
+# поменяется (или строки нет вовсе), `_parse_verify_totals` вернёт None, и
+# вердикт станет "unverified" — то есть поломка парсера деградирует в
+# «не доказано», а не в ложное «успешно».
+_VERIFY_TOTALS_RE = re.compile(
+    r"Итог:\s*✅\s*(\d+)\s*подтвержден\w*\s*,\s*❌\s*(\d+)\s*расхожден\w*")
+
+# Маркеры в тексте САМОГО исполнителя (у него уже есть свой read-back).
+# Явный провал: 🛑 / «Ошибка» / «НЕ удалено». Частичный успех/сомнение:
+# ⚠️ / ⏭ / «не подтверждён» (последнее — из _UNVERIFIED_MSG и родственных).
+_EXEC_FAILURE_MARKERS = ("🛑", "Ошибка", "ошибка при", "НЕ удалено", "не удалено")
+_EXEC_WARN_MARKERS = ("⚠️", "⚠", "⏭", "не подтверждён", "не подтверждена",
+                      "НЕ ПОДТВЕРЖДЁН", "не подтвердилось")
+
+# Признаки того, что независимый отчёт НЕ является настоящей перепроверкой
+# (журнала нет / записей нет / живое состояние недоступно / внутренняя
+# ошибка). Все они = "unverified": мутация могла пройти, но мы не смотрели.
+#
+# Фразы намеренно взяты ДЛИННЫМИ и дословными из `_build_operation_report`:
+# короткое «невозможен»/«нет записей» могло бы случайно совпасть с НАЗВАНИЕМ
+# задачи внутри отчёта и превратить настоящее подтверждение в «не доказано».
+# (Ошибка в эту сторону безопасна, но врать в другую сторону тоже не надо.)
+_REPORT_UNUSABLE_MARKERS = ("Журнал не найден", "В журнале нет записей по",
+                            "Живое состояние TickTick недоступно",
+                            "Error building operation report")
+
+_VERDICT_EMOJI = {"ok": "✅", "partial": "⚠️", "failed": "🛑", "unverified": "❓"}
+_VERDICT_WORD = {"ok": "подтверждено живым чтением",
+                 "partial": "подтверждено частично",
+                 "failed": "не выполнено",
+                 "unverified": "НЕ подтверждено (проверить не удалось)"}
+
+
+def _parse_verify_totals(text: str) -> Optional[Tuple[int, int]]:
+    """(подтверждено, расхождений) из итоговой строки независимого отчёта,
+    либо None, если строку не нашли/не распознали. Вынесено отдельной чистой
+    функцией специально ради тестируемости без сети и БД."""
+    if not text:
+        return None
+    m = _VERIFY_TOTALS_RE.search(text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1)), int(m.group(2))
+    except (TypeError, ValueError):  # pragma: no cover — регулярка даёт цифры
+        return None
+
+
+def _verdict_from_totals(totals: Optional[Tuple[int, int]]) -> str:
+    """Вердикт ТОЛЬКО по фактам независимой перепроверки.
+
+    0/0 — это не успех: подтверждать было нечего (незнакомый тип операции,
+    пустой набор), поэтому "unverified". >0 расхождений при 0 подтверждённых —
+    операция провалилась целиком. Смешанный итог — "partial". "ok" выдаётся
+    единственным сочетанием: расхождений 0 И подтверждённых больше нуля."""
+    if totals is None:
+        return "unverified"
+    ok_n, bad_n = totals
+    if ok_n == 0 and bad_n == 0:
+        return "unverified"
+    if bad_n > 0 and ok_n == 0:
+        return "failed"
+    if bad_n > 0:
+        return "partial"
+    return "ok"
+
+
+def _verified_auto_execute_report(manifest_id: str, tool: str,
+                                  exec_output: str) -> Tuple[str, str]:
+    """Возвращает (полный_markdown_отчёта, verdict).
+
+    verdict ∈ {"ok", "partial", "failed", "unverified"} — см. блок-комментарий
+    выше. Ничего не обрезает: длину теперь держит чанкинг в tg_approval
+    (`send_message_chunked`), а не молчаливое обрезание отчёта по 4096."""
+    exec_output = exec_output or ""
+
+    # 1. Независимая перепроверка. Сама `_build_operation_report` ловит свои
+    #    исключения и возвращает текст, но монкейпатч/будущая правка может и
+    #    бросить — ловим, чтобы автоисполнение никогда не падало на этапе
+    #    «рассказать, что получилось».
+    independent: Optional[str] = None
+    independent_err: Optional[str] = None
+    try:
+        independent = _build_operation_report(manifest_id)
+    except Exception as e:
+        independent_err = str(e)
+        logger.error(f"TG auto-execute: независимая перепроверка "
+                     f"{manifest_id} упала: {e}")
+
+    report_usable = bool(independent) and not any(
+        mark in independent for mark in _REPORT_UNUSABLE_MARKERS)
+    totals = _parse_verify_totals(independent) if report_usable else None
+
+    # 2. Явный провал по самоотчёту исполнителя перебивает всё: если он сам
+    #    написал «🛑 / Ошибка / НЕ удалено» и при этом НИ ОДНОГО ✅ — это
+    #    провал, независимо от того, что покажет журнал.
+    exec_failed = (any(mark in exec_output for mark in _EXEC_FAILURE_MARKERS)
+                   and "✅" not in exec_output)
+    exec_warn = any(mark in exec_output for mark in _EXEC_WARN_MARKERS)
+
+    if exec_failed:
+        verdict = "failed"
+    else:
+        verdict = _verdict_from_totals(totals)
+        # Даунгрейд, но НИКОГДА не апгрейд: сомнение исполнителя (⚠️/⏭/«не
+        # подтверждён») понижает "ok" до "partial". "unverified" при этом
+        # остаётся "unverified" — оно строже "partial" (там хотя бы часть
+        # доказана, здесь не доказано ничего).
+        if verdict == "ok" and exec_warn:
+            verdict = "partial"
+
+    # 3. Полный markdown: оба раздела целиком + честное основание вердикта.
+    if independent is None:
+        independent_block = (f"⚠️ Перепроверку выполнить не удалось: "
+                             f"{independent_err or 'неизвестная ошибка'}")
+    else:
+        independent_block = independent
+
+    if totals is not None:
+        basis = (f"Основание вердикта: независимая перепроверка живым чтением — "
+                 f"✅ {totals[0]} подтверждено, ❌ {totals[1]} расхождений.")
+    elif not report_usable:
+        basis = ("Основание вердикта: независимую перепроверку выполнить НЕ "
+                 "удалось (журнал/живое состояние недоступны) — исход операции "
+                 "НЕ ПОДТВЕРЖДЁН. Это не то же самое, что «успешно».")
+    else:
+        basis = ("Основание вердикта: формат итоговой строки независимого "
+                 "отчёта не распознан — считаем исход НЕ ПОДТВЕРЖДЁННЫМ.")
+    if exec_failed:
+        basis = ("Основание вердикта: исполнитель сам отрапортовал провал "
+                 "(в его отчёте есть маркер ошибки и ни одного ✅). " + basis)
+
+    full_md = "\n".join([
+        f"### {_VERDICT_EMOJI.get(verdict, '❓')} Автоисполнение «{tool}» — "
+        f"{_VERDICT_WORD.get(verdict, verdict)}",
+        f"_manifest: `{manifest_id}`_",
+        "",
+        "#### Что сделал исполнитель",
+        exec_output.strip() or "_(исполнитель не вернул текста)_",
+        "",
+        "#### Независимая перепроверка (живое чтение)",
+        independent_block.strip(),
+        "",
+        basis,
+    ])
+    return full_md, verdict
+
+
+def _manifest_affected_count(m: Optional[Dict]) -> Optional[int]:
+    """Сколько объектов затрагивал манифест — только для КОРОТКОЙ сводки в
+    личку («затронуто 5 задач»). Намеренно не лезет в структуры конкретных
+    типов планов кроме плоского `items` (что не знаем — просто None, и в
+    сводке этой строки не будет)."""
+    if not isinstance(m, dict):
+        return None
+    items = m.get("items")
+    return len(items) if isinstance(items, list) else None
+
+
+def _short_auto_execute_summary(tool: str, verdict: str,
+                                affected: Optional[int],
+                                group_delivered: bool) -> str:
+    """2-4 строки в ЛИЧКУ владельца. Максим просил не захламлять личный чат
+    1:1 простынями — подробности живут в группе «MCP Отчёты», сюда идёт
+    только вердикт. Если в группу отчёт НЕ доставился, сводка обязана сказать
+    это вслух: молчаливая потеря подробностей — тот же самый оптимистичный
+    отчёт, только в другой обёртке."""
+    lines = [f"{_VERDICT_EMOJI.get(verdict, '❓')} Автоисполнение «{tool}» — "
+             f"{_VERDICT_WORD.get(verdict, verdict)}."]
+    if affected is not None:
+        lines.append(f"Затронуто объектов: {affected}.")
+    if group_delivered:
+        lines.append("Подробный отчёт — в группе «MCP Отчёты».")
+    else:
+        lines.append("⚠️ отчёт в группу не доставлен, подробности в логах "
+                     "сервера.")
+    return "\n".join(lines)
+
+
+def _publish_auto_execute_outcome(candidate: Dict, tool: str, full_md: str,
+                                  verdict: str,
+                                  affected: Optional[int]) -> None:
+    """Куда уходит итог (пункты 1-2 ТЗ): ПОЛНЫЙ отчёт — в группу «MCP Отчёты»
+    (архив, чанкинг внутри `post_report_to_group`), КОРОТКАЯ сводка — в то же
+    личное сообщение с кнопками (`summarize_in_owner_chat` редактирует текст
+    и снимает кнопки).
+
+    Обе публикации обёрнуты в try/except, хотя по контракту обе best-effort и
+    не бросают: инвариант «упавший кандидат не рушит остальных» не должен
+    зависеть от чужих гарантий. Вызовы синхронные (requests) — как и раньше;
+    на время HTTP event loop блокируется, это существующее поведение слоя, а
+    не регресс этой правки."""
+    delivered: List[int] = []
+    try:
+        delivered = tg_approval.post_report_to_group(
+            _TG_CFG, candidate["manifest_id"], full_md,
+            tool=tool, verdict=verdict) or []
+    except Exception as e:
+        logger.error(f"TG auto-execute: публикация отчёта в группу упала "
+                     f"({tool}/{candidate['manifest_id']}): {e}")
+    short_md = _short_auto_execute_summary(tool, verdict, affected,
+                                           bool(delivered))
+    try:
+        tg_approval.summarize_in_owner_chat(
+            _TG_CFG, candidate["chat_id"], candidate["message_id"], short_md)
+    except Exception as e:
+        logger.error(f"TG auto-execute: сводка в личку не отправилась "
+                     f"({tool}/{candidate['manifest_id']}): {e}")
+
+
 async def _tg_auto_execute_tick() -> None:
     """One pass: find candidates, execute each via its registered executor,
-    report the result back into the Telegram message. Mirrors gmail-mcp's
-    runAutoExecutePoller — errors from ONE candidate never abort the others."""
+    verify the outcome INDEPENDENTLY, then publish (full report → the «MCP
+    Отчёты» group, short summary → the owner's original button message).
+    Mirrors gmail-mcp's runAutoExecutePoller — errors from ONE candidate never
+    abort the others.
+
+    Пункт 5 ТЗ («несколько параллельных подтверждений») архитектурно уже
+    поддержан, и это НЕ случайность, а свойство четырёх мест сразу:
+      * `_MANIFESTS` — СЛОВАРЬ манифестов, а не единственный слот: сколько
+        планов настроил — столько живых записей, они друг друга не вытесняют;
+      * у КАЖДОЙ строки в `tg_approvals` свой `manifest_id` (PRIMARY KEY) и
+        свой `expires_at` — TTL одного подтверждения не гасит соседние;
+      * этот цикл обходит ВСЕХ кандидатов, а `try/except` стоит ВНУТРИ тела
+        цикла: упавший кандидат съедает своё исключение и не прерывает
+        обработку следующих;
+      * `_consume_manifest_for_auto_execute` — атомарный compare-and-set без
+        единого `await` между проверкой `consumed` и его выставлением, так что
+        на однопоточном event loop два тика физически не могут исполнить один
+        манифест дважды.
+    Отдельного «один pending за раз» в коде нет — при ревизии 2026-08-06 такое
+    место не найдено."""
     for c in _find_tg_auto_execute_candidates():
         mid, tool = c["manifest_id"], c["tool"]
         entry = _AUTO_EXECUTORS.get(tool)
@@ -8825,15 +9079,31 @@ async def _tg_auto_execute_tick() -> None:
             if consumed is None:
                 continue  # race/drift/already consumed — not an error
             report_text = await entry.execute(mid, consumed)
-            tg_approval.report_auto_execution_result(
-                _TG_CFG, c["chat_id"], c["message_id"], report_text)
+            # Слово «успешно» больше не принадлежит исполнителю: сначала
+            # независимая перепроверка, только потом вердикт (пункт 3 ТЗ).
+            full_md, verdict = _verified_auto_execute_report(
+                mid, tool, report_text)
+            _publish_auto_execute_outcome(
+                c, tool, full_md, verdict, _manifest_affected_count(consumed))
         except Exception as e:
             logger.error(f"TG auto-execute: ошибка при исполнении "
                         f"{tool}/{mid}: {e}")
             try:
-                tg_approval.report_auto_execution_result(
-                    _TG_CFG, c["chat_id"], c["message_id"],
-                    f"🛑 Ошибка при автоисполнении «{tool}»: {e}")
+                # Ошибка исполнения идёт по ТОМУ ЖЕ пути: полный текст (с
+                # трассировкой смысла) — в группу как "failed", короткая
+                # сводка — в личку. Так у владельца не остаётся операций,
+                # про которые в архиве вообще ничего нет.
+                err_md = "\n".join([
+                    f"### 🛑 Автоисполнение «{tool}» — ошибка исполнения",
+                    f"_manifest: `{mid}`_",
+                    "",
+                    f"Исключение: `{type(e).__name__}: {e}`",
+                    "",
+                    "Мутация могла быть выполнена ЧАСТИЧНО — исход не "
+                    "подтверждён; проверь `operation_report` по этому "
+                    "manifest_id.",
+                ])
+                _publish_auto_execute_outcome(c, tool, err_md, "failed", None)
             except Exception:
                 pass
 
@@ -8852,20 +9122,61 @@ def _consume_manifest_for_auto_execute(manifest_id: str) -> Optional[Dict]:
 
 
 _TG_AUTO_EXECUTE_INTERVAL_S = float(os.environ.get("TG_AUTO_EXECUTE_INTERVAL_S", "10"))
+# Как часто чистим просроченные подтверждения (пункт 4 ТЗ: сообщение, по
+# которому решения так и не приняли, УДАЛЯЕТСЯ целиком). Отдельный интервал, а
+# не «на каждом тике»: тик — 10 секунд, а уборка ходит в Postgres и в Telegram
+# — гонять её в 6 раз чаще, чем нужно, смысла нет.
+_TG_REAP_INTERVAL_S = float(os.environ.get("TG_REAP_INTERVAL_S", "60"))
 
 
 async def _tg_auto_execute_poller_loop() -> None:
     """Background loop started from main() (see _run_server() below) only
     when TG_APPROVAL_ENABLED — every ~10s (env-tunable), forever, for the
     life of the process. A single tick's exception must never kill the loop
-    (Maksim would then lose auto-execute silently until the next deploy)."""
+    (Maksim would then lose auto-execute silently until the next deploy).
+
+    Два независимых TTL — честно про то, что будет, если их развести:
+      * `_MANIFEST_TTL` (3600 c) — жизнь манифеста в RAM ЭТОГО процесса;
+      * `TG_APPROVAL_TTL_S` (тоже 3600 c) — `expires_at` строки в Postgres,
+        по которому `check_approval` начинает отвечать "none", а reaper
+        сносит сообщение.
+    Они НЕ связаны кодом, совпадение значений — соглашение, а не инвариант.
+    Если RAM-TTL сделать КОРОЧЕ: манифест умрёт раньше строки — кнопка в
+    Telegram «сработает» (строка станет APPROVED), но исполнять будет уже
+    нечего (`_find_tg_auto_execute_candidates` не найдёт манифест в
+    `_MANIFESTS`), и позже reaper уберёт сообщение — операция тихо не
+    произойдёт. Если RAM-TTL сделать ДЛИННЕЕ: строка протухнет первой,
+    `check_approval` вернёт "none", манифест доживёт в памяти бесполезным
+    грузом до `_prune_manifests`. Тот же эффект, что и при рестарте процесса
+    между планом и нажатием: RAM пуста, а строка в Postgres жива."""
     logger.info(f"TG auto-execute: poller started (every {_TG_AUTO_EXECUTE_INTERVAL_S:.0f}s)")
+    last_reap = time.monotonic()
     while True:
         await asyncio.sleep(_TG_AUTO_EXECUTE_INTERVAL_S)
         try:
             await _tg_auto_execute_tick()
         except Exception as e:
             logger.error(f"TG auto-execute poller: unhandled error: {e}")
+        # Уборка — отдельным таймером по монотонным часам (не по системным:
+        # перевод времени/NTP-скачок не должен ни заморозить уборку на час,
+        # ни устроить её на каждом тике). Падение уборки НИКОГДА не убивает
+        # поллер — иначе просроченный мусор в Telegram стоил бы владельцу
+        # всего автоисполнения до следующего деплоя.
+        now = time.monotonic()
+        if now - last_reap >= _TG_REAP_INTERVAL_S:
+            last_reap = now
+            # Флаг живёт в конфиге tg_approval (env TG_REAP_ENABLED); читаем
+            # через getattr, чтобы старый конфиг без этого поля не ронял
+            # поллер AttributeError'ом — по умолчанию уборка включена.
+            if getattr(_TG_CFG, "reap_enabled", True):
+                try:
+                    n = tg_approval.reap_expired(_TG_CFG)
+                    if n:
+                        logger.info("TG reaper: прибрано просроченных "
+                                    f"подтверждений: {n}")
+                except Exception as e:
+                    logger.error(f"TG reaper: уборка упала (поллер продолжает "
+                                 f"работать): {e}")
 
 
 def main():
