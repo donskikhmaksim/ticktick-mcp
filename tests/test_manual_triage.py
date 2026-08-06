@@ -994,6 +994,58 @@ async def test_everything_drifted_calls_no_executor_at_all(monkeypatch, tmp_path
     assert "a1" in live
 
 
+async def test_nothing_done_report_is_classified_as_failure(monkeypatch, tmp_path):
+    """Стык двух веток, который НЕ ловил ни один тест по отдельности.
+
+    `fix/silent-failures` научил кнопочный путь ставить разные надгробия:
+    «выполнено» против «нажато, но НЕ выполнено». Решает это
+    `_auto_execute_report_is_failure`, и судит он по НАЧАЛУ отчёта (внутри
+    успешного отчёта ❌ может стоять у отдельного элемента пачки — это
+    частичный результат, а не провал). manual_triage пришёл другой веткой и
+    начинал свой отчёт нейтральным «### 🧾 Ручной разбор», поэтому случай
+    «не выполнено ВООБЩЕ ничего» получал надгробие «✅ выполнено» — ровно тот
+    тихий отказ, ради которого вторая ветка и писалась.
+
+    Отчёт здесь не копируется в тест строкой (копия разъедется с кодом), а
+    строится настоящим вызовом."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    calls = _stub_sub_impls(monkeypatch, live)
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "delete", "task_id": "a1", "title": "Купить молоко",
+         "said": "не нужно"}])
+    mid = _mid(preview)
+    live.pop("a1")                      # исчезла между планом и подтверждением
+
+    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+
+    assert calls == []
+    assert "НИЧЕГО НЕ ВЫПОЛНЕНО" in out
+    assert s._auto_execute_report_is_failure(out), (
+        "отчёт «ничего не выполнено» классифицирован как УСПЕХ — по кнопке "
+        "он получил бы надгробие «✅ исполнено», и следующий вызов по этому "
+        f"id услышал бы, что всё сделано. Отчёт:\n{out}")
+
+
+async def test_successful_triage_report_is_not_classified_as_failure(
+        monkeypatch, tmp_path):
+    """Обратная сторона того же стыка: нормальный отчёт НЕ должен читаться
+    как провал, иначе выполненная операция получала бы надгробие «НЕ
+    выполнено» и человека звали бы перепроверять сделанное."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    _stub_sub_impls(monkeypatch, live)
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "уже сделал"}])
+    mid = _mid(preview)
+
+    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+
+    assert "✅ Выполнено 1 из 1" in out
+    assert not s._auto_execute_report_is_failure(out), out
+
+
 async def test_executor_ran_but_verification_did_not_confirm(monkeypatch, tmp_path):
     """Под-исполнитель отчитался успехом, а задача осталась на месте (частая
     форма молчаливого отказа TickTick). Итог судится по ЖИВОМУ состоянию, а
