@@ -8,7 +8,7 @@ import asyncio
 from ticktick_mcp.src import server
 
 
-# 75 = 79 authored tools MINUS the 4 declutter tools (plan_declutter,
+# 77 = 81 authored tools MINUS the 4 declutter tools (plan_declutter,
 # execute_declutter, resume_declutter, set_declutter_decision), whose
 # @mcp.tool() decorators are commented out on purpose — Maksim disabled the
 # declutter feature 2026-08-04/05 and it must stay disabled. The count was
@@ -18,7 +18,10 @@ from ticktick_mcp.src import server
 # 74 → 75 (2026-08-06): +1 = `manual_triage` — один гейтованный тул для
 # смешанного ручного разбора (delete/complete/update/move/merge в одном плане
 # с ОДНИМ подтверждением).
-_EXPECTED_TOOLS = 75
+# 75 → 77 (2026-08-06, тот же день): +2 = `create_habit` / `delete_habit`.
+# Обе прибавки пришли РАЗНЫМИ ветками от одной базы (74), поэтому каждая
+# насчитала свой итог (75 и 76) — верный после слияния только их суммарный.
+_EXPECTED_TOOLS = 77
 
 
 def test_all_expected_tools_registered():

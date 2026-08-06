@@ -23,7 +23,8 @@ Fills the gaps the official API lacks:
 - `list_tags` / `get_tasks_by_tag` — tag support
 - `get_inbox_tasks` — read the Inbox
 - `move_task` — move a task between lists
-- `get_habits` / `checkin_habit` (backdatable) / `get_habit_checkins` — habits
+- `get_habits` / `create_habit` / `delete_habit` / `checkin_habit` (backdatable)
+  / `get_habit_checkins` — habits
 - `list_filters` / `run_filter` — list and **execute** saved smart lists
 - `set_task_parent` / `unset_task_parent` — subtasks
 - `batch_complete_tasks` / `batch_delete_tasks` — bulk operations
@@ -120,7 +121,7 @@ narrower fallback when v2 is off.
 | Batch create / update / complete (>1 task, no advanced fields) | v2, v1 fallback | Without v2 these degrade to one-at-a-time v1 calls — no tags/assignee/columns |
 | Tags, assignees, kanban columns/sections, nested subtask trees, `move_task`, `set_task_parent`/`unset_task_parent` | v2 only | No official-API equivalent exists |
 | Completed-tasks list, Inbox read, project groups (folders) | v2 only | — |
-| Habits (`get_habits` / `checkin_habit` / `get_habit_checkins`) | v2 only | — |
+| Habits (`get_habits` / `create_habit` / `delete_habit` / `checkin_habit` / `get_habit_checkins`) | v2 only | Create/delete go through `POST /habits/batch`, the same batch shape as tasks/tags/projects |
 | Trash / restore | v2 only | — |
 | Task comments, `get_task_activity` (edit history), `get_changes` (the audit-log feed) | v2 only | — |
 | `plan_declutter` / `execute_declutter` (dedup, SMART rewrite) | v2 only | Reads the whole task pool via v2 sync state; nothing to fall back to |

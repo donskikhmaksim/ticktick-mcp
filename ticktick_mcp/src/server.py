@@ -7119,6 +7119,288 @@ async def _checkin_habit_impl(habit_name: str, habit_id: str, date: str = None,
         return f"Error checking in habit: {str(e)}"
 
 
+def _describe_create_habit(p: Dict) -> str:
+    kind = ("да/нет" if str(p.get("habit_type")).lower() == "boolean"
+            else f'количественная, цель {p.get("goal")} {p.get("unit")}')
+    return (f'Создаю привычку «{p.get("name")}» ({kind}), раздел '
+            f'{p.get("section")}, повтор {p.get("repeat_rule")}')
+
+
+@mcp.tool()
+async def create_habit(name: str, goal: float = 1.0,
+                       unit: str = "Count", habit_type: str = "boolean",
+                       repeat_rule: str = "RRULE:FREQ=DAILY;INTERVAL=1",
+                       section: str = "morning", color: str = "#97E38B",
+                       icon: str = "habit_daily_check_in",
+                       encouragement: str = "",
+                       manifest_id: str = "", user_reply: str = "",
+                       automation_key: str = "") -> str:
+    """
+    Create a habit (requires v2 API — habits exist only in TickTick's
+    unofficial API). Gated 🟡 (docs/DESIGN_approval_gate.md): two calls, same
+    tool name — nothing is created on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is created yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
+    A habit whose name already exists is NOT created a second time (TickTick
+    itself allows duplicates; this tool refuses instead of quietly making a
+    twin). After the write the server re-reads the live habit list in a
+    separate request and only claims success if the habit is really there.
+
+    Args:
+        name: Name of the new habit (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
+        goal: Target per period — 1 for a plain yes/no habit, e.g. 8 for "8 glasses of water"
+        unit: Unit for a quantitative habit ("Count", "ml", "min", ...); ignored for a boolean one
+        habit_type: "boolean" (just done/not done, default) or "quantitative" (counts up to `goal`)
+        repeat_rule: RRULE string, default daily (e.g. "RRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,WE,FR")
+        section: Time-of-day section: "morning" (default), "afternoon" or "night"
+        color: Hex colour of the habit card
+        icon: TickTick icon name (see an existing habit's iconRes via get_habits)
+        encouragement: Short motivational line TickTick shows on check-in
+        manifest_id: from call #1's response — pass on call #2 to actually create
+        user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    if not (name or "").strip():
+        return "🛑 Пустое имя привычки — нечего создавать. Ничего не изменено."
+    if str(habit_type).lower() not in ("boolean", "quantitative"):
+        return ('🛑 Неверный habit_type — допустимо "boolean" или '
+                '"quantitative". Ничего не изменено.')
+    if str(section).lower().lstrip("_") not in TickTickV2Client.HABIT_SECTIONS:
+        return ('🛑 Неверный section — допустимо "morning", "afternoon" или '
+                '"night". Ничего не изменено.')
+    try:
+        goal = float(goal)
+    except (TypeError, ValueError):
+        return f"🛑 goal должен быть числом, а не {goal!r}. Ничего не изменено."
+    if goal <= 0:
+        return "🛑 goal должен быть больше нуля. Ничего не изменено."
+
+    params = {"name": name.strip(), "goal": goal, "unit": unit,
+              "habit_type": str(habit_type).lower(), "repeat_rule": repeat_rule,
+              "section": str(section).lower().lstrip("_"), "color": color,
+              "icon": icon, "encouragement": encouragement}
+    outcome = _gate_single("create_habit", "create_habit",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_create_habit,
+                           automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _create_habit_impl(**outcome.extra)
+
+
+async def _create_habit_impl(name: str, goal: float = 1.0, unit: str = "Count",
+                             habit_type: str = "boolean",
+                             repeat_rule: str = "RRULE:FREQ=DAILY;INTERVAL=1",
+                             section: str = "morning", color: str = "#97E38B",
+                             icon: str = "habit_daily_check_in",
+                             encouragement: str = "") -> str:
+    """Pure mutation logic for create_habit — no consent gate. Called only by
+    the gated create_habit() above once the plan is approved (or by the
+    Telegram button's background executor, which is the same thing)."""
+    api_type = "Boolean" if habit_type == "boolean" else "Real"
+    try:
+        # Duplicate guard: TickTick happily creates a second habit with the
+        # same name, and the pair is then indistinguishable in every list the
+        # user sees. Refuse instead (fail-closed), same spirit as create_tag.
+        before = await _run_blocking(lambda: ticktick_v2.get_habits())
+        twin = next((h for h in before
+                     if _names_agree(name, h.get("name") or "")), None)
+        if twin is not None:
+            return (f"### ↷ Привычка «{name}» не создана\n\n"
+                    f"- такая привычка **уже есть** (id: {twin.get('id')}, "
+                    f"отметок: {twin.get('totalCheckIns', 0)})\n"
+                    "- второй одноимённой не завожу — их было бы не отличить "
+                    "друг от друга; ничего не изменено")
+        hid = await _run_blocking(lambda: ticktick_v2.create_habit(
+            name, goal=goal, unit=unit, habit_type=api_type,
+            repeat_rule=repeat_rule, section=section, color=color, icon=icon,
+            encouragement=encouragement))
+    except RuntimeError as e:
+        return f"### ❌ Привычка «{name}» НЕ создана — TickTick отклонил: {e}"
+    except Exception as e:
+        logger.error(f"Error in create_habit: {e}")
+        return f"Error creating habit: {str(e)}"
+
+    # Post-verify: a SEPARATE fresh read of the live habit list — never the
+    # write response — must show the habit, under the requested name.
+    try:
+        after = await _run_blocking(lambda: ticktick_v2.get_habits())
+    except Exception as e:
+        return (f"### ⚠️ Привычка «{name}» отправлена (id: {hid}), проверка не выполнена\n\n"
+                f"- ⚠️ независимое перечитывание (`get_habits`) упало с ошибкой: {e}\n"
+                f"- {_UNVERIFIED_MSG}")
+    live = next((h for h in after if h.get("id") == hid), None)
+    if live is None:
+        return (f"### ⚠️ Привычка «{name}» отправлена (id: {hid}), но НЕ подтверждена\n\n"
+                "- ❌ при независимом перечитывании (`get_habits`) её в списке НЕ нашлось\n"
+                "- исход не подтверждён, проверь вручную")
+    real_name = live.get("name") or ""
+    if not _names_agree(name, real_name):
+        return (f"### ❌ Привычка создана, но имя разошлось\n\n"
+                f"- просили «{name}», в живом состоянии «{real_name}» (id: {hid})\n"
+                "- проверь вручную")
+    kind = ("да/нет" if api_type == "Boolean"
+            else f"количественная, цель {live.get('goal')} {live.get('unit')}")
+    return (f"### ✅ Привычка «{real_name}» создана (проверено)\n\n"
+            f"- тип: {kind}\n"
+            f"- повтор: {live.get('repeatRule') or repeat_rule}\n"
+            f"- отмечать: `checkin_habit(habit_name=\"{real_name}\", habit_id=\"{hid}\")`\n"
+            "- 🧾 подтверждено отдельным живым чтением списка привычек "
+            f"(`get_habits`) сразу после создания (id: {hid})")
+
+
+def _describe_delete_habit(p: Dict) -> str:
+    return (f'Удаляю привычку «{p.get("habit_name")}» ВМЕСТЕ со всей историей '
+            "отметок — восстановить нельзя (корзины для привычек в TickTick нет)")
+
+
+@mcp.tool()
+async def delete_habit(habit_name: str, habit_id: str, manifest_id: str = "",
+                       user_reply: str = "", automation_key: str = "") -> str:
+    """
+    ⚠️ Delete a habit permanently, together with its whole check-in history
+    (requires v2 API). There is no habit trash in TickTick — this is
+    IRREVERSIBLE. Gated 🟡 (docs/DESIGN_approval_gate.md): two calls, same
+    tool name — nothing is deleted on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is deleted yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
+    Both habit_name AND habit_id are required and must describe the SAME
+    habit: before deleting, the server re-reads the live habit list and
+    refuses when the id resolves to a different name (protection against
+    deleting the wrong habit). A snapshot of the habit is written to the
+    mutation journal first, since nothing else can bring it back.
+
+    Args:
+        habit_name: Name of the habit (shown first in the summary you show the user, see get_habits) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
+        habit_id: ID of the habit to delete (see get_habits)
+        manifest_id: from call #1's response — pass on call #2 to actually delete
+        user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+    if not (habit_name or "").strip() or not (habit_id or "").strip():
+        return ("🛑 Нужны И имя, И id привычки — удаление вслепую по одному id "
+                "не делаю (см. get_habits). Ничего не изменено.")
+    params = {"habit_name": habit_name, "habit_id": habit_id}
+    outcome = _gate_single("delete_habit", "delete_habit",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_delete_habit,
+                           automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _delete_habit_impl(**outcome.extra)
+
+
+async def _delete_habit_impl(habit_name: str, habit_id: str) -> str:
+    """Pure mutation logic for delete_habit — no consent gate. Called only by
+    the gated delete_habit() above once the plan is approved (or by the
+    Telegram button's background executor, which is the same thing)."""
+    try:
+        # Identity guard (fresh read, never a cached plan-time copy): the id
+        # must exist AND resolve to the given name.
+        habits = await _run_blocking(lambda: ticktick_v2.get_habits())
+        habit = next((h for h in habits if h.get("id") == habit_id), None)
+        if habit is None:
+            return (f"🛑 НЕ удалил — привычки с id {str(habit_id)[:12]}… нет в "
+                    "живом списке (уже удалена/неверный id). Ничего не тронул.")
+        real_name = habit.get("name") or ""
+        if not _names_agree(habit_name, real_name):
+            return (f"🛑 НЕ удалил — habit_id указывает на «{real_name}», а НЕ "
+                    f"«{habit_name}» (защита от «не той привычки»). Ничего не тронул.")
+
+        # Pre-snapshot BEFORE the irreversible call: habits have no trash, so
+        # this journal line is the only thing left to rebuild it by hand. The
+        # write is best-effort (an unwritable journal must not block a
+        # confirmed-by-the-owner delete), but the RESULT text below reports
+        # what actually happened — claiming a snapshot that was never written
+        # would be exactly the kind of lie the output rules forbid.
+        checkins = habit.get("totalCheckIns", 0)
+        journal_path = _journal_write({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "record": "delete_habit-" + uuid.uuid4().hex[:8],
+            "op": "delete_habit",
+            "summary": f"Удаление привычки «{real_name}» ({checkins} отметок)",
+            "snapshot": habit,
+        })
+
+        resp = await _run_blocking(lambda: ticktick_v2.delete_habit(habit_id))
+        api_err = id2error_failures(resp, [habit_id]).get(habit_id)
+        if api_err:
+            return f"### ❌ Привычка «{real_name}» НЕ удалена — TickTick отклонил: {api_err}"
+
+        # Post-verify: a SEPARATE fresh read must no longer show the habit.
+        try:
+            after = await _run_blocking(lambda: ticktick_v2.get_habits())
+        except Exception as e:
+            return (f"### ⚠️ Привычка «{real_name}» отправлена на удаление, проверка не выполнена\n\n"
+                    f"- ⚠️ независимое перечитывание (`get_habits`) упало с ошибкой: {e}\n"
+                    f"- {_UNVERIFIED_MSG}")
+        if any(h.get("id") == habit_id for h in after):
+            return (f"### ❌ Привычка «{real_name}» ВСЁ ЕЩЁ в списке\n\n"
+                    "- удаление не подтвердилось при независимом перечитывании "
+                    "(`get_habits`) — проверь вручную")
+        snap_line = ("- восстановить нельзя; снимок привычки записан в журнал "
+                     "мутаций перед удалением" if journal_path else
+                     "- ⚠️ восстановить нельзя, и снимок в журнал мутаций "
+                     "записать НЕ удалось (журнал недоступен) — вернуть её "
+                     "по данным сервера не выйдет")
+        return (f"### ✅ Привычка «{real_name}» удалена (проверено)\n\n"
+                f"- вместе с ней ушла история отметок: **{checkins}**\n"
+                f"{snap_line}\n"
+                "- 🧾 подтверждено отдельным живым чтением списка привычек "
+                "(`get_habits`) сразу после удаления")
+    except Exception as e:
+        logger.error(f"Error in delete_habit: {e}")
+        return f"Error deleting habit: {str(e)}"
+
+
 @mcp.tool(annotations=READONLY)
 async def get_habit_checkins(habit_name: str, habit_id: str, after_date: str) -> str:
     """
