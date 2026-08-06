@@ -418,6 +418,56 @@ def test_tick_auto_executes_approved_delete_and_reports(monkeypatch):
     assert "MCP Отчёты" in short
 
 
+def test_tick_verifies_tools_that_journal_under_their_own_record_id(
+        monkeypatch, tmp_path):
+    """Независимая перепроверка обязана работать для ЛЮБОГО инструмента, а не
+    только для delete_tasks (прямое требование Максима).
+
+    Поймано аудитом слияния 2026-08-06: `_verified_auto_execute_report` зовёт
+    `_build_operation_report(manifest_id)`, а тот ищет записи журнала по
+    `record`/`manifest`. Совпадение с manifest_id было ТОЛЬКО у delete_tasks —
+    остальные исполнители пишут через `_op_journal` со своим «<op>-<hex>», и
+    после расширения кнопки на 22 тула у всех новых перепроверка возвращала
+    «В журнале нет записей», а вердикт был вечным "unverified". Лечится
+    меткой `tg_manifest`, которую поллер выставляет на время исполнения."""
+    import asyncio
+
+    _enable_tg(monkeypatch)
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: {})
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {})
+
+    mid = "e2e-generic-1"
+    s._MANIFESTS[mid] = {
+        "kind": "delete", "consumed": False, "created": time.monotonic(),
+        "object_hash": s._manifest_object_hash("delete", ["t1"]),
+        "summary": "test", "items": [{"taskId": "t1", "title": "X",
+                                      "projectId": "p1", "snapshot": {}}],
+    }
+
+    async def _fake_impl(manifest_id, m):
+        # Ровно то, что делает любой обычный исполнитель: пишет журнал под
+        # СВОИМ record_id и возвращает текст со ссылкой на него.
+        rid = s._op_journal("complete", [{"taskId": "t1", "title": "Купить молоко"}],
+                            "test")
+        assert not rid.startswith(mid)      # id журнала ≠ id манифеста
+        return "✅ Закрыто 1/1: «Купить молоко»\n" + s._report_line(rid)
+
+    monkeypatch.setattr(s._AUTO_EXECUTORS["delete_tasks"], "execute", _fake_impl)
+    _approvals(monkeypatch, lambda m: "approved" if m == mid else "none", message_id=7)
+    group, private = _fake_report_sinks(monkeypatch)
+
+    asyncio.run(s._tg_auto_execute_tick())
+
+    assert len(group) == 1
+    assert group[0]["verdict"] == "ok"      # было "unverified" до правки
+    assert "Купить молоко" in group[0]["report_md"]
+    assert "В журнале нет записей" not in group[0]["report_md"]
+    # Метка снята: журнал, написанный ПОСЛЕ тика, к этому манифесту не липнет.
+    s._op_journal("complete", [{"taskId": "t2", "title": "Посторонняя"}], "x")
+    assert "Посторонняя" not in s._build_operation_report(mid)
+
+
 def test_tick_skips_when_no_candidates(monkeypatch):
     import asyncio
     _enable_tg(monkeypatch)

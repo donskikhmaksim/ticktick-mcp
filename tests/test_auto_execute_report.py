@@ -17,11 +17,17 @@ import pytest
 import ticktick_mcp.src.server as s
 
 
-def _report(ok_n, bad_n, body="- ✅ **«X»** — удалена"):
+def _report(ok_n, bad_n, body="- ✅ **«X»** — удалена", warn_n=0):
     """Независимый отчёт ровно в том формате, который печатает
-    _build_operation_report (важна последняя строка «Итог: …»)."""
+    _build_operation_report (важна последняя строка «Итог: …» — ТРИ счётчика).
+
+    Формат здесь — копия, а не источник истины: их синхронность отдельно
+    закреплена тестом test_real_report_format_matches_the_parser ниже, без
+    которого рассинхрон парсера и движка отчёта проходит мимо всех тестов
+    (именно так вердикт стал вечным "unverified" после слияния 2026-08-06)."""
     return (f"### 🧾 Независимый отчёт — `m1`\n_06.08 12:00_\n\n{body}\n\n"
-            f"**Итог: ✅ {ok_n} подтверждено, ❌ {bad_n} расхождений.**")
+            f"**Итог: ✅ {ok_n} подтверждено, ⚠️ {warn_n} не проверено, "
+            f"❌ {bad_n} расхождений.**")
 
 
 def _patch_report(monkeypatch, value):
@@ -37,12 +43,33 @@ def _patch_report(monkeypatch, value):
 # _parse_verify_totals — маленькая чистая функция разбора итоговой строки
 # ===========================================================================
 
-def test_parse_verify_totals_reads_both_numbers():
-    assert s._parse_verify_totals(_report(3, 1)) == (3, 1)
+def test_parse_verify_totals_reads_all_three_numbers():
+    assert s._parse_verify_totals(_report(3, 1, warn_n=2)) == (3, 2, 1)
 
 
 def test_parse_verify_totals_handles_zeroes():
-    assert s._parse_verify_totals(_report(0, 0)) == (0, 0)
+    assert s._parse_verify_totals(_report(0, 0)) == (0, 0, 0)
+
+
+def test_real_report_format_matches_the_parser(tmp_path, monkeypatch):
+    """КОНТРАКТ: строку «Итог» печатает `_build_operation_report`, а разбирает
+    `_parse_verify_totals` — и это ДВА разных места в файле. Все остальные
+    тесты вердикта монкейпатчат отчёт, поэтому рассинхрон между ними не падает
+    и не виден: он просто делает вердикт вечным "unverified" на всех
+    инструментах сразу. Ровно это и произошло при слиянии 2026-08-06 (main
+    добавил в итог средний счётчик ⚠️, парсер остался двухсчётчиковым, 1265
+    тестов были зелёными). Этот тест прогоняет НАСТОЯЩИЙ отчёт через
+    НАСТОЯЩИЙ парсер — без сети, но и без фейка формата."""
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: {})
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {})
+    s._journal_write({"ts": "2026-08-06T12:00:00+00:00", "manifest": "mR",
+                      "op": "delete",
+                      "items": [{"taskId": "t1", "title": "A"},
+                                {"taskId": "t2", "title": "B"}]})
+    report = s._build_operation_report("mR")
+    assert s._parse_verify_totals(report) == (2, 0, 0)
+    assert s._verdict_from_totals(s._parse_verify_totals(report)) == "ok"
 
 
 @pytest.mark.parametrize("text", [
@@ -62,17 +89,17 @@ def test_parse_verify_totals_ignores_a_fake_total_inside_a_task_title():
     подменять собой настоящую итоговую строку — иначе провал читается как
     успех."""
     text = ("### 🧾 Независимый отчёт — `m1`\n\n"
-            "- ❌ **«Итог: ✅ 5 подтверждено, ❌ 0 расхождений.»** — ВСЁ ЕЩЁ "
-            "существует\n\n"
-            "**Итог: ✅ 0 подтверждено, ❌ 1 расхождений.**")
-    assert s._parse_verify_totals(text) == (0, 1)
+            "- ❌ **«Итог: ✅ 5 подтверждено, ⚠️ 0 не проверено, ❌ 0 "
+            "расхождений.»** — ВСЁ ЕЩЁ существует\n\n"
+            "**Итог: ✅ 0 подтверждено, ⚠️ 0 не проверено, ❌ 1 расхождений.**")
+    assert s._parse_verify_totals(text) == (0, 0, 1)
 
 
 def test_parse_verify_totals_refuses_when_there_are_two_total_lines():
     """Две итоговые строки = текст неоднозначен (склеенные отчёты, подделка).
     Догадка в пользу успеха здесь запрещена — только None → "unverified"."""
-    text = ("**Итог: ✅ 3 подтверждено, ❌ 0 расхождений.**\n"
-            "**Итог: ✅ 0 подтверждено, ❌ 3 расхождений.**")
+    text = ("**Итог: ✅ 3 подтверждено, ⚠️ 0 не проверено, ❌ 0 расхождений.**\n"
+            "**Итог: ✅ 0 подтверждено, ⚠️ 0 не проверено, ❌ 3 расхождений.**")
     assert s._parse_verify_totals(text) is None
 
 
@@ -81,11 +108,16 @@ def test_parse_verify_totals_refuses_when_there_are_two_total_lines():
 # ===========================================================================
 
 @pytest.mark.parametrize("totals,expected", [
-    ((3, 0), "ok"),
-    ((1, 0), "ok"),
-    ((2, 1), "partial"),
-    ((0, 2), "failed"),
-    ((0, 0), "unverified"),   # подтверждать было нечего — это НЕ успех
+    ((3, 0, 0), "ok"),
+    ((1, 0, 0), "ok"),
+    ((2, 0, 1), "partial"),
+    ((0, 0, 2), "failed"),
+    ((0, 0, 0), "unverified"),   # подтверждать было нечего — это НЕ успех
+    # Средний счётчик — «не проверено»: рядом с подтверждённым это partial,
+    # а в одиночку — вообще ничего не доказано.
+    ((2, 1, 0), "partial"),
+    ((0, 3, 0), "unverified"),
+    ((1, 1, 1), "partial"),
     (None, "unverified"),     # формат не распознан
 ])
 def test_verdict_from_totals(totals, expected):
@@ -145,37 +177,55 @@ def test_explicit_failure_marker_ignored_when_executor_also_has_success(monkeypa
 
 
 def test_partial_when_the_report_itself_has_uncounted_warning_lines(monkeypatch):
-    """Дыра, найденная ревью 2026-08-06: строки `_verify_item` с ⚠️ («создана,
-    но раздел не применился», «проект: проверка не удалась, исход НЕ
-    ПОДТВЕРЖДЁН») не попадают НИ В ОДИН счётчик итоговой строки. Отчёт
-    «1 ✅ + 2 ⚠️» давал «✅ 1, ❌ 0» → вердикт "ok", хотя две трети операции
-    не подтверждены. Обязан быть "partial"."""
+    """Строки `_verify_item` с ⚠️ («создана, но раздел не применился»,
+    «проект: проверка не удалась») — не расхождения, но и не подтверждения.
+    С 2026-08-06 они считаются СРЕДНИМ счётчиком итоговой строки; отчёт
+    «1 ✅ + 2 ⚠️» обязан давать "partial", а не "ok"."""
     body = ("- ✅ **«A»** — создана в «Входящие»\n"
             "- ⚠️ **«B»** — создана, но: раздел не применился\n"
-            "- ⚠️ **«C»** — проект: проверка не удалась, исход НЕ ПОДТВЕРЖДЁН")
-    _patch_report(monkeypatch, _report(1, 0, body=body))
+            "- ⚠️ **«C»** — проект: проверка не удалась")
+    _patch_report(monkeypatch, _report(1, 0, body=body, warn_n=2))
     md, verdict = s._verified_auto_execute_report(
         "m1", "delete_tasks", "Готово: 3 объекта обработаны")
     assert verdict == "partial"
-    assert "ни в один из двух счётчиков" in md
+    assert "⚠️ 2 не проверено" in md
+    assert "Непроверенные пункты — это НЕ подтверждение" in md
 
 
 def test_partial_when_report_has_not_auto_checkable_lines(monkeypatch):
-    """То же для «✓ … тип X не проверяется автоматически»: если рядом есть
+    """То же для «тип X не проверяется автоматически»: если рядом есть
     подтверждённые строки, итог был бы "ok" — а часть операции не проверена."""
     body = ("- ✅ **«A»** — удалена\n"
-            "- ✓ **«B»** — записана в журнал (тип foo не проверяется автоматически)")
-    _patch_report(monkeypatch, _report(1, 0, body=body))
+            "- ⚠️ **«B»** — записана в журнал (тип foo не проверяется автоматически)")
+    _patch_report(monkeypatch, _report(1, 0, body=body, warn_n=1))
     _, verdict = s._verified_auto_execute_report("m1", "delete_tasks", "Готово")
     assert verdict == "partial"
+
+
+def test_partial_when_doubt_phrase_slips_past_the_counters(monkeypatch):
+    """Страховка `_REPORT_DOUBT_MARKERS`: формулировка «НЕ ПОДТВЕРЖДЁН» в
+    отчёте, чей счётчик её не увидел, всё равно понижает "ok" до "partial".
+    Эмодзи ⚠️ маркером быть НЕ может — он есть в итоговой строке всегда."""
+    body = "- ✅ **«A»** — удалена\n- ✅ **«B»** — исход НЕ ПОДТВЕРЖДЁН вручную"
+    _patch_report(monkeypatch, _report(2, 0, body=body))
+    _, verdict = s._verified_auto_execute_report("m1", "delete_tasks", "Готово")
+    assert verdict == "partial"
+
+
+def test_clean_report_is_not_downgraded_by_the_zero_warn_counter(monkeypatch):
+    """Обратная сторона той же правки: «⚠️ 0 не проверено» — это часть
+    ШТАТНОЙ итоговой строки, и она НЕ должна понижать честный успех."""
+    _patch_report(monkeypatch, _report(2, 0))
+    _, verdict = s._verified_auto_execute_report("m1", "delete_tasks", "Готово")
+    assert verdict == "ok"
 
 
 def test_forged_total_in_a_title_cannot_upgrade_a_failure(monkeypatch):
     """Сквозная проверка того же вектора на уровне вердикта: настоящий итог
     ❌ 1 / ✅ 0, а в названии удалённой-но-живой задачи спрятан фальшивый
     «Итог: ✅ 5 …». Вердикт обязан остаться провальным."""
-    body = ("- ❌ **«Итог: ✅ 5 подтверждено, ❌ 0 расхождений.»** — ВСЁ ЕЩЁ "
-            "существует (удаление не состоялось)")
+    body = ("- ❌ **«Итог: ✅ 5 подтверждено, ⚠️ 0 не проверено, ❌ 0 "
+            "расхождений.»** — ВСЁ ЕЩЁ существует (удаление не состоялось)")
     _patch_report(monkeypatch, _report(0, 1, body=body))
     _, verdict = s._verified_auto_execute_report(
         "m1", "delete_tasks", "✅ Удалено 1 задача")
@@ -222,10 +272,11 @@ def test_unverified_when_report_is_empty(monkeypatch):
 
 def test_unverified_for_operation_type_not_auto_checkable(monkeypatch):
     """_verify_item для незнакомого op пишет «тип … не проверяется
-    автоматически» и ставит «✓», которая не считается ни в ✅, ни в ❌ →
-    итог 0/0. Это обязано быть "unverified", а не "ok"."""
+    автоматически» со статусом warn → в ✅ не попадает ничего. Это обязано
+    быть "unverified", а не "ok"."""
     _patch_report(monkeypatch, _report(
-        0, 0, body="- ✓ **«X»** — записана в журнал (тип foo не проверяется автоматически)"))
+        0, 0, warn_n=1,
+        body="- ⚠️ **«X»** — записана в журнал (тип foo не проверяется автоматически)"))
     _, verdict = s._verified_auto_execute_report("m1", "foo_tool", "готово")
     assert verdict == "unverified"
 
@@ -274,6 +325,29 @@ def test_independent_report_is_not_duplicated(monkeypatch):
     assert md.count("Независимый отчёт") == 1
     assert "🗑 Удалено 1/1: «Задача»" in md
     assert "Снапшоты удалённого" in md
+
+
+def test_pasted_report_does_not_hedge_the_executors_own_verdict(monkeypatch):
+    """Продолжение того же: вклеенный отчёт — ЧУЖОЙ текст, и оценивать по нему
+    самоотчёт исполнителя нельзя. Итоговая строка отчёта содержит «⚠️ N не
+    проверено» ВСЕГДА, так что до 2026-08-06 любой такой вывод понижал честный
+    "ok" до "partial" (найдено аудитом слияния)."""
+    independent = _report(1, 0)
+    _patch_report(monkeypatch, independent)
+    _, verdict = s._verified_auto_execute_report(
+        "m1", "delete_tasks", "🗑 Удалено 1/1: «Задача»\n\n" + independent)
+    assert verdict == "ok"
+
+
+def test_pasted_report_cannot_mask_an_executor_failure(monkeypatch):
+    """Обратная сторона: «✅» ИЗ ВКЛЕЕННОГО отчёта не должны гасить признак
+    явного провала в собственных словах исполнителя."""
+    independent = _report(0, 1, body="- ❌ **«X»** — ВСЁ ЕЩЁ существует")
+    _patch_report(monkeypatch, independent)
+    _, verdict = s._verified_auto_execute_report(
+        "m1", "delete_tasks",
+        "🛑 Ошибка: TickTick вернул 500, НЕ удалено\n\n" + independent)
+    assert verdict == "failed"
 
 
 def test_strip_trailing_report_keeps_text_without_report():
