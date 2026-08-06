@@ -350,6 +350,7 @@ def split_for_telegram(md_text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[s
     cur: list[str] = []
     carry: list[str] = []  # разметка, переоткрываемая в начале очередного куска
     reopened = False      # текущий кусок начат с НАШЕЙ переоткрытой разметки
+    emergency_cuts = 0    # сколько раз пришлось резать грубо (для одного лога)
 
     def _emit(lines: list[str], more_ahead: bool) -> tuple[list[str], list[str]]:
         """Кладёт кусок в результат; возвращает то, что надо переоткрыть
@@ -423,10 +424,15 @@ def split_for_telegram(md_text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[s
                 units.extendleft(reversed(parts))
                 continue
             head, tail = _emergency_cut(line, limit)
-            logger.warning(
-                f"TG: строку длиной {len(line)} не удалось разбить по словам "
-                f"(несбалансированная разметка) — режу аварийно по символам, "
-                f"разметка в куске может остаться открытой")
+            emergency_cuts += 1
+            if emergency_cuts == 1:
+                # Ровно один раз за вызов: на мусорном вводе аварийных резов
+                # бывают тысячи, и лог Railway забивался бы одинаковыми
+                # строками (а его объём — деньги и место для НУЖНЫХ ошибок).
+                logger.warning(
+                    f"TG: строку длиной {len(line)} не удалось разбить по "
+                    f"словам (несбалансированная разметка) — режу аварийно "
+                    f"по символам, разметка в куске может остаться открытой")
             if head.strip():
                 chunks.append(head)
             if tail:
@@ -930,14 +936,20 @@ def summarize_in_owner_chat(cfg: TgApprovalConfig, chat_id: str,
         logger.warning(f"TG: message_id отсутствует, сводку некуда вписать "
                        f"(chat={chat_id})")
         return
-    chunks = split_for_telegram(short_md)
+    # Бюджет сужен на длину приписки «(сводка сокращена…)»: без этого запаса
+    # кусок ровно в лимит + приписка давали текст ДЛИННЕЕ 4096, Telegram
+    # отвечал 400, и сводка не появлялась вовсе — а кнопки на исполненном
+    # плане оставались висеть. Тихая потеря сводки, которую видно только в
+    # логах, — ровно тот silent-fail, ради которого всё это переписывалось.
+    _CUT_NOTE = "\n\n_(сводка сокращена — полный отчёт в группе)_"
+    chunks = split_for_telegram(short_md, TELEGRAM_TEXT_LIMIT - len(_CUT_NOTE) - 8)
     if not chunks:
         return
     text = chunks[0]
     if len(chunks) > 1:
         # Сводка по контракту короткая; если вызывающий прислал длинную —
         # обрезаем ЯВНО и говорим, где лежит полный текст.
-        text += "\n\n_(сводка сокращена — полный отчёт в группе)_"
+        text += _CUT_NOTE
     res = _tg_call(cfg, "editMessageText", {
         "chat_id": chat_id,
         "message_id": message_id,
