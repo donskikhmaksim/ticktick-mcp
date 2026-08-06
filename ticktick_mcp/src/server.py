@@ -3314,7 +3314,21 @@ def _require_consent(
     branch, or a sheet-backed declutter row) — the binding/timing checks are
     skipped (there is no plan_shown_at to compare against) but the
     affirmative-reply check still fully applies. Never mutates `manifest`
-    except to invalidate it on an explicit "no"."""
+    except to invalidate it on an explicit "no".
+
+    ОСТАЁТСЯ СИНХРОННОЙ НАМЕРЕННО (2026-08-06, #115). Внутри есть поход в
+    Postgres — `tg_approval.check_approval` (один индексируемый SELECT), и
+    соблазн унести его в поток тем же `_run_blocking`, каким унесена отправка
+    плана, ошибочен. Вся одноразовость манифеста держится на том, что между
+    проверкой (`consumed`/TTL/binding/approval) и простановкой
+    `m["consumed"] = True` у вызывающего гейта НЕТ точки переключения:
+    появится await — и два параллельных execute одного плана смогут пройти
+    проверку оба, то есть операция выполнится дважды. Цена вопроса разная на
+    порядки: отправка плана — это до нескольких МИНУТ ожидания на флуд-
+    отказах, а этот SELECT — миллисекунды (в патологии секунды, ограничены
+    CONSENT_PG_CONNECT_TIMEOUT_S / CONSENT_PG_STATEMENT_TIMEOUT_MS). Если
+    когда-нибудь понадобится унести и его — сначала нужен явный захват
+    манифеста ДО await (compare-and-set «в работе»), а не голый вынос."""
     if _automation_key_matches(automation_key):
         return ConsentResult(True, "automation_key")
     if tier <= 0:
