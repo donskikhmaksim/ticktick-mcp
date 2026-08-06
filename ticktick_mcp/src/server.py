@@ -2666,6 +2666,7 @@ def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
                               manifest_id=manifest_id)
         if not cr.ok:
             return _GateOutcome(False, message=cr.reason)
+        m["consumed"] = True
         return _GateOutcome(True, tasks=stored, summary=m.get("summary") or summary,
                             extra=m.get("extra") or {})
 
@@ -2719,13 +2720,12 @@ def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
     which also skips it
     for brand-new objects that don't exist yet to re-hash against).
 
-    NOTE on one-shot: unlike _gate_batch (which relies on _require_consent
-    alone and — a pre-existing gap found while building this — never actually
-    flips `consumed` to True on the SUCCESS path, so a batch tool's manifest
-    is only "accidentally" one-shot when a retry happens to also trip its
-    identity-guard), this function marks `consumed = True` itself right here,
-    matching docs/DESIGN_approval_gate.md §4.3.3 item 4 ("after success,
-    consumed = True") literally."""
+    NOTE on one-shot: this function marks `consumed = True` itself right
+    here on the SUCCESS path, matching docs/DESIGN_approval_gate.md §4.3.3
+    item 4 ("after success, consumed = True") literally. _gate_batch does
+    the same — see its own SUCCESS-path branch — so both functions are
+    genuinely one-shot on their own, not just "accidentally" so via a retry
+    that happens to also trip the identity-guard."""
     _prune_manifests()
     if manifest_id:
         m = _MANIFESTS.get(manifest_id)
