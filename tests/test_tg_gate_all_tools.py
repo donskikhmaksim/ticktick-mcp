@@ -20,14 +20,20 @@
   5. Отправка в Telegram упала → fail-closed: манифест инвалидирован.
   6. `_generic_gate_rehash` побайтово воспроизводит формулу, по которой хэш
      считался при планировании (иначе binding-проверка кнопки — фикция).
-  7. Для КАЖДОГО из 19 тулов кнопочный путь зовёт ТУ ЖЕ `_<tool>_impl` с ТЕМИ
-     ЖЕ аргументами, что и обычный чат-путь.
+  7. Для КАЖДОГО гейтованного тула кнопочный путь зовёт ТУ ЖЕ `_<tool>_impl`
+     с ТЕМИ ЖЕ аргументами, что и обычный чат-путь.
   8. Поллер видит такие манифесты (approved) и не видит их при pending.
   9. Регресс-страховка через inspect.signature: `_<tool>_impl` существует и
      его обязательные параметры покрыты тем, что лежит в манифесте.
 
 Ни сети, ни Postgres: `tg_approval`-функции и все `_<tool>_impl`
 монкейпатчатся, как в test_gate_tg_determinism.py / test_tg_auto_execute.py.
+
+2026-08-06 (позже в тот же день): к таблице добавлен 20-й тул —
+`create_attachment_upload_url`. Он ничего не пишет сам, но ВЫДАЁТ
+предъявительскую ссылку на запись в аккаунт владельца (публичный маршрут
+PUT /ul/{token}, многоразовый токен до 120 минут), поэтому подтверждение
+нужно ровно в момент выдачи — см. комментарий над тулом в server.py.
 """
 import inspect
 import re
@@ -81,21 +87,33 @@ SINGLE_TOOLS = {
     "update_task_comment": dict(task_title="A", text="новый текст", project_id="p1",
                                 task_id="t1", comment_id="c1"),
     "create_project_column": dict(project_id="p1", name="Колонка", project_name="Проект"),
+    "create_attachment_upload_url": dict(task_id="t1", project_id="p1",
+                                         filename="scan.png", ttl_minutes=15),
 }
 
 ALL_TOOLS = {**BATCH_TOOLS, **SINGLE_TOOLS}
 GATE_OF = {**{t: "batch" for t in BATCH_TOOLS}, **{t: "single" for t in SINGLE_TOOLS}}
 
 
-def test_the_table_covers_exactly_nineteen_tools():
+def test_the_table_covers_exactly_twenty_tools():
     """Если кто-то добавит/уберёт гейтованный тул, эта таблица обязана
     поехать вместе с ним — иначе новый тул молча останется без кнопки."""
     assert len(BATCH_TOOLS) == 6
-    assert len(SINGLE_TOOLS) == 13
-    assert len(ALL_TOOLS) == 19
+    assert len(SINGLE_TOOLS) == 14
+    assert len(ALL_TOOLS) == 20
 
 
 # ───────────────────────── обвязка ─────────────────────────
+
+@pytest.fixture(autouse=True)
+def _public_base_url(monkeypatch):
+    """`create_attachment_upload_url` отказывает ДО гейта, если сервер не знает
+    своего публичного адреса (проверка конфигурации, а не согласия). Здесь
+    проверяется гейт, поэтому адрес задан — иначе call #1 вернул бы не план,
+    а «задайте PUBLIC_BASE_URL». Остальным 19 тулам эта переменная безразлична."""
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://tt.example.com")
+    monkeypatch.delenv("RAILWAY_PUBLIC_DOMAIN", raising=False)
+
 
 @pytest.fixture(autouse=True)
 def _isolate_manifests():

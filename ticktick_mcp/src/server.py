@@ -7941,30 +7941,55 @@ async def get_attachment_download_url(task_id: str, project_id: str = None,
         return f"Error building download link: {str(e)}"
 
 
-# DELIBERATELY NOT GATED (audit 2026-08-06). It looks like a mutator ("create
-# ...") but calling it changes NOTHING in TickTick: the whole body is local —
-# _public_base_url()/SECRET checks, _resolve_project_id() (a READ of cached
-# state), new_attachment_id() (a client-side uuid4 hex, see
-# ticktick_v2_client.py) and _sign_attachment_token() (an in-memory HMAC, kept
-# in no registry). There is not a single write call to ticktick/ticktick_v2 on
-# this path. The actual mutation happens later, in the separate PUT /ul/{token}
-# custom route, when a HUMAN (or their script) uploads bytes — which this MCP
-# client provably cannot do itself (no raw PUT). Wrapping it in a plan→confirm
-# gate would therefore make the user approve twice for one act of uploading and
-# would gate a call with no side effects — a UX regression, not a safety win.
-# What it DOES hand out is a short-lived (≤120 min) write capability, so the
-# docstring's "treat the link like a one-off secret" warning is the real
-# control here.
+def _describe_create_attachment_upload_url(p: Dict) -> str:
+    # НИ ОДНОГО фрагмента будущей ссылки/токена здесь быть не может: токен
+    # подписывается только в `_impl`, уже ПОСЛЕ подтверждения. Иначе пропуск
+    # утёк бы в превью (и в сообщение Telegram) ещё до согласия человека.
+    name = p.get("filename") or "файл без имени"
+    return (f'Выдаю ссылку на загрузку «{name}» в задачу {p.get("task_id")} '
+            f'(действует {_clamp_link_ttl(p.get("ttl_minutes"))} мин; по ней '
+            'кто угодно сможет положить файл в аккаунт)')
+
+
+# ГЕЙТОВАН (аудит 2026-08-06, пересмотр прежнего «намеренно без гейта»). Гейт
+# стоит не за то, что тул ДЕЛАЕТ, а за то, что он ВРУЧАЕТ: маршрут PUT
+# /ul/{token} публичен и проверяет ровно одно — подпись токена
+# (_verify_attachment_token), ни заголовка, ни куки, ни MCP_SECRET предъявлять
+# не нужно, а пишет в TickTick сам сервер сессией владельца. Токен при этом
+# многоразовый (ни nonce, ни реестра использованных) и живёт до
+# ATTACHMENT_LINK_TTL_MAX_MIN=120 минут, то есть это предъявительский пропуск
+# на запись в аккаунт. Прежний довод «модель не может сделать raw PUT»
+# ограничивает интерфейс, а не возможности: агент с оболочкой шлёт обычный
+# HTTP-запрос, а сам тул печатает готовую команду curl. Выдача ссылки —
+# единственный момент, когда сервер вообще способен спросить человека.
 @mcp.tool()
 async def create_attachment_upload_url(task_id: str, project_id: str = None,
                                        filename: str = None,
                                        size_bytes: int = None,
-                                       ttl_minutes: int = 15) -> str:
+                                       ttl_minutes: int = 15,
+                                       manifest_id: str = "", user_reply: str = "",
+                                       automation_key: str = "") -> str:
     """
     Create a temporary upload LINK that puts a file onto a task (requires v2
     API) without the file passing through this conversation. Counterpart of
     get_attachment_download_url; use it when the file is large or simply not in
-    Claude's hands — e.g. it sits on the user's phone or on a server.
+    Claude's hands — e.g. it sits on the user's phone or on a server. Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — NO link is
+    handed out on call #1 (the link is a bearer write-capability into the
+    owner's account, so it is minted only after the approval).
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — no token is signed yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
 
     HONEST LIMITATION: an MCP client (Claude) cannot use this link itself — it
     cannot make raw PUT requests. The link is for a HUMAN with a browser/phone
@@ -7985,6 +8010,16 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
         size_bytes: Expected file size, if known (checked against the 20 MB cap
             up front so the user isn't told "too big" only after uploading)
         ttl_minutes: How long the link stays valid, 1-120 (default 15)
+        manifest_id: from call #1's response — pass on call #2 to actually get the link
+        user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_ready()
     if err:
@@ -7997,6 +8032,28 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
     if size_bytes and size_bytes > ATTACHMENT_MAX_BYTES:
         return (f"Файл {size_bytes // (1024*1024)} МБ — TickTick принимает "
                 f"максимум {ATTACHMENT_MAX_BYTES // (1024*1024)} МБ. Ссылку не делаю.")
+    params = {"task_id": task_id, "project_id": project_id,
+              "filename": filename, "ttl_minutes": ttl_minutes}
+    outcome = _gate_single("create_attachment_upload_url",
+                           "create_attachment_upload_url",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply,
+                           _describe_create_attachment_upload_url,
+                           automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _create_attachment_upload_url_impl(**outcome.extra)
+
+
+async def _create_attachment_upload_url_impl(task_id: str, project_id: str = None,
+                                             filename: str = None,
+                                             ttl_minutes: int = 15) -> str:
+    """Mints the actual bearer upload link — no consent gate. Called only by
+    the gated create_attachment_upload_url() above once the plan is approved
+    (or by the Telegram-button auto-executor, which replays the same params)."""
+    base = _public_base_url()
+    if not base:
+        return _NO_PUBLIC_URL_MSG
     try:
         pid = project_id or _resolve_project_id(task_id, project_id)
         if not pid:

@@ -3,6 +3,7 @@ streaming relay, the /ul upload relay, and the two tools that hand the links
 out. No real network anywhere — the v2 client is faked, so what is asserted is
 the token contract, the HTTP behaviour, and the tools' own guard rails."""
 import json
+import re
 import time
 
 import pytest
@@ -397,10 +398,24 @@ async def test_download_url_tool_reports_unknown_filename(fake_v2, monkeypatch):
 # ===========================================================================
 # Tool: create_attachment_upload_url
 # ===========================================================================
+# Тул гейтован (аудит 2026-08-06): ссылка — предъявительский пропуск на запись
+# в аккаунт, поэтому она выдаётся только вызовом #2, после согласия. Тесты
+# ниже проверяют содержимое ссылки, а не гейт (гейт — в
+# tests/test_gate_attachment_url.py), поэтому ходят через этот хелпер.
+
+async def _upload_url(**kwargs) -> str:
+    """Полный двухфазный вызов: план → честное «да» → сама ссылка."""
+    preview = await s.create_attachment_upload_url(**kwargs)
+    m = re.search(r'manifest_id="([0-9a-f]+)"', preview)
+    assert m, f"вызов #1 не вернул план: {preview!r}"
+    assert "/ul/" not in preview, "план не должен содержать саму ссылку"
+    return await s.create_attachment_upload_url(
+        **kwargs, manifest_id=m.group(1), user_reply="да")
+
 
 async def test_upload_url_tool_returns_a_working_link(fake_v2):
-    out = await s.create_attachment_upload_url(task_id=TASK_ID, project_id=PROJECT_ID,
-                                               filename="scan.png")
+    out = await _upload_url(task_id=TASK_ID, project_id=PROJECT_ID,
+                            filename="scan.png")
     assert "https://tt.example.com/ul/" in out
     token = out.split("/ul/")[1].split()[0].strip('"')
     payload = s._verify_attachment_token(token, "ul")
@@ -410,8 +425,8 @@ async def test_upload_url_tool_returns_a_working_link(fake_v2):
 
 
 async def test_upload_url_tool_is_honest_that_claude_cannot_put(fake_v2):
-    out = await s.create_attachment_upload_url(task_id=TASK_ID, project_id=PROJECT_ID,
-                                               filename="scan.png")
+    out = await _upload_url(task_id=TASK_ID, project_id=PROJECT_ID,
+                            filename="scan.png")
     assert "curl -X PUT" in out
     assert "не могу" in out
 
@@ -435,8 +450,8 @@ async def test_upload_url_tool_says_so_when_domain_is_unknown(fake_v2, monkeypat
 async def test_upload_link_round_trip_reaches_ticktick(client, fake_v2):
     """End to end over HTTP: the link the tool prints is the link the endpoint
     accepts, and the bytes land in the v2 upload call."""
-    out = await s.create_attachment_upload_url(task_id=TASK_ID, project_id=PROJECT_ID,
-                                               filename="note.txt")
+    out = await _upload_url(task_id=TASK_ID, project_id=PROJECT_ID,
+                            filename="note.txt")
     url = out.split("https://tt.example.com")[1].split()[0]
     r = client.put(url, content=b"hi there")
     assert r.status_code == 200
