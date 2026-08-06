@@ -245,7 +245,10 @@ async def test_journal_records_expected_project_and_report_confirms_success(
 
     report = s._build_operation_report(rec["record"])
     assert "снова среди открытых, в нужном списке" in report
-    assert "Итог: ✅ 1 подтверждено, ❌ 0 расхождений" in report
+    # Формат строки «Итог» расширен правкой fix/qa-c-report: добавлен
+    # счётчик ⚠️ «не проверено» плюс отдельная строка «Статус операции».
+    assert "Итог: ✅ 1 подтверждено, ⚠️ 0 не проверено, ❌ 0 расхождений" in report
+    assert "Статус операции:" in report
 
 
 async def test_operation_report_flags_a_restore_that_ended_up_in_the_wrong_project(
@@ -276,14 +279,21 @@ async def test_operation_report_flags_a_restore_that_ended_up_in_the_wrong_proje
 
 
 # ---- ветка "restore" в _verify_item напрямую -------------------------------
+#
+# _verify_item возвращает КОРТЕЖ (status, line), где status — строго
+# "ok"/"warn"/"bad" (правка из fix/qa-c-report: раньше статус пытались
+# восстановить парсингом эмодзи в начале строки, и ⚠️-расхождения терялись —
+# это и был баг «расхождений: 0» при 4 напечатанных пунктах). Поэтому тесты
+# ниже проверяют И статус (по нему считается статистика), И текст строки.
 
 def test_verify_item_flags_restore_that_landed_in_wrong_project():
     names = {"p1": "Работа", "inbox": "Inbox"}
     live_map = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "inbox"}}
     item = {"taskId": "t1", "title": "Купить молоко", "expect": {"projectId": "p1"}}
 
-    line = s._verify_item("restore", item, live_map, names)
+    status, line = s._verify_item("restore", item, live_map, names)
 
+    assert status == "warn"
     assert "⚠️" in line
     assert "не тот список" in line
     assert "Inbox" in line
@@ -295,8 +305,9 @@ def test_verify_item_confirms_restore_in_correct_project():
     live_map = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
     item = {"taskId": "t1", "title": "Купить молоко", "expect": {"projectId": "p1"}}
 
-    line = s._verify_item("restore", item, live_map, names)
+    status, line = s._verify_item("restore", item, live_map, names)
 
+    assert status == "ok"
     assert "✅" in line
     assert "нужном списке" in line
 
@@ -305,7 +316,8 @@ def test_verify_item_restore_not_reappeared_is_still_a_plain_failure():
     names = {"p1": "Работа"}
     item = {"taskId": "t1", "title": "Купить молоко", "expect": {"projectId": "p1"}}
 
-    line = s._verify_item("restore", item, {}, names)
+    status, line = s._verify_item("restore", item, {}, names)
 
+    assert status == "bad"
     assert "❌" in line
     assert "не подтвердилось" in line
