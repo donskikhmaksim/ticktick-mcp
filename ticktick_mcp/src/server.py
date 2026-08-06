@@ -1126,6 +1126,16 @@ async def create_tasks(
         A formatted summary. Each successfully-created root task line ends with
         the created task's id as `(id:<id>)` so callers can link it without a
         follow-up title search.
+
+    TELEGRAM CONFIRMATION LAYER (optional, off by default): "create_tasks" is
+    also the NAME this server announces creation plans under in Telegram —
+    plan_task_creation sends the owner a message with [✅ Подтвердить]/
+    [🛑 Отклонить] buttons itself, and pressing "Подтвердить" makes the server
+    perform the creation on its own (background poller), reporting back into
+    that same message. It is the server doing this, not some external relay
+    on top of MCP. This direct entry point stays automation-only and is NOT
+    part of that flow: `automation_key` bypasses the interactive gate
+    entirely, so no button and no `user_reply` are involved here.
     """
     if not (SECRET and automation_key and hmac.compare_digest(automation_key, SECRET)):
         return ("🛑 Прямое создание — только для автоматики. Интерактивный флоу: "
@@ -1457,6 +1467,24 @@ def _suggest_destinations(titles: List[str], names: Dict[str, str]) -> List[Dict
         return []
 
 
+def _create_object_hash(raw: List[Dict[str, Any]]) -> str:
+    """Binding-хэш для манифеста СОЗДАНИЯ (kind="create"). У остальных
+    манифестов (delete/declutter) объекты уже существуют, и `object_hash`
+    считается по их id — у создаваемых задач id ещё нет по определению,
+    поэтому хэшируется само НОРМАЛИЗОВАННОЕ содержимое каждой задачи
+    (json.dumps с sort_keys — порядок ключей в dict не должен влиять).
+
+    Одна-единственная формула на оба места, где хэш нужен: фаза плана
+    (plan_task_creation) и пересчёт при авто-исполнении по кнопке
+    (_rehash_create_manifest). Не «две одинаковые реализации», а буквально
+    один вызов — иначе побайтовое совпадение держалось бы на честном слове,
+    а разошедшийся хэш беззвучно превратил бы кнопку в «ничего не делает»."""
+    return _manifest_object_hash(
+        "create",
+        [json.dumps(t, sort_keys=True, ensure_ascii=False, default=str)
+         for t in raw])
+
+
 @mcp.tool(annotations=READONLY)
 async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
                              max_items: int = 50) -> str:
@@ -1481,6 +1509,16 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     as every other mutating tool on this server (Maksim, 2026-08-05: no more
     tier exemption for "it's just a create/reversible edit" — ALL write tools
     go through plan→execute, without exception).
+
+    TELEGRAM CONFIRMATION LAYER (optional, off by default): when it is on,
+    THIS SERVER itself also sends the plan to the owner as a Telegram message
+    carrying [✅ Подтвердить]/[🛑 Отклонить] buttons — this is not an external
+    relay bolted on top of MCP, it is the server's own out-of-band second
+    factor. Pressing "Подтвердить" makes the server execute the creation
+    ITSELF (a background poller does it) and rewrites the report into that
+    same Telegram message — no second tool call is needed for it to happen.
+    In that mode a text `user_reply` alone is NOT enough: without the button,
+    execute_task_creation refuses and the plan stays alive.
 
     Args:
         summary: one-line human sentence describing the batch
@@ -1545,9 +1583,22 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
 
     mid = uuid.uuid4().hex[:12]
     now = time.monotonic()
-    _MANIFESTS[mid] = {"kind": "create", "raw": [t for t, _, _ in good],
+    raw_items = [t for t, _, _ in good]
+    _MANIFESTS[mid] = {"kind": "create", "raw": raw_items,
                        "created": now, "plan_shown_at": now,
-                       "summary": summary, "consumed": False}
+                       "summary": summary, "consumed": False,
+                       # `tool` — под каким именем этот план анонсируется в
+                       # Telegram (оно же ключ в TG_APPROVAL_TOOLS и в
+                       # _AUTO_EXECUTORS); `_gate` — метка формы распаковки
+                       # для авто-исполнителя, чтобы он не принял за «свой»
+                       # чужой манифест с таким же kind.
+                       "tool": "create_tasks", "_gate": "create",
+                       # Binding: до 2026-08-06 манифест создания вообще не
+                       # имел object_hash — между планом и нажатием кнопки
+                       # содержимое `raw` можно было подменить, и ни
+                       # _require_consent, ни try_auto_execute этого не
+                       # заметили бы (оба сверяют хэш только `if stored_hash`).
+                       "object_hash": _create_object_hash(raw_items)}
     lines = [f"### 📋 План создания — {len(good)}",
              f"_Манифест `{mid}` · ничего ещё не создано_", ""]
     for i, (t, pname, sug) in enumerate(good, 1):
@@ -1580,7 +1631,12 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
                  f"`execute_task_creation(manifest_id=\"{mid}\", "
                  "user_reply=\"<дословная реплика пользователя>\")` · "
                  "действует 1 час, одноразово.")
-    return "\n".join(lines)
+    # Опциональный ТГ-фактор. При выключенном слое (дефолт) возвращает текст
+    # плана БЕЗ единого изменения; при включённом — шлёт план кнопкой и
+    # помечает манифест `tg_notified`, из-за чего execute-фаза начинает
+    # требовать нажатие. Fail-closed: не смогли отправить — манифест гаснет,
+    # наружу уходит текст ошибки вместо плана.
+    return _maybe_tg_notify_plan("create_tasks", mid, "\n".join(lines))
 
 
 @mcp.tool()
@@ -1591,6 +1647,15 @@ async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
     post-verify, operation_report record). One-shot. Gated 🟡
     (docs/DESIGN_approval_gate.md): user_reply is HARD-enforced — an empty,
     negative, or fabricated-looking reply is refused and nothing is created.
+
+    TELEGRAM CONFIRMATION LAYER (optional, off by default): when plan_task_
+    creation announced this plan in Telegram, THIS SERVER sent the owner a
+    message with [✅ Подтвердить]/[🛑 Отклонить] buttons itself. Pressing
+    "Подтвердить" makes the server run the creation on its own (background
+    poller) and write the report back into that same message — you do not
+    have to call this tool again for it to happen. Until the button is
+    pressed, a text `user_reply` alone is NOT sufficient here: this call is
+    refused with "⏳ Подтвердите кнопкой", and the plan stays alive.
 
     Args:
         manifest_id: id from plan_task_creation
@@ -1604,10 +1669,18 @@ async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
     _prune_manifests()
     m = _MANIFESTS.get(manifest_id)
     if not m or m.get("kind") != "create":
-        return (f"🛑 Манифест создания {manifest_id} не найден/истёк/уже "
-                "исполнен. Сначала plan_task_creation.")
+        return _manifest_gone_msg(
+            manifest_id,
+            f"🛑 Манифест создания {manifest_id} не найден/истёк/уже "
+            "исполнен. Сначала plan_task_creation.")
+    # `tool=`/`manifest_id=` передаются ОБЯЗАТЕЛЬНО (2026-08-06): именно их
+    # отсутствие в execute_task_deletion делало ТГ-гейт недетерминированным
+    # (см. tests/test_gate_tg_determinism.py). Имя тула здесь — то же, под
+    # которым план анонсируется в Telegram («create_tasks»), оно же ключ в
+    # TG_APPROVAL_TOOLS и в _AUTO_EXECUTORS.
     cr = _require_consent(action="create", tier=1, manifest=m,
-                          user_reply=user_reply)
+                          user_reply=user_reply, tool="create_tasks",
+                          manifest_id=manifest_id)
     if not cr.ok:
         return cr.reason
     m["consumed"] = True
@@ -4854,6 +4927,28 @@ async def _create_project_impl(name: str, color: str = "#F18181",
 _PROJECT_DELETE_SAMPLE_CAP = 20  # preview lines shown before the confirm echo
 
 
+def _find_live_inline_manifest(kind: str, key: str) -> Tuple[str, Optional[Dict]]:
+    """Самый свежий ЖИВОЙ манифест данного `kind` с совпадающим `key`.
+
+    Нужна тулам, которые исторически были ОДНОХОДОВЫМИ (delete_project,
+    rename_tag): у них нет параметра `manifest_id`, который можно было бы
+    вернуть модели и получить обратно вторым вызовом, — публичная сигнатура
+    менялась бы, а старые вызовы ломались. Поэтому «план» и «исполнение»
+    здесь по-прежнему различаются наличием `user_reply`, а связь между двумя
+    вызовами держится на естественном ключе объекта (id проекта / пара имён
+    тега). Возвращает ("", None), когда живого плана нет, — тогда вызывающий
+    ведёт себя ровно как до появления манифестов (manifest=None).
+    """
+    _prune_manifests()
+    best_id, best = "", None
+    for mid, m in _MANIFESTS.items():
+        if m.get("kind") != kind or m.get("consumed") or m.get("key") != key:
+            continue
+        if best is None or (m.get("created") or 0) > (best.get("created") or 0):
+            best_id, best = mid, m
+    return best_id, best
+
+
 @mcp.tool()
 async def delete_project(project_name: str, project_id: str, user_reply: str = "") -> str:
     """
@@ -4870,6 +4965,15 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
     The count is re-read fresh on EVERY call (nothing cached from the first
     call), so the project having changed in between is naturally reflected
     rather than deleting against a stale count.
+
+    TELEGRAM CONFIRMATION LAYER (optional, off by default): with it on, the
+    1st call ALSO makes this server send the plan to the owner as a Telegram
+    message with [✅ Подтвердить]/[🛑 Отклонить] buttons — the server's own
+    out-of-band second factor, not an external relay. While the button is
+    untouched, the 2nd call is refused however genuine `user_reply` is
+    («⏳ Подтвердите кнопкой в Telegram-боте»), and a press of "🛑 Отклонить"
+    kills the plan outright. Deletion of a project is NOT auto-executed by
+    the button poller — after approving, repeat the 2nd call.
 
     Args:
         project_name: Name of the project (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
@@ -4904,8 +5008,39 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
     tasks = data.get('tasks') or []
     count = len(tasks)
 
-    cr = _require_consent(action="delete_project", tier=2, manifest=None,
-                          user_reply=user_reply)
+    # Двухфазность через МАНИФЕСТ (2026-08-06). Раньше здесь стояло
+    # `manifest=None` и не передавался `tool=` — то есть удаление ЦЕЛОГО
+    # проекта (самая крупная воронка на сервере: каскадом уходят все его
+    # задачи) было единственной 🔴-операцией ВНЕ Telegram-контура: план
+    # владельцу не уходил, кнопка не требовалась. Просто дописать `tool=`
+    # было нельзя — без отправленного плана строки в `tg_approvals` не
+    # существует, `check_approval` вернул бы "none", и тул отказывал бы
+    # ВСЕГДА при включённом слое. Поэтому фаза плана теперь заводит
+    # настоящий манифест и зовёт `_maybe_tg_notify_plan`, а фаза исполнения
+    # сверяется с ним; `tool=` намеренно НЕ передаётся — основанием требовать
+    # кнопку служит пометка `tg_notified` на самом манифесте, которая
+    # появляется ровно тогда, когда план реально ушёл.
+    #
+    # Публичная сигнатура тула не изменилась: фазы по-прежнему различаются
+    # наличием `user_reply`, связь между вызовами — по id проекта.
+    mid, m = _find_live_inline_manifest("delete_project", project_id)
+    cr = _require_consent(action="delete_project", tier=2, manifest=m,
+                          user_reply=user_reply,
+                          object_ids=[project_id] if m is not None else None,
+                          manifest_id=mid,
+                          # min_gap=0 — сознательно: до появления манифеста
+                          # этот тул анти-дуплетного таймера не имел, и
+                          # включать его заодно значило бы менять поведение
+                          # при выключенном ТГ-слое (запрещено).
+                          min_gap=0)
+    if cr.ok and m is None and tg_approval.enabled_for(_TG_CFG, "delete_project"):
+        # Дыра, которую иначе оставила бы связка «нет манифеста → manifest=
+        # None → ТГ-фактор не требуется»: модель могла позвать тул СРАЗУ с
+        # user_reply="да", без первой фазы, и удалить проект в обход кнопки
+        # при формально включённом слое. Лечится не отказом (это был бы тот
+        # самый «отказывает всегда»), а откатом к ФАЗЕ ПЛАНА: ниже строится
+        # манифест и уходит сообщение с кнопками.
+        cr = ConsentResult(False, "")
     if not cr.ok:
         lines = [f"⚠️ Проект «{live_name}» содержит {count} задач(и) — при "
                  "удалении проекта TickTick удалит их ВМЕСТЕ с ним, "
@@ -4916,18 +5051,35 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
             if count > _PROJECT_DELETE_SAMPLE_CAP:
                 lines.append(f"... и ещё {count - _PROJECT_DELETE_SAMPLE_CAP}.")
             lines.append("")
-        if _is_negative_reply(user_reply):
+        if _is_negative_reply(user_reply) or m is not None:
+            # Отказ человека — план и так аннулирован внутри _require_consent.
+            # m is not None — план УЖЕ существует (и, возможно, уже отправлен
+            # в Telegram): второй раз слать то же самое сообщение нельзя,
+            # показываем причину отказа поверх свежего пересчёта.
             lines.append(cr.reason)
-        else:
-            lines.append(
-                "Ничего не удалено. Покажи это пользователю дословно и "
-                "ДОЖДИСЬ его отдельного ответа (не отвечай за него). Когда "
-                "он явно согласится, вызови "
-                f'delete_project(project_name="{live_name}", '
-                f'project_id="{project_id}", '
-                'user_reply="<дословная реплика пользователя>") — НЕ в этом '
-                'же ходе.')
-        return "\n".join(lines)
+            return "\n".join(lines)
+        lines.append(
+            "Ничего не удалено. Покажи это пользователю дословно и "
+            "ДОЖДИСЬ его отдельного ответа (не отвечай за него). Когда "
+            "он явно согласится, вызови "
+            f'delete_project(project_name="{live_name}", '
+            f'project_id="{project_id}", '
+            'user_reply="<дословная реплика пользователя>") — НЕ в этом '
+            'же ходе.')
+        new_mid = uuid.uuid4().hex[:12]
+        now = time.monotonic()
+        _MANIFESTS[new_mid] = {
+            "kind": "delete_project", "key": project_id,
+            "project_id": project_id, "project_name": live_name,
+            "count": count, "created": now, "plan_shown_at": now,
+            "summary": f"Удаление проекта «{live_name}» ({count} задач)",
+            "consumed": False, "tool": "delete_project",
+            "_gate": "delete_project",
+            "object_hash": _manifest_object_hash("delete_project", [project_id])}
+        return _maybe_tg_notify_plan("delete_project", new_mid, "\n".join(lines))
+
+    if m is not None:
+        m["consumed"] = True  # one-shot: план сгорел вместе с исполнением
 
     # Confirmed — journal a pre-delete snapshot of the project AND every
     # contained task BEFORE the actual delete call, same convention as
@@ -7608,6 +7760,16 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
     judgement, without user_reply, is NOT sufficient — don't fabricate the
     reply.
 
+    TELEGRAM CONFIRMATION LAYER (optional, off by default) — merge branch
+    only: the refusal that describes the merge is ALSO sent by this server to
+    the owner in Telegram, as a message with [✅ Подтвердить]/[🛑 Отклонить]
+    buttons; that is the server's own second factor, not an external relay
+    wrapped around MCP. Until "Подтвердить" is pressed, repeating the call
+    with allow_merge=true and a genuine `user_reply` is still refused — one
+    text reply is not enough in that mode. A tag merge is not auto-executed
+    by the button poller: after approving, repeat the call. The plain-rename
+    branch (no existing target tag) is not gated at all and never notifies.
+
     Args:
         old_name: current tag name
         new_name: new tag name
@@ -7628,16 +7790,58 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
                     f"(возможно опечатка; похожие: {near}). Ничего не тронул.")
         will_merge = new_name.lower() in existing
         if will_merge:
+            # Тот же перевод на манифест, что у delete_project (2026-08-06):
+            # раньше здесь стоял inline-🔴 (`manifest=None`) без `tool=`, и
+            # необратимое слияние тегов оставалось вне Telegram-контура.
+            # Дописать один `tool=` было нельзя — плана в Telegram нет,
+            # `check_approval` вернул бы "none" и тул отказывал бы ВСЕГДА при
+            # включённом слое. Ключ связи двух вызовов — пара имён тегов;
+            # публичная сигнатура не тронута.
+            key = f"{old_name.lower()}→{new_name.lower()}"
+            mid, m = _find_live_inline_manifest("rename_tag_merge", key)
             cr = _require_consent(action="rename_tag_merge", tier=2,
-                                  manifest=None, user_reply=user_reply)
+                                  manifest=m, user_reply=user_reply,
+                                  object_ids=([old_name.lower(), new_name.lower()]
+                                              if m is not None else None),
+                                  manifest_id=mid,
+                                  # см. delete_project: анти-дуплетного
+                                  # таймера у этой ветки не было — не вводим
+                                  # его вместе с манифестом.
+                                  min_gap=0)
+            if cr.ok and m is None and tg_approval.enabled_for(_TG_CFG, "rename_tag"):
+                # см. тот же комментарий в delete_project: без этого вызов
+                # сразу с allow_merge=true + user_reply="да" слил бы теги в
+                # обход кнопки при включённом слое. Откатываемся к фазе
+                # плана, а не отказываем навсегда.
+                cr = ConsentResult(False, "")
             if not (allow_merge and cr.ok):
-                return (f"🛑 Тег «{new_name}» уже существует — это будет СЛИЯНИЕ "
-                        f"тегов «{old_name}» и «{new_name}» (необратимо: какие "
-                        "задачи носили какой тег — потеряется). Покажи это "
-                        "пользователю дословно и, ТОЛЬКО после его явного "
-                        "согласия, повтори с allow_merge=true и "
-                        "user_reply=<дословная реплика пользователя>. Ничего "
-                        "не тронул." + ("" if cr.ok else f" ({cr.reason})"))
+                msg = (f"🛑 Тег «{new_name}» уже существует — это будет СЛИЯНИЕ "
+                       f"тегов «{old_name}» и «{new_name}» (необратимо: какие "
+                       "задачи носили какой тег — потеряется). Покажи это "
+                       "пользователю дословно и, ТОЛЬКО после его явного "
+                       "согласия, повтори с allow_merge=true и "
+                       "user_reply=<дословная реплика пользователя>. Ничего "
+                       "не тронул." + (f" ({cr.reason})"
+                                       if (not cr.ok and cr.reason) else ""))
+                if m is not None or _is_negative_reply(user_reply):
+                    # План уже есть (возможно, уже висит кнопкой в Telegram)
+                    # либо человек отказался — второй раз не шлём.
+                    return msg
+                new_mid = uuid.uuid4().hex[:12]
+                now = time.monotonic()
+                _MANIFESTS[new_mid] = {
+                    "kind": "rename_tag_merge", "key": key,
+                    "old_name": old_name, "new_name": new_name,
+                    "created": now, "plan_shown_at": now,
+                    "summary": f"Слияние тегов «{old_name}» → «{new_name}»",
+                    "consumed": False, "tool": "rename_tag",
+                    "_gate": "rename_tag_merge",
+                    "object_hash": _manifest_object_hash(
+                        "rename_tag_merge",
+                        [old_name.lower(), new_name.lower()])}
+                return _maybe_tg_notify_plan("rename_tag", new_mid, msg)
+            if m is not None:
+                m["consumed"] = True  # one-shot
         await _run_blocking(lambda: ticktick_v2.rename_tag(old_name, new_name))
         # Post-verify against a fresh tag list.
         after = await _live_tag_names()
@@ -8836,7 +9040,28 @@ async def _auto_execute_declutter(manifest_id: str, m: Dict) -> str:
     return await _execute_declutter_ram_impl(manifest_id, m)
 
 
+def _rehash_create_manifest(m: Dict) -> str:
+    """Пересчёт binding-хэша манифеста создания при нажатии кнопки. Зовёт
+    РОВНО ту же `_create_object_hash`, что и plan_task_creation, — не
+    «повторяет формулу», а буквально ту же функцию, поэтому побайтовое
+    совпадение гарантировано конструкцией, а не аккуратностью."""
+    return _create_object_hash(m.get("raw") or [])
+
+
+async def _auto_execute_create_tasks(manifest_id: str, m: Dict) -> str:
+    # Страховка от чужого манифеста с таким же kind: этот исполнитель умеет
+    # распаковывать ТОЛЬКО форму, которую кладёт plan_task_creation
+    # (summary + raw). Манифест на этот момент уже погашен вызывающим, так
+    # что «отказ» здесь — это отказ ИСПОЛНЯТЬ, а не тихое исполнение не того.
+    if m.get("_gate") != "create" or "raw" not in m:
+        return ("🛑 Автоисполнение отменено: манифест не в формате плана "
+                "создания задач (kind=create, но нет raw/_gate) — ничего не "
+                "создано. Построй план заново через plan_task_creation.")
+    return await _create_tasks_impl(m.get("summary") or "", m.get("raw") or [])
+
+
 _register_auto_executor("delete_tasks", _rehash_delete_manifest, _auto_execute_delete_tasks)
+_register_auto_executor("create_tasks", _rehash_create_manifest, _auto_execute_create_tasks)
 # DISABLED 2026-08-04/05 together with the @mcp.tool() decorators above — the
 # TG-button auto-execute poller (_tg_auto_execute_tick) dispatches through
 # THIS registry directly, bypassing the MCP tool layer entirely. Commenting
@@ -8862,7 +9087,8 @@ _register_auto_executor("delete_tasks", _rehash_delete_manifest, _auto_execute_d
 # the ONE spot below that needs to go from "found a _MANIFESTS entry" to
 # "which _AUTO_EXECUTORS key" without re-deriving it from scratch. Extend
 # this (and _AUTO_EXECUTORS) together when a future kind gets TG wiring.
-_AUTO_EXECUTE_TOOL_FOR_KIND = {"delete": "delete_tasks", "declutter": "execute_declutter"}
+_AUTO_EXECUTE_TOOL_FOR_KIND = {"delete": "delete_tasks", "declutter": "execute_declutter",
+                               "create": "create_tasks"}
 
 
 def _find_tg_auto_execute_candidates() -> List[Dict]:

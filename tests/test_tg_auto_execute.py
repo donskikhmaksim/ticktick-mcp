@@ -241,7 +241,14 @@ def test_find_candidates_skips_consumed(monkeypatch):
 def test_find_candidates_skips_kind_with_no_registered_tool(monkeypatch):
     _enable_tg(monkeypatch)
     now = time.monotonic()
-    s._MANIFESTS["cand4"] = {"kind": "create", "consumed": False, "created": now}
+    # Раньше здесь стоял kind="create" как пример НЕ проведённого через
+    # Telegram вида манифеста. С 2026-08-06 создание задач проведено
+    # (_AUTO_EXECUTE_TOOL_FOR_KIND["create"] = "create_tasks"), поэтому
+    # берём kind, у которого авто-исполнителя действительно нет:
+    # "delete_project" — его план в Telegram уходит, но по кнопке сервер сам
+    # ничего не удаляет, модель обязана повторить вызов тула.
+    s._MANIFESTS["cand4"] = {"kind": "delete_project", "consumed": False,
+                             "created": now}
     monkeypatch.setattr(tg, "check_approval", lambda mid: "approved" if mid == "cand4" else "none")
     ids = {c["manifest_id"] for c in s._find_tg_auto_execute_candidates()}
     assert "cand4" not in ids
