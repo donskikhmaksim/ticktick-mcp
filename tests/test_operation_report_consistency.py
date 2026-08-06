@@ -34,11 +34,11 @@ def _count_body_bullets(report: str) -> dict:
     """Считает пункты-вердикты по ведущему статусному эмодзи прямо из
     напечатанного markdown — это независимая «эталонная правда», с которой
     сверяется подсчёт в строке «Итог»."""
-    lines = [l for l in report.splitlines() if l.startswith("- ")]
+    lines = [ln for ln in report.splitlines() if ln.startswith("- ")]
     return {
-        "ok": sum(1 for l in lines if l.startswith("- ✅")),
-        "warn": sum(1 for l in lines if l.startswith("- ⚠️")),
-        "bad": sum(1 for l in lines if l.startswith("- ❌")),
+        "ok": sum(1 for ln in lines if ln.startswith("- ✅")),
+        "warn": sum(1 for ln in lines if ln.startswith("- ⚠️")),
+        "bad": sum(1 for ln in lines if ln.startswith("- ❌")),
         "total": len(lines),
     }
 
@@ -158,6 +158,6 @@ async def test_zero_discrepancies_is_a_clean_and_honest_report(
     # В теле (построчных пунктах) не должно быть случайных маркеров
     # расхождений (строки «Итог»/«Статус» законно содержат «❌ 0» — грязным
     # не должно быть только тело с пунктами-буллетами).
-    body = "\n".join(l for l in report.splitlines() if l.startswith("- "))
+    body = "\n".join(ln for ln in report.splitlines() if ln.startswith("- "))
     assert "❌" not in body
     assert "⚠️" not in body

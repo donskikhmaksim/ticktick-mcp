@@ -74,7 +74,6 @@ def test_subtree_height_counts_deepest_branch():
 
 
 def test_subtree_height_cycle_does_not_hang():
-    by_id = {"a": {"id": "a", "parentId": None}, "b": {"id": "b", "parentId": "a"}}
     children_of = {"a": ["b"], "b": ["a"]}  # deliberately corrupt/circular
     assert s._subtree_height("a", children_of) >= 1  # returns, doesn't hang
 
@@ -238,7 +237,7 @@ async def test_set_task_parent_batch_mixed_ok_and_too_deep(monkeypatch):
     live["deep"] = {"id": "deep", "title": "Deep", "projectId": "p1"}
     live["deepchild"] = {"id": "deepchild", "title": "Deep child",
                          "projectId": "p1", "parentId": "deep"}
-    fake = _wire_parent(monkeypatch, live)
+    _wire_parent(monkeypatch, live)
 
     result = await s._set_task_parent_impl(
         "тест", [{"taskId": "shallow", "title": "Shallow"},

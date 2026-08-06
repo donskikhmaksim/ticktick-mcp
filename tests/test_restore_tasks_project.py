@@ -171,7 +171,7 @@ async def test_move_fixup_failure_is_reported_as_discrepancy_not_success(
         monkeypatch):
     trash = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
     live = {}
-    fake = _wire(monkeypatch, live, trash, restore_drops_destination=True,
+    _wire(monkeypatch, live, trash, restore_drops_destination=True,
                 fallback_project="inbox", move_is_noop=True)
 
     result = await s._restore_tasks_impl(

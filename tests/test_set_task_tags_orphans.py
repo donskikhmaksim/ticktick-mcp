@@ -175,7 +175,7 @@ async def test_partial_failure_only_skips_the_affected_task(monkeypatch):
         "t1": {"id": "t1", "title": "Задача A", "projectId": "p1", "tags": []},
         "t2": {"id": "t2", "title": "Задача B", "projectId": "p1", "tags": []},
     }
-    fake = _wire(monkeypatch, live, tags=[], poison_tags={"призрак"})
+    _wire(monkeypatch, live, tags=[], poison_tags={"призрак"})
 
     preview = await s.set_task_tags("Ставлю теги", [
         {"taskId": "t1", "title": "Задача A", "tags": ["хороший"]},

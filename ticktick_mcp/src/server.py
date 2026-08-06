@@ -7088,8 +7088,22 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
     # exist yet, so the user sees "will be created" BEFORE approving, not
     # just after the fact. Skipped on call #2 and on an empty/missing
     # `tasks` — _gate_batch refuses those without needing a tag lookup.
-    existing_tags = (set(await _live_tag_names(force=True))
-                     if not manifest_id and tasks else set())
+    #
+    # Чтение живого списка тегов здесь — best-effort, и ронять фазу ПЛАНА оно
+    # не имеет права: план обязан строиться, даже когда живое состояние
+    # недоступно (клиент не поднят, сеть легла). Это НЕ ослабление
+    # fail-closed: пометка «тег будет создан» — информационная, а настоящая
+    # защита от тега-сироты стоит в _set_task_tags_impl, где отсутствующий
+    # тег регистрируется в аккаунте ПЕРЕД записью на задачу — и там
+    # недоступность состояния уже честно останавливает операцию.
+    existing_tags: set = set()
+    if not manifest_id and tasks:
+        try:
+            existing_tags = set(await _live_tag_names(force=True))
+        except Exception as e:
+            logger.warning(f"set_task_tags: не удалось прочитать список тегов "
+                           f"для превью плана ({e}) — пометка «будет создан» "
+                           "в этом плане не показывается")
 
     def _describe_tags(t: Dict) -> str:
         wanted = t.get("tags") or []
