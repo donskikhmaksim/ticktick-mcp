@@ -1176,3 +1176,25 @@ async def test_synthetic_manifest_is_cleaned_up_even_if_deletion_raises(
         await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
 
     assert not [k for k in s._MANIFESTS if k.startswith("triage-")]
+
+
+async def test_changes_invisible_in_the_open_list_are_reported_as_unchecked(
+        monkeypatch, tmp_path):
+    """Напоминание/повтор/колонка/исполнитель в списке открытых задач не
+    видны — сверить их нечем. Отчёт обязан сказать «не проверяется
+    автоматически», а не зачесть операцию в успех."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    calls = _stub_sub_impls(monkeypatch, live)
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "update", "task_id": "b2", "title": "Отчёт",
+         "changes": {"reminders": ["09:00"]},
+         "said": "напомни утром"}])
+    mid = _mid(preview)
+
+    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+
+    assert [c[0] for c in calls] == ["update"]
+    assert "⚠️ не проверяется автоматически: 1" in out
+    assert "✅ Выполнено 0 из 1" in out
+    assert "не проверить" in out
