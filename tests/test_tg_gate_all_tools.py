@@ -64,6 +64,14 @@ BATCH_TOOLS = {
     "restore_tasks": dict(
         summary="Восстанавливаю 1", tasks=[{"taskId": "t1", "title": "A"}],
         to_project_id="p2"),
+    # manual_triage — единственный в таблице, чей call #1 читает ЖИВОЕ
+    # состояние ещё до гейта (identity guard по каждому переданному id),
+    # поэтому `_no_client_checks` ниже подменяет `_open_by_id` /
+    # `_v2_project_names` детерминированным состоянием ровно с этой задачей.
+    "manual_triage": dict(
+        summary="Разбираю 1",
+        operations=[{"op": "complete", "task_id": "t1", "title": "A",
+                     "said": "уже сделал"}]),
 }
 
 SINGLE_TOOLS = {
@@ -163,7 +171,7 @@ def _public_base_url(monkeypatch):
     """`create_attachment_upload_url` отказывает ДО гейта, если сервер не знает
     своего публичного адреса (проверка конфигурации, а не согласия). Здесь
     проверяется гейт, поэтому адрес задан — иначе call #1 вернул бы не план,
-    а «задайте PUBLIC_BASE_URL». Остальным 19 тулам эта переменная безразлична."""
+    а «задайте PUBLIC_BASE_URL». Остальным 20 тулам эта переменная безразлична."""
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://tt.example.com")
     monkeypatch.delenv("RAILWAY_PUBLIC_DOMAIN", raising=False)
 
@@ -196,11 +204,22 @@ def _tg_off(monkeypatch):
         tools_allowlist=None, ttl_s=3600))
 
 
+# Детерминированное «живое состояние» для тулов, которые сверяют переданные
+# id ДО гейта (сегодня это только manual_triage — его identity guard обязан
+# работать на фазе плана, иначе человек увидел бы план по несуществующим
+# задачам). Остальные 20 тулов сюда не заглядывают вовсе.
+_LIVE_TASKS = {"t1": {"id": "t1", "title": "A", "projectId": "p1"}}
+_LIVE_PROJECTS = {"p1": "Проект-1", "p2": "Проект-2"}
+
+
 def _no_client_checks(monkeypatch):
-    """Ни один из 19 тулов не должен ходить в TickTick до гейта — глушим
-    только проверки готовности клиента."""
+    """Ни один из 20 тулов не должен ходить в СЕТЬ до гейта — глушим проверки
+    готовности клиента и подменяем чтение живого состояния локальным dict."""
     monkeypatch.setattr(s, "_ensure_ready", lambda: None)
     monkeypatch.setattr(s, "_ensure_official", lambda: None)
+    monkeypatch.setattr(s, "_open_by_id",
+                        lambda fresh=False: {k: dict(v) for k, v in _LIVE_TASKS.items()})
+    monkeypatch.setattr(s, "_v2_project_names", lambda: dict(_LIVE_PROJECTS))
 
 
 def _stub_impl(monkeypatch, tool, recorder):
@@ -555,7 +574,7 @@ async def test_tick_does_not_touch_declutter_manifests(monkeypatch):
 # Предохранитель «инвариант 2» в tg_approval.try_auto_execute читал поле
 # `_auto_tool`, которого не писал НИКТО (см. комментарий там же) — то есть не
 # срабатывал никогда. Пока кнопка была у одного тула, это было безвредно; с
-# 19 тулами ошибка диспетчеризации означала бы исполнение ЧУЖОЙ операции по
+# 21 тулом ошибка диспетчеризации означала бы исполнение ЧУЖОЙ операции по
 # чужому подтверждению. Тестов на это не было — потому дыра и не всплыла.
 
 async def test_manifest_is_not_executable_under_another_tools_name(monkeypatch):
