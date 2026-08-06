@@ -250,10 +250,17 @@ def test_echo_artifacts_are_refused_with_an_explanation(reply):
     assert "дословн" in reason.lower(), reason
 
 
-def test_unrecognized_reply_falls_through_to_the_generic_instruction():
-    """Ответ не распознан ни как «да», ни как «нет» — отдельного объяснения
-    нет, вызывающий подставляет общий _NO_REPLY_INSTRUCTION."""
+def test_unrecognized_reply_is_ambiguous_with_its_own_explanation():
+    """ИЗМЕНЕНО 2026-08-06 (смена принципа на fail-closed). Раньше нераспознанный
+    ответ давал kind="unrecognized" и ПУСТОЕ объяснение — вызывающий подставлял
+    общий _NO_REPLY_INSTRUCTION («передай дословную реплику»), который для этого
+    случая просто неверен: реплику-то передали, она непонятна. Теперь такой
+    ответ — kind="ambiguous" со своим текстом, который просит человека ответить
+    однозначно. Отказ по-прежнему отказ, план по-прежнему жив."""
     v = s._classify_consent_reply("что там по погоде")
-    assert v.kind == "unrecognized"
-    assert s._consent_refusal_reason("что там по погоде") == ""
+    assert v.kind == "ambiguous"
+    reason = s._consent_refusal_reason("что там по погоде")
+    assert reason and "🛑" in reason
+    assert "однозначн" in reason.lower(), reason
     assert s._is_affirmative_reply("что там по погоде") is False
+    assert s._is_negative_reply("что там по погоде") is False

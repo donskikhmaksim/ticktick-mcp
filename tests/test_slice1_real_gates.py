@@ -38,15 +38,39 @@ def _extract_manifest_id(preview: str) -> str:
 class _FakeV2:
     """Minimal fake covering every v2 batch call the 6 gated tools use,
     mutating a shared `live` dict (and an optional `trash` dict for
-    restore_tasks) so post-verify's fresh re-read reflects the change."""
+    restore_tasks) so post-verify's fresh re-read reflects the change.
 
-    def __init__(self, live, trash=None):
+    `tags` is the fake account tag list (list of {"name","label"} dicts) that
+    backs get_tags()/get_state()/create_tag() — set_task_tags auto-registers
+    not-yet-existing tags through create_tag before touching any task (see
+    tests/test_set_task_tags_orphans.py for the dedicated coverage of that
+    path); this fake just needs to not blow up with AttributeError when it's
+    called incidentally by the other gate-cycle tests in this file."""
+
+    def __init__(self, live, trash=None, tags=None):
         self.live = live
         self.trash = trash or {}
         self.calls = []
+        self.tags = tags if tags is not None else []
 
     def invalidate_cache(self):
         pass
+
+    def get_state(self, force=False):
+        # Read-only — deliberately NOT appended to self.calls, which this
+        # file's tests treat as a mutation log (`fake.calls == []` after a
+        # preview-only call #1 asserts "nothing was mutated", not "nothing
+        # was read").
+        return {"tags": self.tags}
+
+    def get_tags(self):
+        return self.tags
+
+    def create_tag(self, name, color=None):
+        self.calls.append(("create_tag", name))
+        self.tags.append({"name": name.lstrip("#").lower(), "label": name,
+                          "color": color})
+        return {}
 
     def batch_update_tasks(self, changes):
         self.calls.append(("update", changes))
@@ -125,13 +149,13 @@ class _FakeOfficial:
         return {"id": task_id}
 
 
-def _wire(monkeypatch, live, names=None, trash=None, ensure="official"):
+def _wire(monkeypatch, live, names=None, trash=None, ensure="official", tags=None):
     if ensure == "official":
         monkeypatch.setattr(s, "_ensure_official", lambda: None)
     monkeypatch.setattr(s, "_ensure_ready", lambda: None)
     monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: dict(live))
     monkeypatch.setattr(s, "_v2_project_names", lambda: names or {"p1": "Работа"})
-    fake = _FakeV2(live, trash)
+    fake = _FakeV2(live, trash, tags)
     monkeypatch.setattr(s, "ticktick_v2", fake)
     official = _FakeOfficial(live)
     monkeypatch.setattr(s, "ticktick", official)
