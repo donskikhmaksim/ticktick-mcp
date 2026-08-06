@@ -26,6 +26,19 @@ PRIMARY KEY), так что строка с `server='ticktick'` обрабаты
 
 OFF BY DEFAULT: без `TG_APPROVAL_ENABLED=true` ни одна функция здесь не
 делает сетевых обращений и не трогает Postgres.
+
+ТРАНСПОРТ ОТЧЁТОВ (2026-08-06). Личка владельца — это «пульт»: план с
+кнопками, а после исполнения — КОРОТКАЯ сводка вместо плана
+(`summarize_in_owner_chat`), причём просроченные планы из неё удаляются
+целиком (`reap_expired`). ПОЛНЫЙ отчёт уходит отдельным сообщением в
+группу-архив (`post_report_to_group`, env `TG_REPORTS_CHAT_ID`, у Максима это
+группа «MCP Отчёты» с chat_id вида `-100…`; не задан — отчёты идут в личку).
+Искусственная обрезка текста убрана: и план, и отчёт бьются на несколько
+сообщений (`split_for_telegram` + `send_message_chunked`) с честной проверкой
+длины УЖЕ сконвертированного HTML.
+
+Env этого слоя: TG_APPROVAL_ENABLED, TG_BOT_TOKEN, TG_OWNER_CHAT_ID,
+TG_APPROVAL_TOOLS, TG_APPROVAL_TTL_S, TG_REPORTS_CHAT_ID, TG_REAP_ENABLED.
 """
 
 from __future__ import annotations
@@ -34,16 +47,43 @@ import logging
 import os
 import re
 import time
+from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional
+from zoneinfo import ZoneInfo
 
 import requests
 
 logger = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org"
-PREVIEW_CAP = 3500  # см. gmail-mcp: Telegram sendMessage.text лимит 4096
+# Настоящий лимит Bot API на sendMessage.text. Раньше здесь стоял ИСКУССТВЕННЫЙ
+# PREVIEW_CAP=3500 с обрезкой «…» — Максим 2026-08-06 потребовал его убрать:
+# длинный план/отчёт нельзя молча резать, его надо доставить целиком, разбив на
+# несколько сообщений (см. split_for_telegram / send_message_chunked).
+TELEGRAM_TEXT_LIMIT = 4096
 TG_TIMEOUT_S = 8
+
+# Отчёты датируются в часовом поясе владельца, НЕ в UTC (жёсткое требование
+# Максима: он читает время глазами и не должен пересчитывать). Резолвится
+# ЛЕНИВО и под try: в урезанном образе без пакета tzdata ZoneInfo бросает, а
+# упасть на импорте модуля из-за форматирования даты в отчёте — несоразмерная
+# цена; тогда честно откатываемся на фиксированный -08:00 и пишем в лог.
+OWNER_TZ_NAME = "America/Los_Angeles"
+_owner_tz = None
+
+
+def _resolve_owner_tz():
+    global _owner_tz
+    if _owner_tz is None:
+        try:
+            _owner_tz = ZoneInfo(OWNER_TZ_NAME)
+        except Exception as e:  # noqa: BLE001 — нет базы часовых поясов
+            logger.warning(f"TG: не нашёл зону {OWNER_TZ_NAME} ({e}) — время в "
+                           f"отчётах пойдёт с фиксированным -08:00")
+            _owner_tz = timezone(timedelta(hours=-8), "PST")
+    return _owner_tz
 
 
 @dataclass
@@ -54,6 +94,11 @@ class TgApprovalConfig:
     server: str  # константа "ticktick", как CONSENT_SERVER у TS-серверов
     tools_allowlist: Optional[set]  # None = все гейтованные тулы
     ttl_s: int
+    # Новые поля — с дефолтами СОЗНАТЕЛЬНО: конфиг конструируется в тестах и в
+    # server.py позиционно/по именам без них, и добавление обязательных полей
+    # сломало бы существующие вызовы. Пустой reports_chat_id = «отчёты в личку».
+    reports_chat_id: str = ""
+    reap_enabled: bool = True
 
 
 def load_tg_approval_config() -> TgApprovalConfig:
@@ -65,6 +110,13 @@ def load_tg_approval_config() -> TgApprovalConfig:
         {t.strip() for t in tools_raw.split(",") if t.strip()} if tools_raw else None
     )
     ttl_s = int(os.environ.get("TG_APPROVAL_TTL_S", "3600"))
+    # Группа-архив отчётов (у Максима это «MCP Отчёты», id вида -100…). Если не
+    # задана — отчёты идут в личку владельца, т.е. поведение как до 2026-08-06.
+    reports_chat_id = os.environ.get("TG_REPORTS_CHAT_ID", "").strip() or owner_chat_id
+    # Уборщик просроченных сообщений включён ПО УМОЛЧАНИЮ: висящий в чате план
+    # без кнопок — мусор, который человек может принять за актуальный. Выключать
+    # приходится явным TG_REAP_ENABLED=false (на время отладки).
+    reap_enabled = os.environ.get("TG_REAP_ENABLED", "").strip().lower() != "false"
     if enabled and (not bot_token or not owner_chat_id):
         missing = ", ".join(
             n for n, v in (("TG_BOT_TOKEN", bot_token), ("TG_OWNER_CHAT_ID", owner_chat_id)) if not v
@@ -76,6 +128,7 @@ def load_tg_approval_config() -> TgApprovalConfig:
     return TgApprovalConfig(
         enabled=enabled, bot_token=bot_token, owner_chat_id=owner_chat_id,
         server="ticktick", tools_allowlist=tools_allowlist, ttl_s=ttl_s,
+        reports_chat_id=reports_chat_id, reap_enabled=reap_enabled,
     )
 
 
@@ -111,14 +164,222 @@ def md_to_telegram_html(text: str) -> str:
     return joined
 
 
-def _clip(s: str, max_len: int = PREVIEW_CAP) -> str:
-    one = s.strip()
-    return one if len(one) <= max_len else one[: max_len] + "…"
+# ───────────────────────── чанкинг под лимит Telegram ─────────────────────────
+#
+# Почему не «обрезать по 3500 символов исходника», как было раньше:
+#   1) обрезка ТЕРЯЕТ данные — план/отчёт с хвостом в 200 задач превращался в
+#      «…», и человек подтверждал кнопкой то, чего не видел;
+#   2) считать длину ИСХОДНИКА в принципе неверно — Telegram считает символы
+#      УЖЕ ОТКОНВЕРТИРОВАННОГО HTML, а конвертация только УДЛИНЯЕТ текст
+#      (`&`→`&amp;` +4, `<`→`&lt;` +3, `**x**`→`<b>x</b>` +3, `` `x` ``→
+#      `<code>x</code>` +11). Поэтому весь бюджет здесь считается по
+#      len(md_to_telegram_html(кусок)), а не по len(кусок).
+#
+# Пары разметки (`**` и `` ` ``) нельзя рвать между сообщениями: Telegram
+# распарсит первый кусок как HTML с незакрытым `<b>` и вернёт 400 «can't parse
+# entities», т.е. сообщение просто НЕ ДОЙДЁТ. Поэтому кусок либо сбалансирован
+# по построению (пару целиком уносим в следующий кусок), либо мы честно
+# дозакрываем разметку в конце и переоткрываем её в начале следующего.
+
+def _open_markers(s: str) -> list[str]:
+    """Какие парные маркеры (`**`, `` ` ``) остались ОТКРЫТЫМИ в конце текста
+    (стеком, в порядке открытия). Нужен и для решения «рвать / не рвать», и для
+    дозакрытия куска.
+
+    `_italic_` здесь НЕ учитывается намеренно: его regex требует non-word
+    границы, поэтому одиночное подчёркивание в середине слова
+    (`n8n_email_algo`) курсивом не становится и разметку не ломает."""
+    stack: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s.startswith("**", i):
+            if stack and stack[-1] == "**":
+                stack.pop()
+            else:
+                stack.append("**")
+            i += 2
+        elif s[i] == "`":
+            if stack and stack[-1] == "`":
+                stack.pop()
+            else:
+                stack.append("`")
+            i += 1
+        else:
+            i += 1
+    return stack
+
+
+def _closing_for(s: str) -> str:
+    """Хвост, которым надо дозакрыть текст, чтобы разметка была парной."""
+    return "".join(reversed(_open_markers(s)))
+
+
+def _html_len(s: str) -> int:
+    """Длина ПОСЛЕ конвертации — единственная величина, которую считает
+    Telegram. Всё бюджетирование в этом модуле идёт через неё."""
+    return len(md_to_telegram_html(s))
+
+
+def _hard_split_word(prefix: str, word: str, limit: int) -> int:
+    """Последний рубеж: слово само длиннее лимита (например, вставленный URL
+    или base64) — режем по символам. Возвращает, сколько символов слова влезет
+    в кусок, начинающийся с `prefix`. Бинарный поиск + линейная докрутка:
+    HTML-длина почти монотонна по длине префикса, но не строго (курсив может
+    «включиться» при обрезке), поэтому результат перепроверяется."""
+    lo, hi, best = 1, len(word), 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        cand = prefix + word[:mid]
+        if _html_len(cand + _closing_for(cand)) <= limit:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    while best > 1:
+        cand = prefix + word[:best]
+        if _html_len(cand + _closing_for(cand)) <= limit:
+            break
+        best -= 1
+    # Не разрубать `**` пополам: осиротевшая одиночная `*` не ломает HTML, но
+    # выглядит мусором и в следующем куске уже не составит пару.
+    if 0 < best < len(word) and word[best - 1] == "*" and word[best] == "*":
+        best -= 1
+    return max(best, 1)  # хотя бы один символ, иначе бесконечный цикл
+
+
+def _split_long_line(line: str, limit: int) -> list[str]:
+    """Одна строка длиннее лимита — режем её по границам СЛОВ (пробел), а если
+    и слово не влезает — по символам. Каждый выданный фрагмент самодостаточен:
+    незакрытая разметка дозакрывается в конце и переоткрывается в начале
+    следующего фрагмента."""
+    words = line.split(" ")
+    out: list[str] = []
+    prefix = ""      # переоткрытая разметка, унаследованная от прошлого фрагмента
+    cur = ""
+    started = False
+    i = 0
+    while i < len(words):
+        w = words[i]
+        cand = (cur + " " + w) if started else (cur + w)
+        if _html_len(cand + _closing_for(cand)) <= limit:
+            cur, started = cand, True
+            i += 1
+            continue
+        if started:
+            out.append(cur + _closing_for(cur))
+            prefix = "".join(_open_markers(cur))
+            cur, started = prefix, False
+            continue
+        # даже одно слово (вместе с переоткрытой разметкой) не влезло
+        k = _hard_split_word(cur, w, limit)
+        piece = cur + w[:k]
+        out.append(piece + _closing_for(piece))
+        prefix = "".join(_open_markers(piece))
+        cur, started = prefix, False
+        words[i] = w[k:]
+        if not words[i]:
+            i += 1
+    if started:
+        out.append(cur + _closing_for(cur))
+    return out
+
+
+def _finalize_chunk(lines: list[str], limit: int) -> tuple[str, list[str], list[str]]:
+    """Закрывает набранный кусок. Сначала пытается ОТДАТЬ хвостовые строки в
+    следующий кусок, чтобы разметка внутри осталась парной (предпочтительный
+    путь по ТЗ); если сбалансировать не выходит (например, весь кусок — одна
+    гигантская строка с открытым `**`), сообщает наружу, что осталось
+    открытым, — решение «дозакрывать или нет» принимает вызывающий, потому что
+    только он знает, есть ли продолжение.
+
+    Возвращает (текст_куска БЕЗ дозакрытия, строки_обратно_в_очередь,
+    открытые_маркеры)."""
+    for cut in range(len(lines), 0, -1):
+        text = "\n".join(lines[:cut])
+        # проверяем и баланс, и длину: откат хвоста в редком случае может
+        # ВКЛЮЧИТЬ курсив («_x_bar» → «_x_») и удлинить HTML.
+        if not _open_markers(text) and _html_len(text) <= limit:
+            return text, lines[cut:], []
+    text = "\n".join(lines)
+    return text, [], _open_markers(text)
+
+
+def split_for_telegram(md_text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
+    """Режет markdown так, чтобы КАЖДЫЙ кусок ПОСЛЕ md_to_telegram_html()
+    укладывался в `limit` символов. Инвариант, который держит весь модуль:
+    len(md_to_telegram_html(chunk)) <= limit для любого возвращённого chunk.
+
+    Приоритет границ: перенос строки → пробел → символ (последний рубеж).
+    Пустой/пробельный вход → [] (слать нечего)."""
+    if not md_text or not md_text.strip():
+        return []
+
+    units = deque()
+    for line in md_text.split("\n"):
+        if _html_len(line) <= limit:
+            units.append(line)
+        else:
+            units.extend(_split_long_line(line, limit))
+
+    chunks: list[str] = []
+    cur: list[str] = []
+    carry: list[str] = []  # разметка, переоткрываемая в начале очередного куска
+    reopened = False      # текущий кусок начат с НАШЕЙ переоткрытой разметки
+
+    def _emit(lines: list[str], more_ahead: bool) -> tuple[list[str], list[str]]:
+        """Кладёт кусок в результат; возвращает то, что надо переоткрыть
+        дальше. Дозакрываем разметку ТОЛЬКО если это наш собственный разрыв
+        (есть продолжение или кусок начат с переоткрытой пары) — изначально
+        кривой markdown («**» без пары в исходнике) правкой не «чиним», чтобы
+        не менять смысл текста автора."""
+        text, leftover, opened = _finalize_chunk(lines, limit)
+        if opened and (more_ahead or leftover or reopened):
+            text += "".join(reversed(opened))
+            nxt = list(opened)
+        else:
+            nxt = []
+        if text.strip():
+            chunks.append(text.strip("\n") or text)
+        return nxt, leftover
+
+    while units or cur:
+        if not units:
+            carry, leftover = _emit(cur, more_ahead=False)
+            cur, reopened = [], bool(carry)
+            units.extendleft(reversed(leftover))
+            continue
+
+        line = units.popleft()
+        if not cur and carry:
+            line = "".join(carry) + line
+            carry, reopened = [], True
+        cand = "\n".join(cur + [line])
+        if _html_len(cand + _closing_for(cand)) <= limit:
+            cur.append(line)
+            continue
+        if not cur:
+            # Строка не влезла в ПУСТОЙ кусок (обычно из-за переоткрытой
+            # разметки, добавленной к уже нарезанному фрагменту) — дорезаем.
+            parts = _split_long_line(line, limit)
+            if len(parts) <= 1:
+                cur.append(line)  # дорезать нечего — принимаем как есть
+                continue
+            units.extendleft(reversed(parts))
+            continue
+        carry, leftover = _emit(cur, more_ahead=True)
+        cur, reopened = [], bool(carry)
+        units.extendleft(reversed(leftover + [line]))
+    return chunks
 
 
 # ───────────────────────── Telegram HTTP ─────────────────────────
 
 def _tg_call(cfg: TgApprovalConfig, method: str, body: dict) -> dict:
+    """error_code/parameters пробрасываются наружу намеренно: без них не
+    отличить «разметка кривая» (400) от «слишком часто» (429 + retry_after), а
+    от этого зависит, повторять запрос или менять формат (см.
+    send_message_chunked)."""
     url = f"{TELEGRAM_API}/bot{cfg.bot_token}/{method}"
     try:
         res = requests.post(url, json=body, timeout=TG_TIMEOUT_S)
@@ -127,7 +388,129 @@ def _tg_call(cfg: TgApprovalConfig, method: str, body: dict) -> dict:
         logger.warning(f"TG approval: {method} failed: {e}")
         return {"ok": False, "description": str(e)}
     return {"ok": bool(data.get("ok")) and res.ok, "result": data.get("result"),
-            "description": data.get("description")}
+            "description": data.get("description"),
+            "error_code": data.get("error_code"),
+            "parameters": data.get("parameters") or {}}
+
+
+# Место под хвостовой маркер «(часть N/M)», который добавляется УЖЕ ПОСЛЕ
+# нарезки, — поэтому при многокусковой отправке бюджет куска сужается на эту
+# величину (с запасом на трёхзначные номера частей).
+_PART_SUFFIX_RESERVE = 48
+
+_PARSE_ERROR_HINTS = (
+    "can't parse entities",
+    "cant parse entities",
+    "unsupported start tag",
+    "unclosed start tag",
+    "can't find end tag",
+    "can't find end of the entity",
+    "wrong http url",  # то же семейство: ссылка внутри разметки не распарсилась
+)
+
+_SEND_ATTEMPTS = 3
+
+
+def _is_parse_error(res: dict) -> bool:
+    desc = (res.get("description") or "").lower()
+    return any(h in desc for h in _PARSE_ERROR_HINTS)
+
+
+def _retry_after_s(res: dict) -> Optional[int]:
+    params = res.get("parameters") or {}
+    ra = params.get("retry_after")
+    if isinstance(ra, (int, float)) and ra > 0:
+        return int(ra)
+    if res.get("error_code") == 429:
+        return 1  # 429 без параметра — подождём символическую секунду
+    desc = (res.get("description") or "").lower()
+    if "too many requests" in desc:
+        m = re.search(r"retry after (\d+)", desc)
+        return int(m.group(1)) if m else 1
+    return None
+
+
+def send_message_chunked(cfg: TgApprovalConfig, chat_id: str, md_text: str,
+                         *, reply_markup_on_last: dict | None = None,
+                         disable_notification: bool = False) -> tuple[bool, list[int], str]:
+    """Доставляет текст любой длины: режет на куски, шлёт по одному, кнопки
+    вешает только на ПОСЛЕДНЕЕ сообщение (иначе вебхук gmail-mcp снимет их не
+    с того сообщения, а «активной» останется висеть кнопка на обрубке плана).
+
+    Возвращает (ok, message_ids, error). ok=True — только если дошли ВСЕ куски;
+    message_ids содержит id всех реально доставленных сообщений даже при
+    ok=False, чтобы вызывающий мог прибрать за собой.
+
+    Защита от главного silent-fail Telegram: при 400 «can't parse entities»
+    (кривая разметка внутри текста) кусок повторяется БЕЗ parse_mode —
+    plain-текстом исходного markdown. Лучше некрасивое сообщение, чем
+    потерянное. При 429 — сон на retry_after и повтор."""
+    chunks = split_for_telegram(md_text, TELEGRAM_TEXT_LIMIT)
+    if not chunks:
+        return False, [], "пустой текст — отправлять нечего"
+    if len(chunks) > 1:
+        # пересчитываем с местом под «(часть N/M)»
+        chunks = split_for_telegram(md_text, TELEGRAM_TEXT_LIMIT - _PART_SUFFIX_RESERVE)
+    total = len(chunks)
+
+    message_ids: list[int] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        is_last = idx == total
+        html = md_to_telegram_html(chunk)
+        plain = chunk
+        if total > 1:
+            html += f"\n\n<i>(часть {idx}/{total})</i>"
+            plain += f"\n\n(часть {idx}/{total})"
+
+        sent = None
+        use_plain = False
+        error = ""
+        for attempt in range(1, _SEND_ATTEMPTS + 1):
+            body: Dict[str, Any] = {"chat_id": chat_id,
+                                    "text": plain if use_plain else html}
+            if not use_plain:
+                body["parse_mode"] = "HTML"
+            if disable_notification:
+                body["disable_notification"] = True
+            if is_last and reply_markup_on_last is not None:
+                body["reply_markup"] = reply_markup_on_last
+            res = _tg_call(cfg, "sendMessage", body)
+            if res.get("ok"):
+                sent = res
+                break
+            error = res.get("description") or "Telegram sendMessage failed"
+            wait_s = _retry_after_s(res)
+            if wait_s is not None and attempt < _SEND_ATTEMPTS:
+                logger.warning(f"TG: 429 от Telegram, жду {wait_s}s и повторяю "
+                               f"кусок {idx}/{total}")
+                time.sleep(wait_s)
+                continue
+            if _is_parse_error(res) and not use_plain and attempt < _SEND_ATTEMPTS:
+                logger.warning(f"TG: Telegram не распарсил HTML куска {idx}/{total} "
+                               f"({error}) — повторяю без parse_mode, plain-текстом")
+                use_plain = True
+                continue
+            break
+        if sent is None:
+            return False, message_ids, error
+        mid = (sent.get("result") or {}).get("message_id")
+        if mid is not None:
+            message_ids.append(mid)
+    return True, message_ids, ""
+
+
+def delete_message(cfg: TgApprovalConfig, chat_id: str, message_id: int) -> bool:
+    """Best-effort удаление. Сообщение, которое человек уже стёр руками, или
+    старше 48 часов (Bot API их удалять не даёт) — это НЕ ошибка процесса:
+    возвращаем False и пишем в debug, наружу ничего не бросаем."""
+    if message_id is None:
+        return False
+    res = _tg_call(cfg, "deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+    if not res.get("ok"):
+        logger.debug(f"TG: deleteMessage({chat_id}, {message_id}) не удалось: "
+                     f"{res.get('description')}")
+        return False
+    return True
 
 
 # ───────────────────────── Postgres (общий с 5 TS-серверами) ─────────────────
@@ -152,6 +535,25 @@ def store_ready() -> bool:
 
 
 def _ensure_schema() -> None:
+    """DDL таблицы `tg_approvals` ОБЩИЙ с gmail-mcp (`src/store.ts`, там он
+    помечен FROZEN) — её создают и читают шесть серверов сразу, поэтому базовый
+    CREATE TABLE обязан оставаться байт-в-байт совместимым и меняться только
+    согласованно.
+
+    Новые колонки добавляются отдельными идемпотентными `ADD COLUMN IF NOT
+    EXISTS` и это БЕЗОПАСНО для TS-стороны: gmail-mcp читает строки через
+    node-pg ПО ИМЕНАМ колонок (`row.manifest_id`, `row.chat_id`, …), нигде не
+    полагаясь на порядок/количество полей, и во всех своих INSERT перечисляет
+    колонки явно. Новая колонка для него просто не существует.
+
+    Что добавляем (нужно транспорту отчётов, 2026-08-06):
+      extra_message_ids  — id ДОПОЛНИТЕЛЬНЫХ сообщений плана, когда он не влез
+                           в одно; кнопки всегда на последнем, его id лежит в
+                           штатном message_id (иначе вебхук gmail-mcp снял бы
+                           разметку не с того сообщения);
+      report_chat_id     — куда ушёл отчёт (группа-архив или личка);
+      report_message_ids — какими сообщениями ушёл, чтобы reap_expired() мог
+                           убрать за собой весь след манифеста."""
     conn = _pg_pool.getconn()
     try:
         with conn, conn.cursor() as cur:
@@ -170,6 +572,15 @@ def _ensure_schema() -> None:
                 """
             )
             cur.execute(
+                "ALTER TABLE tg_approvals ADD COLUMN IF NOT EXISTS extra_message_ids  BIGINT[]"
+            )
+            cur.execute(
+                "ALTER TABLE tg_approvals ADD COLUMN IF NOT EXISTS report_chat_id     TEXT"
+            )
+            cur.execute(
+                "ALTER TABLE tg_approvals ADD COLUMN IF NOT EXISTS report_message_ids BIGINT[]"
+            )
+            cur.execute(
                 "CREATE INDEX IF NOT EXISTS tg_approvals_cleanup_idx "
                 "ON tg_approvals (server, status, expires_at)"
             )
@@ -182,15 +593,44 @@ def _now_ms() -> int:
 
 
 def create_tg_approval(manifest_id: str, chat_id: str, message_id: Optional[int],
-                        expires_at_ms: int) -> None:
+                        expires_at_ms: int,
+                        extra_message_ids: Optional[list[int]] = None) -> None:
+    """`message_id` — сообщение С КНОПКАМИ (последнее), `extra_message_ids` —
+    предшествующие куски того же плана. Разделение не косметическое: вебхук
+    gmail-mcp правит именно `message_id`, а reaper обязан прибрать все."""
     conn = _pg_pool.getconn()
     try:
         with conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO tg_approvals (manifest_id, server, chat_id, message_id, "
-                "status, created_at, expires_at) VALUES (%s, %s, %s, %s, 'PENDING', %s, %s)",
-                (manifest_id, "ticktick", chat_id, message_id, _now_ms(), expires_at_ms),
+                "status, created_at, expires_at, extra_message_ids) "
+                "VALUES (%s, %s, %s, %s, 'PENDING', %s, %s, %s)",
+                (manifest_id, "ticktick", chat_id, message_id, _now_ms(), expires_at_ms,
+                 list(extra_message_ids or [])),
             )
+    finally:
+        _pg_pool.putconn(conn)
+
+
+def record_report_messages(manifest_id: str, chat_id: str, message_ids: list[int]) -> None:
+    """Запоминает, куда и какими сообщениями ушёл отчёт. Фильтр
+    `server='ticktick'` обязателен — чужие строки этот сервер не правит
+    (manifest_id глобально уникален, но дисциплина одна на все шесть серверов).
+    Best-effort: отчёт УЖЕ доставлен, и неудачная запись в БД не должна
+    ронять вызывающего — она стоит ровно одного: reaper потом не найдёт эти
+    сообщения и они переживут TTL."""
+    if not store_ready():
+        return
+    conn = _pg_pool.getconn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE tg_approvals SET report_chat_id = %s, report_message_ids = %s "
+                "WHERE manifest_id = %s AND server = 'ticktick'",
+                (chat_id, list(message_ids or []), manifest_id),
+            )
+    except Exception as e:
+        logger.warning(f"TG: не смог записать report_message_ids для {manifest_id}: {e}")
     finally:
         _pg_pool.putconn(conn)
 
@@ -228,23 +668,29 @@ def notify_plan(cfg: TgApprovalConfig, manifest_id: str, preview_body: str,
     же контракт, что requireConsent's notifyPlan в TS."""
     if not store_ready():
         return False, "Postgres для TG-approval не настроен (CONSENT_DATABASE_URL)"
-    text = f"{md_to_telegram_html(_clip(preview_body))}\n\n{tool} · ticktick"
-    sent = _tg_call(cfg, "sendMessage", {
-        "chat_id": cfg.owner_chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "reply_markup": {
+    text = f"{preview_body}\n\n{tool} · ticktick"
+    ok, message_ids, err = send_message_chunked(
+        cfg, cfg.owner_chat_id, text,
+        reply_markup_on_last={
             "inline_keyboard": [[
                 {"text": "✅ Подтвердить", "callback_data": f"a:{manifest_id}"},
                 {"text": "🛑 Отклонить", "callback_data": f"r:{manifest_id}"},
             ]]
         },
-    })
-    if not sent.get("ok"):
-        return False, sent.get("description") or "Telegram sendMessage failed"
-    message_id = (sent.get("result") or {}).get("message_id")
+    )
+    if not ok:
+        # Обрубок плана без кнопок в чате опаснее, чем ничего: человек может
+        # принять его за полный и «подтвердить» в чате то, чего не видел.
+        # Поэтому уже доставленные куски убираем и честно проваливаем гейт.
+        for mid in message_ids:
+            delete_message(cfg, cfg.owner_chat_id, mid)
+        return False, err or "Telegram sendMessage failed"
+    # Кнопки — на ПОСЛЕДНЕМ сообщении, его id и есть «тот самый» message_id,
+    # с которым работает вебхук gmail-mcp; предыдущие куски идут в extra_*.
+    message_id = message_ids[-1] if message_ids else None
+    extra_ids = message_ids[:-1]
     expires_at = _now_ms() + cfg.ttl_s * 1000
-    create_tg_approval(manifest_id, cfg.owner_chat_id, message_id, expires_at)
+    create_tg_approval(manifest_id, cfg.owner_chat_id, message_id, expires_at, extra_ids)
     return True, ""
 
 
@@ -354,26 +800,159 @@ def try_auto_execute(
     return consume_manifest(manifest_id)
 
 
-def report_auto_execution_result(cfg: TgApprovalConfig, chat_id: str,
-                                  message_id: Optional[int], report_text: str) -> None:
-    """Отправляет ИТОГ исполнения В ТО ЖЕ сообщение Telegram, где были кнопки
-    (Максим, 2026-08-05: «нажал кнопку — сразу исполнилось, результат — сюда
-    же»). `editMessageText` заменяет и текст (план → отчёт), и `reply_markup`
-    (кнопки снимаются тем же вызовом — Telegram API позволяет одним запросом).
-    Best-effort: если чат/сообщение недоступны (человек стёр сообщение руками)
-    — не бросает, просто логирует; реальное исполнение УЖЕ произошло и не
-    должно откатываться из-за того, что отчёт некуда вписать."""
+# ─────────────── Отчёт в группу-архив + короткая сводка в личку ───────────────
+#
+# Разделение ролей (Максим, 2026-08-06): личка — это «пульт» (план, кнопки,
+# короткая сводка «сделано/не сделано»), а ПОЛНЫЙ отчёт живёт в отдельной
+# группе-архиве (у Максима — «MCP Отчёты», chat_id вида -100…, задаётся через
+# TG_REPORTS_CHAT_ID). Личка при этом ещё и подчищается по TTL (reap_expired),
+# а архив в группе остаётся.
+
+_VERDICT_HEADERS = {
+    "ok": "✅ Исполнено и подтверждено",
+    "partial": "⚠️ Исполнено частично",
+    "failed": "🛑 Ошибка исполнения",
+    "unverified": "⚠️ Исполнено, НО независимой перепроверкой не подтверждено",
+}
+
+
+def _owner_now_str() -> str:
+    """Время глазами владельца — America/Los_Angeles, никогда UTC."""
+    return datetime.now(_resolve_owner_tz()).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def post_report_to_group(cfg: TgApprovalConfig, manifest_id: str, report_md: str,
+                         *, tool: str, verdict: str) -> list[int]:
+    """Публикует ПОЛНЫЙ отчёт об исполнении в группу-архив и запоминает в БД,
+    куда он ушёл. Возвращает id доставленных сообщений ([] — не доставлено).
+
+    НИКОГДА не бросает: мутация в TickTick к этому моменту уже произошла, и
+    падение на отправке отчёта не должно превращаться в ошибку тула — иначе
+    вызывающий решит, что действие не выполнено, и повторит его."""
+    try:
+        chat_id = cfg.reports_chat_id or cfg.owner_chat_id
+        if not chat_id:
+            logger.warning("TG: некуда публиковать отчёт — ни TG_REPORTS_CHAT_ID, "
+                           "ни TG_OWNER_CHAT_ID не заданы")
+            return []
+        header = _VERDICT_HEADERS.get(verdict) or _VERDICT_HEADERS["unverified"]
+        text = (f"### {header}\n"
+                f"{tool} · `{manifest_id}` · {_owner_now_str()}\n\n"
+                f"{report_md}")
+        ok, message_ids, err = send_message_chunked(cfg, chat_id, text)
+        if not ok:
+            # Частичная доставка — не повод «забыть» id: их всё равно надо
+            # записать, иначе reaper не найдёт эти сообщения.
+            logger.warning(f"TG: отчёт по {manifest_id} доставлен не полностью "
+                           f"({len(message_ids)} сообщ.): {err}")
+        if message_ids:
+            record_report_messages(manifest_id, chat_id, message_ids)
+        return message_ids
+    except Exception as e:  # noqa: BLE001 — отчёт best-effort по определению
+        logger.warning(f"TG: не смог опубликовать отчёт по {manifest_id}: {e}")
+        return []
+
+
+def summarize_in_owner_chat(cfg: TgApprovalConfig, chat_id: str,
+                            message_id: Optional[int], short_md: str) -> None:
+    """Заменяет план в личке КОРОТКОЙ сводкой и снимает кнопки одним
+    `editMessageText` (Telegram позволяет менять текст и reply_markup вместе).
+    Текст сводки формирует вызывающий — здесь только транспорт.
+
+    Best-effort: если человек стёр сообщение руками или оно старше суток —
+    просто лог, исключений наружу нет (мутация уже произошла)."""
     if message_id is None:
-        logger.warning(f"TG auto-execute: messageId отсутствует, отчёт некуда "
-                       f"вписать (chat={chat_id})")
+        logger.warning(f"TG: message_id отсутствует, сводку некуда вписать "
+                       f"(chat={chat_id})")
         return
+    chunks = split_for_telegram(short_md)
+    if not chunks:
+        return
+    text = chunks[0]
+    if len(chunks) > 1:
+        # Сводка по контракту короткая; если вызывающий прислал длинную —
+        # обрезаем ЯВНО и говорим, где лежит полный текст.
+        text += "\n\n_(сводка сокращена — полный отчёт в группе)_"
     res = _tg_call(cfg, "editMessageText", {
         "chat_id": chat_id,
         "message_id": message_id,
-        "text": md_to_telegram_html(_clip(report_text)),
+        "text": md_to_telegram_html(text),
         "parse_mode": "HTML",
         "reply_markup": {"inline_keyboard": []},
     })
     if not res.get("ok"):
-        logger.warning(f"TG auto-execute: editMessageText failed for message "
-                       f"{message_id}: {res.get('description')}")
+        logger.warning(f"TG: editMessageText для сообщения {message_id} не удался: "
+                       f"{res.get('description')}")
+
+
+def report_auto_execution_result(cfg: TgApprovalConfig, chat_id: str,
+                                  message_id: Optional[int], report_text: str) -> None:
+    """DEPRECATED (2026-08-06): осталась только ради обратной совместимости с
+    существующими вызовами в server.py. Раньше вписывала ВЕСЬ отчёт в то же
+    сообщение с кнопками (и резала его на 3500 символах); теперь полный отчёт
+    уходит в группу через post_report_to_group(), а сюда идёт короткая сводка.
+    Новый код должен звать summarize_in_owner_chat() напрямую."""
+    summarize_in_owner_chat(cfg, chat_id, message_id, report_text)
+
+
+# ───────────────────────── TTL-уборка (reaper) ─────────────────────────
+
+def reap_expired(cfg: TgApprovalConfig) -> int:
+    """Удаляет из чата просроченные планы, по которым решения так и не приняли
+    (Максим: «не просто снятие кнопок, а полное удаление сообщения» — иначе в
+    личке копятся мёртвые планы, неотличимые с виду от живых).
+
+    Тонкости, за которые заплачено разбором чужого кода:
+      • Забираем строки атомарно одним `DELETE … RETURNING` — два тика поллера
+        (или два процесса) не смогут взять одну и ту же строку и удалить
+        сообщение дважды.
+      • Ловим не только 'PENDING', но и 'EXPIRED': sweep gmail-mcp не фильтрует
+        по `server` и мог уже перевести НАШУ строку PENDING→EXPIRED, сняв
+        кнопки, но САМО сообщение он в этом случае не удаляет — оно остаётся
+        висеть, и добить его обязаны мы.
+      • 'APPROVED'/'REJECTED' не трогаем СОЗНАТЕЛЬНО: кнопку нажали, значит
+        отчёт в группе — это архив состоявшегося решения, он должен жить; те
+        строки после TTL приберёт sweep gmail-mcp.
+    """
+    if not cfg.reap_enabled or not store_ready():
+        return 0
+    try:
+        conn = _pg_pool.getconn()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"TG reaper: нет соединения с Postgres: {e}")
+        return 0
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM tg_approvals
+                 WHERE server = 'ticktick'
+                   AND status IN ('PENDING', 'EXPIRED')
+                   AND expires_at <= %s
+                RETURNING manifest_id, chat_id, message_id, extra_message_ids,
+                          report_chat_id, report_message_ids
+                """,
+                (_now_ms(),),
+            )
+            rows = cur.fetchall()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"TG reaper: DELETE … RETURNING не удался: {e}")
+        return 0
+    finally:
+        _pg_pool.putconn(conn)
+
+    for row in rows:
+        manifest_id, chat_id, message_id, extra_ids, report_chat, report_ids = row
+        try:
+            targets = [(chat_id, message_id)] + [(chat_id, m) for m in (extra_ids or [])]
+            rchat = report_chat or chat_id
+            targets += [(rchat, m) for m in (report_ids or [])]
+            for tgt_chat, tgt_msg in targets:
+                if tgt_chat and tgt_msg is not None:
+                    delete_message(cfg, str(tgt_chat), tgt_msg)
+        except Exception as e:  # noqa: BLE001 — один битый манифест не должен
+            # оставить неубранными все остальные
+            logger.warning(f"TG reaper: уборка {manifest_id} прервалась: {e}")
+    if rows:
+        logger.info(f"TG reaper: прибрано просроченных манифестов: {len(rows)}")
+    return len(rows)
