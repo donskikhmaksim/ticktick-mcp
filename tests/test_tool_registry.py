@@ -8,12 +8,23 @@ import asyncio
 from ticktick_mcp.src import server
 
 
-def test_all_78_tools_registered():
+# 74 = 78 authored tools MINUS the 4 declutter tools (plan_declutter,
+# execute_declutter, resume_declutter, set_declutter_decision), whose
+# @mcp.tool() decorators are commented out on purpose — Maksim disabled the
+# declutter feature 2026-08-04/05 and it must stay disabled. The count was
+# left at 78 when that happened, so this test has been red on main ever
+# since; fixed here to the real number rather than silently ignored. Re-enabling
+# declutter means bumping this back to 78 in the same commit.
+_EXPECTED_TOOLS = 74
+
+
+def test_all_expected_tools_registered():
     tools = asyncio.run(server.mcp.list_tools())
-    assert len(tools) == 78, (
-        f"expected 78 registered @mcp.tool()s, got {len(tools)} — "
+    assert len(tools) == _EXPECTED_TOOLS, (
+        f"expected {_EXPECTED_TOOLS} registered @mcp.tool()s, got {len(tools)} — "
         "a decorator likely got glued to the previous line (grep for "
-        "'[^ ]@mcp\\.tool' in server.py)"
+        "'[^ ]@mcp\\.tool' in server.py), or a tool was added/removed without "
+        "updating _EXPECTED_TOOLS"
     )
 
 
