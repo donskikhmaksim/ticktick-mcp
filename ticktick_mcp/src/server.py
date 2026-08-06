@@ -1150,6 +1150,20 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
     to_verify = []  # (title, id, expected_pid, expected_col) — checked at the end
     sub_verify = []  # (title, id) of created SUBTASKS — existence re-checked too
 
+    # Один сброс кэша на весь вызов (не на каждую задачу): официальный API
+    # создания молча перекладывает задачу в Inbox, если переданный projectId
+    # не резолвится в ЖИВОЙ проект (битый/устаревший/удалённый id) — при
+    # этом приходит 200 с id задачи, то есть внешне это выглядит успехом,
+    # если не поймать это ЗДЕСЬ, до записи. Один invalidate + первый вызов
+    # _guard_project ниже форсируют один реальный перезапрос; остальные
+    # элементы того же батча переиспользуют это свежее состояние (оно ещё
+    # в пределах своего короткого TTL) вместо перезапроса на каждую задачу.
+    if ticktick_v2:
+        try:
+            ticktick_v2.invalidate_cache()
+        except Exception:
+            pass
+
     for i, t in enumerate(tasks):
         # Idempotent: a no-op if plan_task_creation already resolved these
         # (defends direct/headless callers that skip the plan phase).
@@ -1159,11 +1173,14 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
         if not title or not project_id:
             failed.append(f"#{i+1}: missing title or project_id")
             continue
-        # Destination guard: when the caller names the project, verify the id
-        # actually IS that project — a wrong id would file the task somewhere
-        # else entirely (the create-side twin of «не та задача»).
+        # Guard назначения, FAIL-CLOSED: project_id ОБЯЗАН резолвиться в
+        # живой проект — require_known=True отказывает, даже если вызывающий
+        # не передал project_name для сверки (обычный случай). Без этого
+        # нерезолвящийся id уходил прямиком в вызов создания, и бэкенд
+        # TickTick молча сбрасывал задачу в Inbox — баг доставки, который
+        # читается как чистый «✓ создано».
         exp_proj = t.get("project_name") or t.get("projectName") or ""
-        refuse = _guard_project(project_id, exp_proj)
+        refuse = _guard_project(project_id, exp_proj, require_known=True)
         if refuse:
             failed.append(f"#{i+1} «{title}»: {refuse}")
             continue
@@ -1512,8 +1529,16 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
             pending.append((i, t))
             continue
         pname = names.get(pid)
-        if names and pname is None:
-            refused.append(f"#{i} «{title}»: проект {pid} не найден")
+        if pname is None:
+            # FAIL-CLOSED: отказ всегда, когда id не резолвится в живой
+            # проект — в том числе когда сама карта `names` пустая (v2
+            # недоступен И v1-фолбэк тоже не сработал). Старое условие
+            # `if names and pname is None` пропускало эту проверку целиком
+            # на пустой карте — битый/устаревший project_id проходил план
+            # непроверенным и на execute уходил в Inbox без единого отказа.
+            reason = ("проект по id не найден" if names else
+                      "список проектов сейчас недоступен — сверить id нельзя")
+            refused.append(f"#{i} «{title}»: {pid} — {reason}")
             continue
         exp_name = t.get("project_name") or t.get("projectName") or ""
         if exp_name and pname and not _names_agree(exp_name, pname):
