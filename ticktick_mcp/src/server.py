@@ -8271,12 +8271,53 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
         return f"Error renaming tag: {str(e)}"
 
 
+def _describe_delete_tag(p: Dict) -> str:
+    return f'Удаляю тег «{p.get("name")}»'
+
+
 @mcp.tool()
-async def delete_tag(name: str) -> str:
-    """Delete a tag (requires v2 API). Tasks keep existing; they just lose the tag."""
+async def delete_tag(name: str, manifest_id: str = "", user_reply: str = "",
+                     automation_key: str = "") -> str:
+    """
+    Delete a tag (requires v2 API). Tasks keep existing; they just lose the
+    tag. Gated 🟡 (docs/DESIGN_approval_gate.md): two calls, same tool name —
+    nothing is deleted on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is deleted yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — name is ignored on this
+    call (the manifest's own stored value is used). Do NOT make call #2 in
+    the same turn as call #1.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
+    Args:
+        name: Tag name (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
+        manifest_id: from call #1's response — pass on call #2 to actually delete
+        user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+    """
     err = _ensure_ready()
     if err:
         return err
+    params = {"name": name}
+    outcome = _gate_single("delete_tag", "delete_tag",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_delete_tag,
+                           automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _delete_tag_impl(**outcome.extra)
+
+
+async def _delete_tag_impl(name: str) -> str:
+    """Pure mutation logic for delete_tag — no consent gate. Called only by
+    the gated delete_tag() above once the plan is approved."""
     try:
         existing = await _live_tag_names()
         if name.lower() not in existing:
@@ -8583,20 +8624,59 @@ async def _update_task_comment_impl(task_title: str, text: str, project_id: str,
         return f"Error updating comment: {str(e)}"
 
 
+def _describe_delete_task_comment(p: Dict) -> str:
+    return f'Удаляю комментарий на «{p.get("task_title")}»'
+
+
 @mcp.tool()
-async def delete_task_comment(task_title: str, project_id: str, task_id: str, comment_id: str) -> str:
+async def delete_task_comment(task_title: str, project_id: str, task_id: str,
+                              comment_id: str, manifest_id: str = "",
+                              user_reply: str = "", automation_key: str = "") -> str:
     """
-    Delete a task comment (requires v2 API).
+    Delete a task comment (requires v2 API). Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    deleted on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is deleted yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
 
     Args:
         task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         project_id: ID of the project
         task_id: ID of the task
         comment_id: ID of the comment to delete
+        manifest_id: from call #1's response — pass on call #2 to actually delete
+        user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
         return err
+    params = {"task_title": task_title, "project_id": project_id,
+              "task_id": task_id, "comment_id": comment_id}
+    outcome = _gate_single("delete_task_comment", "delete_task_comment",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_delete_task_comment,
+                           automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _delete_task_comment_impl(**outcome.extra)
+
+
+async def _delete_task_comment_impl(task_title: str, project_id: str,
+                                    task_id: str, comment_id: str) -> str:
+    """Pure mutation logic for delete_task_comment — no consent gate. Called
+    only by the gated delete_task_comment() above once the plan is approved."""
     try:
         g = _guard_task(task_id, task_title or "", project_id)
         if g.status == "unavailable":
