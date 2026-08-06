@@ -396,7 +396,7 @@ async def test_delete_project_unchanged_when_tg_off(monkeypatch, tmp_path):
     assert "Telegram" not in preview
     assert seen == []
 
-    out = await s.delete_project("Работа", "p1", user_reply="да")
+    await s.delete_project("Работа", "p1", user_reply="да")
     assert fake.deleted_ids == ["p1"]
     assert calls["n"] == 0
 
