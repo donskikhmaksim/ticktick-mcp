@@ -162,7 +162,7 @@ narrower fallback when v2 is off.
 |---|---|---|
 | Get / create / update / delete / complete **one** task or project, by id | v1 | The only thing guaranteed to survive a v2 outage |
 | Create a subtask under an existing task | v1 | `create_subtask` |
-| List/browse projects and a single project's tasks | v1 | `get_projects`, `get_project`, `get_project_tasks`, `get_task` |
+| List/browse projects and a single project's tasks | v1 (+ v2 for the Inbox) | `get_projects`, `get_project`, `get_project_tasks`, `get_task`. The official API has no Inbox at all, so the built-in Inbox is added to the listing from the v2 state and its id is served from v2 as well — without v2 the Inbox is simply absent, never faked |
 | List/filter across **all** open tasks (priority, due today/tomorrow/in N days/this week, overdue, search, recurring, GTD engaged/next) | v2 preferred, v1 fallback | v1 fallback works but is slower (one request per project) and omits the Inbox |
 | Batch create / update / complete (>1 task, no advanced fields) | v2, v1 fallback | Without v2 these degrade to one-at-a-time v1 calls — no tags/assignee/columns |
 | Tags, assignees, kanban columns/sections, nested subtask trees, `move_task`, `set_task_parent`/`unset_task_parent` | v2 only | No official-API equivalent exists |
