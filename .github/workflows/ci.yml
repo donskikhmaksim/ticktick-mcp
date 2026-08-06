@@ -59,3 +59,25 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck
           shellcheck scripts/*.sh
+
+      - name: Workflow files are parseable
+        # Не формальность: .github/workflows/sync-upstream.yml пролежал
+        # битым (перенос строки обратным слэшем разрывал блок `run: |`)
+        # с 2026-07-22 по 2026-08-06 — GitHub молча ронял КАЖДЫЙ запуск с
+        # "workflow file issue", и авто-обновление форков у самостоятельных
+        # деплойщиков не работало ни разу. Один разбор YAML это ловит сразу.
+        run: |
+          python3 -m pip install --quiet 'PyYAML>=6,<7'
+          python3 - <<'PY'
+          import pathlib, sys, yaml
+          bad = []
+          for p in sorted(pathlib.Path(".github/workflows").glob("*.y*ml")):
+              try:
+                  yaml.safe_load(p.read_text())
+              except yaml.YAMLError as e:
+                  bad.append(f"{p}: {e}")
+          if bad:
+              print("\n".join(bad))
+              sys.exit(1)
+          print("all workflow files parse")
+          PY
