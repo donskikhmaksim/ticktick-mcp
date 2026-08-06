@@ -32,6 +32,8 @@
 """
 
 
+import re
+
 import pytest
 
 import ticktick_mcp.src.server as s
@@ -114,6 +116,22 @@ def wired(monkeypatch, tmp_path):
     s._MANIFEST_TOMBSTONES.clear()
     manifest_store.close_store()
     tg._pg_pool = None
+
+
+_MID_RE = re.compile(r"Манифест `([0-9a-f]{6,})`")
+
+
+def _mid_of(text):
+    """id плана — ТОЛЬКО из текста ответа, как его видит сетевой клиент.
+
+    Раньше четыре теста ниже доставали id прямо из реестра планов в памяти
+    ЭТОГО процесса — путь, которого у клиента по HTTP нет и быть не может.
+    Такой тест остаётся зелёным, даже если план снаружи безымянный, и прямо
+    нарушает обещание в шапке файла: «ни одна проверка не смотрит на кухню
+    сервера»."""
+    m = _MID_RE.search(text)
+    assert m, f"в ответе нет id плана — снаружи его нечем назвать:\n{text}"
+    return m.group(1)
 
 
 @pytest.fixture
@@ -373,7 +391,7 @@ async def test_key_on_the_second_call_still_works_and_kills_the_plan(
     from ticktick_mcp.src import manifest_store
 
     preview = await s.create_tag(name="из-двух-шагов")
-    mid = next(iter(s._MANIFESTS))
+    mid = _mid_of(preview)
     assert mid in preview and _rows_in_tg_approvals() == ["PENDING"]
 
     out = await s.create_tag(name="из-двух-шагов", manifest_id=mid,
@@ -399,8 +417,8 @@ async def test_key_uses_the_stored_plan_not_the_second_call_arguments(
         wired, tag_spy):
     """No-swap: подменить содержимое между планом и исполнением нельзя даже
     с верным ключом — работают СОХРАНЁННЫЕ параметры плана."""
-    await s.create_tag(name="что-показали-человеку")
-    mid = next(iter(s._MANIFESTS))
+    preview = await s.create_tag(name="что-показали-человеку")
+    mid = _mid_of(preview)
 
     await s.create_tag(name="что-подсунули-потом", manifest_id=mid,
                        automation_key=s.SECRET)
@@ -452,8 +470,8 @@ async def test_chat_yes_alone_still_cannot_execute_a_telegram_plan(
     """Контрольный выстрел по главному страху: правка #118 НЕ должна была
     открыть текстовый путь. План ушёл в Telegram → «да» в чате по-прежнему
     ничего не исполняет (исполнит только нажатие кнопки, через поллер)."""
-    await s.create_tag(name="только-кнопкой")
-    mid = next(iter(s._MANIFESTS))
+    preview = await s.create_tag(name="только-кнопкой")
+    mid = _mid_of(preview)
 
     out = await s.create_tag(name="только-кнопкой", manifest_id=mid,
                              user_reply="да, давай")
@@ -466,8 +484,8 @@ async def test_chat_yes_alone_still_cannot_execute_a_telegram_plan(
 async def test_plan_row_stays_pending_after_a_refused_bad_key(wired, tag_spy):
     """Неверный ключ не должен ни исполнять, ни ломать уже созданный план:
     строка остаётся PENDING и живой ровно до решения человека."""
-    await s.create_tag(name="живой-план", automation_key="not-the-real-secret")
-    mid = next(iter(s._MANIFESTS))
+    preview = await s.create_tag(name="живой-план", automation_key="not-the-real-secret")
+    mid = _mid_of(preview)
 
     assert _rows_in_tg_approvals() == ["PENDING"]
     assert tag_spy == []

@@ -281,22 +281,38 @@ async def test_execute_task_creation_unknown_manifest_is_refused(monkeypatch):
 # ===========================================================================
 
 class _FakeV2Delete:
-    def __init__(self, live):
+    """`reject` — идентификаторы, которые TickTick отклонит ПОЭЛЕМЕНТНО.
+
+    Это не выдумка ради красоты: /batch/* отвечает HTTP 200 и складывает
+    отказы по отдельным задачам в карту `id2error` (см. `id2error_failures`),
+    то есть вызов «удался», а часть задач не тронута. Раньше все двойники
+    удаления возвращали пустой `{}` — отказать они не умели в принципе, и
+    ветка «TickTick отклонил N» была мертва во всём наборе: её можно было
+    выкинуть из сервера, не уронив ни одного теста, и молчаливый отказ
+    показывался бы человеку как «удалено»."""
+
+    def __init__(self, live, reject=()):
         self._live = live
+        self._reject = set(reject)
         self.deleted_ids = []
 
     def batch_delete_tasks(self, items):
+        errors = {}
         for it in items:
-            self._live.pop(it["taskId"], None)
-            self.deleted_ids.append(it["taskId"])
-        return {}
+            tid = it["taskId"]
+            if tid in self._reject:
+                errors[tid] = "exceed_quota"
+                continue
+            self._live.pop(tid, None)
+            self.deleted_ids.append(tid)
+        return {"id2etag": {}, "id2error": errors}
 
 
-def _wire_delete_tasks(monkeypatch, live, tmp_path=None):
+def _wire_delete_tasks(monkeypatch, live, tmp_path=None, reject=()):
     monkeypatch.setattr(s, "_ensure_ready", lambda: None)
     monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: dict(live))
     monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Покупки"})
-    fake = _FakeV2Delete(live)
+    fake = _FakeV2Delete(live, reject=reject)
     monkeypatch.setattr(s, "ticktick_v2", fake)
     if tmp_path is not None:
         monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
@@ -467,3 +483,65 @@ async def test_rename_tag_merge_with_genuine_consent_succeeds(monkeypatch):
     result = await s.rename_tag("a", "b", allow_merge=True, user_reply="да, сливай")
     assert "renamed" in result
     assert fake._names == ["b"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Боевой дефолт паузы: тестовая фикстура его глушит — значит проверяем отдельно
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_the_production_default_of_the_consent_gap_is_not_zero():
+    """`tests/conftest.py` ставит `MIN_CONSENT_GAP=0` на ВСЮ сессию: юнит-тесты
+    строят план и подтверждают его за микросекунды, и настоящая пауза мешала
+    бы им. Плата за это — боевой дефолт не проверен нигде: обнули его в
+    `server.py`, и весь пакет останется зелёным, а защита от «модель выдала
+    план и „да“ в одном ходу» исчезнет.
+
+    Поэтому дефолт читается из ИСХОДНИКА, а не из уже вычисленного значения
+    (в этом процессе оно равно нулю по вине фикстуры) — обещание в шапке
+    conftest.py («отдельный тест возвращает положительное значение») наконец
+    выполняется."""
+    import ast
+    import pathlib
+
+    src = pathlib.Path(s.__file__).read_text(encoding="utf-8")
+    defaults = []
+    for node in ast.walk(ast.parse(src)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"):
+            continue
+        args = node.args
+        if len(args) == 2 and isinstance(args[0], ast.Constant) \
+                and args[0].value == "MIN_CONSENT_GAP" \
+                and isinstance(args[1], ast.Constant):
+            defaults.append(args[1].value)
+
+    assert defaults, "не нашёл дефолт MIN_CONSENT_GAP в server.py"
+    for value in defaults:
+        assert float(value) > 0, (
+            f"боевой дефолт паузы согласия равен {value!r} — самоподтверждение "
+            "в один ход перестанет отсекаться")
+
+
+async def test_delete_reports_a_per_item_rejection_instead_of_success(
+        monkeypatch, tmp_path):
+    """TickTick ответил HTTP 200, но задачу не удалил (`id2error`). Отчёт
+    обязан назвать это отказом, а не молча посчитать задачу удалённой.
+
+    До этого теста ни один двойник пакетных вызовов не умел отказывать, и
+    разбор `id2error` можно было выкинуть из сервера, не уронив ничего."""
+    live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
+    fake = _wire_delete_tasks(monkeypatch, live, tmp_path, reject=["t1"])
+
+    preview = await s.delete_tasks(
+        "⚠️ Удаляю «Купить молоко»",
+        [{"taskId": "t1", "title": "Купить молоко", "projectId": "p1"}])
+    mid = _extract_manifest_id(preview)
+
+    result = await s.delete_tasks("⚠️ Удаляю «Купить молоко»", manifest_id=mid,
+                                  user_reply="да, удаляй")
+
+    assert fake.deleted_ids == []
+    assert "t1" in live, "отклонённая задача обязана остаться на месте"
+    assert "отклонил" in result, f"поэлементный отказ не показан:\n{result}"
+    assert "Удалено 1" not in result, (
+        f"отклонённая задача посчитана удалённой:\n{result}")

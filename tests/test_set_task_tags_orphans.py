@@ -58,12 +58,19 @@ class _FakeTagsV2:
         return self.tags
 
     def create_tag(self, name, color=None):
-        bare = name.lstrip("#").lower()
-        self.calls.append(("create_tag", bare))
-        if bare in self.poison_tags:
+        """Двойник настоящего TickTickV2Client.create_tag: он приводит имя к
+        нижнему регистру и НЕ срезает решётку — срезать её обязан вызывающий.
+
+        Раньше двойник делал `name.lstrip("#").lower()`, то есть брал на себя
+        работу сервера: убери нормализацию из server.py — и тесты остались бы
+        зелёными, а в TickTick уехал бы тег-фантом «#работа» (по решётке они
+        не совпадают, и такой тег не виден в списке и не удаляется)."""
+        stored = name.lower()
+        self.calls.append(("create_tag", stored))
+        if stored in self.poison_tags:
             return {}  # "succeeds" but never actually registers
-        if not any((t.get("name") or "").lower() == bare for t in self.tags):
-            self.tags.append({"name": bare, "label": name, "color": color})
+        if not any((t.get("name") or "").lower() == stored for t in self.tags):
+            self.tags.append({"name": stored, "label": name, "color": color})
         return {}
 
     def batch_update_tasks(self, changes):
@@ -221,3 +228,30 @@ async def test_task_write_mismatch_after_registration_is_reported_as_failure(mon
     # live tags never actually changed.
     assert "❌" in result
     assert live["t1"]["tags"] == []
+
+
+async def test_hash_and_case_are_normalised_by_the_server_not_by_the_double(
+        monkeypatch):
+    """Ни один тест файла не подавал тег с решёткой или заглавной буквой —
+    все входы («новый», «дом») уже были нормализованы руками. Нормализацию
+    при этом делал ещё и двойник, так что убери её из server.py — и всё
+    осталось бы зелёным, а в TickTick уехал бы тег-фантом «#работа»:
+    в списке тегов он не виден, через delete_tag не удаляется, а на задаче
+    висит."""
+    live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1",
+                   "tags": []}}
+    fake = _wire(monkeypatch, live, tags=[])
+
+    preview = await s.set_task_tags(
+        "Ставлю тег",
+        [{"taskId": "t1", "title": "Купить молоко", "tags": ["#Работа"]}])
+    mid = _extract_manifest_id(preview)
+    await s.set_task_tags("Ставлю тег", manifest_id=mid, user_reply="да")
+
+    registered = [c[1] for c in fake.calls if c[0] == "create_tag"]
+    assert registered == ["работа"], (
+        f"в аккаунт зарегистрирован тег-фантом: {registered}")
+    written = [c[1] for c in fake.calls if c[0] == "update"]
+    assert written and written[0][0]["tags"] == ["работа"], (
+        f"на задачу записан ненормализованный тег: {written}")
+    assert [t["name"] for t in fake.tags] == ["работа"]

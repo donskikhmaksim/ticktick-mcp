@@ -23,6 +23,8 @@ re-tested here; `_guard_task`/`_guard_project` are monkeypatched to a plain
 No real network — the v2/official clients are faked."""
 import re
 
+import pytest
+
 import ticktick_mcp.src.server as s
 
 
@@ -84,10 +86,23 @@ class FakeV2:
         return {}
 
     def move_project_to_group(self, project_id, group_id):
+        """Записывает РОВНО то, что передал вызывающий.
+
+        Раньше здесь стояло `None if group_id == "NONE" else group_id`, то
+        есть двойник САМ делал нормализацию, которую обязан делать клиент. На
+        этом и держался баг #100: клиент отправлял в TickTick буквальную
+        строку "NONE", группы с таким id не существует, разгруппировка не
+        срабатывала НИКОГДА — а тест был зелёный, потому что контракт из
+        докстринга соблюдал только фейк.
+
+        Семантику самой разгруппировки проверять здесь нечем (двойник стоит
+        НА МЕСТЕ клиента, то есть ниже того слоя, где она живёт) — она
+        проверяется сквозным тестом через настоящий клиент в
+        tests/test_silent_failures.py."""
         self.calls.append(("move_group", project_id, group_id))
         for p in self.projects:
             if p.get("id") == project_id:
-                p["groupId"] = None if group_id == "NONE" else group_id
+                p["groupId"] = group_id
 
     def list_projects(self):
         return list(self.projects)
@@ -133,13 +148,51 @@ class FakeV2:
 
 
 class FakeOfficial:
-    def __init__(self):
+    """Двойник официального клиента.
+
+    `live` — то же изменяемое состояние, что у FakeV2: созданная подзадача
+    обязана стать ВИДНОЙ среди открытых задач, иначе настоящий post-verify
+    вернёт «❌ Создание НЕ подтвердилось». Раньше двойник её никуда не
+    записывал, и «успешный» тест этого тула был зелёным на явном отказе —
+    критерий `"🛑" not in result` к post-verify нечувствителен.
+
+    `project_id` пишется в журнал вызовов намеренно: именно он решает, в
+    каком списке окажется подзадача, и без него подмена проекта была
+    ненаблюдаемой.
+    """
+
+    def __init__(self, live=None):
         self.calls = []
+        self.live = live if live is not None else {}
 
     def create_subtask(self, subtask_title, parent_task_id, project_id,
                        content=None, priority=0):
-        self.calls.append(("create_subtask", subtask_title, parent_task_id))
-        return {"id": "sub1", "title": subtask_title}
+        self.calls.append(("create_subtask", subtask_title, parent_task_id,
+                           project_id))
+        task = {"id": "sub1", "title": subtask_title, "projectId": project_id,
+                "parentId": parent_task_id}
+        self.live[task["id"]] = task
+        return dict(task)
+
+
+def _assert_confirmed_success(result: str):
+    """Критерий успеха для тулов этого файла.
+
+    Раньше здесь стояло `assert "🛑" not in result`, и это НЕ проверка успеха:
+    отказ гейта печатается через 🛑, а провал ПОСЛЕДУЮЩЕЙ проверки факта —
+    через ❌ («создал, но среди открытых задач не вижу»). Тест оставался
+    зелёным ровно на том исходе, ради которого post-verify и написан, — и
+    один из тулов файла (create_subtask) в этом состоянии и находился: его
+    «успешный» прогон возвращал «❌ Создание НЕ подтвердилось».
+
+    Требуется явный след ПЕРЕЧИТАННОГО факта («проверено»/✅), а не молчание.
+    ⚠️ не запрещается: у некоторых тулов это информационная приписка про
+    границы операции (что именно не переносится в копию), а не отказ."""
+    assert "🛑" not in result, result
+    assert "❌" not in result, f"post-verify не подтвердил операцию:\n{result}"
+    assert "провер" in result.lower() or "✅" in result, (
+        f"в ответе нет следа перечитанного факта — операция объявлена "
+        f"успешной без подтверждения:\n{result}")
 
 
 def _wire(monkeypatch, fake_v2=None, fake_official=None, guard_task=True,
@@ -159,8 +212,13 @@ def _wire(monkeypatch, fake_v2=None, fake_official=None, guard_task=True,
 # ===========================================================================
 
 async def test_create_subtask_full_gate_cycle(monkeypatch):
-    official = FakeOfficial()
-    fake_v2 = FakeV2(live={"p1": {"id": "p1", "title": "Купить молоко", "projectId": "p1"}})
+    # ОДНО состояние на оба клиента: подзадачу создаёт официальный клиент, а
+    # перечитывает её post-verify через v2. Пока состояния были разными,
+    # созданная подзадача не появлялась среди открытых, и «успешный» прогон
+    # возвращал «❌ Создание НЕ подтвердилось» — при зелёном тесте.
+    live = {"p1": {"id": "p1", "title": "Купить молоко", "projectId": "p1"}}
+    official = FakeOfficial(live=live)
+    fake_v2 = FakeV2(live=live)
     _wire(monkeypatch, fake_v2=fake_v2, fake_official=official)
 
     preview = await s.create_subtask("Купить молоко", "Купить хлеб", "p1", "proj1")
@@ -176,13 +234,41 @@ async def test_create_subtask_full_gate_cycle(monkeypatch):
 
     result = await s.create_subtask("Купить молоко", "Купить хлеб", "p1", "proj1",
                                      manifest_id=mid, user_reply="да")
-    assert official.calls == [("create_subtask", "Купить хлеб", "p1")]
-    assert "🛑" not in result
+    # Проект назначения — часть ожидания: именно он решает, в каком списке
+    # окажется подзадача, и без него подмена проекта была ненаблюдаемой.
+    assert official.calls == [("create_subtask", "Купить хлеб", "p1", "p1")]
+    _assert_confirmed_success(result)
 
     again = await s.create_subtask("Купить молоко", "Купить хлеб", "p1", "proj1",
                                     manifest_id=mid, user_reply="да")
     assert "🛑" in again
     assert len(official.calls) == 1
+
+
+async def test_create_subtask_reports_a_silent_refusal_instead_of_success(
+        monkeypatch):
+    """Молчаливый отказ TickTick: HTTP 200 с id, но задачи в списке открытых
+    нет. Тул обязан сказать «НЕ подтвердилось», а не рапортовать успех.
+
+    Тест новый: раньше двойник вообще не умел «создать» задачу так, чтобы её
+    было видно, поэтому ЛЮБОЙ прогон возвращал этот самый отказ — и различить
+    молчаливый провал от нормального успеха было нечем."""
+    live = {"p1": {"id": "p1", "title": "Купить молоко", "projectId": "p1"}}
+    official = FakeOfficial(live=live)
+    # ответ есть, эффекта нет — ровно то, что делает молчаливый отказ
+    official.create_subtask = lambda subtask_title, parent_task_id, project_id, \
+        content=None, priority=0: {"id": "sub1", "title": subtask_title}
+    fake_v2 = FakeV2(live=live)
+    _wire(monkeypatch, fake_v2=fake_v2, fake_official=official)
+
+    preview = await s.create_subtask("Купить молоко", "Купить хлеб", "p1", "proj1")
+    mid = _extract_manifest_id(preview)
+
+    result = await s.create_subtask("Купить молоко", "Купить хлеб", "p1", "proj1",
+                                    manifest_id=mid, user_reply="да")
+
+    assert "❌" in result, f"молчаливый отказ выдан за успех:\n{result}"
+    assert "НЕ подтвердилось" in result
 
 
 async def test_create_subtask_invalid_priority_refused_before_gate(monkeypatch):
@@ -232,7 +318,7 @@ async def test_unset_task_parent_confirmed_detaches(monkeypatch):
     result = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1",
                                        manifest_id=mid, user_reply="да")
     assert ("unset_parent", "c") in fake_v2.calls
-    assert "🛑" not in result
+    _assert_confirmed_success(result)
 
 
 # ===========================================================================
@@ -253,7 +339,7 @@ async def test_create_project_group_full_gate_cycle(monkeypatch):
 
     result = await s.create_project_group("Личное", manifest_id=mid, user_reply="да")
     assert ("create_group", "Личное") in fake_v2.calls
-    assert "🛑" not in result
+    _assert_confirmed_success(result)
 
     again = await s.create_project_group("Личное", manifest_id=mid, user_reply="да")
     assert "🛑" in again
@@ -274,7 +360,7 @@ async def test_delete_project_group_full_gate_cycle(monkeypatch):
     result = await s.delete_project_group("Личное", "g1", manifest_id=mid, user_reply="да")
     assert ("delete_group", "g1") in fake_v2.calls
     assert not any(g["id"] == "g1" for g in fake_v2.groups)
-    assert "🛑" not in result
+    _assert_confirmed_success(result)
 
 
 async def test_delete_project_group_unknown_manifest_refused(monkeypatch):
@@ -304,7 +390,7 @@ async def test_move_project_to_group_full_gate_cycle(monkeypatch):
                                            manifest_id=mid, user_reply="да")
     assert ("move_group", "p1", "g1") in fake_v2.calls
     assert fake_v2.projects[0]["groupId"] == "g1"
-    assert "🛑" not in result
+    _assert_confirmed_success(result)
 
 
 # ===========================================================================
@@ -327,7 +413,34 @@ async def test_add_task_comment_full_gate_cycle(monkeypatch):
     result = await s.add_task_comment("Купить молоко", "не забыть", "p1", "t1",
                                       manifest_id=mid, user_reply="да")
     assert ("add_comment", "t1", "не забыть") in fake_v2.calls
-    assert "🛑" not in result
+    # ВНИМАНИЕ: критерий здесь слабее, чем у соседних тулов, и это не небрежность
+    # теста, а факт про сам тул: `_add_task_comment_impl` не перечитывает
+    # комментарии после записи, поэтому подтверждать нечем. Строгий критерий
+    # означал бы, что тест утверждает больше, чем сервер проверил.
+    assert "🛑" not in result and "❌" not in result, result
+
+
+@pytest.mark.skip(reason="НЕ РЕАЛИЗОВАНО: add_task_comment не перечитывает "
+                         "комментарии после записи, поэтому «Comment added» — "
+                         "это эхо запроса, а не подтверждённый факт. Молчаливый "
+                         "отказ TickTick (HTTP 200 + пустой результат) тул "
+                         "объявит успехом. Добавление post-verify меняет "
+                         "поведение инструмента — решение владельца, а не "
+                         "правка теста.")
+async def test_add_task_comment_confirms_the_comment_is_really_there(monkeypatch):
+    fake_v2 = FakeV2(live={"t1": {"id": "t1", "title": "Купить молоко",
+                                 "projectId": "p1"}})
+    _wire(monkeypatch, fake_v2=fake_v2)
+    # двойник, который «принял» запись, но ничего не сохранил — ровно то, чем
+    # TickTick отвечает при молчаливом отказе
+    fake_v2.add_task_comment = lambda project_id, task_id, text: None
+
+    preview = await s.add_task_comment("Купить молоко", "не забыть", "p1", "t1")
+    mid = _extract_manifest_id(preview)
+    result = await s.add_task_comment("Купить молоко", "не забыть", "p1", "t1",
+                                      manifest_id=mid, user_reply="да")
+
+    assert "❌" in result or "⚠️" in result
 
 
 # ===========================================================================
@@ -347,7 +460,7 @@ async def test_attach_file_to_task_full_gate_cycle(monkeypatch):
                                          url="https://x/file.pdf",
                                          manifest_id=mid, user_reply="да")
     assert ("attach", "t1") in fake_v2.calls
-    assert "🛑" not in result
+    _assert_confirmed_success(result)
 
 
 async def test_attach_file_to_task_missing_source_refused_before_gate(monkeypatch):
@@ -372,7 +485,7 @@ async def test_create_tag_full_gate_cycle(monkeypatch):
 
     result = await s.create_tag("срочное", manifest_id=mid, user_reply="да")
     assert ("create_tag", "срочное") in fake_v2.calls
-    assert "🛑" not in result
+    _assert_confirmed_success(result)
 
     again = await s.create_tag("срочное", manifest_id=mid, user_reply="да")
     assert "🛑" in again
@@ -394,7 +507,7 @@ async def test_duplicate_task_full_gate_cycle(monkeypatch):
                                     manifest_id=mid, user_reply="да")
     assert ("duplicate", "t1") in fake_v2.calls
     assert "t1-copy" in fake_v2.live
-    assert "🛑" not in result
+    _assert_confirmed_success(result)
 
 
 # ===========================================================================
@@ -414,4 +527,4 @@ async def test_update_task_comment_full_gate_cycle(monkeypatch):
                                          manifest_id=mid, user_reply="да")
     assert ("update_comment", "c1", "новый текст") in fake_v2.calls
     assert fake_v2.comments["t1"][0]["title"] == "новый текст"
-    assert "🛑" not in result
+    _assert_confirmed_success(result)

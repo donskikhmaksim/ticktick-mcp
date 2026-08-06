@@ -67,9 +67,11 @@ class _FakeV2:
         return self.tags
 
     def create_tag(self, name, color=None):
+        # Как настоящий клиент: только нижний регистр. Решётку обязан срезать
+        # вызывающий (server.py) — двойник за него этого не делает, иначе не
+        # заметил бы, что нормализация из сервера исчезла.
         self.calls.append(("create_tag", name))
-        self.tags.append({"name": name.lstrip("#").lower(), "label": name,
-                          "color": color})
+        self.tags.append({"name": name.lower(), "label": name, "color": color})
         return {}
 
     def batch_update_tasks(self, changes):

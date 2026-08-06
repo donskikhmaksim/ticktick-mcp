@@ -528,8 +528,12 @@ async def test_delete_project_is_button_only_and_the_poller_executes_it(
     _tg_on(monkeypatch)
     _notify_ok(monkeypatch)
 
-    await s.delete_project("Работа", "p1")             # фаза плана
-    mid = next(i for i, m in s._MANIFESTS.items() if m.get("kind") == "delete_project")
+    preview = await s.delete_project("Работа", "p1")   # фаза плана
+    # id берём из ТЕКСТА ответа — как сетевой клиент. Раньше здесь стояло
+    # `next(i for i, m in s._MANIFESTS.items() ...)`: id доставался из памяти
+    # процесса, поэтому тест остался бы зелёным, даже если бы план снаружи
+    # был безымянным (именно так дыра и прожила незамеченной).
+    mid = _mid_of(preview)
     assert s._MANIFESTS[mid]["tg_notified"] is True
 
     _verdict(monkeypatch, "approved")
@@ -578,9 +582,8 @@ async def test_rename_tag_merge_is_button_only_and_the_poller_executes_it(
     _tg_on(monkeypatch)
     _notify_ok(monkeypatch)
 
-    await s.rename_tag("a", "b", allow_merge=True)     # фаза плана
-    mid = next(i for i, m in s._MANIFESTS.items()
-               if m.get("kind") == "rename_tag_merge")
+    preview = await s.rename_tag("a", "b", allow_merge=True)   # фаза плана
+    mid = _mid_of(preview)                                     # как сетевой клиент
     _verdict(monkeypatch, "approved")
 
     out = await s.rename_tag("a", "b", allow_merge=True, user_reply="да, сливай")

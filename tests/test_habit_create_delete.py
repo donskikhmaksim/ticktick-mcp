@@ -63,8 +63,21 @@ class FakeHabitsV2:
         return [dict(h) for h in self._habits]
 
     # --- запись ---
-    def create_habit(self, name, **kwargs):
-        self.create_calls.append({"name": name, **kwargs})
+    # Сигнатура — ДОСЛОВНАЯ копия TickTickV2Client.create_habit, а не
+    # `**kwargs`. Разница принципиальная: `**kwargs` проглатывает что угодно,
+    # поэтому двойник не может заметить ни опечатку в имени параметра, ни
+    # пропущенное поле — а живой клиент на опечатке упал бы с TypeError, и
+    # пропущенное поле уехало бы в TickTick значением по умолчанию.
+    def create_habit(self, name, *, goal=1.0, step=0.0, unit="Count",
+                     habit_type="Boolean",
+                     repeat_rule="RRULE:FREQ=DAILY;INTERVAL=1",
+                     section="morning", color="#97E38B",
+                     icon="habit_daily_check_in", encouragement=""):
+        self.create_calls.append({
+            "name": name, "goal": goal, "step": step, "unit": unit,
+            "habit_type": habit_type, "repeat_rule": repeat_rule,
+            "section": section, "color": color, "icon": icon,
+            "encouragement": encouragement})
         if self._write_effect == "rejected":
             raise RuntimeError("habit limit reached")
         hid = f"new{len(self.create_calls)}"
@@ -72,10 +85,8 @@ class FakeHabitsV2:
             return hid
         stored = name if self._write_effect != "renamed" else name + " (копия)"
         self._habits.append({
-            "id": hid, "name": stored, "goal": kwargs.get("goal", 1.0),
-            "unit": kwargs.get("unit", "Count"),
-            "type": kwargs.get("habit_type", "Boolean"),
-            "repeatRule": kwargs.get("repeat_rule", ""), "totalCheckIns": 0,
+            "id": hid, "name": stored, "goal": goal, "unit": unit,
+            "type": habit_type, "repeatRule": repeat_rule, "totalCheckIns": 0,
         })
         return hid
 
@@ -145,6 +156,23 @@ async def test_create_habit_success_is_post_verified(monkeypatch):
     assert len(fake.create_calls) == 1
     # одно чтение до записи (защита от близнеца) + ОТДЕЛЬНОЕ свежее после
     assert fake.get_habits_calls == 2
+
+
+@pytest.mark.skip(reason="НЕ ПРОВЕРЕНО ЖИВЬЁМ: сервер не передаёт `step`, и "
+                         "количественная привычка уезжает в TickTick с "
+                         "step=0.0. Правильное значение и последствия нуля "
+                         "(ломается ли шаг отметки в приложении) можно узнать "
+                         "только запросом к настоящему TickTick — чинить "
+                         "вслепую нельзя. Пропуск честнее зелёного теста.")
+async def test_quantitative_habit_gets_a_usable_increment_step(monkeypatch):
+    """Двойник больше не прячет этот пробел: с дословной сигнатурой видно, что
+    `step` до клиента не доходит вовсе. Раньше `**kwargs` проглатывал факт."""
+    fake = FakeHabitsV2(HABITS)
+    _wire(monkeypatch, fake)
+
+    await _create(name="Вода", goal=8, unit="ml", habit_type="quantitative")
+
+    assert fake.create_calls[0]["step"] > 0
 
 
 async def test_create_habit_passes_through_quantitative_params(monkeypatch):

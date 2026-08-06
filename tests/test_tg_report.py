@@ -11,6 +11,7 @@ fallback'ом и уборка по TTL.
 пропадёт молча.
 """
 import random
+import re
 
 import pytest
 
@@ -236,8 +237,21 @@ def test_real_report_symbols_produce_valid_html():
 # send_message_chunked — кнопки, plain-fallback, 429
 # ===========================================================================
 
+def _visible_len(html_text: str) -> int:
+    """Длина так, как её считает Telegram: разметочные теги превращаются в
+    entities и в лимит 4096 не входят, входит видимый текст."""
+    return len(re.sub(r"<[^>]+>", "", html_text))
+
+
 class _FakeTelegram:
-    """Записывает тела запросов и отдаёт заранее заданные ответы."""
+    """Записывает тела запросов и отдаёт заранее заданные ответы.
+
+    Единственное, в чём двойник обязан быть НЕ добрее живого Bot API: длина.
+    Раньше он принимал `editMessageText`/`sendMessage` любого размера, и
+    поэтому весь расчёт бюджета сводки (резерв под приписку «сводка
+    сокращена») держался ни на чём — его можно было выкинуть, оставив пакет
+    зелёным, и вернуть ровно тот инцидент, ради которого он написан: 400 →
+    сводки нет → кнопки на исполненном плане висят дальше."""
 
     def __init__(self, responses=None):
         self.bodies = []
@@ -246,12 +260,142 @@ class _FakeTelegram:
 
     def __call__(self, cfg, method, body):
         self.bodies.append((method, body))
+        text = body.get("text")
+        if isinstance(text, str) and _visible_len(text) > tg.TELEGRAM_TEXT_LIMIT:
+            return {"ok": False, "error_code": 400, "parameters": {},
+                    "description": "Bad Request: message is too long"}
         if self.responses:
             res = self.responses.pop(0)
             if res is not None:
                 return res
         self._next_id += 1
         return {"ok": True, "result": {"message_id": self._next_id}}
+
+
+# ===========================================================================
+# approval_status_of — единственная формула вердикта кнопки
+# ===========================================================================
+#
+# Прямых тестов у неё не было вовсе: чат-путь во всех файлах подменяет
+# `check_approval` готовой строкой, а поллеру подавали только APPROVED и
+# PENDING. То есть «нажал 🛑» как СТРОКА БАЗЫ не превращалась в вердикт ни в
+# одном тесте — при том что это единственное, что отделяет отказ владельца от
+# исполнения.
+
+def test_approval_status_of_classifies_every_row_shape():
+    now = tg._now_ms()
+    future, past = now + 3_600_000, now - 1
+
+    assert tg.approval_status_of(None) == "none"
+    assert tg.approval_status_of(
+        {"status": "APPROVED", "expires_at": future}) == "approved"
+    assert tg.approval_status_of(
+        {"status": "REJECTED", "expires_at": future}) == "rejected"
+    assert tg.approval_status_of(
+        {"status": "PENDING", "expires_at": future}) == "pending"
+    # TTL истёк — «как будто не спрашивали», гейт закрыт
+    assert tg.approval_status_of(
+        {"status": "PENDING", "expires_at": past}) == "none"
+    # решение владельца НЕ протухает вместе с TTL: отказ остаётся отказом
+    assert tg.approval_status_of(
+        {"status": "REJECTED", "expires_at": past}) == "rejected"
+    assert tg.approval_status_of(
+        {"status": "APPROVED", "expires_at": past}) == "approved"
+
+
+# ===========================================================================
+# _tg_call — разбор ответа живого Bot API
+# ===========================================================================
+#
+# До 2026-08-06 эта функция не исполнялась НИ ОДНИМ тестом: во всех файлах она
+# подменялась двойником, который возвращал уже разобранный словарь. То есть
+# весь пакет проверял контракт, который сам же и выдумывал, а код, который
+# этот контракт обязан произвести из сырого ответа Telegram, не проверялся
+# нигде. Убери из `_tg_call` `error_code`/`parameters` — и 429 перестанет
+# распознаваться (`_retry_after_s`), а 400 «ok:false» при HTTP 200 начнёт
+# читаться как успешная доставка. Оба следствия молчаливые.
+
+class _FakeHTTPResponse:
+    def __init__(self, payload, status_ok=True):
+        self._payload = payload
+        self.ok = status_ok
+
+    def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+def _patch_post(monkeypatch, response):
+    seen = {}
+
+    def fake_post(url, json=None, timeout=None):
+        seen.update(url=url, body=json, timeout=timeout)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(tg.requests, "post", fake_post)
+    return seen
+
+
+def test_tg_call_builds_the_bot_url_and_returns_the_result(monkeypatch):
+    seen = _patch_post(monkeypatch, _FakeHTTPResponse(
+        {"ok": True, "result": {"message_id": 42}}))
+
+    res = tg._tg_call(_cfg(), "sendMessage", {"chat_id": "111", "text": "hi"})
+
+    assert seen["url"] == f"{tg.TELEGRAM_API}/botfaketoken/sendMessage"
+    assert seen["body"] == {"chat_id": "111", "text": "hi"}
+    assert seen["timeout"] == tg.TG_TIMEOUT_S
+    assert res["ok"] is True and res["result"] == {"message_id": 42}
+
+
+def test_tg_call_passes_429_through_so_the_retry_can_read_it(monkeypatch):
+    """429 узнаётся ТОЛЬКО по error_code/parameters. Потеряются здесь —
+    длинный отчёт молча оборвётся на середине."""
+    _patch_post(monkeypatch, _FakeHTTPResponse(
+        {"ok": False, "error_code": 429, "description": "Too Many Requests",
+         "parameters": {"retry_after": 37}}, status_ok=False))
+
+    res = tg._tg_call(_cfg(), "sendMessage", {})
+
+    assert res["ok"] is False
+    assert res["error_code"] == 429
+    assert res["parameters"] == {"retry_after": 37}
+    assert tg._retry_after_s(res) == 37
+
+
+def test_tg_call_keeps_the_parse_error_description(monkeypatch):
+    """По этому описанию `send_message_chunked` решает повторить кусок без
+    parse_mode. Стереть description — и сообщение потеряется навсегда."""
+    _patch_post(monkeypatch, _FakeHTTPResponse(
+        {"ok": False, "error_code": 400,
+         "description": "Bad Request: can't parse entities: Unsupported start tag"},
+        status_ok=False))
+
+    res = tg._tg_call(_cfg(), "sendMessage", {})
+
+    assert res["ok"] is False and tg._is_parse_error(res) is True
+
+
+def test_tg_call_does_not_call_an_http_error_a_success(monkeypatch):
+    """HTTP 500 при формально «ok»-теле — не доставка. Проверяется именно
+    `and res.ok`: без него сообщение считалось бы ушедшим."""
+    _patch_post(monkeypatch, _FakeHTTPResponse(
+        {"ok": True, "result": {"message_id": 7}}, status_ok=False))
+
+    assert tg._tg_call(_cfg(), "sendMessage", {})["ok"] is False
+
+
+def test_tg_call_survives_a_broken_body_and_a_dead_network(monkeypatch):
+    _patch_post(monkeypatch, _FakeHTTPResponse(ValueError("не JSON")))
+    res = tg._tg_call(_cfg(), "sendMessage", {})
+    assert res["ok"] is False and "не JSON" in res["description"]
+
+    _patch_post(monkeypatch, RuntimeError("сеть отвалилась"))
+    res = tg._tg_call(_cfg(), "sendMessage", {})
+    assert res["ok"] is False and "сеть отвалилась" in res["description"]
 
 
 def test_buttons_are_attached_only_to_the_last_message(monkeypatch):
@@ -525,6 +669,23 @@ def test_notify_plan_survives_a_failed_update_of_message_ids(monkeypatch):
     assert tg.notify_plan(_cfg(), "m1", "### план", "delete_tasks") == (True, "")
 
 
+def test_notify_plan_fails_closed_without_a_store(monkeypatch):
+    """Нет Postgres — нет строки, значит нажатие кнопки физически не сможет
+    ничего подтвердить. Явная проверка `store_ready()` не была покрыта: во
+    ВСЕХ харнессах стор объявлен готовым, поэтому её можно было удалить, и
+    корректность держалась бы на побочном эффекте (падении на `None.getconn`)
+    вместо решения."""
+    monkeypatch.setattr(tg, "store_ready", lambda: False)
+    monkeypatch.setattr(tg, "send_message_chunked",
+                        lambda *a, **k: pytest.fail("слать было нельзя"))
+    monkeypatch.setattr(tg, "create_tg_approval",
+                        lambda *a, **k: pytest.fail("строку писать было некуда"))
+
+    ok, err = tg.notify_plan(_cfg(), "m1", "### план", "delete_tasks")
+
+    assert ok is False and "Postgres" in err
+
+
 def test_notify_plan_fails_closed_when_the_row_cannot_be_created(monkeypatch):
     """Нет строки — нет гейта: отправлять план с кнопками, которые физически
     не смогут ничего подтвердить, нельзя."""
@@ -645,6 +806,30 @@ def test_summary_reports_failure_so_caller_keeps_the_plan_chunks(monkeypatch):
     assert tg.summarize_in_owner_chat(_cfg(), "111", 55, "сводка") is False
 
 
+def test_summary_longer_than_the_limit_is_cut_and_still_delivered(monkeypatch):
+    """Ветка `len(chunks) > 1` в summarize_in_owner_chat не была покрыта ни
+    одним тестом, а двойник Telegram принимал текст любой длины — то есть
+    резерв бюджета под приписку можно было выкинуть, и пакет остался бы
+    зелёным. Живой Bot API на этом отвечает 400, сводка не появляется, кнопки
+    на исполненном плане висят дальше.
+
+    Вход намеренно плотный (много коротких строк): нарезка заполняет первый
+    кусок почти под самый лимит, поэтому именно приписка и решает, влезет
+    сообщение или нет."""
+    fake = _FakeTelegram()
+    monkeypatch.setattr(tg, "_tg_call", fake)
+    long_summary = "\n".join(f"строка {i}" for i in range(900))
+
+    assert tg.summarize_in_owner_chat(_cfg(), "111", 55, long_summary) is True
+
+    method, body = fake.bodies[0]
+    assert method == "editMessageText"
+    assert _visible_len(body["text"]) <= tg.TELEGRAM_TEXT_LIMIT
+    assert "сводка сокращена" in body["text"], (
+        "обрезали молча — человек не узнает, что видит не весь итог")
+    assert body["reply_markup"] == {"inline_keyboard": []}
+
+
 def test_summary_without_message_id_is_a_noop(monkeypatch):
     fake = _FakeTelegram()
     monkeypatch.setattr(tg, "_tg_call", fake)
@@ -717,11 +902,18 @@ def test_reap_never_touches_an_archive_of_a_decided_operation(monkeypatch):
     список», а не только опечатку в тексте."""
     now = tg._now_ms()
     store = _FakeStatusStore([
-        # (manifest_id, status, expires_at, chat, msg, extra, rchat, rids)
-        ("m-pending", "PENDING", now - 1, "111", 900, [898, 899], "-100777", [500]),
-        ("m-expired", "EXPIRED", now - 1, "111", 910, [], None, None),
-        ("m-approved", "APPROVED", now - 1, "111", 920, [918], "-100777", [600, 601]),
-        ("m-rejected", "REJECTED", now - 1, "111", 930, [928], "-100777", [700]),
+        # (manifest_id, server, status, expires_at, chat, msg, extra, rchat, rids)
+        ("m-pending", "ticktick", "PENDING", now - 1, "111", 900, [898, 899],
+         "-100777", [500]),
+        ("m-expired", "ticktick", "EXPIRED", now - 1, "111", 910, [], None, None),
+        ("m-approved", "ticktick", "APPROVED", now - 1, "111", 920, [918],
+         "-100777", [600, 601]),
+        ("m-rejected", "ticktick", "REJECTED", now - 1, "111", 930, [928],
+         "-100777", [700]),
+        # чужие строки в ОБЩЕЙ таблице: просрочены и неотвечены — то есть
+        # подходят под все условия, кроме принадлежности серверу
+        ("m-gmail", "gmail", "PENDING", now - 1, "111", 940, [938], None, None),
+        ("m-calendar", "calendar", "EXPIRED", now - 1, "111", 950, [], None, None),
     ])
     monkeypatch.setattr(tg, "store_ready", lambda: True)
     monkeypatch.setattr(tg, "_pg_pool", store)
@@ -734,11 +926,15 @@ def test_reap_never_touches_an_archive_of_a_decided_operation(monkeypatch):
     # неотвеченный план сносится целиком: кнопки + куски + сообщения отчёта
     assert deleted == [("111", 900), ("111", 898), ("111", 899),
                        ("-100777", 500), ("111", 910)]
-    # ни одного удаления в архиве решённых операций
+    # ни одного удаления в архиве решённых операций и в чужих сообщениях
     archive_ids = {918, 920, 928, 930, 600, 601, 700}
     assert not [d for d in deleted if d[1] in archive_ids]
-    # и сами строки решённых операций остались в таблице
-    assert {r[0] for r in store.rows} == {"m-approved", "m-rejected"}
+    foreign_ids = {938, 940, 950}
+    assert not [d for d in deleted if d[1] in foreign_ids], (
+        "стёрли сообщение чужого MCP-сервера из лички владельца")
+    # и сами строки решённых операций (а также чужие) остались в таблице
+    assert {r[0] for r in store.rows} == {"m-approved", "m-rejected",
+                                          "m-gmail", "m-calendar"}
 
 
 def test_reap_survives_a_row_without_a_message_id(monkeypatch):
@@ -827,6 +1023,16 @@ class _FakePool:
 # исчезнет условие — упадёт assert прямо в execute.
 
 class _StatusAwareCursor:
+    """Строка стора: (manifest_id, server, status, expires_at, chat_id,
+    message_id, extra_message_ids, report_chat_id, report_message_ids).
+
+    Колонка `server` здесь НЕ формальность: таблица `tg_approvals` общая с
+    пятью TS-серверами (gmail/drive/calendar/docs/sheets), и все шесть ходят
+    ОДНИМ ботом. Раньше её в этом двойнике не было вовсе — то есть двойник
+    физически не мог заметить, если бы уборка ticktick-mcp начала сносить
+    чужие PENDING-строки и стирать чужие сообщения с кнопками из лички
+    владельца."""
+
     _COLUMNS = ("manifest_id", "chat_id", "message_id", "extra_message_ids",
                 "report_chat_id", "report_message_ids")
 
@@ -839,20 +1045,24 @@ class _StatusAwareCursor:
         self.sql = sql
         flat = " ".join(sql.split())
         assert flat.startswith("DELETE FROM tg_approvals"), flat
+        assert "server = 'ticktick'" in flat, (
+            "уборка обязана ограничиваться СВОИМИ строками: таблица общая с "
+            "gmail/drive/calendar/docs/sheets-mcp")
         assert "status IN ('PENDING', 'EXPIRED')" in flat, (
             "уборка обязана ограничиваться неотвеченными планами")
         assert "expires_at <= %s" in flat
         now = (params or (0,))[0]
         keep, taken = [], []
         for row in self._store.rows:
-            _mid, status, expires_at = row[0], row[1], row[2]
-            if status in ("PENDING", "EXPIRED") and expires_at <= now:
+            _mid, server, status, expires_at = row[0], row[1], row[2], row[3]
+            if (server == "ticktick" and status in ("PENDING", "EXPIRED")
+                    and expires_at <= now):
                 taken.append(row)
             else:
                 keep.append(row)
         self._store.rows = keep
         # RETURNING отдаёт колонки в порядке из запроса (см. _COLUMNS)
-        self._returned = [(r[0], r[3], r[4], r[5], r[6], r[7]) for r in taken]
+        self._returned = [(r[0], r[4], r[5], r[6], r[7], r[8]) for r in taken]
 
     def fetchall(self):
         return self._returned

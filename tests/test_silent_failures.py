@@ -125,14 +125,13 @@ def _collect_reports(monkeypatch):
                         lambda cfg, chat_id, message_id, text: reports.append(text))
     monkeypatch.setattr(tg, "summarize_in_owner_chat",
                         lambda cfg, chat_id, message_id, text:
-                        reports.append(text) or True, raising=False)
+                        reports.append(text) or True)
     monkeypatch.setattr(tg, "post_report_to_group",
                         lambda cfg, mid, md, *, tool, verdict:
                         archive.append(md)
-                        or tg.ReportDelivery([2], 1, 1, True), raising=False)
+                        or tg.ReportDelivery([2], 1, 1, True))
     monkeypatch.setattr(tg, "send_message_chunked",
-                        lambda cfg, chat, md, **kw: tg.SendResult(True, [1], "", 1),
-                        raising=False)
+                        lambda cfg, chat, md, **kw: tg.SendResult(True, [1], "", 1))
     return reports, archive
 
 

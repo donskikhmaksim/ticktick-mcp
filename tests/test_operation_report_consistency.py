@@ -161,3 +161,58 @@ async def test_zero_discrepancies_is_a_clean_and_honest_report(
     body = "\n".join(ln for ln in report.splitlines() if ln.startswith("- "))
     assert "❌" not in body
     assert "⚠️" not in body
+
+
+def test_report_refuses_to_confirm_anything_when_state_is_unavailable(
+        monkeypatch, tmp_path):
+    """«Живого состояния нет» ≠ «в живом состоянии пусто».
+
+    Двойник во всех тестах выше отдаёт `dict(live)` и потому НИКОГДА не может
+    ответить None — то есть ветка «состояние недоступно» не исполнялась ни
+    разу, хотя настоящий `_open_by_id` возвращает None при недоступном v2.
+    Разница не косметическая: пустой словарь для удаления читается как «задача
+    действительно исчезла ✅», поэтому при полностью недоступном TickTick
+    отчёт объявил бы успешной операцию, которой никто не проверял."""
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
+    monkeypatch.setattr(s, "_v2_project_names",
+                        lambda: (_ for _ in ()).throw(
+                            AssertionError("после None ходить дальше незачем")))
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+
+    rid = "unavail01"
+    s._journal_write({"ts": "2026-08-05T12:00:00+00:00", "record": rid,
+                      "op": "delete", "summary": "t",
+                      "items": [{"taskId": "d1", "title": "Удалённая"}]})
+
+    report = s._build_operation_report(rid)
+
+    assert "НЕ ПОДТВЕРЖДЁН" in report
+    assert "Статус операции: ✅" not in report
+    assert not [ln for ln in report.splitlines() if ln.startswith("- ✅")], (
+        "недоступное состояние выдано за подтверждённый успех")
+
+
+def test_post_verify_reads_a_fresh_state_not_the_cache(monkeypatch, tmp_path):
+    """Перепроверка обязана читать состояние ЗАНОВО (`fresh=True`): иначе
+    параллельный читатель успевает подсунуть снимок, снятый ДО мутации, и
+    отчёт «подтвердит» то, чего не было. Двойники раньше принимали `fresh` и
+    молча его выбрасывали, поэтому требование не проверялось нигде."""
+    seen = []
+
+    def _live(fresh=False):
+        seen.append(fresh)
+        return {}
+
+    monkeypatch.setattr(s, "_open_by_id", _live)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {})
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+
+    rid = "freshchk1"
+    s._journal_write({"ts": "2026-08-05T12:00:00+00:00", "record": rid,
+                      "op": "delete", "summary": "t",
+                      "items": [{"taskId": "d1", "title": "Удалённая"}]})
+
+    s._build_operation_report(rid)
+
+    assert seen and all(seen), (
+        "отчёт сверялся с кэшем: перепроверка обязана перечитать состояние")

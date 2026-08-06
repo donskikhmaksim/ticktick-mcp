@@ -223,9 +223,14 @@ def _enable_tg(monkeypatch, allowlist=None):
 
 def _fake_report_sinks(monkeypatch):
     """Подменяет ДВА получателя итога автоисполнения: группу «MCP Отчёты»
-    (полный отчёт) и личку владельца (короткая сводка). raising=False — эти
-    функции появляются в tg_approval параллельной правкой, тест не должен
-    зависеть от порядка слияния веток."""
+    (полный отчёт) и личку владельца (короткая сводка).
+
+    Раньше здесь стояло `raising=False` — страховка на время, пока эти функции
+    ехали параллельной веткой. Ветки слиты давно, а страховка осталась и
+    превратилась в обманку: `raising=False` не проверяет атрибут, а СОЗДАЁТ
+    его, поэтому тест оставался зелёным и в случае, когда функции в
+    `tg_approval` больше нет вовсе (например, её переименовали) — продолжая
+    утверждать, что итог доставлен и кнопки сняты."""
     group, private = [], []
 
     def _post(cfg, manifest_id, report_md, *, tool, verdict):
@@ -240,8 +245,8 @@ def _fake_report_sinks(monkeypatch):
         private.append((chat_id, message_id, short_md))
         return True  # правка принята Telegram — сводка вписана
 
-    monkeypatch.setattr(tg, "post_report_to_group", _post, raising=False)
-    monkeypatch.setattr(tg, "summarize_in_owner_chat", _summarize, raising=False)
+    monkeypatch.setattr(tg, "post_report_to_group", _post)
+    monkeypatch.setattr(tg, "summarize_in_owner_chat", _summarize)
     return group, private
 
 
@@ -300,6 +305,28 @@ def test_find_candidates_skips_unapproved(monkeypatch):
                              "items": [{"taskId": "t1", "title": "X"}]}
     _approvals(monkeypatch, lambda mid: "pending")
     assert s._find_tg_auto_execute_candidates() == []
+
+
+def test_find_candidates_skips_rejected(monkeypatch):
+    """Самый опасный из всех сценариев кнопки — «человек нажал 🛑, а сервер
+    всё равно выполнил» — до 2026-08-06 не проверялся НИ РАЗУ: поллеру
+    подавали только APPROVED и PENDING, а чат-путь во всех файлах подменяет
+    `check_approval` готовой строкой, то есть настоящая классификация строки
+    БД (`approval_status_of`) на пути поллера не исполнялась.
+
+    Здесь статус REJECTED проходит через настоящий `approval_status_of`."""
+    _enable_tg(monkeypatch)
+    now = time.monotonic()
+    s._MANIFESTS["cand-rejected"] = {
+        "kind": "delete", "consumed": False, "created": now,
+        "items": [{"taskId": "t1", "title": "X"}]}
+    _approvals(monkeypatch,
+               lambda mid: "rejected" if mid == "cand-rejected" else "none")
+
+    ids = {c["manifest_id"] for c in s._find_tg_auto_execute_candidates()}
+
+    assert "cand-rejected" not in ids, (
+        "владелец нажал «Отклонить», а сервер взял операцию в исполнение")
 
 
 def test_find_candidates_skips_consumed(monkeypatch):
@@ -662,17 +689,16 @@ def _lost_sinks(monkeypatch, claimed=None):
         claims.append(list(ids))
         return list(ids) if claimed is None else list(claimed)
 
-    monkeypatch.setattr(tg, "claim_lost_manifests", _claim, raising=False)
+    monkeypatch.setattr(tg, "claim_lost_manifests", _claim)
     monkeypatch.setattr(tg, "clear_inline_keyboard",
-                        lambda cfg, chat, mid: cleared.append((chat, mid)) or True,
-                        raising=False)
+                        lambda cfg, chat, mid: cleared.append((chat, mid)) or True)
     monkeypatch.setattr(tg, "send_message_chunked",
                         lambda cfg, chat, md, **kw: dm.append((chat, md))
                         or tg.SendResult(True, [1], "", 1))
     monkeypatch.setattr(tg, "post_report_to_group",
                         lambda cfg, mid, md, *, tool, verdict: archive.append(
                             (mid, md, tool, verdict))
-                        or tg.ReportDelivery([2], 1, 1, True), raising=False)
+                        or tg.ReportDelivery([2], 1, 1, True))
     return dm, archive, cleared, claims
 
 
@@ -744,16 +770,13 @@ def test_announce_claims_the_row_before_telling_anyone(monkeypatch, tmp_path):
     monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
     order = []
     monkeypatch.setattr(tg, "claim_lost_manifests",
-                        lambda ids: order.append("claim") or list(ids),
-                        raising=False)
-    monkeypatch.setattr(tg, "clear_inline_keyboard", lambda *a, **k: True,
-                        raising=False)
+                        lambda ids: order.append("claim") or list(ids))
+    monkeypatch.setattr(tg, "clear_inline_keyboard", lambda *a, **k: True)
     monkeypatch.setattr(tg, "send_message_chunked",
                         lambda cfg, chat, md, **kw: order.append("dm")
                         or tg.SendResult(True, [1], "", 1))
     monkeypatch.setattr(tg, "post_report_to_group",
-                        lambda *a, **k: tg.ReportDelivery([2], 1, 1, True),
-                        raising=False)
+                        lambda *a, **k: tg.ReportDelivery([2], 1, 1, True))
 
     s._announce_lost_manifests([
         {"manifest_id": "gone-11", "chat_id": "c1", "message_id": 1,
