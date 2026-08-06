@@ -1782,8 +1782,11 @@ async def update_tasks(
     return await _update_tasks_impl(outcome.summary, outcome.tasks)
 
 
-def _describe_update_item(t: Dict[str, Any]) -> str:
-    title = t.get("title") or t.get("taskId") or t.get("task_id") or "?"
+def _update_change_bits(t: Dict[str, Any], sep: str = "; ") -> str:
+    """Человеческий перечень изменений ОДНОЙ задачи («название → «X»; срок →
+    2026-08-10»), без обёртки с названием. Вынесено из _describe_update_item,
+    чтобы manual_triage печатал те же формулировки тем же кодом, а не своей
+    копией, которая со временем разойдётся."""
     bits = []
     if t.get("new_title"):
         bits.append(f"название → «{t['new_title']}»")
@@ -1801,8 +1804,12 @@ def _describe_update_item(t: Dict[str, Any]) -> str:
         bits.append("колонка меняется")
     if t.get("assignee") is not None:
         bits.append("исполнитель меняется")
-    changes = "; ".join(bits) or "(поля изменений не распознаны)"
-    return f"**«{title}»** — {changes}"
+    return sep.join(bits) or "(поля изменений не распознаны)"
+
+
+def _describe_update_item(t: Dict[str, Any]) -> str:
+    title = t.get("title") or t.get("taskId") or t.get("task_id") or "?"
+    return f"**«{title}»** — {_update_change_bits(t)}"
 
 
 async def _update_tasks_impl(
@@ -2922,7 +2929,8 @@ class _GateOutcome:
 
 def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
                 summary: str, manifest_id: str, user_reply: str,
-                describe_item, extra: Optional[Dict] = None) -> _GateOutcome:
+                describe_item, extra: Optional[Dict] = None,
+                items_arg: str = "tasks") -> _GateOutcome:
     """Runs the two-call consent gate. Returns a _GateOutcome: when
     `.proceed` is True, the caller must actually run the mutation using
     `.tasks`/`.summary`/`.extra`; when False, `.message` is the full response
@@ -2930,7 +2938,10 @@ def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
     context beyond the per-task list (e.g. set_task_parent's target parent,
     move_tasks's destination project) — stored verbatim in the manifest and
     handed back unchanged on call #2, same one-shot/no-swap guarantee as
-    `tasks`."""
+    `tasks`. `items_arg` — как ЭТОТ тул называет свой список в собственной
+    сигнатуре (у всех «списочных» тулов это `tasks`, у manual_triage —
+    `operations`); подставляется в печатаемую модели инструкцию для call #2,
+    чтобы она не позвала тул несуществующим именем аргумента."""
     _prune_manifests()
     if manifest_id:
         m = _MANIFESTS.get(manifest_id)
@@ -2984,11 +2995,11 @@ def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
     lines.append(
         "Покажи это пользователю дословно и ДОЖДИСЬ его отдельного ответа "
         "(не отвечай за него). Когда он явно согласится, вызови этот же "
-        f'инструмент снова: {tool_name}(summary="{summary}", tasks=[...], '
+        f'инструмент снова: {tool_name}(summary="{summary}", {items_arg}=[...], '
         f'manifest_id="{mid}", user_reply="<дословная реплика пользователя>") '
-        "— НЕ в этом же ходе (сам список tasks можно повторить как есть, на "
-        "2-м вызове он игнорируется — используются данные из манифеста). "
-        "Манифест одноразовый, действует 1 час.")
+        f"— НЕ в этом же ходе (сам список {items_arg} можно повторить как "
+        "есть, на 2-м вызове он игнорируется — используются данные из "
+        "манифеста). Манифест одноразовый, действует 1 час.")
     return _GateOutcome(False, message=_maybe_tg_notify_plan(
         tool_name, mid, "\n".join(lines)))
 
@@ -9520,6 +9531,624 @@ async def _create_project_column_impl(project_id: str, name: str,
     except Exception as e:
         return (f"### ⚠️ Раздел «{name}» создан (id: {cid}), но НЕ подтверждён\n\n"
                 f"⚠️ {_UNVERIFIED_MSG} ({e})")
+
+
+# ---------------------------------------------------------------------------
+# manual_triage — ОДИН смешанный план из РАЗНОРОДНЫХ операций, ОДНО
+# подтверждение, одно исполнение с общим честным отчётом.
+#
+# Зачем: владелец разбирает инбокс живым текстом («эти удалить, эту
+# переименовать, эту в проект X, эти два — дубли, объедини, эту закрой»).
+# Раньше каждая такая операция была отдельным гейтованным тулом со своим
+# подтверждением, и разбор 20 задач превращался в 20 циклов «план → да».
+#
+# ЧЕГО ЭТОТ ТУЛ НЕ УМЕЕТ — НАМЕРЕННО (следствие инцидента с plan_declutter,
+# который отключён навсегда, см. docs/DESIGN_approval_gate.md §6.4): у него
+# НЕТ и не может быть ни одного параметра-фильтра/скоупа/запроса. Он не
+# сканирует аккаунт и физически не способен «предложить, что удалить»:
+# единственный вход — явный список операций с явными task_id, каждый со
+# словами ЧЕЛОВЕКА в поле `said`. Живое состояние читается ТОЛЬКО чтобы
+# проверить переданные id (identity guard) и достать имена проектов —
+# никогда чтобы ДОБАВИТЬ кандидата в план.
+# ---------------------------------------------------------------------------
+
+# Порядок = возрастание разрушительности. Он же порядок показа в превью и
+# порядок исполнения: сначала обратимое, необратимое — последним, чтобы сбой
+# на середине не оставил задачу удалённой раньше, чем её успели поправить.
+_TRIAGE_OPS = ("update", "move", "complete", "merge", "delete")
+_TRIAGE_ORDER = {op: i for i, op in enumerate(_TRIAGE_OPS)}
+_TRIAGE_EMOJI = {"update": "✏️", "move": "↪", "complete": "✅",
+                 "merge": "🔗", "delete": "🗑"}
+_TRIAGE_VERB = {"update": "изменить", "move": "перенести", "complete": "закрыть",
+                "merge": "объединить", "delete": "удалить"}
+# Ключи, которые НЕЛЬЗЯ класть в `changes`: они пересеклись бы со служебными
+# полями элемента, который уходит в _update_tasks_impl, и молча разоружили бы
+# identity-guard (например changes={"title": ...} подменил бы «текущее
+# название» на желаемое, и сверка id↔задача сравнила бы значение сама с собой).
+_TRIAGE_FORBIDDEN_CHANGE_KEYS = ("title", "taskId", "task_id", "projectId",
+                                 "project_id")
+
+
+def _describe_triage_op(op: Dict) -> str:
+    """Одна человекочитаемая строка про одну операцию — то, что человек
+    реально увидит перед тем, как сказать «да». Никаких голых id: настоящие
+    названия задач и проектов из ЖИВОГО состояния, плюс дословный хвост «по
+    вашим словам», чтобы было видно, откуда взялась каждая строка плана."""
+    said = (op.get("said") or "").strip()
+    tail = f" — по вашим словам: «{said}»" if said else ""
+    kind = op.get("op")
+    proj = op.get("_project_name") or ""
+    where = f" (проект «{proj}»)" if proj else ""
+    if op.get("_skip"):
+        shown = op.get("title") or op.get("_live_title") or op.get("task_id") or "?"
+        return f"⚠️ ПРОПУЩЕНО — «{shown}»: {op['_skip']}"
+    title = op.get("_live_title") or op.get("title") or op.get("task_id") or "?"
+    if kind == "delete":
+        return f"🗑 Удалить «{title}»{where}{tail}"
+    if kind == "complete":
+        return f"✅ Закрыть «{title}»{where}{tail}"
+    if kind == "update":
+        return (f"✏️ Изменить «{title}»{where}: "
+                f"{_update_change_bits(op.get('changes') or {}, sep=', ')}{tail}")
+    if kind == "move":
+        to = op.get("_to_project_name") or op.get("to_project") \
+            or op.get("to_project_id") or "?"
+        return f"↪ Перенести «{title}»: «{proj}» → «{to}»{tail}"
+    if kind == "merge":
+        keep_title = op.get("_keep_live_title") or op.get("keep_title") or "?"
+        keep_proj = op.get("_keep_project_name") or ""
+        keep_where = f" (проект «{keep_proj}»)" if keep_proj else ""
+        return (f"🔗 Объединить: удалить дубль «{title}»{where}, оставить "
+                f"«{keep_title}»{keep_where}{tail}")
+    return f"• {kind} «{title}»{tail}"
+
+
+def _validate_triage_ops(operations: List[Dict], max_items: int) -> Optional[str]:
+    """Fail-closed валидация ВСЕГО плана до единой мутации. Любое нарушение —
+    отказ ЦЕЛИКОМ (не «выкинем плохую строку и сделаем остальное»): человек
+    диктовал разбор как одно решение, и молча исполненная половина хуже, чем
+    честный отказ с указанием, что именно поправить. Возвращает текст отказа
+    или None."""
+    if not operations:
+        return ("🛑 Пустой список операций — разбирать нечего. Этот инструмент "
+                "НЕ выбирает задачи сам: передай явный список того, что "
+                "человек сказал сделать.")
+    if len(operations) > max_items:
+        return (f"🛑 Отказ: операций {len(operations)} — больше капа "
+                f"{max_items}. Разбей разбор на части (или подними max_items "
+                "осознанно). Ничего не сделано.")
+    kind_of: Dict[str, str] = {}
+    for i, op in enumerate(operations, 1):
+        if not isinstance(op, dict):
+            return (f"🛑 Отказ: операция #{i} — не объект. Каждая операция это "
+                    "словарь с полями op/task_id/title/said. Ничего не сделано.")
+        kind = str(op.get("op") or "").strip().lower()
+        if kind not in _TRIAGE_ORDER:
+            return (f"🛑 Отказ: операция #{i} — неизвестный op={op.get('op')!r}. "
+                    f"Допустимо: {', '.join(_TRIAGE_OPS)}. Ничего не сделано.")
+        tid = str(op.get("task_id") or "").strip()
+        if not tid:
+            return (f"🛑 Отказ: операция #{i} ({kind}) — пустой task_id. "
+                    "Ничего не сделано.")
+        title = str(op.get("title") or "").strip()
+        if not title:
+            return (f"🛑 Отказ: операция #{i} ({kind}) — пустой title. Точное "
+                    "текущее название обязательно: по нему сервер проверяет, "
+                    "что id указывает на ТУ задачу. Ничего не сделано.")
+        said = str(op.get("said") or "").strip()
+        if not said:
+            return (f"🛑 Отказ: операция #{i} («{title}») — пустое поле said. "
+                    "В нём должны быть СЛОВА ЧЕЛОВЕКА про ЭТУ задачу "
+                    "(дословно или сжато), иначе в предпросмотре не видно, "
+                    "откуда взялась строка плана. Ничего не сделано.")
+        if tid in kind_of:
+            return (f"🛑 Отказ: task_id {tid[:8]}… встречается в плане дважды "
+                    f"({kind_of[tid]} и {kind}) — одну задачу нельзя и "
+                    "изменить, и удалить одним планом. Ничего не сделано.")
+        kind_of[tid] = kind
+        if kind == "update":
+            changes = op.get("changes")
+            if not isinstance(changes, dict) or not changes:
+                return (f"🛑 Отказ: операция #{i} («{title}») — update без "
+                        "непустого changes. Ничего не сделано.")
+            bad = [k for k in _TRIAGE_FORBIDDEN_CHANGE_KEYS if k in changes]
+            if bad:
+                return (f"🛑 Отказ: операция #{i} («{title}») — в changes "
+                        f"запрещённые ключи {bad}: они разоружили бы сверку "
+                        "id↔задача. Переименование — это changes={\"new_title\": "
+                        "\"...\"}, а перенос — отдельная операция op=\"move\". "
+                        "Ничего не сделано.")
+        if kind == "move" and not (str(op.get("to_project_id") or "").strip()
+                                   or str(op.get("to_project") or "").strip()):
+            return (f"🛑 Отказ: операция #{i} («{title}») — move без "
+                    "to_project_id и без to_project. Ничего не сделано.")
+        if kind == "merge":
+            if not str(op.get("keep_task_id") or "").strip():
+                return (f"🛑 Отказ: операция #{i} («{title}») — merge без "
+                        "keep_task_id (какую копию оставляем). Ничего не сделано.")
+            if not str(op.get("keep_title") or "").strip():
+                return (f"🛑 Отказ: операция #{i} («{title}») — merge без "
+                        "keep_title. Ничего не сделано.")
+    # Отдельным проходом: «оставляемая» копия не должна сама исчезнуть в этом
+    # же плане — иначе объединение снесёт ОБЕ копии и данные пропадут совсем.
+    doomed = {tid for tid, k in kind_of.items()
+              if k in ("delete", "merge", "complete")}
+    for i, op in enumerate(operations, 1):
+        if str(op.get("op") or "").strip().lower() != "merge":
+            continue
+        keep = str(op.get("keep_task_id") or "").strip()
+        if keep == str(op.get("task_id") or "").strip():
+            return (f"🛑 Отказ: операция #{i} — keep_task_id совпадает с "
+                    "task_id (задача объединяется сама с собой). Ничего не "
+                    "сделано.")
+        if keep in doomed:
+            return (f"🛑 Отказ: операция #{i} — задача, которую надо ОСТАВИТЬ "
+                    f"({keep[:8]}…), в этом же плане удаляется/закрывается "
+                    "другой операцией. Так пропали бы обе копии. Ничего не "
+                    "сделано.")
+    return None
+
+
+def _resolve_triage_destination(op: Dict, names: Dict) -> Tuple[str, str, str]:
+    """Проект назначения для move → (id, имя, причина-отказа). По id — через
+    обычный guard проекта; по имени — ТОЛЬКО точное совпадение (_names_agree),
+    никакого поиска по подстроке: именно подстрочный матчинг проектов был
+    одной из причин declutter-инцидента («Работа» ловила «Работа/архив»)."""
+    to_id = str(op.get("to_project_id") or "").strip()
+    claim = str(op.get("to_project") or "").strip()
+    if to_id:
+        refuse = _guard_project(to_id, claim, fresh=False, require_known=True)
+        if refuse:
+            return "", "", ("проект назначения не подтверждён — "
+                            + refuse.lstrip("🛑 ").rstrip())
+        return to_id, names.get(to_id, to_id), ""
+    matches = [pid for pid, nm in names.items() if _names_agree(claim, nm)]
+    if not matches:
+        return "", "", (f"проект назначения «{claim}» не найден среди живых "
+                        "проектов (точное совпадение имени, не подстрока)")
+    if len(matches) > 1:
+        return "", "", (f"под именем «{claim}» найдено {len(matches)} проектов "
+                        "— неоднозначно, передай to_project_id")
+    return matches[0], names.get(matches[0], claim), ""
+
+
+def _resolve_triage_ops(operations: List[Dict], by_id: Dict[str, Dict],
+                        names: Dict) -> List[Dict]:
+    """Сверяет КАЖДУЮ переданную операцию с живым состоянием и обогащает её
+    тем, что нужно для предпросмотра и исполнения. Ничего не добавляет и
+    ничего не выкидывает: операция, не прошедшая сверку, помечается `_skip` с
+    причиной и остаётся видимой в плане."""
+    resolved: List[Dict] = []
+    for op in operations:
+        e = dict(op)
+        e["op"] = str(op.get("op") or "").strip().lower()
+        e["task_id"] = str(op.get("task_id") or "").strip()
+        # Относительные даты («завтра», «понедельник») разрешаются ЗДЕСЬ, в
+        # фазе плана, по часам сервера — чтобы в превью и в манифесте стояла
+        # ровно та дата, которая потом запишется (тот же приём, что в
+        # update_tasks перед _gate_batch).
+        if e["op"] == "update" and isinstance(e.get("changes"), dict):
+            ch = dict(e["changes"])
+            for key in ("due_date", "start_date"):
+                if key in ch:
+                    ch[key] = _resolve_relative_date(ch[key])
+            e["changes"] = ch
+        live = by_id.get(e["task_id"])
+        if not live:
+            e["_skip"] = ("не найдена среди открытых задач (кто-то удалил или "
+                          "закрыл её вручную?)")
+            resolved.append(e)
+            continue
+        live_title = live.get("title") or ""
+        if not _names_agree(e.get("title") or "", live_title):
+            e["_skip"] = (f"название не совпало — по этому id сейчас "
+                          f"«{live_title}», а в плане «{e.get('title')}»")
+            resolved.append(e)
+            continue
+        pid = live.get("projectId") or ""
+        e["_project_id"] = pid
+        e["_project_name"] = names.get(pid, "")
+        e["_live_title"] = live_title
+        e["_snapshot"] = _snapshot_of(live)
+        if e["op"] == "move":
+            to_id, to_name, why = _resolve_triage_destination(e, names)
+            if why:
+                e["_skip"] = why
+                resolved.append(e)
+                continue
+            e["_to_project_id"] = to_id
+            e["_to_project_name"] = to_name
+        if e["op"] == "merge":
+            keep_id = str(e.get("keep_task_id") or "").strip()
+            keep_live = by_id.get(keep_id)
+            if not keep_live:
+                e["_skip"] = (f"основная задача «{e.get('keep_title')}» не "
+                              "найдена среди открытых — дубль НЕ удаляю, иначе "
+                              "не осталось бы ни одной копии")
+                resolved.append(e)
+                continue
+            if not _names_agree(e.get("keep_title") or "",
+                                keep_live.get("title") or ""):
+                e["_skip"] = ("основная задача по keep_task_id называется "
+                              f"«{keep_live.get('title')}», а не "
+                              f"«{e.get('keep_title')}» — дубль НЕ удаляю")
+                resolved.append(e)
+                continue
+            e["_keep_live_title"] = keep_live.get("title") or ""
+            e["_keep_project_name"] = names.get(keep_live.get("projectId") or "", "")
+        resolved.append(e)
+    return resolved
+
+
+def _triage_summary_with_counts(summary: str, ops: List[Dict]) -> str:
+    """Заголовок предпросмотра (он же уходит в Telegram): исходная фраза плюс
+    сводка по типам. Считается по операциям, которые ДЕЙСТВИТЕЛЬНО пойдут в
+    работу — пропущенные вынесены отдельным хвостом, а не спрятаны в числах."""
+    doing = [o for o in ops if not o.get("_skip")]
+    counts = collections.Counter(o["op"] for o in doing)
+    parts = [f"{_TRIAGE_VERB[k]} {counts[k]}" for k in _TRIAGE_OPS if counts.get(k)]
+    out = f"{summary} — " + ", ".join(parts) if parts else summary
+    skipped = len(ops) - len(doing)
+    if skipped:
+        out += f"; пропущено {skipped}"
+    return out
+
+
+def _triage_expected_changes(changes: Dict) -> Dict:
+    """Перевод «интерфейсных» полей changes (в том виде, в каком их понимает
+    _update_tasks_impl) в поля ЖИВОЙ задачи, по которым _verify_item умеет
+    судить факт. Поля, невидимые в списке открытых задач (напоминания, повтор,
+    колонка, исполнитель), сюда НЕ попадают — про них отчёт честно скажет «не
+    проверяется автоматически», а не выдаст непроверенное за подтверждённое."""
+    exp: Dict[str, Any] = {}
+    if changes.get("new_title") is not None:
+        exp["title"] = changes["new_title"]
+    if changes.get("content") is not None:
+        exp["content"] = changes["content"]
+    if changes.get("priority") is not None:
+        exp["priority"] = changes["priority"]
+    if changes.get("tags") is not None:
+        exp["tags"] = [str(x).lstrip("#").lower() for x in changes["tags"]]
+    for src, dst in (("due_date", "dueDate"), ("start_date", "startDate")):
+        if changes.get(src):
+            val, _all_day = _normalize_date(changes[src])
+            exp[dst] = val
+    return exp
+
+
+def _triage_drift_reason(op: Dict, by_id: Dict[str, Dict],
+                         names: Dict) -> str:
+    """Повторная сверка ПЕРЕД самой мутацией: между показом плана и «да»
+    могли пройти минуты, и человек мог что-то поправить руками. Возвращает
+    причину, по которой операцию исполнять НЕЛЬЗЯ, или пустую строку."""
+    live = by_id.get(op.get("task_id"))
+    if not live:
+        return "исчезла из открытых задач между планом и исполнением"
+    if not _names_agree(op.get("title") or "", live.get("title") or ""):
+        return (f"название изменилось после плана (сейчас «{live.get('title')}»)")
+    if op["op"] == "move":
+        to_id = op.get("_to_project_id") or ""
+        if not to_id or to_id not in names:
+            return "проект назначения больше не существует"
+    if op["op"] == "merge":
+        keep = by_id.get(str(op.get("keep_task_id") or ""))
+        if not keep:
+            return ("основная задача исчезла из открытых — дубль НЕ трогаю "
+                    "(иначе не осталось бы ни одной копии)")
+        if not _names_agree(op.get("keep_title") or "", keep.get("title") or ""):
+            return (f"основную задачу переименовали (сейчас «{keep.get('title')}») "
+                    "— дубль НЕ трогаю")
+    return ""
+
+
+def _verify_triage_op(op: Dict, live_map: Dict[str, Dict],
+                      names: Dict) -> Tuple[str, str]:
+    """Независимый вердикт по ОДНОЙ операции, судимый по свежему живому
+    состоянию, а НЕ по тексту ответа под-исполнителя. Возвращает
+    (статус ∈ ok/fail/unchecked, строка вердикта)."""
+    kind = op["op"]
+    title = op.get("_live_title") or op.get("title") or ""
+    item: Dict[str, Any] = {"taskId": op.get("task_id"), "title": title}
+    if kind in ("delete", "merge"):
+        line = _verify_item("delete", item, live_map, names)
+    elif kind == "complete":
+        line = _verify_item("complete", item, live_map, names)
+    elif kind == "move":
+        item["expect"] = {"projectId": op.get("_to_project_id")}
+        line = _verify_item("move", item, live_map, names)
+    else:
+        expect = _triage_expected_changes(op.get("changes") or {})
+        if not expect:
+            return "unchecked", (
+                f"- ⚠️ **«{title}»** — изменения отправлены, но по живому "
+                "списку открытых задач их не проверить (повтор/напоминание/"
+                "колонка/исполнитель там не видны) — см. текст ниже")
+        item["expect"] = {"changes": expect}
+        line = _verify_item("update", item, live_map, names)
+    return ("ok" if "✅" in line[:8] else "fail"), line
+
+
+def _triage_blocked_lines(blocked: List[Tuple[Dict, str]]) -> List[str]:
+    out = ["#### ⏭ Пропущено — НЕ выполнено"]
+    for op, why in blocked:
+        shown = op.get("_live_title") or op.get("title") or op.get("task_id") or "?"
+        emoji = _TRIAGE_EMOJI.get(op.get("op"), "•")
+        verb = _TRIAGE_VERB.get(op.get("op"), op.get("op"))
+        out.append(f"- {emoji} «{shown}» ({verb}): {why}")
+    return out
+
+
+@mcp.tool()
+async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
+                        max_items: int = 50, manifest_id: str = "",
+                        user_reply: str = "") -> str:
+    """
+    Apply a MIXED batch of triage decisions the HUMAN has ALREADY MADE AND
+    SAID OUT LOUD — delete / complete / update / move / merge-duplicates — in
+    ONE plan, ONE confirmation, ONE execution with one honest report. Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    changed on call #1.
+
+    ⛔ THIS TOOL DOES NOT ANALYSE ANYTHING. Do NOT scan the user's task list,
+    do NOT propose what to delete, do NOT "helpfully" add tasks the user did
+    not name. It has NO filter/scope/query parameter on purpose (an earlier
+    auto-scanning tool once mixed real tasks with test ones into a
+    ready-to-run plan and was disabled forever). EVERY operation must
+    correspond to a concrete sentence the human said, and that sentence goes
+    into that operation's `said` field, VERBATIM (or tightly condensed).
+    A blanket phrase reused on every row («разобрать инбокс», «cleanup») is a
+    protocol violation — `said` must be what the human said about THAT task.
+    Empty `said` → the whole plan is refused.
+
+    Call #1 (manifest_id omitted): each `task_id` is checked against LIVE
+    state (does it exist, does its live title still match the `title` you
+    sent, for move — does the destination project resolve, for merge — is the
+    task you want to KEEP alive and correctly named). Anything that fails is
+    marked ПРОПУЩЕНО with a reason and is NOT executed. The result is a
+    numbered preview, ordered least-destructive-first (update → move →
+    complete → merge → delete), where every line shows the real task/project
+    names and the human's own words. NOTHING is mutated.
+    Call #2 (ONLY after the human actually replied, in a LATER turn): repeat
+    the call with manifest_id=<id from call #1> and user_reply=<their literal
+    last message>. Do NOT re-send `operations` — it is ignored on call #2
+    (the manifest's stored operations are executed, so the set cannot be
+    swapped between plan and execution). Do NOT make call #2 in the same turn
+    as call #1.
+
+    Each element of `operations`:
+      {
+        "op":      "delete" | "complete" | "update" | "move" | "merge",
+        "task_id": "<task id>",                      # required, non-empty
+        "title":   "<the task's exact CURRENT title>",  # required — identity guard
+        "said":    "<what the HUMAN said about THIS task>",  # required
+        # op="update" only — same field names update_tasks itself takes:
+        "changes": {"new_title": "...", "due_date": "YYYY-MM-DD",
+                    "start_date": "...", "priority": 0|1|3|5,
+                    "content": "...", "tags": ["..."]},
+        # op="move" only — one of:
+        "to_project_id": "<project id>",   # preferred
+        "to_project":    "<exact project name>",   # EXACT match, not substring
+        # op="merge" only (merge = delete the duplicate, keep the original):
+        "keep_task_id": "<id of the copy that STAYS>",
+        "keep_title":   "<its exact current title>"
+      }
+
+    Example (one call, five different decisions):
+      operations=[
+        {"op":"delete","task_id":"a1","title":"Купить молоко",
+         "said":"это уже неактуально"},
+        {"op":"update","task_id":"b2","title":"Отчёт",
+         "changes":{"new_title":"Сдать отчёт за июль","due_date":"2026-08-10"},
+         "said":"переименуй и поставь на понедельник"},
+        {"op":"move","task_id":"c3","title":"Позвонить Ивану",
+         "to_project_id":"p_work","said":"это рабочее"},
+        {"op":"complete","task_id":"d4","title":"Оплатить интернет",
+         "said":"уже сделал"},
+        {"op":"merge","task_id":"e5","title":"Позвонить в банк",
+         "keep_task_id":"e6","keep_title":"Позвонить в банк",
+         "said":"это одно и то же, оставь одну"}]
+
+    Refused OUTRIGHT (nothing is mutated, no manifest is created): an empty
+    list, more than max_items, an unknown `op`, a missing task_id/title/said,
+    the same task_id in two operations, update without `changes`, move without
+    a destination, merge without keep_task_id/keep_title, or a merge whose
+    kept task is itself deleted/closed elsewhere in the same plan.
+
+    Args:
+        summary: one-line human sentence in the user's language, e.g. «Разбираю входящие после созвона» — the server appends the per-type counts to it
+        operations: the explicit list described above — required on call #1, IGNORED on call #2
+        max_items: refuse to plan more operations than this (blast cap)
+        manifest_id: from call #1's response — pass on call #2 to actually apply
+        user_reply: the user's literal reply approving the plan — required on call #2
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+
+    enriched: Optional[List[Dict]] = None
+    if not manifest_id:
+        refusal = _validate_triage_ops(list(operations or []), max_items)
+        if refusal:
+            return refusal
+        by_id = _open_by_id(fresh=True)
+        if by_id is None:
+            return _STATE_UNAVAILABLE_MSG
+        names = _v2_project_names()
+        enriched = _resolve_triage_ops(list(operations), by_id, names)
+        # list.sort устойчива: внутри одного типа исходный порядок сохраняется,
+        # а всё пропущенное уезжает в конец, не перемешиваясь между собой.
+        enriched.sort(key=lambda o: (1, 0) if o.get("_skip")
+                      else (0, _TRIAGE_ORDER[o["op"]]))
+        if all(o.get("_skip") for o in enriched):
+            # Просить «да» на план, где исполнять нечего, — это выпрашивать
+            # согласие на пустоту. Манифест не создаётся вовсе.
+            return ("🛑 Ни одна операция не прошла сверку с живым состоянием — "
+                    "план НЕ построен, ничего не изменено:\n"
+                    + "\n".join(f"- {_describe_triage_op(o)}" for o in enriched))
+        summary = _triage_summary_with_counts(summary, enriched)
+
+    outcome = _gate_batch("manual_triage", "manual_triage", enriched, summary,
+                          manifest_id, user_reply, _describe_triage_op,
+                          items_arg="operations")
+    if not outcome.proceed:
+        return outcome.message
+    return await _manual_triage_impl(outcome.summary, outcome.tasks)
+
+
+async def _manual_triage_impl(summary: str, tasks: List[Dict]) -> str:
+    """Pure mutation logic for manual_triage — NO consent gate (the gate lives
+    in the public manual_triage() above; this is also what the Telegram button
+    replays via _generic_gate_auto_execute, which calls impl(summary, tasks)).
+
+    Two hard rules here:
+      1. Every operation is re-checked against LIVE state immediately before
+         the mutation — anything that drifted since the plan is skipped, never
+         "applied anyway".
+      2. The final verdict is NOT parsed out of the sub-executors' texts: after
+         all of them run, this reads fresh live state ONE more time and judges
+         each operation independently (_verify_item). Unreadable state ⇒
+         «исход НЕ ПОДТВЕРЖДЁН», not «успех»."""
+    err = _ensure_ready()
+    if err:
+        return err
+    ops = list(tasks or [])
+    by_id = _open_by_id(fresh=True)
+    if by_id is None:
+        return _STATE_UNAVAILABLE_MSG
+    names = _v2_project_names()
+
+    ready: List[Dict] = []
+    blocked: List[Tuple[Dict, str]] = []
+    for op in ops:
+        if op.get("_skip"):
+            blocked.append((op, op["_skip"]))
+            continue
+        why = _triage_drift_reason(op, by_id, names)
+        if why:
+            blocked.append((op, why))
+            continue
+        ready.append(op)
+
+    if not ready:
+        return "\n".join(
+            [f"### 🧾 Ручной разбор — {summary}",
+             "🛑 НИЧЕГО НЕ ВЫПОЛНЕНО — ни одна операция не пережила повторную "
+             "сверку с живым состоянием (между планом и подтверждением что-то "
+             "изменилось). Ни одна задача не тронута.", ""]
+            + _triage_blocked_lines(blocked))
+
+    sections: List[Tuple[str, str]] = []
+
+    upd = [o for o in ready if o["op"] == "update"]
+    if upd:
+        items = [{"taskId": o["task_id"],
+                  "projectId": (by_id.get(o["task_id"]) or {}).get("projectId")
+                  or o.get("_project_id", ""),
+                  "title": o.get("title") or "",
+                  **(o.get("changes") or {})} for o in upd]
+        sections.append(("✏️ Изменения", await _update_tasks_impl(summary, items)))
+
+    mov = [o for o in ready if o["op"] == "move"]
+    if mov:
+        by_dest: Dict[str, List[Dict]] = {}
+        for o in mov:
+            by_dest.setdefault(o["_to_project_id"], []).append(o)
+        # Один вызов на проект назначения: _move_tasks_impl переносит весь
+        # переданный список В ОДИН проект.
+        for dest, group in by_dest.items():
+            text = await _move_tasks_impl(
+                summary,
+                [{"taskId": o["task_id"], "title": o.get("title") or ""}
+                 for o in group],
+                dest, names.get(dest))
+            sections.append((f"↪ Перенос → «{names.get(dest, dest)}»", text))
+
+    done = [o for o in ready if o["op"] == "complete"]
+    if done:
+        items = [{"taskId": o["task_id"], "title": o.get("title") or "",
+                  "projectId": o.get("_project_id", "")} for o in done]
+        sections.append(("✅ Закрытие", await _complete_tasks_impl(summary, items)))
+
+    gone = [o for o in ready if o["op"] in ("merge", "delete")]
+    if gone:
+        # Удаление идёт через ТОТ ЖЕ проверенный движок, что и обычное
+        # plan_task_deletion → execute_task_deletion: собираем синтетический
+        # манифест ровно того формата, который строит plan_task_deletion, и
+        # отдаём его _execute_task_deletion_impl (он сам ещё раз сверит
+        # название+проект перед необратимым шагом). Манифест временный и
+        # удаляется в finally — он не должен пережить этот вызов и попасть
+        # под фоновый TG-поллер.
+        mid = "triage-" + uuid.uuid4().hex[:12]
+        items = []
+        for o in gone:
+            live = by_id.get(o["task_id"]) or {}
+            pid = live.get("projectId") or o.get("_project_id", "")
+            items.append({"taskId": o["task_id"], "projectId": pid,
+                          "title": live.get("title") or o.get("title") or "",
+                          "project": names.get(pid, ""),
+                          "snapshot": o.get("_snapshot") or _snapshot_of(live)})
+        now = time.monotonic()
+        _MANIFESTS[mid] = {
+            "kind": "delete", "items": items, "created": now,
+            "plan_shown_at": now, "consumed": False, "summary": summary,
+            "object_hash": _manifest_object_hash(
+                "delete", [it["taskId"] for it in items]),
+        }
+        try:
+            text = await _execute_task_deletion_impl(mid, _MANIFESTS[mid])
+        finally:
+            _MANIFESTS.pop(mid, None)
+        n_merge = sum(1 for o in gone if o["op"] == "merge")
+        label = "🗑 Удаление" + (" и объединение дублей" if n_merge else "")
+        sections.append((label, text))
+
+    # ── Независимая сверка: своё свежее чтение, а НЕ разбор текстов выше ──
+    fresh = _open_by_id(fresh=True)
+    lines = ["### 🧾 Ручной разбор — итог", f"_{summary}_", ""]
+    if fresh is None:
+        lines.append(f"⚠️ Отправлено {len(ready)} операций из {len(ops)}, но "
+                     f"{_UNVERIFIED_MSG} Считать выполненным НЕЛЬЗЯ — "
+                     "проверьте в TickTick вручную.")
+        verdicts: List[str] = []
+    else:
+        fresh_names = _v2_project_names()
+        statuses, verdicts = [], []
+        for o in ready:
+            st, line = _verify_triage_op(o, fresh, fresh_names)
+            statuses.append((o["op"], st))
+            verdicts.append(line)
+        n_ok = sum(1 for _k, st in statuses if st == "ok")
+        n_fail = sum(1 for _k, st in statuses if st == "fail")
+        n_unchecked = sum(1 for _k, st in statuses if st == "unchecked")
+        per_kind = collections.Counter(k for k, st in statuses if st == "ok")
+        head = f"✅ Выполнено {n_ok} из {len(ops)}"
+        if blocked:
+            head += f" · ⏭ пропущено {len(blocked)} (см. ниже)"
+        lines.append(head)
+        lines.append(
+            f"✏️ Изменено {per_kind.get('update', 0)} · "
+            f"↪ Перенесено {per_kind.get('move', 0)} · "
+            f"✅ Закрыто {per_kind.get('complete', 0)} · "
+            f"🗑 Удалено {per_kind.get('delete', 0)} · "
+            f"🔗 Объединено {per_kind.get('merge', 0)}")
+        tail = f"❌ Не подтверждено сверкой: {n_fail}"
+        if n_unchecked:
+            tail += f" · ⚠️ не проверяется автоматически: {n_unchecked}"
+        lines.append(tail)
+    if verdicts:
+        lines += ["", "#### 🔍 Независимая сверка по каждой операции"] + verdicts
+    for title, text in sections:
+        lines += ["", f"#### {title}", text]
+    if blocked:
+        lines += [""] + _triage_blocked_lines(blocked)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
