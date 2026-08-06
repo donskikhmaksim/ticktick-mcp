@@ -85,7 +85,7 @@ TickTick, сгруппированных по темам. Вам не нужно
 
 > Этот раздел собирается автоматически из кода сервера (`scripts/gen_guide.py`). Руками не редактируйте — при следующем запуске генератора правки затрутся.
 
-**Всего инструментов: 78.**
+**Всего инструментов: 74.**
 
 ### Задачи (создать, изменить, выполнить, удалить)
 
@@ -195,14 +195,5 @@ TickTick, сгруппированных по темам. Вам не нужно
 | `get_trash` | Показать содержимое корзины (недавно удалённое). |
 | `restore_tasks` | Вернуть задачи из корзины. |
 | `operation_report` | Отчёт-проверка после массовой операции: что реально произошло. |
-
-### Новое / без описания (обновите scripts/gen_guide.py)
-
-| Инструмент | Что делает |
-| --- | --- |
-| `execute_declutter` | Phase 2 of the declutter: apply EXACTLY the mutating actions the manifest |
-| `plan_declutter` | Phase 1 of the retroactive declutter ("разбор помойки"): READ every open |
-| `resume_declutter` | Resume a sheet-backed declutter manifest (plan_declutter(persist="sheet")) |
-| `set_declutter_decision` | Set the `decision` column (approved/rejected) for specific rows of a |
 
 <!-- TOOLS:AUTO-END -->
