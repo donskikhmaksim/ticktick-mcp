@@ -58,6 +58,14 @@ BATCH_TOOLS = {
     "restore_tasks": dict(
         summary="Восстанавливаю 1", tasks=[{"taskId": "t1", "title": "A"}],
         to_project_id="p2"),
+    # manual_triage — единственный в таблице, чей call #1 читает ЖИВОЕ
+    # состояние ещё до гейта (identity guard по каждому переданному id),
+    # поэтому `_no_client_checks` ниже подменяет `_open_by_id` /
+    # `_v2_project_names` детерминированным состоянием ровно с этой задачей.
+    "manual_triage": dict(
+        summary="Разбираю 1",
+        operations=[{"op": "complete", "task_id": "t1", "title": "A",
+                     "said": "уже сделал"}]),
 }
 
 SINGLE_TOOLS = {
@@ -87,12 +95,13 @@ ALL_TOOLS = {**BATCH_TOOLS, **SINGLE_TOOLS}
 GATE_OF = {**{t: "batch" for t in BATCH_TOOLS}, **{t: "single" for t in SINGLE_TOOLS}}
 
 
-def test_the_table_covers_exactly_nineteen_tools():
+def test_the_table_covers_exactly_twenty_tools():
     """Если кто-то добавит/уберёт гейтованный тул, эта таблица обязана
-    поехать вместе с ним — иначе новый тул молча останется без кнопки."""
-    assert len(BATCH_TOOLS) == 6
+    поехать вместе с ним — иначе новый тул молча останется без кнопки.
+    19 → 20 (2026-08-06): +1 = `manual_triage`."""
+    assert len(BATCH_TOOLS) == 7
     assert len(SINGLE_TOOLS) == 13
-    assert len(ALL_TOOLS) == 19
+    assert len(ALL_TOOLS) == 20
 
 
 # ───────────────────────── обвязка ─────────────────────────
@@ -125,11 +134,22 @@ def _tg_off(monkeypatch):
         tools_allowlist=None, ttl_s=3600))
 
 
+# Детерминированное «живое состояние» для тулов, которые сверяют переданные
+# id ДО гейта (сегодня это только manual_triage — его identity guard обязан
+# работать на фазе плана, иначе человек увидел бы план по несуществующим
+# задачам). Остальные 19 тулов сюда не заглядывают вовсе.
+_LIVE_TASKS = {"t1": {"id": "t1", "title": "A", "projectId": "p1"}}
+_LIVE_PROJECTS = {"p1": "Проект-1", "p2": "Проект-2"}
+
+
 def _no_client_checks(monkeypatch):
-    """Ни один из 19 тулов не должен ходить в TickTick до гейта — глушим
-    только проверки готовности клиента."""
+    """Ни один из 20 тулов не должен ходить в СЕТЬ до гейта — глушим проверки
+    готовности клиента и подменяем чтение живого состояния локальным dict."""
     monkeypatch.setattr(s, "_ensure_ready", lambda: None)
     monkeypatch.setattr(s, "_ensure_official", lambda: None)
+    monkeypatch.setattr(s, "_open_by_id",
+                        lambda fresh=False: {k: dict(v) for k, v in _LIVE_TASKS.items()})
+    monkeypatch.setattr(s, "_v2_project_names", lambda: dict(_LIVE_PROJECTS))
 
 
 def _stub_impl(monkeypatch, tool, recorder):

@@ -35,3 +35,13 @@ def test_attach_file_to_task_is_registered():
     tools = asyncio.run(server.mcp.list_tools())
     names = {t.name for t in tools}
     assert "attach_file_to_task" in names
+
+
+def test_manual_triage_is_registered_and_declutter_is_not():
+    """`manual_triage` — ручная замена отключённого автоматического
+    declutter'а: он обязан быть опубликован, а все четыре declutter-тула —
+    оставаться снятыми с регистрации (владелец отключил их навсегда)."""
+    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    assert "manual_triage" in names
+    assert names.isdisjoint({"plan_declutter", "execute_declutter",
+                             "resume_declutter", "set_declutter_decision"})
