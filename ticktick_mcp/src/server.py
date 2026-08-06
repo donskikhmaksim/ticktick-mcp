@@ -2011,7 +2011,8 @@ async def update_tasks(
     summary: str,
     tasks: List[Dict[str, Any]] = None,
     manifest_id: str = "",
-    user_reply: str = ""
+    user_reply: str = "",
+    automation_key: str = ""
 ) -> str:
     """
     Update one or more tasks in TickTick. Gated 🟡 (docs/DESIGN_approval_gate.md):
@@ -2057,11 +2058,20 @@ async def update_tasks(
     Example (batch):  [{"title": "A", "taskId": "1", "priority": 3},
                        {"title": "B", "taskId": "2", "due_date": "2026-07-05"}]
 
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         summary: Human-readable confirmation line (see above)
         tasks: List of task change objects — required on call #1, ignored on call #2
         manifest_id: from call #1's response — pass on call #2 to actually update
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -2084,7 +2094,8 @@ async def update_tasks(
                 if key in t:
                     t[key] = _resolve_relative_date(t[key])
     outcome = await _gate_batch("update", "update_tasks", tasks, summary,
-                                manifest_id, user_reply, _describe_update_item)
+                                manifest_id, user_reply, _describe_update_item,
+                                automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _update_tasks_impl(outcome.summary, outcome.tasks)
@@ -2378,7 +2389,8 @@ async def _update_tasks_impl(
         return f"Error updating tasks: {str(e)}"
 @mcp.tool()
 async def complete_tasks(summary: str, tasks: List[Dict[str, str]] = None,
-                         manifest_id: str = "", user_reply: str = "") -> str:
+                         manifest_id: str = "", user_reply: str = "",
+                         automation_key: str = "") -> str:
     """
     Mark one or more tasks as complete in one call. Gated 🟡
     (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
@@ -2399,12 +2411,21 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]] = None,
     being completed: [{"title": "Buy milk", "taskId": "abc", "projectId": "xyz"}].
     project_name is optional but nice to have for a single task.
 
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         summary: Human-readable confirmation line (see above)
         tasks: List of {"title","taskId","projectId"} objects — required on
             call #1, ignored on call #2
         manifest_id: from call #1's response — pass on call #2 to actually complete
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -2420,7 +2441,8 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]] = None,
         return err
     outcome = await _gate_batch(
         "complete", "complete_tasks", tasks, summary, manifest_id, user_reply,
-        lambda t: f"**«{t.get('title') or t.get('taskId')}»**")
+        lambda t: f"**«{t.get('title') or t.get('taskId')}»**",
+        automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _complete_tasks_impl(outcome.summary, outcome.tasks)
@@ -2542,7 +2564,8 @@ async def _complete_tasks_impl(summary: str, tasks: List[Dict[str, str]]) -> str
         return f"Error completing tasks: {str(e)}"
 @mcp.tool()
 async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = None,
-                       manifest_id: str = "", user_reply: str = "") -> str:
+                       manifest_id: str = "", user_reply: str = "",
+                       automation_key: str = "") -> str:
     """
     ⚠️ Delete one or more tasks permanently. Gated (🔴 — even a SINGLE
     deletion): this is now a two-call plan → user says yes → execute flow,
@@ -2571,12 +2594,21 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
     BULK (more than DIRECT_DELETE_CAP tasks) is refused here outright — use
     plan_task_deletion → execute_task_deletion instead.
 
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         summary: Human-readable line starting with ⚠️ (see above)
         tasks: List of {"title","projectName","taskId","projectId"} objects
             — required on call #1, ignored on call #2
         manifest_id: from call #1's response — pass on call #2 to actually delete
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
@@ -2593,8 +2625,15 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
                 manifest_id,
                 f"🛑 Манифест удаления {manifest_id} не найден/истёк/уже "
                 "исполнен. Начни заново: delete_tasks(summary, tasks).")
+        # `automation_key` (#118): headless-клиенту с ВЕРНЫМ ключом второй
+        # вызов вообще не нужен — первый уже исполняет. Но если план всё-таки
+        # был построен (ретрай, старый двухшаговый клиент, план от прошлого
+        # интерактивного круга), ключ обязан провести его до конца, а не
+        # оставить висеть: `_require_consent` пропускает по ключу первой же
+        # своей строкой.
         cr = _require_consent(action="delete", tier=2, manifest=m,
                               user_reply=user_reply,
+                              automation_key=automation_key,
                               object_ids=[it["taskId"] for it in m["items"]],
                               tool="delete_tasks", manifest_id=manifest_id)
         if not cr.ok:
@@ -2659,6 +2698,25 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
                            "created": now, "plan_shown_at": now,
                            "object_hash": obj_hash,
                            "summary": summary, "consumed": False}
+        # ─── ОБХОД ПО КЛЮЧУ — ДО показа плана и ДО отправки (#118) ───
+        # У delete_tasks гейт СОБСТВЕННЫЙ (свой вид манифеста с items и
+        # снимками задач), поэтому общий блок из `_gate_batch` сюда не
+        # подставить — но контракт ровно тот же: верный ключ исполняет с
+        # первого вызова, кнопка владельцу не уходит.
+        #
+        # Что НЕ пропускается по ключу: всё, что выше по этой же ветке —
+        # обязательный title каждой задачи, сверка id↔название↔проект против
+        # живого состояния, потолок DIRECT_DELETE_CAP. Ключ снимает вопрос
+        # «человек согласен?», а не «та ли это задача»: identity guard в
+        # `_execute_task_deletion_impl` отрабатывает ещё раз, снимок пишется
+        # в журнал, эффект перепроверяется свежим чтением — как и по кнопке.
+        if _automation_key_matches(automation_key):
+            done = await _execute_task_deletion_impl(mid, _MANIFESTS[mid])
+            # `lines` — предупреждения про пропущенные/несовпавшие задачи.
+            # В интерактивном пути они видны человеку в превью; headless-путь
+            # превью не печатает, поэтому они едут прямо в ответ, иначе
+            # автоматика молча не узнала бы, что часть списка не тронута.
+            return "\n".join([done] + lines) if lines else done
         preview = [f"### 📋 Готов удалить — {len(items)}",
                   _plan_id_line(mid, "ничего ещё не удалено"), ""]
         for i, it in enumerate(items, 1):
@@ -3981,11 +4039,40 @@ def _gate_batch_preview_lines(tool_name: str, mid: str, summary: str,
     return lines
 
 
+async def _claim_plan_for_automation(kind: str, manifest_id: str) -> Optional[Dict]:
+    """Ветка «headless-клиент всё же прислал manifest_id» общего обхода по
+    ключу (#118). Ключ к этому моменту УЖЕ проверен вызывающими воротами —
+    эта функция сама ничего не решает про доступ.
+
+    Зачем она вообще нужна, раз с #118 верный ключ исполняет операцию с
+    ПЕРВОГО вызова и никакого плана не строит. Второй вызов всё равно
+    случается: план мог быть построен ДО правки (клиент по старой схеме ходит
+    в два захода), мог прилететь ретрай того же шага пайплайна, а мог просто
+    остаться живой план от предыдущего, ещё интерактивного круга. Во всех
+    этих случаях правильно исполнить именно СОХРАНЁННЫЕ данные плана (тот же
+    no-swap контракт, что и на чат-пути) и ПОГАСИТЬ план — иначе он остался
+    бы висеть с живой кнопкой в Telegram и мог быть исполнен ВТОРОЙ раз
+    нажатием, уже после того как автоматика всё сделала.
+
+    Возвращает сам манифест (уже погашенный) либо None, если живого плана
+    этого вида нет — тогда вызывающие ворота идут обычным путём, который сам
+    и объяснит, что не так (истёк / не тот вид / нечего делать)."""
+    if not manifest_id:
+        return None
+    await _rehydrate_manifest(manifest_id)
+    m = _MANIFESTS.get(manifest_id)
+    if not m or m.get("kind") != kind or m.get("consumed"):
+        return None
+    _mark_manifest_consumed(m, manifest_id)
+    return m
+
+
 async def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
                       summary: str, manifest_id: str, user_reply: str,
                       describe_item, extra: Optional[Dict] = None,
                       items_arg: str = "tasks",
-                      notes: Optional[List[str]] = None) -> _GateOutcome:
+                      notes: Optional[List[str]] = None,
+                      automation_key: str = "") -> _GateOutcome:
     """Runs the two-call consent gate. Returns a _GateOutcome: when
     `.proceed` is True, the caller must actually run the mutation using
     `.tasks`/`.summary`/`.extra`; when False, `.message` is the full response
@@ -3998,12 +4085,44 @@ async def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
     `operations`); подставляется в печатаемую модели инструкцию для call #2,
     чтобы она не позвала тул несуществующим именем аргумента.
 
+    `automation_key` (#118) — ключ headless-автоматики. ВЕРНЫЙ ключ
+    исполняет операцию СРАЗУ, на первом же вызове: фаза плана не строится и
+    сообщение с кнопками владельцу НЕ уходит (см. общий блок ниже — он стоит
+    первым в обеих воротах). Неверный/пустой/отсутствующий ключ не меняет
+    ничего: всё идёт прежним путём план → подтверждение.
+
     КОРУТИНА (2026-08-06, #115): единственный await здесь — отправка плана в
     Telegram в самом конце ветки call #1 (`_maybe_tg_notify_plan`, который
     уводит сетевую часть в поток). Ветка call #2 остаётся полностью
     синхронной: между проверкой `_require_consent` и `m["consumed"] = True`
     нет ни одной точки переключения, поэтому одноразовость манифеста
     по-прежнему держится на однопоточности event loop'а."""
+    # ─── ОБХОД ПО КЛЮЧУ — ДО построения плана и ДО отправки (#118) ───
+    # Раньше ключ сверялся только в `_require_consent`, то есть уже ВНУТРИ
+    # ветки call #2. Для headless-клиента (n8n) это означало худшее из двух:
+    # первый вызов всё равно строил план и отправлял владельцу сообщение с
+    # кнопками, которое никто никогда не нажмёт, а операция выполнялась лишь
+    # со второго вызова. Кнопки копились в личке пачками — и обесценивали сам
+    # механизм подтверждения: человек привыкает жать не глядя.
+    #
+    # Сверка стоит ПЕРВОЙ строкой обоих гейтов намеренно: ниже неё нет ни
+    # одной ветки, которая создаёт манифест или зовёт `_maybe_tg_notify_plan`.
+    # Ослабления здесь нет: `_automation_key_matches` — то же самое сравнение
+    # с `MCP_SECRET` за постоянное время, что и в `_require_consent`; при
+    # неверном, пустом или отсутствующем ключе оно возвращает False, и
+    # управление уходит в прежний интерактивный путь целиком.
+    if _automation_key_matches(automation_key):
+        stored = await _claim_plan_for_automation(kind, manifest_id)
+        if stored is not None:
+            return _GateOutcome(True, tasks=stored.get("tasks") or [],
+                                summary=stored.get("summary") or summary,
+                                extra=stored.get("extra") or {})
+        if not manifest_id and tasks:
+            return _GateOutcome(True, tasks=tasks, summary=summary,
+                                extra=extra or {})
+        # Ни живого плана, ни данных для работы — проваливаемся в обычный
+        # путь, чтобы отказ сформулировал он (там уже есть точные тексты про
+        # «манифест не найден/истёк» и «пустой список»), а не копия здесь.
     _prune_manifests()
     if manifest_id:
     # План мог быть построен ДРУГИМ процессом (перезапуск между планом и
@@ -4080,9 +4199,7 @@ async def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
     """Call #1 (manifest_id omitted): stores `params` VERBATIM in a one-shot
     manifest and returns a preview built by describe_fn(params) — nothing is
     mutated. Call #2 (manifest_id + user_reply): _require_consent(tier=1, ...)
-    is checked (a valid `automation_key` short-circuits the user_reply check,
-    same headless-bypass contract as create_tasks/_gate_batch — see
-    references/automation-secrets.md §8), then the STORED params (never call
+    is checked, then the STORED params (never call
     #2's own arguments) are handed back via `.extra` — same no-swap contract
     as _gate_batch. The stored `object_hash` here is a hash of the PARAMS
     (_manifest_params_hash) — there is no list of object ids to bind to (many
@@ -4099,9 +4216,26 @@ async def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
     genuinely one-shot on their own, not just "accidentally" so via a retry
     that happens to also trip the identity-guard.
 
+    `automation_key` (#118) — ровно тот же общий обход, что и в `_gate_batch`
+    выше, теми же строками и по тем же причинам: ВЕРНЫЙ ключ исполняет
+    операцию с ПЕРВОГО вызова, плана не строит и сообщение с кнопками не
+    отправляет. Раньше он учитывался только внутри ветки call #2 (через
+    `_require_consent`), поэтому первый вызов headless-клиента всё равно
+    заваливал владельца кнопками.
+
     КОРУТИНА по той же причине и с той же оговоркой, что и `_gate_batch`
     выше (#115): await ровно один — отправка плана в Telegram в конце ветки
     call #1; ветка call #2 синхронна от проверки согласия до `consumed`."""
+    # ─── ОБХОД ПО КЛЮЧУ — ДО построения плана и ДО отправки (#118) ───
+    # Тот же блок, что и в `_gate_batch`; развёрнутое обоснование — там.
+    if _automation_key_matches(automation_key):
+        stored = await _claim_plan_for_automation(kind, manifest_id)
+        if stored is not None:
+            return _GateOutcome(True, extra=stored.get("params") or {})
+        if not manifest_id and params:
+            return _GateOutcome(True, extra=params)
+        # Ни живого плана, ни параметров — пусть обычный путь ниже объяснит,
+        # что именно не так (истёкший манифест / пустые параметры).
     _prune_manifests()
     if manifest_id:
     # План мог быть построен ДРУГИМ процессом (перезапуск между планом и
@@ -6250,9 +6384,11 @@ async def create_project(
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -6262,7 +6398,7 @@ async def create_project(
         view_mode: View mode - one of list, kanban, or timeline (optional)
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -7164,9 +7300,11 @@ async def create_subtask(
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -7179,7 +7317,7 @@ async def create_subtask(
         priority: Priority level (0: None, 1: Low, 3: Medium, 5: High) (optional)
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -7378,7 +7516,8 @@ async def get_inbox_tasks() -> str:
 @mcp.tool()
 async def move_tasks(summary: str, tasks: List[Dict[str, str]] = None,
                      to_project_id: str = "", to_project_name: str = None,
-                     manifest_id: str = "", user_reply: str = "") -> str:
+                     manifest_id: str = "", user_reply: str = "",
+                     automation_key: str = "") -> str:
     """
     Move one or more open tasks to a destination list in one call (requires
     v2 API). All tasks go to the same destination. Gated 🟡
@@ -7401,6 +7540,14 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]] = None,
     Put the human title inside each task object so the dialog shows what
     moves: [{"title": "Buy milk", "taskId": "abc"}].
 
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         summary: Human-readable confirmation line (see above)
         tasks: List of {"title": "...", "taskId": "..."} objects — required
@@ -7410,6 +7557,7 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]] = None,
         to_project_name: Destination list name (shown in the dialog)
         manifest_id: from call #1's response — pass on call #2 to actually move
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -7426,7 +7574,8 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]] = None,
     outcome = await _gate_batch(
         "move", "move_tasks", tasks, summary, manifest_id, user_reply,
         lambda t: f"**«{t.get('title') or t.get('taskId')}»** → {to_project_name or to_project_id}",
-        extra={"to_project_id": to_project_id, "to_project_name": to_project_name})
+        extra={"to_project_id": to_project_id, "to_project_name": to_project_name},
+        automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     ex = outcome.extra
@@ -7569,9 +7718,11 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -7588,7 +7739,7 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
         value: Numeric value for quantitative habits (optional; defaults to the goal when done)
         manifest_id: from call #1's response — pass on call #2 to actually record
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -7740,9 +7891,11 @@ async def create_habit(name: str, goal: float = 1.0,
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -7763,7 +7916,7 @@ async def create_habit(name: str, goal: float = 1.0,
         encouragement: Short motivational line TickTick shows on check-in
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -7887,9 +8040,11 @@ async def delete_habit(habit_name: str, habit_id: str, manifest_id: str = "",
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -7904,7 +8059,7 @@ async def delete_habit(habit_name: str, habit_id: str, manifest_id: str = "",
         habit_id: ID of the habit to delete (see get_habits)
         manifest_id: from call #1's response — pass on call #2 to actually delete
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -8055,7 +8210,8 @@ async def list_filters() -> str:
 async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
                           parent_task_id: str = "", project_id: str = "",
                           parent_task_title: str = None,
-                          manifest_id: str = "", user_reply: str = "") -> str:
+                          manifest_id: str = "", user_reply: str = "",
+                          automation_key: str = "") -> str:
     """
     Nest one or more tasks under a parent in one call (requires v2 API).
     All tasks and the parent must be in the same project. Gated 🟡
@@ -8079,6 +8235,14 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
     Put the human title inside each task object so the dialog shows what's
     being nested: [{"title": "Step 1", "taskId": "abc"}].
 
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         summary: Human-readable confirmation line (see above)
         tasks: List of {"title": "...", "taskId": "..."} objects — required
@@ -8090,6 +8254,7 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
         parent_task_title: Title of the parent (shown in the dialog)
         manifest_id: from call #1's response — pass on call #2 to actually nest
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -8107,7 +8272,8 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
         "parent", "set_task_parent", tasks, summary, manifest_id, user_reply,
         lambda t: f"**«{t.get('title') or t.get('taskId')}»** → под «{parent_task_title or parent_task_id}»",
         extra={"parent_task_id": parent_task_id, "project_id": project_id,
-               "parent_task_title": parent_task_title})
+               "parent_task_title": parent_task_title},
+        automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     ex = outcome.extra
@@ -8260,9 +8426,11 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -8274,7 +8442,7 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
         project_id: ID of the project both tasks live in
         manifest_id: from call #1's response — pass on call #2 to actually detach
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -8350,7 +8518,8 @@ async def _unset_task_parent_impl(task_title: str, parent_task_title: str,
 
 @mcp.tool()
 async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
-                        manifest_id: str = "", user_reply: str = "") -> str:
+                        manifest_id: str = "", user_reply: str = "",
+                        automation_key: str = "") -> str:
     """
     Replace tags on one or more tasks in one call (requires v2 API). Gated
     🟡 (docs/DESIGN_approval_gate.md): two calls, same tool name —
@@ -8377,12 +8546,21 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
     list of tags it should have (replaces existing):
     [{"title": "Buy milk", "taskId": "abc", "tags": ["errand", "today"]}]
 
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         summary: Human-readable confirmation line (see above)
         tasks: List of {"title","taskId","tags"} objects — required on call
             #1, ignored on call #2
         manifest_id: from call #1's response — pass on call #2 to actually retag
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -8431,7 +8609,7 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
 
     outcome = await _gate_batch(
         "tags", "set_task_tags", tasks, summary, manifest_id, user_reply,
-        _describe_tags)
+        _describe_tags, automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _set_task_tags_impl(outcome.summary, outcome.tasks)
@@ -8745,9 +8923,11 @@ async def create_project_group(name: str, manifest_id: str = "",
     call (the manifest's own stored value is used). Do NOT make call #2 in
     the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -8755,7 +8935,7 @@ async def create_project_group(name: str, manifest_id: str = "",
         name: Name of the new group (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -8821,9 +9001,11 @@ async def delete_project_group(group_name: str, group_id: str,
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -8832,7 +9014,7 @@ async def delete_project_group(group_name: str, group_id: str,
         group_id: ID of the group
         manifest_id: from call #1's response — pass on call #2 to actually delete
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -8905,9 +9087,11 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -8917,7 +9101,7 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
         group_id: ID of the destination group, or "NONE" to ungroup
         manifest_id: from call #1's response — pass on call #2 to actually move
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -9038,9 +9222,11 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -9051,7 +9237,7 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
         task_id: ID of the task
         manifest_id: from call #1's response — pass on call #2 to actually add
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -9155,7 +9341,8 @@ async def get_trash(limit: int = 50) -> str:
 @mcp.tool()
 async def restore_tasks(summary: str, tasks: List[Dict[str, str]] = None,
                         to_project_id: str = None,
-                        manifest_id: str = "", user_reply: str = "") -> str:
+                        manifest_id: str = "", user_reply: str = "",
+                        automation_key: str = "") -> str:
     """
     Restore one or more tasks from the trash in one call (requires v2 API).
     Gated 🟡 (docs/DESIGN_approval_gate.md): two calls, same tool
@@ -9173,6 +9360,14 @@ async def restore_tasks(summary: str, tasks: List[Dict[str, str]] = None,
     at the TOP of the summary you show the user, e.g. «Восстанавливаю из
     корзины задачу „Купить молоко"» or «Восстанавливаю из корзины 3 задачи».
 
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         summary: Human-readable confirmation line (see above)
         tasks: List of {"taskId": "...", "title": "..."} objects — required
@@ -9186,6 +9381,7 @@ async def restore_tasks(summary: str, tasks: List[Dict[str, str]] = None,
             reported, never hidden as success.
         manifest_id: from call #1's response — pass on call #2 to actually restore
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -9202,7 +9398,8 @@ async def restore_tasks(summary: str, tasks: List[Dict[str, str]] = None,
     outcome = await _gate_batch(
         "restore", "restore_tasks", tasks, summary, manifest_id, user_reply,
         lambda t: f"**«{t.get('title') or t.get('taskId')}»**",
-        extra={"to_project_id": to_project_id})
+        extra={"to_project_id": to_project_id},
+        automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     ex = outcome.extra
@@ -9387,9 +9584,11 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -9402,7 +9601,7 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
         filename: File name to store it as (optional; inferred from url if omitted)
         manifest_id: from call #1's response — pass on call #2 to actually attach
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -9752,9 +9951,11 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -9779,7 +9980,7 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
         ttl_minutes: How long the link stays valid, 1-120 (default 15)
         manifest_id: from call #1's response — pass on call #2 to actually get the link
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -9871,9 +10072,11 @@ async def create_tag(name: str, color: str = None, manifest_id: str = "",
     this call (the manifest's own stored values are used). Do NOT make call
     #2 in the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -9882,7 +10085,7 @@ async def create_tag(name: str, color: str = None, manifest_id: str = "",
         color: Optional hex color like '#FF6161'
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -10090,9 +10293,11 @@ async def delete_tag(name: str, manifest_id: str = "", user_reply: str = "",
     call (the manifest's own stored value is used). Do NOT make call #2 in
     the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -10100,7 +10305,7 @@ async def delete_tag(name: str, manifest_id: str = "", user_reply: str = "",
         name: Tag name (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         manifest_id: from call #1's response — pass on call #2 to actually delete
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
@@ -10173,9 +10378,11 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None,
     relay is involved. In that mode a text user_reply alone is NOT enough:
     without the button press call #2 is refused and nothing is changed.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -10189,7 +10396,7 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None,
         task_title: Title of the task (optional but recommended)
         manifest_id: from call #1's response — pass on call #2 to actually mark it
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
@@ -10255,9 +10462,11 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -10270,7 +10479,7 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
         task_title: Title of the task (optional but recommended for confirmation)
         manifest_id: from call #1's response — pass on call #2 to actually duplicate
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -10357,9 +10566,11 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -10371,7 +10582,7 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
         comment_id: ID of the comment to edit
         manifest_id: from call #1's response — pass on call #2 to actually edit
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -10448,9 +10659,11 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str,
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -10461,7 +10674,7 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str,
         comment_id: ID of the comment to delete
         manifest_id: from call #1's response — pass on call #2 to actually delete
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
@@ -10549,9 +10762,11 @@ async def update_project(project_name: str, project_id: str, name: str = None,
     relay is involved. In that mode a text user_reply alone is NOT enough:
     without the button press call #2 is refused and nothing is changed.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -10563,7 +10778,7 @@ async def update_project(project_name: str, project_id: str, name: str = None,
         view_mode: 'list', 'kanban', or 'timeline' (optional)
         manifest_id: from call #1's response — pass on call #2 to actually update
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
     """
     err = _ensure_official()
     if err:
@@ -10673,9 +10888,11 @@ async def archive_project(project_name: str, project_id: str, archived: bool = T
     relay is involved. In that mode a text user_reply alone is NOT enough:
     without the button press call #2 is refused and nothing is changed.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -10685,7 +10902,7 @@ async def archive_project(project_name: str, project_id: str, archived: bool = T
         archived: True to archive, False to restore it to active
         manifest_id: from call #1's response — pass on call #2 to actually archive
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
@@ -11386,9 +11603,11 @@ async def create_project_column(project_id: str, name: str,
     ignored on this call (the manifest's own stored values are used). Do NOT
     make call #2 in the same turn as call #1.
 
-    automation_key (call #2 only) is ONLY for headless automation clients
-    (bots/pipelines): they pass their own connection secret to prove they are
-    automation, which bypasses the interactive user_reply requirement.
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
     ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
     know it and guessing is a protocol violation.
 
@@ -11403,7 +11622,7 @@ async def create_project_column(project_id: str, name: str,
             creating the column elsewhere)
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
-        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -11987,7 +12206,7 @@ def _triage_blocked_lines(blocked: List[Tuple[Dict, str]]) -> List[str]:
 @mcp.tool()
 async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
                         max_items: int = 50, manifest_id: str = "",
-                        user_reply: str = "") -> str:
+                        user_reply: str = "", automation_key: str = "") -> str:
     """
     Apply a MIXED batch of triage decisions the HUMAN has ALREADY MADE AND
     SAID OUT LOUD — delete / complete / update / move / merge-duplicates — in
@@ -12075,12 +12294,21 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
     deleted/closed elsewhere in the same plan, or (when the Telegram approval
     layer is on) a plan too long to fit one Telegram message.
 
+    automation_key is ONLY for headless automation clients (bots/pipelines):
+    they pass their own connection secret to prove they are automation. A
+    VALID key runs the operation IMMEDIATELY on the FIRST call — no plan, no
+    user_reply, and no Telegram button is sent to the owner. A wrong, empty
+    or missing key changes nothing: the ordinary plan → approval flow applies.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
     Args:
         summary: one-line human sentence in the user's language, e.g. «Разбираю входящие после созвона» — the server appends the per-type counts to it
         operations: the explicit list described above — required on call #1, IGNORED on call #2 (may be repeated verbatim)
         max_items: refuse to plan more operations than this (blast cap); the server's own hard cap is 50 and this argument can only lower it
         manifest_id: from call #1's response — pass on call #2 to actually apply
         user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
 
     Telegram approval layer (when it is enabled on this server): the plan
     built by call #1 is also sent to the owner as a Telegram message with
@@ -12122,7 +12350,8 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
 
     outcome = await _gate_batch("manual_triage", "manual_triage", enriched, summary,
                                 manifest_id, user_reply, _describe_triage_op,
-                                items_arg="operations", notes=notes)
+                                items_arg="operations", notes=notes,
+                                automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _manual_triage_impl(outcome.summary, outcome.tasks)

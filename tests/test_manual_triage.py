@@ -522,8 +522,12 @@ async def test_tool_has_no_filter_or_scope_parameter():
     входа, через который он мог бы «просканировать и предложить»."""
     import inspect
     params = set(inspect.signature(s.manual_triage).parameters)
+    # `automation_key` добавлен 2026-08-06 (#118): headless-клиент с верным
+    # ключом исполняет батч сразу, без плана и без кнопки владельцу. Ко входу
+    # «просканируй и предложи» это отношения не имеет — набор всё равно
+    # закреплён ЦЕЛИКОМ, чтобы новый параметр нельзя было добавить молча.
     assert params == {"summary", "operations", "max_items", "manifest_id",
-                      "user_reply"}
+                      "user_reply", "automation_key"}
 
 
 # ═══════════════════ 5. Полный цикл одного подтверждения ════════════════════
@@ -700,7 +704,7 @@ async def test_published_tool_schema_exposes_no_filter_or_scope_parameter():
     props = set((tool.inputSchema.get("properties") or {}))
 
     assert props == {"summary", "operations", "max_items", "manifest_id",
-                     "user_reply"}, props
+                     "user_reply", "automation_key"}, props
     assert tool.inputSchema.get("required") == ["summary"]
     # `operations` — именно СПИСОК объектов, а не строка-запрос.
     assert tool.inputSchema["properties"]["operations"]["type"] == "array"
