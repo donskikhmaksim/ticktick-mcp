@@ -1589,14 +1589,20 @@ async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
     Phase 2: create exactly what plan_task_creation planned and the user
     approved. Runs the normal creation engine (id echo, destination
     post-verify, operation_report record). One-shot. Gated 🟡
-    (docs/DESIGN_approval_gate.md): user_reply is HARD-enforced — an empty,
-    negative, or fabricated-looking reply is refused and nothing is created.
+    (docs/DESIGN_approval_gate.md): user_reply is HARD-enforced — refused, and
+    nothing is created, when the reply is empty, a negation (anywhere in the
+    sentence), an echo of the server's own manifest jargon, a partial "yes"
+    carrying a caveat/exclusion («ок, кроме последней» — the manifest can only
+    be applied whole), or a paraphrase of the user rather than their words
+    («пользователь: да»). The server CANNOT tell a genuine «да» from one a
+    model made up — the only real out-of-band factor is the Telegram button
+    confirmation, when that layer is enabled (TG_APPROVAL_ENABLED).
 
     Args:
         manifest_id: id from plan_task_creation
         user_reply: the user's literal reply approving the plan — REQUIRED,
-            must be a genuine affirmative («да»/«ok»/…), verbatim, not
-            invented
+            must be a genuine affirmative («да»/«ok»/…), quoted verbatim, not
+            paraphrased and not made up
     """
     err = _ensure_official()
     if err:
@@ -2299,12 +2305,18 @@ _CONSENT_AFFIRMATIVE_WORDS = {
     "да", "ага", "угу", "ок", "окей", "окай", "подтверждаю", "подтверждено",
     "удаляй", "удали", "давай", "го", "погнали", "делай", "применяй",
     "применить", "применяем", "конечно", "точно",
+    # 2026-08-06: добавлены по итогам аудита — обычные человеческие «да»,
+    # которые раньше молча давали ОТКАЗ (владелец пишет их регулярно). Взяты
+    # ТОЛЬКО однозначные: «ладно»/«ну ладно»/«наверное да»/«думаю да» намеренно
+    # НЕ добавлены — это неуверенность, а не согласие (fail-closed).
+    "хорошо", "договорились", "принято", "валяй",
     "yes", "yep", "yeah", "sure", "confirm", "confirmed", "ok", "okay",
-    "approve", "approved", "go", "+", "+1",
+    "approve", "approved", "go", "+", "+1", "agreed", "proceed",
 }
 _CONSENT_NEGATIVE_WORDS = {
     "нет", "неа", "не", "стоп", "отмена", "отмени", "погоди", "подожди",
     "отбой", "не надо", "cancel", "no", "nope", "stop", "wait", "don't",
+    "not", "nah", "abort", "отставить", "нельзя",
 }
 # A reply that merely echoes the server's OWN manifest jargon back is not a
 # human "yes" — it's exactly what a model that fabricates consent would type
@@ -2313,6 +2325,124 @@ _CONSENT_ECHO_ARTIFACT_RE = re.compile(
     r'^(delete|create|declutter)\s*\d+$|manifest_id|execute_\w+\s*\(|plan_\w+\s*\(|^\{.*\}$',
     re.IGNORECASE | re.DOTALL,
 )
+
+# ---------------------------------------------------------------------------
+# Аудит 2026-08-06: три дыры В САМОМ классификаторе ответа. Они опаснее любой
+# отдельно взятой дыры в отдельном туле, потому что гейт согласия расширяется
+# с 2 тулов на ~25 — дефект классификатора тиражируется на все сразу.
+# ---------------------------------------------------------------------------
+
+# (A) ЧАСТИЧНОЕ согласие исполнялось как полное. Манифест исполняется ТОЛЬКО
+# целиком — частичного режима у сервера физически нет, — поэтому ответ вида
+# «ок, кроме последней» / «удали первые три, а последнюю не надо» раньше
+# приводил к удалению В ТОМ ЧИСЛЕ того, что человек явно исключил. Любой
+# маркер оговорки/исключения ⇒ это НЕ полное согласие.
+#
+# Про слово «только» — fail-closed с узким белым списком. «Только» по умолчанию
+# считается оговоркой («ок, только молоко», «да, только вторую»), потому что по
+# свободному тексту нельзя надёжно понять, сузил человек набор или нет, а цена
+# ошибки несимметрична: ложный отказ стоит человеку одной лишней фразы, ложное
+# согласие — удалённых данных. Исключение сделано ровно для наречий ТЕМПА и
+# МАНЕРЫ («да, только быстрее», «ок, только аккуратно») — они не про объекты
+# плана, а про то, как его исполнить, и это частая живая формулировка.
+_CONSENT_MANNER_ADVERBS = (
+    r"быстрее|побыстрее|быстро|скорее|поскорее|аккуратно|аккуратнее|"
+    r"осторожно|осторожнее|внимательно|внимательнее|тихо|медленно|спокойно|"
+    r"пожалуйста|давай|давайте"
+)
+_CONSENT_CAVEAT_RE = re.compile(
+    r"\b(?:"
+    r"кроме|исключая|исключи\w*|за\s+исключением|"
+    r"но\s+не|а\s+не|"
+    r"не\s+(?:надо|нужно|трогай|трогая|удаляй|удали|включай|бери|берём|стоит)|"
+    r"оставь\w*|оставить|оставим|оставляем|оставляя|"
+    r"пропусти\w*|пропустить|пропустим|пропуская|"
+    r"только(?!\s+(?:" + _CONSENT_MANNER_ADVERBS + r")\b)|"
+    r"без\s+(?!проблем|вопросов|базара|разговоров|сомнений|задержек|"
+    r"проволочек|лишних)\w+|"
+    r"except|excluding|exclude|apart\s+from|other\s+than|but\s+not|"
+    r"all\s+but|everything\s+but|skip"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# (C) Пересказ ответа человека моделью («Пользователь: да», «он сказал да»,
+# «yes (по словам пользователя)») проходил как дословная реплика. Докстринги
+# требуют ДОСЛОВНУЮ последнюю реплику — пересказ это самый частый честный
+# промах модели, и отличить его от подделки сервер не может, поэтому отказ.
+_CONSENT_PARAPHRASE_RE = re.compile(
+    r"^(?:пользователь|юзер|человек|владелец|хозяин|user|the\s+user)\s*[:\-—]|"
+    r"^(?:пользователь|юзер|человек|владелец|он|она|user)\s+"
+    r"(?:сказал|сказала|ответил|ответила|подтвердил|подтвердила|говорит|"
+    r"пишет|написал|написала)\b|"
+    r"^(?:the\s+user|he|she|they)\s+(?:said|says|replied|confirmed|approved)\b|"
+    r"\b(?:по|согласно)\s+словам\s+(?:пользователя|юзера|человека|владельца)\b|"
+    r"\bсо\s+слов\s+(?:пользователя|юзера|человека|владельца)\b|"
+    r"\bas\s+(?:the\s+)?user\s+said\b|\baccording\s+to\s+the\s+user\b",
+    re.IGNORECASE,
+)
+
+# Неуверенность и безразличие — «наверное да», «думаю да», «делай что хочешь»,
+# «мне всё равно». Формально там есть утвердительное слово («да», «делай»), но
+# согласия человек не давал: он либо колеблется, либо самоустраняется. Для
+# необратимой операции это не «да» (то же основание, по которому «ну ладно» не
+# попало в словарь согласий).
+_CONSENT_HEDGE_RE = re.compile(
+    r"\b(?:наверн(?:ое|о)|возможно|может\s+быть|думаю|кажется|вроде(?:\s+бы)?|"
+    r"не\s+уверен\w*|сомневаюсь|"
+    r"как\s+(?:хочешь|хотите|знаешь|знаете|сам\w*)|"
+    r"что\s+(?:хочешь|хотите)|всё\s+равно|все\s+равно|пофиг|"
+    r"maybe|probably|i\s+guess|i\s+think|whatever|up\s+to\s+you|"
+    r"not\s+sure|dunno"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_CONSENT_REFUSAL_REASONS = {
+    "echo": (
+        "🛑 Ответ повторяет служебный жаргон самого сервера (манифест-id, имя "
+        "инструмента, JSON, «DELETE 5»), а не человеческую реплику. Это ровно "
+        "то, что печатает модель, подтверждающая саму себя. Ничего не сделано, "
+        "план ещё активен: спроси человека и передай его ответ дословно."
+    ),
+    "paraphrase": (
+        "🛑 Похоже на ПЕРЕСКАЗ ответа человека, а не на его дословную реплику "
+        "(«Пользователь: да», «он сказал да», «yes (по словам пользователя)»). "
+        "Нужна последняя реплика человека БУКВАЛЬНО, как он её написал, без "
+        "твоих слов вокруг. Ничего не сделано, план ещё активен — спроси "
+        "человека и передай его ответ дословно."
+    ),
+    "caveat": (
+        "🛑 В ответе есть оговорка/исключение — это ЧАСТИЧНОЕ согласие, а "
+        "сервер не умеет исполнять план частично: манифест применяется только "
+        "целиком, включая то, что человек исключил. Ничего не сделано, план "
+        "аннулирован. Построй план ЗАНОВО — уже под уточнённый набор "
+        "объектов, — покажи его человеку и спроси подтверждение ещё раз."
+    ),
+    "negative": (
+        "🛑 В ответе есть отрицание — это НЕ согласие, где бы оно ни стояло в "
+        "фразе. Ничего не сделано, план аннулирован. Если человек хотел другой "
+        "набор объектов — построй план заново и спроси подтверждение ещё раз."
+    ),
+    "hedge": (
+        "🛑 Ответ выражает неуверенность или безразличие («наверное да», "
+        "«делай что хочешь»), а не согласие. Для необратимой операции этого "
+        "недостаточно. Ничего не сделано, план ещё активен: переспроси "
+        "человека прямо — нужно однозначное «да» или «нет»."
+    ),
+}
+
+
+class ConsentReplyVerdict:
+    """Разбор ответа человека одним проходом: `kind` — что это за ответ
+    ("affirmative" | "caveat" | "negative" | "paraphrase" | "hedge" | "echo" |
+    "empty" | "unrecognized"), `reason` — готовый обучающий текст отказа ("" для
+    affirmative и для случаев, где вызывающий подставляет свой дефолт)."""
+    __slots__ = ("kind", "reason")
+
+    def __init__(self, kind: str, reason: str = ""):
+        self.kind = kind
+        self.reason = reason
 
 
 def _normalize_consent_reply(reply: Optional[str]) -> str:
@@ -2326,28 +2456,68 @@ def _consent_tokens(norm: str) -> List[str]:
     return [t.strip('.,!?;:') for t in norm.split()]
 
 
-def _is_negative_reply(reply: Optional[str]) -> bool:
+def _classify_consent_reply(reply: Optional[str]) -> ConsentReplyVerdict:
+    """Единственное место, где решается, что означает ответ человека. Порядок
+    проверок — от «ответа человека вообще нет» к «ответ есть, но он не полное
+    согласие»; всё, что не распознано однозначно как согласие, — отказ
+    (fail-closed)."""
     norm = _normalize_consent_reply(reply)
     if not norm:
-        return False
+        return ConsentReplyVerdict("empty")
+    if _CONSENT_ECHO_ARTIFACT_RE.search(norm):
+        return ConsentReplyVerdict("echo", _CONSENT_REFUSAL_REASONS["echo"])
+    # Пересказ проверяем ДО оговорки и отрицания: если реплики человека тут
+    # вообще нет, план губить незачем — модели надо просто переспросить.
+    if _CONSENT_PARAPHRASE_RE.search(norm):
+        return ConsentReplyVerdict("paraphrase",
+                                   _CONSENT_REFUSAL_REASONS["paraphrase"])
+    # Целая фраза-отказ («не надо») — это отказ, а не оговорка: проверяем до
+    # маркеров оговорки, иначе «не надо» уехало бы в caveat из-за «не + надо».
+    if norm in _CONSENT_NEGATIVE_WORDS:
+        return ConsentReplyVerdict("negative",
+                                   _CONSENT_REFUSAL_REASONS["negative"])
+    if _CONSENT_CAVEAT_RE.search(norm):
+        return ConsentReplyVerdict("caveat", _CONSENT_REFUSAL_REASONS["caveat"])
     tokens = _consent_tokens(norm)
-    return any(t in _CONSENT_NEGATIVE_WORDS for t in tokens[:4]) or norm in _CONSENT_NEGATIVE_WORDS
+    # (B) Отрицание ищем по ВСЕМ токенам, а не в окне первых четырёх: именно
+    # из-за окна «да, всё верно, но подожди с третьей» считалось согласием,
+    # хотя докстринг обещал обратное. Согласие по-прежнему ищем в первых 4
+    # токенах, чтобы «да, и ещё сделай X» продолжало работать.
+    if any(t in _CONSENT_NEGATIVE_WORDS for t in tokens) or \
+            norm in _CONSENT_NEGATIVE_WORDS:
+        return ConsentReplyVerdict("negative",
+                                   _CONSENT_REFUSAL_REASONS["negative"])
+    if _CONSENT_HEDGE_RE.search(norm):
+        return ConsentReplyVerdict("hedge", _CONSENT_REFUSAL_REASONS["hedge"])
+    if norm in _CONSENT_AFFIRMATIVE_WORDS or \
+            any(t in _CONSENT_AFFIRMATIVE_WORDS for t in tokens[:4]):
+        return ConsentReplyVerdict("affirmative")
+    return ConsentReplyVerdict("unrecognized")
+
+
+def _consent_refusal_reason(reply: Optional[str]) -> str:
+    """Конкретное объяснение, ПОЧЕМУ ответ не принят за согласие ("" — если
+    принят, либо если объяснять нечего и подойдёт общий `_NO_REPLY_INSTRUCTION`
+    вызывающего)."""
+    return _classify_consent_reply(reply).reason
+
+
+def _is_negative_reply(reply: Optional[str]) -> bool:
+    """«Ответ есть, и он НЕ согласие, причём план надо аннулировать» — прямое
+    отрицание в любом месте фразы ИЛИ частичное согласие с оговоркой (в обоих
+    случаях исполнять показанный план целиком нельзя, его надо перестроить).
+    Пересказ и эхо сюда НЕ входят: там реплики человека попросту нет, план
+    остаётся валидным и вызов можно повторить с дословным ответом."""
+    return _classify_consent_reply(reply).kind in ("negative", "caveat")
 
 
 def _is_affirmative_reply(reply: Optional[str]) -> bool:
     """True only for a real human-shaped "yes" — see docs/DESIGN_approval_gate.md
-    §4.3.3. Fail-closed: empty, negative, or manifest-echo-shaped replies are
-    NEVER affirmative, even if they also happen to contain a "да" substring
-    inside a longer sentence that also negates."""
-    norm = _normalize_consent_reply(reply)
-    if not norm or _CONSENT_ECHO_ARTIFACT_RE.search(norm):
-        return False
-    if _is_negative_reply(reply):
-        return False
-    if norm in _CONSENT_AFFIRMATIVE_WORDS:
-        return True
-    tokens = _consent_tokens(norm)
-    return any(t in _CONSENT_AFFIRMATIVE_WORDS for t in tokens[:4])
+    §4.3.3. Fail-closed: empty, negative, manifest-echo-shaped, paraphrased
+    («пользователь: да») and partially-agreeing («ок, кроме последней») replies
+    are NEVER affirmative. A negation ANYWHERE in the sentence outweighs an
+    affirmative word — the check is not windowed."""
+    return _classify_consent_reply(reply).kind == "affirmative"
 
 
 def _manifest_object_hash(action: str, ids: List[str]) -> str:
@@ -2900,9 +3070,13 @@ async def execute_task_deletion(manifest_id: str, user_reply: str = "") -> str:
     user's VERBATIM last chat message, given ONLY after they actually saw the
     plan and replied — do not paraphrase, summarize, or invent it, and do not
     call this in the same turn where you printed the plan. The server checks
-    it's a genuine affirmative reply (not a negation, not empty, not you
-    echoing back manifest jargon), enforces a minimum gap since the plan was
-    shown, and consumes the manifest once. Every item is also re-verified
+    the reply looks like a human affirmative — not empty, no negation anywhere
+    in the sentence, not manifest jargon echoed back, not a partial "yes" with
+    a caveat («ок, кроме последней»: the manifest is applied whole or not at
+    all), not a paraphrase of the user («пользователь: да») — enforces a
+    minimum gap since the plan was shown, and consumes the manifest once. It
+    cannot tell a genuine «да» from a made-up one; the only out-of-band factor
+    is the Telegram button, when enabled. Every item is also re-verified
     against live state (renamed since planning → skipped); full task
     snapshots are appended to the deletion journal before the delete; the
     effect is post-verified against fresh state.
