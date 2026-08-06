@@ -630,3 +630,31 @@ def test_manifest_affected_count_knows_every_gate_shape():
         {"_gate": "single", "kind": "create_tag", "params": {"name": "x"}}) == 1
     # незнакомая форма — по-прежнему None, а не выдуманное число
     assert s._manifest_affected_count({"_gate": "batch", "kind": "complete"}) is None
+
+
+# ===========================================================================
+# Отметка «итог уже публиковался» (2026-08-06)
+# ===========================================================================
+
+def test_publish_marks_the_candidate_before_anything_can_fail(monkeypatch):
+    """Отметка ставится по факту ВХОДА в публикацию, а не по её успеху —
+    именно она делает второй отчёт невозможным конструктивно (проверку в
+    аварийной ветке поллера см. в test_tg_auto_execute.py). Здесь фиксируется
+    сам контракт: даже если публикация упала на середине, кандидат уже
+    помечен, и «🛑 ошибка исполнения» поверх уже доложенного результата не
+    появится."""
+    import ticktick_mcp.src.tg_approval as tg
+    _publish_harness(monkeypatch, group_ids=[1])
+    monkeypatch.setattr(tg, "post_report_to_group",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            RuntimeError("группа недоступна")))
+    monkeypatch.setattr(s, "_short_auto_execute_summary",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            RuntimeError("и сводка тоже")))
+    candidate = {"manifest_id": "m1", "chat_id": "111", "message_id": 9}
+
+    with pytest.raises(RuntimeError):
+        s._publish_auto_execute_outcome(candidate, "delete_tasks", "отчёт",
+                                        "ok", 3)
+
+    assert candidate[s._OUTCOME_PUBLISHED_KEY] is True

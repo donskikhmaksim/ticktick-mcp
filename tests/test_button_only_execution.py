@@ -247,7 +247,7 @@ async def test_operation_is_not_lost_the_poller_still_executes_it(
     _verdict(monkeypatch, "approved")
     await c.execute(mid, "да")                          # текстом — отказ
 
-    monkeypatch.setattr(tg, "get_tg_approvals", lambda ids: {
+    monkeypatch.setattr(tg, "get_tg_approvals", lambda ids, lost_scan_since_ms=None: {
         i: {"status": "APPROVED", "expires_at": tg._now_ms() + 3_600_000,
             "chat_id": "c1", "message_id": 7} for i in ids if i == mid})
     found = [x for x in s._find_tg_auto_execute_candidates()

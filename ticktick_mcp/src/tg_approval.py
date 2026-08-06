@@ -696,7 +696,15 @@ def _ensure_schema() -> None:
                            разметку не с того сообщения);
       report_chat_id     — куда ушёл отчёт (группа-архив или личка);
       report_message_ids — какими сообщениями ушёл, чтобы reap_expired() мог
-                           убрать за собой весь след манифеста."""
+                           убрать за собой весь след манифеста;
+      lost_notified_at   — когда владельцу СКАЗАЛИ, что подтверждение принято,
+                           а исполнять оказалось нечего (план жил только в
+                           памяти процесса и не пережил перезапуск). Это
+                           «уже сообщили», а не «просрочено»: без такой
+                           отметки поллер писал бы одно и то же сообщение
+                           каждые 10 секунд, пока строка не умрёт по TTL, —
+                           и она обязана быть В БАЗЕ, а не в памяти, потому
+                           что память как раз и потеряли."""
     conn = _pg_pool.getconn()
     try:
         with conn, conn.cursor() as cur:
@@ -722,6 +730,9 @@ def _ensure_schema() -> None:
             )
             cur.execute(
                 "ALTER TABLE tg_approvals ADD COLUMN IF NOT EXISTS report_message_ids BIGINT[]"
+            )
+            cur.execute(
+                "ALTER TABLE tg_approvals ADD COLUMN IF NOT EXISTS lost_notified_at   BIGINT"
             )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS tg_approvals_cleanup_idx "
@@ -865,7 +876,8 @@ def get_tg_approval(manifest_id: str) -> Optional[dict]:
             "extra_message_ids": list(row[4] or []) if len(row) > 4 else []}
 
 
-def get_tg_approvals(manifest_ids: Iterable[str]) -> Dict[str, dict]:
+def get_tg_approvals(manifest_ids: Iterable[str],
+                     lost_scan_since_ms: Optional[int] = None) -> Dict[str, dict]:
     """ПАКЕТНОЕ чтение тех же строк, что и get_tg_approval, — ОДИН запрос в
     Postgres на весь список вместо одной поездки на каждый id.
 
@@ -888,18 +900,47 @@ def get_tg_approvals(manifest_ids: Iterable[str]) -> Dict[str, dict]:
     поллер авто-исполнения читает строки только отсюда, и потерянный здесь
     `extra_message_ids` тихо сломал бы уборку предыдущих кусков длинного плана
     в личке (`_cleanup_plan_leftovers` в server.py) — они оставались бы в чате
-    навсегда."""
+    навсегда.
+
+    `lost_scan_since_ms` (2026-08-06) — ПОИСК ПОТЕРЯННЫХ ПЛАНОВ в ТОМ ЖЕ
+    запросе. Манифесты живут только в памяти процесса, а решение по кнопке —
+    в этой таблице; если сервис перезапустился между отправкой плана и
+    нажатием, строка станет APPROVED, а исполнять будет нечего, и поиск
+    кандидатов «от памяти» (`manifest_id = ANY(...)`) такую строку не увидит
+    НИКОГДА — по определению, её id в память уже не входит. Поэтому при
+    заданном параметре к тому же WHERE добавляется вторая ветка: строки
+    server='ticktick' со статусом APPROVED, про потерю которых ещё не
+    сообщали (`lost_notified_at IS NULL`) и которые не слишком стары
+    (`expires_at > lost_scan_since_ms`). Именно вторая ветка ТОГО ЖЕ запроса,
+    а не отдельная поездка в базу: сохранить «одно обращение к Postgres на
+    проход» тут так же важно, как и раньше (см. абзац выше).
+
+    Отбор «кто из них правда потерян» здесь СОЗНАТЕЛЬНО не делается — он
+    зависит от состояния памяти этого процесса (живые манифесты, надгробия) и
+    живёт чистой функцией в server.py, где это состояние видно и тестируемо
+    без базы."""
     ids = [str(i) for i in manifest_ids]
-    if not ids or not store_ready():
+    if not store_ready():
         return {}
+    if not ids and lost_scan_since_ms is None:
+        return {}
+    where = "server = 'ticktick' AND (manifest_id = ANY(%s)"
+    params: List[Any] = [ids]
+    if lost_scan_since_ms is None:
+        where += ")"
+    else:
+        where += (" OR (status = 'APPROVED' AND lost_notified_at IS NULL "
+                  "AND expires_at > %s))")
+        params.append(int(lost_scan_since_ms))
     conn = _pg_pool.getconn()
     try:
         with conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT manifest_id, status, expires_at, chat_id, message_id, "
-                "extra_message_ids "
-                "FROM tg_approvals WHERE manifest_id = ANY(%s) AND server = 'ticktick'",
-                (ids,),
+                "extra_message_ids, created_at, decided_at, report_message_ids, "
+                "lost_notified_at "
+                f"FROM tg_approvals WHERE {where}",
+                tuple(params),
             )
             rows: List[tuple] = cur.fetchall()
     finally:
@@ -908,8 +949,53 @@ def get_tg_approvals(manifest_ids: Iterable[str]) -> Dict[str, dict]:
                    "message_id": r[4],
                    # Та же нормализация, что в get_tg_approval: NULL/старая
                    # строка без колонки → пустой список, а не None.
-                   "extra_message_ids": list(r[5] or []) if len(r) > 5 else []}
+                   "extra_message_ids": list(r[5] or []) if len(r) > 5 else [],
+                   # Поля ниже нужны ТОЛЬКО поиску потерянных планов; на пути
+                   # обычного авто-исполнения их никто не читает, поэтому их
+                   # появление ничего там не меняет.
+                   "created_at": r[6] if len(r) > 6 else None,
+                   "decided_at": r[7] if len(r) > 7 else None,
+                   "report_message_ids": list(r[8] or []) if len(r) > 8 else [],
+                   "lost_notified_at": r[9] if len(r) > 9 else None}
             for r in rows}
+
+
+def claim_lost_manifests(manifest_ids: Iterable[str]) -> List[str]:
+    """Атомарно занимает право СКАЗАТЬ владельцу «подтверждение принято, но
+    план не сохранился» — по каждой строке ровно один раз за всю её жизнь.
+
+    Почему именно `UPDATE ... WHERE lost_notified_at IS NULL ... RETURNING`, а
+    не «проверил → отправил → пометил»: поллер тикает каждые 10 секунд, а при
+    выкатке нового билда какое-то время работают ДВА процесса сразу. Проверка
+    и пометка в разных запросах дали бы либо шквал одинаковых сообщений в
+    личку, либо два сообщения об одной потере. Здесь же строку получает тот,
+    чей UPDATE выиграл; остальным она просто не возвращается.
+
+    Пометка ставится ДО отправки сообщения намеренно: не доставленное
+    уведомление хуже, чем повторяющееся вечно каждые 10 секунд (второе Максим
+    запретил прямо). Провал отправки виден в логе как ERROR.
+
+    Возвращает id, которые достались НАМ (пустой список = сообщать нечего)."""
+    ids = [str(i) for i in manifest_ids]
+    if not ids or not store_ready():
+        return []
+    conn = _pg_pool.getconn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE tg_approvals SET lost_notified_at = %s "
+                "WHERE manifest_id = ANY(%s) AND server = 'ticktick' "
+                "AND status = 'APPROVED' AND lost_notified_at IS NULL "
+                "RETURNING manifest_id",
+                (_now_ms(), ids),
+            )
+            rows = cur.fetchall()
+    except Exception as e:  # noqa: BLE001 — не смогли занять = молчим, не спамим
+        logger.warning(f"TG: не смог пометить потерянные планы {ids}: {e}")
+        return []
+    finally:
+        _pg_pool.putconn(conn)
+    return [r[0] for r in rows]
 
 
 # ───────────────────────── Публичное API для server.py ─────────────────────
@@ -1120,12 +1206,32 @@ _VERDICT_HEADERS = {
     "partial": "⚠️ Исполнено частично",
     "failed": "🛑 Ошибка исполнения",
     "unverified": "⚠️ Исполнено, НО независимой перепроверкой не подтверждено",
+    # «lost» — это НЕ ошибка исполнения: исполнения вообще не было. Отдельный
+    # заголовок нужен, чтобы в архиве такие случаи не смешивались с «🛑 Ошибка
+    # исполнения» (там мутация могла пройти частично, здесь — не начиналась).
+    "lost": "🛑 Подтверждено, но исполнять было нечего (план не сохранился)",
 }
 
 
 def _owner_now_str() -> str:
     """Время глазами владельца — America/Los_Angeles, никогда UTC."""
     return datetime.now(_resolve_owner_tz()).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def owner_time_str(epoch_ms: Optional[int]) -> str:
+    """Момент из epoch-миллисекунд (так время хранится в `tg_approvals`) в том
+    же виде, в каком владелец читает всё остальное — его собственный часовой
+    пояс, никогда UTC. Пустое/битое значение честно называется словами, а не
+    подставляется «началом эпохи»."""
+    if not epoch_ms:
+        return "время неизвестно"
+    try:
+        return datetime.fromtimestamp(int(epoch_ms) / 1000,
+                                      _resolve_owner_tz()).strftime(
+            "%Y-%m-%d %H:%M:%S %Z")
+    except Exception as e:  # noqa: BLE001 — форматирование даты не должно ронять отчёт
+        logger.warning(f"TG: не смог отформатировать время {epoch_ms!r}: {e}")
+        return "время неизвестно"
 
 
 class ReportDelivery(NamedTuple):
@@ -1226,6 +1332,32 @@ def summarize_in_owner_chat(cfg: TgApprovalConfig, chat_id: str,
     if not res.get("ok"):
         logger.warning(f"TG: editMessageText для сообщения {message_id} не удался: "
                        f"{res.get('description')}")
+        return False
+    return True
+
+
+def clear_inline_keyboard(cfg: TgApprovalConfig, chat_id: str,
+                          message_id: Optional[int]) -> bool:
+    """Снимает кнопки [✅][🛑] с сообщения, НЕ трогая его текст.
+
+    Отличие от `summarize_in_owner_chat` не косметическое, а смысловое: та
+    ЗАМЕНЯЕТ текст плана итогом (после исполнения итог важнее плана). А когда
+    исполнять было нечего, план — единственное, что у владельца осталось от
+    его же просьбы: затерев текст, мы отняли бы у него возможность понять, что
+    именно повторять. Поэтому текст остаётся, а вводящие в заблуждение кнопки
+    убираются, и объяснение приходит отдельным сообщением.
+
+    Best-effort: сообщение стёрли руками / Telegram не в духе → False и лог."""
+    if message_id is None:
+        return False
+    res = _tg_call(cfg, "editMessageReplyMarkup", {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reply_markup": {"inline_keyboard": []},
+    })
+    if not res.get("ok"):
+        logger.warning(f"TG: не смог снять кнопки с сообщения {message_id} в "
+                       f"чате {chat_id}: {res.get('description')}")
         return False
     return True
 
