@@ -4138,7 +4138,11 @@ async def _execute_declutter_from_sheet(manifest_id: str) -> str:
         return f"Error executing declutter manifest (sheet): {str(e)}"
 
 
-@mcp.tool(annotations=READONLY)
+# DISABLED 2026-08-04 по прямому указанию Максима ("Деклатер закоменть пока") —
+# QA-инцидент: plan_declutter молча смешал реальные задачи с тестовыми в одном
+# манифесте на исполнение. Держать выключенным, пока функция не настроена и
+# не протестирована безопасно. Раскомментировать decorator ниже, чтобы вернуть.
+# @mcp.tool(annotations=READONLY)
 async def plan_declutter(scope: str = "", dry_run: bool = True,
                          max_tasks: int = 0, persist: str = "ram") -> str:
     """
@@ -4372,7 +4376,8 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
     return _maybe_tg_notify_plan("execute_declutter", mid, "\n".join(lines) + sheet_note)
 
 
-@mcp.tool()
+# DISABLED 2026-08-04 — см. пометку у plan_declutter выше.
+# @mcp.tool()
 async def execute_declutter(manifest_id: str, user_reply: str = "") -> str:
     """
     Phase 2 of the declutter: apply EXACTLY the mutating actions the manifest
@@ -4506,7 +4511,8 @@ async def _execute_declutter_ram_impl(manifest_id: str, m: Dict) -> str:
         return f"Error executing declutter manifest: {str(e)}"
 
 
-@mcp.tool()
+# DISABLED 2026-08-04 — см. пометку у plan_declutter выше.
+# @mcp.tool()
 async def resume_declutter(manifest_id: str, user_reply: str = "") -> str:
     """
     Resume a sheet-backed declutter manifest (plan_declutter(persist="sheet"))
@@ -4550,7 +4556,8 @@ async def resume_declutter(manifest_id: str, user_reply: str = "") -> str:
     return await _execute_declutter_from_sheet(manifest_id)
 
 
-@mcp.tool()
+# DISABLED 2026-08-04 — см. пометку у plan_declutter выше.
+# @mcp.tool()
 async def set_declutter_decision(manifest_id: str, row_ids: List[int],
                                  decision: str, user_reply: str = "") -> str:
     """
