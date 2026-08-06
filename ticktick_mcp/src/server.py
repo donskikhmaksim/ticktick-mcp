@@ -561,6 +561,57 @@ def _open_by_id(fresh: bool = False) -> Optional[Dict[str, Dict]]:
         return None
 
 
+# TickTick's own apps hard-cap nested subtasks at 5 total levels (root task =
+# level 1, subtask = level 2, sub-subtask = level 3, … down to level 5) —
+# confirmed 2026-08-06 against TickTick's official help center, "Multilevel
+# Tasks" article, FAQ "Does multi-level task support unlimited splitting?":
+# «At present, we only allow up to 5 levels of nested tasks. If the limit is
+# exceeded, you cannot continue to add.» That cap lives in TickTick's own
+# apps' UI, NOT in the v2 API this server calls directly — so a tree built
+# here could silently exceed what TickTick's own apps can display or let you
+# edit further. We enforce the same real cap here instead, fail-closed,
+# always from LIVE parentId chains (never from what a caller merely claims).
+MAX_TASK_NEST_LEVELS = 5
+
+
+def _task_level(task_id: str, by_id: Dict[str, Dict]) -> int:
+    """1-based nesting level of an EXISTING task from its live parentId chain
+    (a root task with no parent = level 1). Cycle-safe: a corrupt/circular
+    chain stops counting instead of looping forever."""
+    level = 1
+    seen = {task_id}
+    cur = (by_id.get(task_id) or {}).get("parentId")
+    while cur and cur not in seen:
+        level += 1
+        seen.add(cur)
+        cur = (by_id.get(cur) or {}).get("parentId")
+    return level
+
+
+def _children_index(by_id: Dict[str, Dict]) -> Dict[str, List[str]]:
+    """{parentId: [childId, …]} built once from the live open-task map, for
+    walking a task's DOWNWARD subtree (depth-adding checks)."""
+    idx: Dict[str, List[str]] = {}
+    for tid, t in by_id.items():
+        pid = t.get("parentId")
+        if pid:
+            idx.setdefault(pid, []).append(tid)
+    return idx
+
+
+def _subtree_height(task_id: str, children_of: Dict[str, List[str]],
+                    _seen: Optional[set] = None) -> int:
+    """How many levels task_id's OWN live subtree already spans (a leaf task
+    counts as 1). A task being re-parented may already have descendants of
+    its own — moving it deeper drags them along, so the depth check must be
+    against what it would ADD below the new parent, not just its own level."""
+    _seen = (_seen or set()) | {task_id}
+    kids = [k for k in (children_of.get(task_id) or []) if k not in _seen]
+    if not kids:
+        return 1
+    return 1 + max(_subtree_height(k, children_of, _seen) for k in kids)
+
+
 # Zero-width / variation-selector chars that can silently differ between two
 # otherwise-identical titles (emoji VS16, ZWJ, ZWSP, BOM).
 _INVISIBLE = ("️", "‍", "​", "﻿", "‎", "‏")
@@ -1015,14 +1066,34 @@ def _build_v2_task_obj(node: Dict, project_id: str, task_id: str,
     return obj
 
 
+def _requested_tree_depth(node: Dict) -> int:
+    """Depth (in levels, the node itself counted as 1) of a task/subtask dict
+    tree AS REQUESTED by the caller — a pure function over the payload, no
+    I/O. String subtasks are leaves (they can't carry their own `subtasks`
+    field); dict subtasks recurse. Used to fail-closed BEFORE building
+    anything when a request would exceed MAX_TASK_NEST_LEVELS, instead of
+    silently truncating deep branches after the fact."""
+    subtasks = node.get("subtasks") or []
+    if not subtasks:
+        return 1
+    return 1 + max(
+        (_requested_tree_depth(s) if isinstance(s, dict) else 1) for s in subtasks
+    )
+
+
 def _flatten_task_tree(node: Dict, project_id: str, parent_id: str = None,
-                       level: int = 0, max_level: int = 3):
+                       level: int = 0, max_level: int = MAX_TASK_NEST_LEVELS - 1):
     """Recursively flatten a nested task tree.
     Returns (tasks, relations) where:
       tasks     — list of v2 task objects WITHOUT parentId (TickTick ignores it in batch/task)
       relations — list of {"parentId","taskId","projectId"} for batch/taskParent call
     IDs are pre-generated so both calls can be built before any HTTP request.
-    max_level=3 means task + 3 levels of nesting (4 levels total)."""
+    max_level (default MAX_TASK_NEST_LEVELS-1=4) means task + 4 levels of
+    nesting (5 levels total — TickTick's own real cap, see
+    MAX_TASK_NEST_LEVELS above). This is a defense-in-depth backstop only:
+    callers are expected to refuse oversized requests via
+    _requested_tree_depth() BEFORE reaching this function, so in practice the
+    cutoff below should never actually trigger and silently drop a branch."""
     import uuid as _uuid
     task_id = _uuid.uuid4().hex[:24]
     obj = _build_v2_task_obj(node, project_id, task_id, parent_id=None)
@@ -1050,7 +1121,9 @@ async def create_tasks(
 ) -> str:
     """
     Create one or more tasks in TickTick with full nested subtask support
-    (up to 4 levels: task → subtask → sub-subtask → sub-sub-subtask).
+    (up to 5 levels: task → subtask → sub-subtask → sub-sub-subtask →
+    sub-sub-sub-subtask — TickTick's own real cap; requests that would nest
+    deeper are refused outright, nothing partial gets created).
 
     ⛔ INTERACTIVE ASSISTANTS: this tool will REFUSE your call. Use
     plan_task_creation (read-only) → reprint its echo VERBATIM → get the
@@ -1080,7 +1153,7 @@ async def create_tasks(
       parent_id (existing task ID to attach root as a subtask; requires v2),
       repeat_flag (RRULE; root task only via official API; use build_recurrence_rule),
       reminders (list of triggers; root task only via official API; use build_reminder),
-      subtasks (list of strings OR list of full task objects — recursive, up to 3 levels deep)
+      subtasks (list of strings OR list of full task objects — recursive, up to 4 levels deep)
 
     Dates: use "YYYY-MM-DD" for all-day; full ISO "YYYY-MM-DDThh:mm:ss+0000"
     only when the user specified an exact time. Do NOT invent a time.
@@ -1103,13 +1176,14 @@ async def create_tasks(
       [{"title": "Epic", "project_id": "x",
         "subtasks": ["Step 1", "Step 2", "Step 3"]}]
 
-    Nested structure with full params (up to 4 levels):
+    Nested structure with full params (up to 5 levels):
       [{"title": "Q3 Launch", "project_id": "x", "priority": 5,
         "subtasks": [
           {"title": "Design", "due_date": "2026-07-15", "priority": 3,
            "subtasks": [
              {"title": "Mockups", "due_date": "2026-07-10",
-              "subtasks": [{"title": "Mobile screens"}]}
+              "subtasks": [{"title": "Mobile screens",
+                            "subtasks": [{"title": "Icon set"}]}]}
            ]},
           {"title": "Dev", "due_date": "2026-07-20",
            "subtasks": [{"title": "Backend"}, {"title": "Frontend"}]}
@@ -1160,6 +1234,7 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
 
     to_verify = []  # (title, id, expected_pid, expected_col) — checked at the end
     sub_verify = []  # (title, id) of created SUBTASKS — existence re-checked too
+    _depth_by_id = None  # lazily-fetched live state, only if some task attaches to an existing parent
 
     # Один сброс кэша на весь вызов (не на каждую задачу): официальный API
     # создания молча перекладывает задачу в Inbox, если переданный projectId
@@ -1198,6 +1273,32 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
         priority = t.get("priority", 0)
         if priority not in [0, 1, 3, 5]:
             failed.append(f"#{i+1} «{title}»: неверный приоритет")
+            continue
+
+        # Depth guard: TickTick supports at most MAX_TASK_NEST_LEVELS total
+        # levels counting from the root task — see MAX_TASK_NEST_LEVELS
+        # above. The requested tree's own depth comes straight from the
+        # payload (nothing is live yet); if it attaches under an EXISTING
+        # task (parent_id), that task's LIVE depth is added on top — a
+        # caller's own claim about how deep it already sits is never
+        # trusted. Refused up front, fail-closed — nothing in this task is
+        # created, not even the levels that would have fit.
+        ext_parent_id = t.get("parent_id")
+        base_level = 0
+        if ext_parent_id:
+            if _depth_by_id is None:
+                _depth_by_id = _open_by_id(fresh=True)
+            if _depth_by_id is None:
+                failed.append(f"#{i+1} «{title}»: {_STATE_UNAVAILABLE_MSG}")
+                continue
+            base_level = _task_level(ext_parent_id, _depth_by_id)
+        total_depth = base_level + _requested_tree_depth(t)
+        if total_depth > MAX_TASK_NEST_LEVELS:
+            failed.append(
+                f"#{i+1} «{title}»: 🛑 запрошенная вложенность даёт "
+                f"{total_depth} уровней вместо {MAX_TASK_NEST_LEVELS} "
+                "поддерживаемых TickTick (считая от корневой задачи) — "
+                "задача НЕ создана целиком.")
             continue
 
         has_nested = any(
@@ -6094,9 +6195,14 @@ async def _create_subtask_impl(parent_task_title: str, subtask_title: str,
                                content: str = None, priority: int = 0) -> str:
     """Pure mutation logic for create_subtask — no consent gate. Called only
     by the gated create_subtask() above once the plan is approved."""
+    # Fetch live state ONCE — reused for the identity guard AND the depth
+    # check below (both must see the same snapshot).
+    by_id = _open_by_id(fresh=True)
+    if by_id is None:
+        return _STATE_UNAVAILABLE_MSG
     # Identity guard on the PARENT: a stale parent_task_id would attach the new
     # subtask under a different task (or a dead one) while reporting success.
-    g = _guard_task(parent_task_id, parent_task_title or "", project_id)
+    g = _guard_task(parent_task_id, parent_task_title or "", project_id, by_id=by_id)
     if g.status == "unavailable":
         return g.message
     if g.status == "mismatch":
@@ -6105,6 +6211,18 @@ async def _create_subtask_impl(parent_task_title: str, subtask_title: str,
     if g.status == "missing":
         return (f"🛑 НЕ создал подзадачу — родитель «{parent_task_title}» не "
                 "среди открытых задач (завершён/удалён/неверный id). Ничего не тронул.")
+    # Depth guard: TickTick supports at most MAX_TASK_NEST_LEVELS total levels
+    # counting from the root task — see MAX_TASK_NEST_LEVELS above for the
+    # source. Computed from the LIVE parentId chain, not from anything the
+    # caller claims.
+    parent_level = _task_level(parent_task_id, by_id)
+    new_level = parent_level + 1
+    if new_level > MAX_TASK_NEST_LEVELS:
+        return (f"🛑 НЕ создал подзадачу — «{g.title or parent_task_title}» "
+                f"уже на уровне {parent_level} из {MAX_TASK_NEST_LEVELS} "
+                "(считая от корневой задачи), новая подзадача оказалась бы "
+                f"на уровне {new_level}. TickTick не поддерживает вложенность "
+                f"глубже {MAX_TASK_NEST_LEVELS} уровней. Ничего не тронул.")
     # The subtask must live in the parent's REAL project.
     project_id = g.project_id or project_id
     try:
@@ -6724,8 +6842,14 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
         while cur and cur not in ancestors:
             ancestors.add(cur)
             cur = (by_id.get(cur) or {}).get("parentId")
+        # Depth guard: the parent's own live level (root = 1) plus however
+        # many levels the task being nested ALREADY spans below itself (it
+        # may already have its own subtasks, which move with it) must not
+        # exceed TickTick's real cap — see MAX_TASK_NEST_LEVELS above.
+        parent_level = len(ancestors)
+        children_of = _children_index(by_id)
         found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
-        rows, cycle_refused, cross_refused = [], [], []
+        rows, cycle_refused, cross_refused, depth_refused = [], [], [], []
         ok_items = []
         for f in found:
             if f["taskId"] in ancestors:
@@ -6734,6 +6858,15 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
             if f["projectId"] and f["projectId"] != parent_pid:
                 cross_refused.append(
                     f"«{f['title']}» (в «{_v2_project_names().get(f['projectId'], f['projectId'])}»)")
+                continue
+            height = _subtree_height(f["taskId"], children_of)
+            resulting_level = parent_level + height
+            if resulting_level > MAX_TASK_NEST_LEVELS:
+                extra = (f" (у неё уже есть свои подзадачи на {height - 1} "
+                         "уровень(ей) вниз)" if height > 1 else "")
+                depth_refused.append(
+                    f"«{f['title']}»{extra}: получилось бы "
+                    f"{resulting_level} из {MAX_TASK_NEST_LEVELS} уровней")
                 continue
             # Each child's OWN live projectId — never stamp the parent's onto
             # a row TickTick would reject or corrupt.
@@ -6772,6 +6905,11 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
             lines.append(f"🛑 НЕ вложено {len(cross_refused)} — задачи в ДРУГОМ "
                          f"проекте, а родитель в «{_v2_project_names().get(parent_pid, parent_pid)}». "
                          "Сначала перенеси move_tasks: " + ", ".join(cross_refused))
+        if depth_refused:
+            lines.append(f"🛑 НЕ вложено {len(depth_refused)} — TickTick не "
+                         f"поддерживает вложенность глубже {MAX_TASK_NEST_LEVELS} "
+                         "уровней (считая от корневой задачи): "
+                         + "; ".join(depth_refused))
         if failed:
             extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
             lines.append(f"❌ НЕ вложено {len(failed)} (parentId не применился"
