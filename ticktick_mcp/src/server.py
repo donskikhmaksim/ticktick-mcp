@@ -561,6 +561,57 @@ def _open_by_id(fresh: bool = False) -> Optional[Dict[str, Dict]]:
         return None
 
 
+# TickTick's own apps hard-cap nested subtasks at 5 total levels (root task =
+# level 1, subtask = level 2, sub-subtask = level 3, … down to level 5) —
+# confirmed 2026-08-06 against TickTick's official help center, "Multilevel
+# Tasks" article, FAQ "Does multi-level task support unlimited splitting?":
+# «At present, we only allow up to 5 levels of nested tasks. If the limit is
+# exceeded, you cannot continue to add.» That cap lives in TickTick's own
+# apps' UI, NOT in the v2 API this server calls directly — so a tree built
+# here could silently exceed what TickTick's own apps can display or let you
+# edit further. We enforce the same real cap here instead, fail-closed,
+# always from LIVE parentId chains (never from what a caller merely claims).
+MAX_TASK_NEST_LEVELS = 5
+
+
+def _task_level(task_id: str, by_id: Dict[str, Dict]) -> int:
+    """1-based nesting level of an EXISTING task from its live parentId chain
+    (a root task with no parent = level 1). Cycle-safe: a corrupt/circular
+    chain stops counting instead of looping forever."""
+    level = 1
+    seen = {task_id}
+    cur = (by_id.get(task_id) or {}).get("parentId")
+    while cur and cur not in seen:
+        level += 1
+        seen.add(cur)
+        cur = (by_id.get(cur) or {}).get("parentId")
+    return level
+
+
+def _children_index(by_id: Dict[str, Dict]) -> Dict[str, List[str]]:
+    """{parentId: [childId, …]} built once from the live open-task map, for
+    walking a task's DOWNWARD subtree (depth-adding checks)."""
+    idx: Dict[str, List[str]] = {}
+    for tid, t in by_id.items():
+        pid = t.get("parentId")
+        if pid:
+            idx.setdefault(pid, []).append(tid)
+    return idx
+
+
+def _subtree_height(task_id: str, children_of: Dict[str, List[str]],
+                    _seen: Optional[set] = None) -> int:
+    """How many levels task_id's OWN live subtree already spans (a leaf task
+    counts as 1). A task being re-parented may already have descendants of
+    its own — moving it deeper drags them along, so the depth check must be
+    against what it would ADD below the new parent, not just its own level."""
+    _seen = (_seen or set()) | {task_id}
+    kids = [k for k in (children_of.get(task_id) or []) if k not in _seen]
+    if not kids:
+        return 1
+    return 1 + max(_subtree_height(k, children_of, _seen) for k in kids)
+
+
 # Zero-width / variation-selector chars that can silently differ between two
 # otherwise-identical titles (emoji VS16, ZWJ, ZWSP, BOM).
 _INVISIBLE = ("️", "‍", "​", "﻿", "‎", "‏")
@@ -1015,14 +1066,34 @@ def _build_v2_task_obj(node: Dict, project_id: str, task_id: str,
     return obj
 
 
+def _requested_tree_depth(node: Dict) -> int:
+    """Depth (in levels, the node itself counted as 1) of a task/subtask dict
+    tree AS REQUESTED by the caller — a pure function over the payload, no
+    I/O. String subtasks are leaves (they can't carry their own `subtasks`
+    field); dict subtasks recurse. Used to fail-closed BEFORE building
+    anything when a request would exceed MAX_TASK_NEST_LEVELS, instead of
+    silently truncating deep branches after the fact."""
+    subtasks = node.get("subtasks") or []
+    if not subtasks:
+        return 1
+    return 1 + max(
+        (_requested_tree_depth(s) if isinstance(s, dict) else 1) for s in subtasks
+    )
+
+
 def _flatten_task_tree(node: Dict, project_id: str, parent_id: str = None,
-                       level: int = 0, max_level: int = 3):
+                       level: int = 0, max_level: int = MAX_TASK_NEST_LEVELS - 1):
     """Recursively flatten a nested task tree.
     Returns (tasks, relations) where:
       tasks     — list of v2 task objects WITHOUT parentId (TickTick ignores it in batch/task)
       relations — list of {"parentId","taskId","projectId"} for batch/taskParent call
     IDs are pre-generated so both calls can be built before any HTTP request.
-    max_level=3 means task + 3 levels of nesting (4 levels total)."""
+    max_level (default MAX_TASK_NEST_LEVELS-1=4) means task + 4 levels of
+    nesting (5 levels total — TickTick's own real cap, see
+    MAX_TASK_NEST_LEVELS above). This is a defense-in-depth backstop only:
+    callers are expected to refuse oversized requests via
+    _requested_tree_depth() BEFORE reaching this function, so in practice the
+    cutoff below should never actually trigger and silently drop a branch."""
     import uuid as _uuid
     task_id = _uuid.uuid4().hex[:24]
     obj = _build_v2_task_obj(node, project_id, task_id, parent_id=None)
@@ -1050,7 +1121,9 @@ async def create_tasks(
 ) -> str:
     """
     Create one or more tasks in TickTick with full nested subtask support
-    (up to 4 levels: task → subtask → sub-subtask → sub-sub-subtask).
+    (up to 5 levels: task → subtask → sub-subtask → sub-sub-subtask →
+    sub-sub-sub-subtask — TickTick's own real cap; requests that would nest
+    deeper are refused outright, nothing partial gets created).
 
     ⛔ INTERACTIVE ASSISTANTS: this tool will REFUSE your call. Use
     plan_task_creation (read-only) → reprint its echo VERBATIM → get the
@@ -1080,7 +1153,7 @@ async def create_tasks(
       parent_id (existing task ID to attach root as a subtask; requires v2),
       repeat_flag (RRULE; root task only via official API; use build_recurrence_rule),
       reminders (list of triggers; root task only via official API; use build_reminder),
-      subtasks (list of strings OR list of full task objects — recursive, up to 3 levels deep)
+      subtasks (list of strings OR list of full task objects — recursive, up to 4 levels deep)
 
     Dates: use "YYYY-MM-DD" for all-day; full ISO "YYYY-MM-DDThh:mm:ss+0000"
     only when the user specified an exact time. Do NOT invent a time.
@@ -1103,13 +1176,14 @@ async def create_tasks(
       [{"title": "Epic", "project_id": "x",
         "subtasks": ["Step 1", "Step 2", "Step 3"]}]
 
-    Nested structure with full params (up to 4 levels):
+    Nested structure with full params (up to 5 levels):
       [{"title": "Q3 Launch", "project_id": "x", "priority": 5,
         "subtasks": [
           {"title": "Design", "due_date": "2026-07-15", "priority": 3,
            "subtasks": [
              {"title": "Mockups", "due_date": "2026-07-10",
-              "subtasks": [{"title": "Mobile screens"}]}
+              "subtasks": [{"title": "Mobile screens",
+                            "subtasks": [{"title": "Icon set"}]}]}
            ]},
           {"title": "Dev", "due_date": "2026-07-20",
            "subtasks": [{"title": "Backend"}, {"title": "Frontend"}]}
@@ -1160,6 +1234,21 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
 
     to_verify = []  # (title, id, expected_pid, expected_col) — checked at the end
     sub_verify = []  # (title, id) of created SUBTASKS — existence re-checked too
+    _depth_by_id = None  # lazily-fetched live state, only if some task attaches to an existing parent
+
+    # Один сброс кэша на весь вызов (не на каждую задачу): официальный API
+    # создания молча перекладывает задачу в Inbox, если переданный projectId
+    # не резолвится в ЖИВОЙ проект (битый/устаревший/удалённый id) — при
+    # этом приходит 200 с id задачи, то есть внешне это выглядит успехом,
+    # если не поймать это ЗДЕСЬ, до записи. Один invalidate + первый вызов
+    # _guard_project ниже форсируют один реальный перезапрос; остальные
+    # элементы того же батча переиспользуют это свежее состояние (оно ещё
+    # в пределах своего короткого TTL) вместо перезапроса на каждую задачу.
+    if ticktick_v2:
+        try:
+            ticktick_v2.invalidate_cache()
+        except Exception:
+            pass
 
     for i, t in enumerate(tasks):
         # Idempotent: a no-op if plan_task_creation already resolved these
@@ -1170,17 +1259,46 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
         if not title or not project_id:
             failed.append(f"#{i+1}: missing title or project_id")
             continue
-        # Destination guard: when the caller names the project, verify the id
-        # actually IS that project — a wrong id would file the task somewhere
-        # else entirely (the create-side twin of «не та задача»).
+        # Guard назначения, FAIL-CLOSED: project_id ОБЯЗАН резолвиться в
+        # живой проект — require_known=True отказывает, даже если вызывающий
+        # не передал project_name для сверки (обычный случай). Без этого
+        # нерезолвящийся id уходил прямиком в вызов создания, и бэкенд
+        # TickTick молча сбрасывал задачу в Inbox — баг доставки, который
+        # читается как чистый «✓ создано».
         exp_proj = t.get("project_name") or t.get("projectName") or ""
-        refuse = _guard_project(project_id, exp_proj)
+        refuse = _guard_project(project_id, exp_proj, require_known=True)
         if refuse:
             failed.append(f"#{i+1} «{title}»: {refuse}")
             continue
         priority = t.get("priority", 0)
         if priority not in [0, 1, 3, 5]:
             failed.append(f"#{i+1} «{title}»: неверный приоритет")
+            continue
+
+        # Depth guard: TickTick supports at most MAX_TASK_NEST_LEVELS total
+        # levels counting from the root task — see MAX_TASK_NEST_LEVELS
+        # above. The requested tree's own depth comes straight from the
+        # payload (nothing is live yet); if it attaches under an EXISTING
+        # task (parent_id), that task's LIVE depth is added on top — a
+        # caller's own claim about how deep it already sits is never
+        # trusted. Refused up front, fail-closed — nothing in this task is
+        # created, not even the levels that would have fit.
+        ext_parent_id = t.get("parent_id")
+        base_level = 0
+        if ext_parent_id:
+            if _depth_by_id is None:
+                _depth_by_id = _open_by_id(fresh=True)
+            if _depth_by_id is None:
+                failed.append(f"#{i+1} «{title}»: {_STATE_UNAVAILABLE_MSG}")
+                continue
+            base_level = _task_level(ext_parent_id, _depth_by_id)
+        total_depth = base_level + _requested_tree_depth(t)
+        if total_depth > MAX_TASK_NEST_LEVELS:
+            failed.append(
+                f"#{i+1} «{title}»: 🛑 запрошенная вложенность даёт "
+                f"{total_depth} уровней вместо {MAX_TASK_NEST_LEVELS} "
+                "поддерживаемых TickTick (считая от корневой задачи) — "
+                "задача НЕ создана целиком.")
             continue
 
         has_nested = any(
@@ -1551,8 +1669,16 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
             pending.append((i, t))
             continue
         pname = names.get(pid)
-        if names and pname is None:
-            refused.append(f"#{i} «{title}»: проект {pid} не найден")
+        if pname is None:
+            # FAIL-CLOSED: отказ всегда, когда id не резолвится в живой
+            # проект — в том числе когда сама карта `names` пустая (v2
+            # недоступен И v1-фолбэк тоже не сработал). Старое условие
+            # `if names and pname is None` пропускало эту проверку целиком
+            # на пустой карте — битый/устаревший project_id проходил план
+            # непроверенным и на execute уходил в Inbox без единого отказа.
+            reason = ("проект по id не найден" if names else
+                      "список проектов сейчас недоступен — сверить id нельзя")
+            refused.append(f"#{i} «{title}»: {pid} — {reason}")
             continue
         exp_name = t.get("project_name") or t.get("projectName") or ""
         if exp_name and pname and not _names_agree(exp_name, pname):
@@ -1925,9 +2051,9 @@ async def _update_tasks_impl(
                 if fresh is None:
                     line = f"✏️ «{shown_title}» отправлено, но {_UNVERIFIED_MSG}"
                 else:
-                    verdict = _verify_item("update", item, fresh,
-                                           _v2_project_names())
-                    if "✅" in verdict[:8]:
+                    status, verdict = _verify_item("update", item, fresh,
+                                                   _v2_project_names())
+                    if status == "ok":
                         line = f"✏️ «{shown_title}» обновлено (проверено)"
                     else:
                         line = (f"❌ «{shown_title}» — изменения НЕ видны в "
@@ -2019,8 +2145,8 @@ async def _update_tasks_impl(
                             f"«{label_of.get(it['taskId'], it['title'])}» — "
                             f"TickTick отклонил: {api_fail[it['taskId']]}")
                         continue
-                    verdict = _verify_item("update", it, fresh, names)
-                    if "✅" in verdict[:8]:
+                    status, verdict = _verify_item("update", it, fresh, names)
+                    if status == "ok":
                         updated.append(label_of.get(it["taskId"], it["title"]))
                     else:
                         not_applied.append(verdict.lstrip("- "))
@@ -3524,8 +3650,16 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
 
 
 def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
-                 names: Dict) -> str:
-    """One verdict line for one journaled item, judged from CURRENT live state."""
+                 names: Dict) -> Tuple[str, str]:
+    """Один вердикт по одной записи из журнала, по ТЕКУЩЕМУ живому состоянию.
+
+    Возвращает (status, line): status — строго одно из "ok"/"warn"/"bad", и
+    ЭТО ЕДИНСТВЕННОЕ, по чему вызывающий код имеет право считать статистику
+    (см. _build_operation_report). Статус НИКОГДА не восстанавливается заново
+    парсингом эмодзи в начале `line` — именно так раньше терялись расхождения
+    с пометкой ⚠️ (баг «расхождений: 0» при 4 напечатанных пунктах). Каждый
+    return ниже явно указывает статус рядом со строкой, к которой он относится.
+    """
     tid = item.get("taskId")
     title = item.get("title") or (item.get("snapshot") or {}).get("title") \
         or f"[task {str(tid)[:8]}…]"
@@ -3533,16 +3667,30 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
     exp = item.get("expect") or {}
 
     if op == "delete":
-        return (f"- ❌ **«{title}»** — ВСЁ ЕЩЁ существует (удаление не состоялось "
-                "или восстановлена)" if live else f"- ✅ **«{title}»** — удалена")
+        return (("bad", f"- ❌ **«{title}»** — ВСЁ ЕЩЁ существует (удаление не "
+                 "состоялось или восстановлена)") if live else
+                ("ok", f"- ✅ **«{title}»** — удалена"))
     if op == "restore":
-        return (f"- ✅ **«{title}»** — снова среди открытых" if live else
-                f"- ❌ **«{title}»** — НЕ появилась среди открытых "
-                "(восстановление не подтвердилось)")
+        # Сведение двух правок (fix/qa-c-report + fix/qa-e-restore):
+        # C перевёл ВСЕ ветки на явный кортеж (status, line) — статус больше
+        # никогда не восстанавливается парсингом эмодзи; E добавил сюда
+        # сверку проекта назначения (задача может вернуться из корзины, но
+        # не в тот список). Проверка E сохранена целиком, в контракте C:
+        # «вернулась, но не туда» — это именно ⚠️/"warn", то самое
+        # расхождение, потеря которого и была багом «расхождений: 0».
+        if not live:
+            return ("bad", f"- ❌ **«{title}»** — НЕ появилась среди открытых "
+                    "(восстановление не подтвердилось)")
+        want_pid = exp.get("projectId")
+        if want_pid and live.get("projectId") != want_pid:
+            return ("warn", f"- ⚠️ **«{title}»** — среди открытых, но в «"
+                    f"{names.get(live.get('projectId'), live.get('projectId'))}»"
+                    f", а не в «{names.get(want_pid, want_pid)}» (не тот список)")
+        return ("ok", f"- ✅ **«{title}»** — снова среди открытых, в нужном списке")
     if op in ("complete", "abandon"):
         verb = "закрыта" if op == "complete" else "отмечена «не буду делать»"
-        return (f"- ❌ **«{title}»** — всё ещё среди открытых" if live
-                else f"- ✅ **«{title}»** — {verb} (ушла из открытых)")
+        return (("bad", f"- ❌ **«{title}»** — всё ещё среди открытых") if live
+                else ("ok", f"- ✅ **«{title}»** — {verb} (ушла из открытых)"))
     if op == "delete_project":
         # tid here is the PROJECT id, not a task id. Re-fetch fresh via the
         # None-distinguishing helper rather than trusting the `names` dict
@@ -3550,15 +3698,16 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         # "project confirmed deleted".
         fresh_names = _v2_project_names_or_none()
         if fresh_names is None:
-            return (f"- ⚠️ **«{title}»** — проект: проверка не удалась (не "
-                    "получилось перечитать список проектов), исход НЕ "
+            return ("warn", f"- ⚠️ **«{title}»** — проект: проверка не удалась "
+                    "(не получилось перечитать список проектов), исход НЕ "
                     "ПОДТВЕРЖДЁН")
         still = fresh_names.get(tid)
-        return (f"- ❌ **«{title}»** — проект ВСЁ ЕЩЁ существует (удаление не "
-                "подтвердилось)" if still else
-                f"- ✅ **«{title}»** — проект удалён")
+        return (("bad", f"- ❌ **«{title}»** — проект ВСЁ ЕЩЁ существует "
+                 "(удаление не подтвердилось)") if still else
+                ("ok", f"- ✅ **«{title}»** — проект удалён"))
     if live is None:
-        return f"- ❌ **«{title}»** — не найдена среди открытых (ожидалась живой)"
+        return ("bad", f"- ❌ **«{title}»** — не найдена среди открытых "
+                "(ожидалась живой)")
     if op == "create":
         probs = []
         want_pid = exp.get("projectId")
@@ -3568,7 +3717,8 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         if exp.get("columnId") and live.get("columnId") != exp.get("columnId"):
             probs.append("раздел не применился")
         if probs:
-            return f"- ⚠️ **«{title}»** — создана, но: " + "; ".join(probs)
+            return ("warn", f"- ⚠️ **«{title}»** — создана, но: "
+                    + "; ".join(probs))
         # State the FACTS, not agreement-with-intent: the reader must SEE where
         # it landed, so a wrong-but-consistent request is still visible.
         facts = [f"в «{names.get(live.get('projectId'), live.get('projectId'))}»"]
@@ -3578,29 +3728,30 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
             facts.append(f"срок {str(live['dueDate'])[:10]}")
         if live.get("priority"):
             facts.append(f"приоритет {PRIORITY_MAP.get(live['priority'], live['priority'])}")
-        return f"- ✅ **«{title}»** — создана {', '.join(facts)}"
+        return ("ok", f"- ✅ **«{title}»** — создана {', '.join(facts)}")
     if op == "move":
         want = exp.get("projectId")
-        return (f"- ✅ **«{title}»** — в **«{names.get(want, want)}»**"
+        return (("ok", f"- ✅ **«{title}»** — в **«{names.get(want, want)}»**")
                 if live.get("projectId") == want else
-                f"- ❌ **«{title}»** — осталась в «{names.get(live.get('projectId'), '?')}»")
+                ("bad", f"- ❌ **«{title}»** — осталась в «{names.get(live.get('projectId'), '?')}»"))
     if op == "tags":
         want = set(exp.get("tags") or [])
         got = set(live.get("tags") or [])
-        return (f"- ✅ **«{title}»** — теги {sorted(got)}" if want == got else
-                f"- ❌ **«{title}»** — теги {sorted(got)}, ожидались {sorted(want)}")
+        return (("ok", f"- ✅ **«{title}»** — теги {sorted(got)}") if want == got
+                else ("bad", f"- ❌ **«{title}»** — теги {sorted(got)}, "
+                      f"ожидались {sorted(want)}"))
     if op == "parent":
         want = exp.get("parentId")  # None = detached
         got = live.get("parentId")
         # A parentId "applied" toward a parent that is NOT itself alive among
         # open tasks is an orphaning, not a success — check the parent too.
         if want and want not in live_map:
-            return (f"- ❌ **«{title}»** — родитель {str(want)[:8]}… НЕ среди "
-                    "открытых задач (вложение под несуществующего/закрытого "
-                    "родителя)")
+            return ("bad", f"- ❌ **«{title}»** — родитель {str(want)[:8]}… НЕ "
+                    "среди открытых задач (вложение под несуществующего/"
+                    "закрытого родителя)")
         ok = (got == want) if want else not got
-        return (f"- ✅ **«{title}»** — родитель применён" if ok else
-                f"- ❌ **«{title}»** — parentId={got!r}, ожидался {want!r}")
+        return (("ok", f"- ✅ **«{title}»** — родитель применён") if ok else
+                ("bad", f"- ❌ **«{title}»** — parentId={got!r}, ожидался {want!r}"))
     if op == "update":
         changes = exp.get("changes") or {}
         diffs = []
@@ -3615,9 +3766,15 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
                     diffs.append(f"tags: {got} ≠ {want}")
             elif got != want:
                 diffs.append(f"{field}: {got!r} ≠ {want!r}")
-        return (f"- ❌ **«{title}»** — не применилось: " + "; ".join(diffs)) if diffs \
-            else f"- ✅ **«{title}»** — все изменения на месте"
-    return f"- ✓ **«{title}»** — записана в журнал (тип {op} не проверяется автоматически)"
+        return (("bad", f"- ❌ **«{title}»** — не применилось: " + "; ".join(diffs))
+                if diffs else ("ok", f"- ✅ **«{title}»** — все изменения на месте"))
+    # Тип операции без выделенного проверятеля: автоматически НЕ проверяется —
+    # это предупреждение, а не молчаливый успех, и должно считаться как такое.
+    # Также: ASCII-символ "✓" запрещён как статусный маркер замороженной
+    # легендой (output-format.md §7.2) — используем ⚠️, как и в остальных
+    # случаях «не проверено».
+    return ("warn", f"- ⚠️ **«{title}»** — записана в журнал (тип {op} не "
+            "проверяется автоматически)")
 
 
 @mcp.tool(annotations=READONLY)
@@ -3683,7 +3840,16 @@ def _build_operation_report(record_id: str) -> str:
             pass
         lines = [f"### 🧾 Независимый отчёт — `{record_id}`",
                  f"_{when} · журнал операции ⇄ живое состояние TickTick_", ""]
-        ok = bad = 0
+        # Единый источник истины: каждый вердикт сначала собирается сюда, в
+        # виде пары (status, напечатанная_строка). И строки, печатаемые ниже,
+        # и итоговый подсчёт дальше — оба выведены из ЭТОГО ЖЕ списка, а не
+        # из отдельного счётчика, заново распознающего эмодзи в тексте. Это
+        # структурно исключает расхождение между напечатанными пунктами и
+        # строкой «Итог» (именно так раньше получалось «0 расхождений» рядом
+        # с 4 явными пунктами ⚠️ — эти пункты начинались с ⚠️, а старый
+        # счётчик по первым символам строки его не распознавал, поэтому
+        # пункт печатался, но никогда не учитывался).
+        verdicts: List[Tuple[str, str]] = []
         for rec in records:
             op = rec.get("op") or "delete"
             items = rec.get("items") or [
@@ -3691,17 +3857,23 @@ def _build_operation_report(record_id: str) -> str:
                 for s in rec.get("deleted", [])
             ]
             for item in items:
-                line = _verify_item(op, item, live, names)
-                lines.append(line)
-                # Verdict lines are markdown bullets ("- ✅ **«…»**"), so match
-                # the mark anywhere in the prefix, not at line start.
-                head = line[:8]
-                if "✅" in head:
-                    ok += 1
-                elif "❌" in head:
-                    bad += 1
+                verdicts.append(_verify_item(op, item, live, names))
+        lines.extend(line for _, line in verdicts)
+        ok = sum(1 for status, _ in verdicts if status == "ok")
+        warn = sum(1 for status, _ in verdicts if status == "warn")
+        bad = sum(1 for status, _ in verdicts if status == "bad")
         lines.append("")
-        lines.append(f"**Итог: ✅ {ok} подтверждено, ❌ {bad} расхождений.**")
+        lines.append(f"**Итог: ✅ {ok} подтверждено, ⚠️ {warn} не проверено, "
+                      f"❌ {bad} расхождений.**")
+        # Явный, однозначный общий вердикт для headless/программных
+        # потребителей (например, бота tg-ai-assistant) — они не должны
+        # прочитать отчёт с хотя бы одним расхождением или непроверенным
+        # пунктом как успех.
+        overall = "❌" if bad else ("⚠️" if warn else "✅")
+        tail = ("есть расхождения — это НЕ успех." if bad else
+                "есть непроверенные пункты — это НЕ полный успех." if warn else
+                "всё подтверждено.")
+        lines.append(f"**Статус операции: {overall}** — {tail}")
         lines.append("[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО — "
                      "это серверная проверка, не заменяй её своим пересказом]")
         return "\n".join(lines)
@@ -6179,9 +6351,14 @@ async def _create_subtask_impl(parent_task_title: str, subtask_title: str,
                                content: str = None, priority: int = 0) -> str:
     """Pure mutation logic for create_subtask — no consent gate. Called only
     by the gated create_subtask() above once the plan is approved."""
+    # Fetch live state ONCE — reused for the identity guard AND the depth
+    # check below (both must see the same snapshot).
+    by_id = _open_by_id(fresh=True)
+    if by_id is None:
+        return _STATE_UNAVAILABLE_MSG
     # Identity guard on the PARENT: a stale parent_task_id would attach the new
     # subtask under a different task (or a dead one) while reporting success.
-    g = _guard_task(parent_task_id, parent_task_title or "", project_id)
+    g = _guard_task(parent_task_id, parent_task_title or "", project_id, by_id=by_id)
     if g.status == "unavailable":
         return g.message
     if g.status == "mismatch":
@@ -6190,6 +6367,18 @@ async def _create_subtask_impl(parent_task_title: str, subtask_title: str,
     if g.status == "missing":
         return (f"🛑 НЕ создал подзадачу — родитель «{parent_task_title}» не "
                 "среди открытых задач (завершён/удалён/неверный id). Ничего не тронул.")
+    # Depth guard: TickTick supports at most MAX_TASK_NEST_LEVELS total levels
+    # counting from the root task — see MAX_TASK_NEST_LEVELS above for the
+    # source. Computed from the LIVE parentId chain, not from anything the
+    # caller claims.
+    parent_level = _task_level(parent_task_id, by_id)
+    new_level = parent_level + 1
+    if new_level > MAX_TASK_NEST_LEVELS:
+        return (f"🛑 НЕ создал подзадачу — «{g.title or parent_task_title}» "
+                f"уже на уровне {parent_level} из {MAX_TASK_NEST_LEVELS} "
+                "(считая от корневой задачи), новая подзадача оказалась бы "
+                f"на уровне {new_level}. TickTick не поддерживает вложенность "
+                f"глубже {MAX_TASK_NEST_LEVELS} уровней. Ничего не тронул.")
     # The subtask must live in the parent's REAL project.
     project_id = g.project_id or project_id
     try:
@@ -6809,8 +6998,14 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
         while cur and cur not in ancestors:
             ancestors.add(cur)
             cur = (by_id.get(cur) or {}).get("parentId")
+        # Depth guard: the parent's own live level (root = 1) plus however
+        # many levels the task being nested ALREADY spans below itself (it
+        # may already have its own subtasks, which move with it) must not
+        # exceed TickTick's real cap — see MAX_TASK_NEST_LEVELS above.
+        parent_level = len(ancestors)
+        children_of = _children_index(by_id)
         found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
-        rows, cycle_refused, cross_refused = [], [], []
+        rows, cycle_refused, cross_refused, depth_refused = [], [], [], []
         ok_items = []
         for f in found:
             if f["taskId"] in ancestors:
@@ -6819,6 +7014,15 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
             if f["projectId"] and f["projectId"] != parent_pid:
                 cross_refused.append(
                     f"«{f['title']}» (в «{_v2_project_names().get(f['projectId'], f['projectId'])}»)")
+                continue
+            height = _subtree_height(f["taskId"], children_of)
+            resulting_level = parent_level + height
+            if resulting_level > MAX_TASK_NEST_LEVELS:
+                extra = (f" (у неё уже есть свои подзадачи на {height - 1} "
+                         "уровень(ей) вниз)" if height > 1 else "")
+                depth_refused.append(
+                    f"«{f['title']}»{extra}: получилось бы "
+                    f"{resulting_level} из {MAX_TASK_NEST_LEVELS} уровней")
                 continue
             # Each child's OWN live projectId — never stamp the parent's onto
             # a row TickTick would reject or corrupt.
@@ -6857,6 +7061,11 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
             lines.append(f"🛑 НЕ вложено {len(cross_refused)} — задачи в ДРУГОМ "
                          f"проекте, а родитель в «{_v2_project_names().get(parent_pid, parent_pid)}». "
                          "Сначала перенеси move_tasks: " + ", ".join(cross_refused))
+        if depth_refused:
+            lines.append(f"🛑 НЕ вложено {len(depth_refused)} — TickTick не "
+                         f"поддерживает вложенность глубже {MAX_TASK_NEST_LEVELS} "
+                         "уровней (считая от корневой задачи): "
+                         + "; ".join(depth_refused))
         if failed:
             extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
             lines.append(f"❌ НЕ вложено {len(failed)} (parentId не применился"
@@ -6995,6 +7204,12 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
 
     Call #1 (manifest_id omitted): builds a one-shot manifest from `tasks`
     and returns a preview of the new tags per task — nothing is changed yet.
+    Any tag that doesn't exist in the account yet is flagged in the preview
+    as "будет создан" (will be created): TickTick keeps tags in two places —
+    the account's own tag list and a raw label on the task — so a brand-new
+    name is registered in the account's tag list FIRST (same path as
+    create_tag), then applied to the task(s). This avoids creating an orphan
+    tag that's invisible to list_tags and undeletable via delete_tag.
     Call #2 (after the user actually replied): repeat the call with
     manifest_id=<id from call #1> and user_reply=<the user's literal last
     message> — `tasks` is ignored on this call (the manifest's own stored
@@ -7025,9 +7240,42 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
     err = _ensure_ready()
     if err:
         return err
+    # Preview-time only (call #1, non-empty tasks): flag tags that don't
+    # exist yet, so the user sees "will be created" BEFORE approving, not
+    # just after the fact. Skipped on call #2 and on an empty/missing
+    # `tasks` — _gate_batch refuses those without needing a tag lookup.
+    #
+    # Чтение живого списка тегов здесь — best-effort, и ронять фазу ПЛАНА оно
+    # не имеет права: план обязан строиться, даже когда живое состояние
+    # недоступно (клиент не поднят, сеть легла). Это НЕ ослабление
+    # fail-closed: пометка «тег будет создан» — информационная, а настоящая
+    # защита от тега-сироты стоит в _set_task_tags_impl, где отсутствующий
+    # тег регистрируется в аккаунте ПЕРЕД записью на задачу — и там
+    # недоступность состояния уже честно останавливает операцию.
+    existing_tags: set = set()
+    if not manifest_id and tasks:
+        try:
+            existing_tags = set(await _live_tag_names(force=True))
+        except Exception as e:
+            logger.warning(f"set_task_tags: не удалось прочитать список тегов "
+                           f"для превью плана ({e}) — пометка «будет создан» "
+                           "в этом плане не показывается")
+
+    def _describe_tags(t: Dict) -> str:
+        wanted = t.get("tags") or []
+        parts = []
+        for tag in wanted:
+            bare = tag.lstrip("#").lower()
+            if bare and bare not in existing_tags:
+                parts.append(f"{tag} (тег не существует — будет создан)")
+            else:
+                parts.append(tag)
+        return (f"**«{t.get('title') or t.get('taskId')}»** → теги: "
+                + (", ".join(parts) or "(пусто)"))
+
     outcome = _gate_batch(
         "tags", "set_task_tags", tasks, summary, manifest_id, user_reply,
-        lambda t: f"**«{t.get('title') or t.get('taskId')}»** → теги: {', '.join(t.get('tags') or []) or '(пусто)'}")
+        _describe_tags)
     if not outcome.proceed:
         return outcome.message
     return await _set_task_tags_impl(outcome.summary, outcome.tasks)
@@ -7051,12 +7299,60 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                     "tags": [x.lstrip("#").lower() for x in (t.get("tags") or [])]}
                    for t in tasks
                    if (t.get("taskId") or t.get("task_id")) in ok]
+
+        # TickTick keeps tags in TWO places: the account's tag list
+        # (/batch/tag — what list_tags/create_tag/delete_tag see) and a raw
+        # label string on each task (/batch/task). Writing a brand-new label
+        # straight onto a task WITHOUT registering it in the account tag list
+        # first creates an ORPHAN tag: invisible to list_tags, undeletable via
+        # delete_tag, but still attached to the task. So: register every
+        # not-yet-existing tag through the same account-level path create_tag
+        # uses, BEFORE touching any task — and post-verify the registration
+        # itself, not just assume the 200 meant it worked.
+        requested = sorted({t for c in changes for t in c["tags"] if t})
+        # force=False: _open_by_id(fresh=True) just above already forced a
+        # fresh sync-state fetch (tags included) within the TTL window — no
+        # need for a second network round-trip for the same snapshot.
+        existing_tags = set(await _live_tag_names(force=False))
+        to_register = [t for t in requested if t not in existing_tags]
+        for tag_name in to_register:
+            try:
+                await _run_blocking(lambda tn=tag_name: ticktick_v2.create_tag(tn))
+            except Exception as e:
+                logger.error(
+                    f"set_task_tags: auto-registration of tag '{tag_name}' "
+                    f"raised: {e}")
+        after_create = (set(await _live_tag_names(force=True))
+                        if to_register else existing_tags)
+        registered = [t for t in to_register if t in after_create]
+        failed_register = [t for t in to_register if t not in after_create]
+
+        # Fail closed for exactly the tags that couldn't be registered: drop
+        # the WHOLE per-task change rather than send a truncated tag list —
+        # set_task_tags REPLACES all tags on a task, so silently stripping
+        # just the bad tag from a change could wipe tags the user never
+        # asked to touch. The task is left completely untouched instead.
+        skipped_tasks = []
+        if failed_register:
+            bad_set = set(failed_register)
+            kept = []
+            for c in changes:
+                bad = set(c["tags"]) & bad_set
+                if bad:
+                    skipped_tasks.append((ok[c["taskId"]]["title"], sorted(bad)))
+                else:
+                    kept.append(c)
+            changes = kept
+
         api_fail = {}
         if changes:
             resp = await _run_blocking(
                 lambda: ticktick_v2.batch_update_tasks(changes))
             api_fail = id2error_failures(resp, [c["taskId"] for c in changes])
-        # Inline post-verify: live tags must equal the requested set.
+        # Inline post-verify: live tags must equal the requested set, AND any
+        # newly-registered tag must be visible in the account's own tag list
+        # (list_tags) — this is the proof that (b) actually closed the
+        # orphan hole, not just moved it.
         tags_by_id = {c["taskId"]: c["tags"] for c in changes}
         applied, failed = [], []
         unverified = False
@@ -7066,6 +7362,8 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                 unverified = True
             else:
                 for f in found:
+                    if f["taskId"] not in tags_by_id:
+                        continue  # skipped above — never sent, don't verify
                     want = set(tags_by_id.get(f["taskId"], []))
                     got = set((fresh.get(f["taskId"]) or {}).get("tags") or [])
                     ok_item = want == got and f["taskId"] not in api_fail
@@ -7074,6 +7372,22 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
         if applied:
             lines.append(f"🏷 Теги обновлены у {len(applied)} (проверено): "
                          + ", ".join(f"«{t}»" for t in applied))
+        if registered:
+            lines.append(
+                f"🆕 Новые теги зарегистрированы в аккаунте (проверено — видны "
+                f"в list_tags, удаляются delete_tag), {len(registered)}: "
+                + ", ".join(f"«{t}»" for t in registered))
+        if failed_register:
+            lines.append(
+                f"⚠️ Не удалось зарегистрировать в аккаунте {len(failed_register)} "
+                "тег(ов) — они НЕ проставлены ни на одну задачу (во избежание "
+                "тега-сироты): " + ", ".join(f"«{t}»" for t in failed_register))
+        if skipped_tasks:
+            parts = "; ".join(
+                f"«{title}» (тег{'и' if len(bad) > 1 else ''} "
+                + ", ".join(f"«{b}»" for b in bad) + ")"
+                for title, bad in skipped_tasks)
+            lines.append(f"🛑 Пропущено, задачи НЕ тронуты, {len(skipped_tasks)}: " + parts)
         if unverified:
             lines.append(f"Отправлено {len(changes)}, но {_UNVERIFIED_MSG}")
         if failed:
@@ -7090,7 +7404,7 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
             rid = _op_journal("tags", [
                 {"taskId": f["taskId"], "title": f["title"],
                  "expect": {"tags": tags_by_id.get(f["taskId"], [])}}
-                for f in found], summary)
+                for f in found if f["taskId"] in tags_by_id], summary)
             lines.append(_report_line(rid))
         return "\n".join(lines) if lines else "Ничего не изменено."
     except Exception as e:
@@ -7651,7 +7965,11 @@ async def restore_tasks(summary: str, tasks: List[Dict[str, str]] = None,
             on call #1, ignored on call #2. Get IDs/titles from get_trash.
         to_project_id: Optional destination list for all tasks; defaults to
             each task's original list — required (if used) on call #1,
-            ignored on call #2
+            ignored on call #2. Either way, the destination is verified
+            against the live task after restoring (TickTick's restore call
+            can silently drop it to Inbox) and auto-corrected with one
+            follow-up move if it missed; a mismatch that survives that is
+            reported, never hidden as success.
         manifest_id: from call #1's response — pass on call #2 to actually restore
         user_reply: the user's literal reply approving the plan — required on call #2
 
@@ -7707,7 +8025,17 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
             if not _names_agree(exp, real):
                 mismatch.append(f"«{exp}» → в корзине по этому id «{real}»")
                 continue
-            ok_items.append({"taskId": tid, "title": exp or real})
+            # Ожидаемый пункт назначения: явный override побеждает; иначе —
+            # СОБСТВЕННЫЙ исходный список задачи из записи в корзине (то, что
+            # обещает докстринг: «defaults to each task's original list»).
+            # Считаем это ЗДЕСЬ, из уже имеющегося снимка корзины, чтобы
+            # post-verify ниже реально мог это сверить, а не слепо доверять,
+            # что вызов восстановления сам всё сделал правильно.
+            orig_pid = (entry.get("projectId") or entry.get("projectID")
+                       or entry.get("listId"))
+            want_pid = to_project_id or orig_pid
+            ok_items.append({"taskId": tid, "title": exp or real,
+                             "want_pid": want_pid})
         if mismatch:
             return ("🛑 НЕ восстановил — id НЕ совпал с названием в корзине "
                     "(защита от «не той задачи»): " + "; ".join(mismatch)
@@ -7717,25 +8045,87 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
             resp = await _run_blocking(lambda: ticktick_v2.batch_restore_tasks(
                 [i["taskId"] for i in ok_items], to_project_id))
             api_fail = id2error_failures(resp, [i["taskId"] for i in ok_items])
-        # Post-verify: restored tasks must reappear among OPEN tasks.
-        restored, failed = [], []
+        # Post-verify: восстановленные задачи ДОЛЖНЫ снова появиться среди
+        # ОТКРЫТЫХ и ДОЛЖНЫ оказаться в ожидаемом проекте. Замечено, что
+        # /trash/restore у TickTick теряет пункт назначения и кидает задачу
+        # в Inbox независимо от переданного projectId — поэтому «снова среди
+        # открытых» САМО ПО СЕБЕ не доказательство того, что обещание
+        # докстринга («original list») выполнилось. Проект сверяется явно,
+        # и если он не совпал — чинится одним явным дополнительным
+        # перемещением (тем же вызовом, что использует move_tasks), прежде
+        # чем результат уходит в отчёт. Расхождение, пережившее и этот
+        # фикс, идёт в вывод как расхождение — никогда молча как успех.
+        names = _v2_project_names()
+        restored, unknown_dest, failed = [], [], []
+        wrong_project = []  # [(title, want_pid, got_pid)] — так и не туда даже после фикса
         unverified = False
         if ok_items:
             fresh = _open_by_id(fresh=True)
             if fresh is None:
                 unverified = True
             else:
+                to_fix = []
                 for i in ok_items:
-                    ok = i["taskId"] in fresh and i["taskId"] not in api_fail
-                    (restored if ok else failed).append(i["title"])
+                    live = fresh.get(i["taskId"])
+                    if live is None or i["taskId"] in api_fail:
+                        failed.append(i["title"])
+                    elif not i["want_pid"]:
+                        # Не удалось определить исходный список из записи в
+                        # корзине — честно сказать об этом, а не молча
+                        # засчитать как успех, который на деле не проверен.
+                        unknown_dest.append(i["title"])
+                    elif live.get("projectId") != i["want_pid"]:
+                        to_fix.append(i)
+                    else:
+                        restored.append(i["title"])
+                if to_fix:
+                    fix_by_pid: Dict[str, List[str]] = {}
+                    for i in to_fix:
+                        fix_by_pid.setdefault(i["want_pid"], []).append(i["taskId"])
+                    fix_api_fail: Dict[str, str] = {}
+                    for pid, ids in fix_by_pid.items():
+                        try:
+                            mresp = await _run_blocking(
+                                lambda pid=pid, ids=ids:
+                                    ticktick_v2.batch_move_tasks(ids, pid))
+                            fix_api_fail.update(id2error_failures(mresp, ids))
+                        except Exception as e:
+                            logger.error("restore_tasks: corrective move to "
+                                        f"{pid} failed: {e}")
+                            for tid2 in ids:
+                                fix_api_fail.setdefault(tid2, str(e))
+                    fresh2 = _open_by_id(fresh=True)
+                    for i in to_fix:
+                        live2 = (fresh2 or {}).get(i["taskId"])
+                        if (fresh2 is not None and live2 is not None
+                                and i["taskId"] not in fix_api_fail
+                                and live2.get("projectId") == i["want_pid"]):
+                            restored.append(i["title"])
+                        elif fresh2 is None:
+                            unverified = True
+                        else:
+                            got = (live2 or {}).get("projectId")
+                            wrong_project.append((i["title"], i["want_pid"], got))
         lines = []
         if restored:
             lines.append(f"↩ Восстановлено из корзины {len(restored)} "
-                         "(проверено — снова среди открытых): "
-                         + ", ".join(f"«{t}»" for t in restored))
+                         "(проверено — снова среди открытых, в нужном "
+                         "списке): " + ", ".join(f"«{t}»" for t in restored))
         if unverified:
             lines.append(f"Восстановление {len(ok_items)} отправлено, но "
                          f"{_UNVERIFIED_MSG}")
+        if wrong_project:
+            parts = [f"«{t}» — попала в «{names.get(got, got)}», а не в "
+                    f"«{names.get(want, want)}» (восстановилась не туда, и "
+                    "попытка переместить в нужный список не помогла)"
+                    for t, want, got in wrong_project]
+            lines.append("⚠️ Восстановлено НЕ в исходный/запрошенный список "
+                        f"{len(wrong_project)}: " + "; ".join(parts))
+        if unknown_dest:
+            lines.append(f"⚠️ Восстановлено {len(unknown_dest)}, но исходный "
+                        "список не удалось определить из записи в корзине — "
+                        "куда реально попали, не проверено: "
+                        + ", ".join(f"«{t}»" for t in unknown_dest))
         if failed:
             extra = "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items())
             lines.append(f"❌ НЕ восстановлено {len(failed)} (не появились среди "
@@ -7745,7 +8135,10 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
             lines.append(f"↷ Не найдены в корзине {len(absent)}: "
                          + ", ".join(f"«{t}»" for t in absent))
         if ok_items:
-            rid = _op_journal("restore", ok_items, summary)
+            rid = _op_journal("restore", [
+                {"taskId": i["taskId"], "title": i["title"],
+                 "expect": {"projectId": i["want_pid"]}} for i in ok_items
+            ], summary)
             lines.append(_report_line(rid))
         return "\n".join(lines) if lines else "Ничего не восстановлено."
     except Exception as e:
@@ -8427,12 +8820,53 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
         return f"Error renaming tag: {str(e)}"
 
 
+def _describe_delete_tag(p: Dict) -> str:
+    return f'Удаляю тег «{p.get("name")}»'
+
+
 @mcp.tool()
-async def delete_tag(name: str) -> str:
-    """Delete a tag (requires v2 API). Tasks keep existing; they just lose the tag."""
+async def delete_tag(name: str, manifest_id: str = "", user_reply: str = "",
+                     automation_key: str = "") -> str:
+    """
+    Delete a tag (requires v2 API). Tasks keep existing; they just lose the
+    tag. Gated 🟡 (docs/DESIGN_approval_gate.md): two calls, same tool name —
+    nothing is deleted on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is deleted yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — name is ignored on this
+    call (the manifest's own stored value is used). Do NOT make call #2 in
+    the same turn as call #1.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
+
+    Args:
+        name: Tag name (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
+        manifest_id: from call #1's response — pass on call #2 to actually delete
+        user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+    """
     err = _ensure_ready()
     if err:
         return err
+    params = {"name": name}
+    outcome = _gate_single("delete_tag", "delete_tag",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_delete_tag,
+                           automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _delete_tag_impl(**outcome.extra)
+
+
+async def _delete_tag_impl(name: str) -> str:
+    """Pure mutation logic for delete_tag — no consent gate. Called only by
+    the gated delete_tag() above once the plan is approved."""
     try:
         existing = await _live_tag_names()
         if name.lower() not in existing:
@@ -8739,20 +9173,59 @@ async def _update_task_comment_impl(task_title: str, text: str, project_id: str,
         return f"Error updating comment: {str(e)}"
 
 
+def _describe_delete_task_comment(p: Dict) -> str:
+    return f'Удаляю комментарий на «{p.get("task_title")}»'
+
+
 @mcp.tool()
-async def delete_task_comment(task_title: str, project_id: str, task_id: str, comment_id: str) -> str:
+async def delete_task_comment(task_title: str, project_id: str, task_id: str,
+                              comment_id: str, manifest_id: str = "",
+                              user_reply: str = "", automation_key: str = "") -> str:
     """
-    Delete a task comment (requires v2 API).
+    Delete a task comment (requires v2 API). Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    deleted on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is deleted yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
 
     Args:
         task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         project_id: ID of the project
         task_id: ID of the task
         comment_id: ID of the comment to delete
+        manifest_id: from call #1's response — pass on call #2 to actually delete
+        user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
         return err
+    params = {"task_title": task_title, "project_id": project_id,
+              "task_id": task_id, "comment_id": comment_id}
+    outcome = _gate_single("delete_task_comment", "delete_task_comment",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_delete_task_comment,
+                           automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _delete_task_comment_impl(**outcome.extra)
+
+
+async def _delete_task_comment_impl(task_title: str, project_id: str,
+                                    task_id: str, comment_id: str) -> str:
+    """Pure mutation logic for delete_task_comment — no consent gate. Called
+    only by the gated delete_task_comment() above once the plan is approved."""
     try:
         g = _guard_task(task_id, task_title or "", project_id)
         if g.status == "unavailable":

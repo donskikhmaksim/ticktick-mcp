@@ -89,18 +89,71 @@ SINGLE_TOOLS = {
     "create_project_column": dict(project_id="p1", name="Колонка", project_name="Проект"),
     "create_attachment_upload_url": dict(task_id="t1", project_id="p1",
                                          filename="scan.png", ttl_minutes=15),
+    # Дополнено при сборке ветки восьми QA-фиксов (2026-08-06):
+    # `delete_tag` / `delete_task_comment` переведены на _gate_single этой же
+    # веткой и кнопку получают автоматически (generic-исполнитель находит их
+    # по метке `_gate` и по имени `_<tool>_impl`); `abandon_task` /
+    # `archive_project` / `update_project` были гейтованы и раньше, но в эту
+    # таблицу не попали. Теперь она покрывает ВСЕ тулы, идущие через общие
+    # гейт-функции, а тест ниже сверяет её с кодом, а не с числом-константой.
+    "delete_tag": dict(name="дом"),
+    "delete_task_comment": dict(task_title="A", project_id="p1", task_id="t1",
+                                comment_id="c1"),
+    "abandon_task": dict(summary="Отказываюсь", task_id="t1", task_title="A"),
+    "archive_project": dict(project_name="Проект", project_id="p1", archived=True),
+    "update_project": dict(project_name="Проект", project_id="p1", name="Новое имя"),
 }
 
 ALL_TOOLS = {**BATCH_TOOLS, **SINGLE_TOOLS}
 GATE_OF = {**{t: "batch" for t in BATCH_TOOLS}, **{t: "single" for t in SINGLE_TOOLS}}
 
 
-def test_the_table_covers_exactly_twenty_tools():
+def test_the_table_covers_every_gated_tool_in_the_code():
     """Если кто-то добавит/уберёт гейтованный тул, эта таблица обязана
-    поехать вместе с ним — иначе новый тул молча останется без кнопки."""
-    assert len(BATCH_TOOLS) == 6
-    assert len(SINGLE_TOOLS) == 14
-    assert len(ALL_TOOLS) == 20
+    поехать вместе с ним — иначе новый тул молча останется без кнопки.
+
+    Раньше здесь стояло голое `len(ALL_TOOLS) == 20`, и это НЕ ловило
+    настоящую опасность: тул, заведённый через общий гейт и забытый в
+    таблице, оставлял константу верной, а сам тул — непроверенным (так и
+    вышло с abandon_task / archive_project / update_project). Теперь список
+    берётся из САМОГО КОДА: разбираем server.py и вытаскиваем второй
+    аргумент каждого вызова _gate_batch/_gate_single — это имя тула."""
+    import ast
+    import pathlib
+
+    src = pathlib.Path(s.__file__).read_text(encoding="utf-8")
+    in_code = {}
+    for node in ast.walk(ast.parse(src)):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in ("_gate_single", "_gate_batch")):
+            names = [a.value for a in node.args
+                     if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+            if len(names) >= 2:
+                in_code[names[1]] = ("single" if node.func.id == "_gate_single"
+                                     else "batch")
+
+    missing = sorted(set(in_code) - set(ALL_TOOLS))
+    assert not missing, (
+        f"гейтованные тулы без записи в таблице: {missing} — у них не "
+        "проверен контракт кнопки, и она может молча не работать")
+
+    stale = sorted(set(ALL_TOOLS) - set(in_code))
+    assert not stale, (f"в таблице есть тулы, которых нет среди гейтованных: "
+                       f"{stale}")
+
+    wrong_gate = {t: (GATE_OF[t], in_code[t]) for t in ALL_TOOLS
+                  if GATE_OF[t] != in_code[t]}
+    assert not wrong_gate, (f"форма гейта разъехалась с кодом "
+                            f"(ожидание, факт): {wrong_gate}")
+
+
+def test_every_gated_tool_has_its_impl_function():
+    """Кнопка зовёт исполнителя по имени `_<имя_тула>_impl`. Если имя
+    разъедется, кнопка перестанет работать МОЛЧА — без ошибки и без падения
+    остальных тестов. Эта проверка ловит именно такой разъезд."""
+    missing = [t for t in ALL_TOOLS if not callable(getattr(s, f"_{t}_impl", None))]
+    assert not missing, (f"нет функции-исполнителя _<tool>_impl для: {missing} "
+                         "— generic-исполнителю кнопки нечего звать")
 
 
 # ───────────────────────── обвязка ─────────────────────────
