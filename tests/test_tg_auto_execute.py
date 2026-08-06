@@ -194,9 +194,35 @@ def test_consume_manifest_for_auto_execute_unknown_id():
 # ===========================================================================
 
 def _enable_tg(monkeypatch, allowlist=None):
-    monkeypatch.setattr(s, "_TG_CFG", tg.TgApprovalConfig(
-        enabled=True, bot_token="x", owner_chat_id="1", server="ticktick",
-        tools_allowlist=allowlist, ttl_s=3600))
+    fields = dict(enabled=True, bot_token="x", owner_chat_id="1",
+                  server="ticktick", tools_allowlist=allowlist, ttl_s=3600)
+    # TgApprovalConfig прирастает полями (reports_chat_id/reap_enabled,
+    # 2026-08-06) — подставляем их только если они реально объявлены, чтобы
+    # тест не ломался ни на старой, ни на новой версии конфига.
+    extra = {"reports_chat_id": "-100999", "reap_enabled": True}
+    known = getattr(tg.TgApprovalConfig, "__dataclass_fields__", {})
+    fields.update({k: v for k, v in extra.items() if k in known})
+    monkeypatch.setattr(s, "_TG_CFG", tg.TgApprovalConfig(**fields))
+
+
+def _fake_report_sinks(monkeypatch):
+    """Подменяет ДВА получателя итога автоисполнения: группу «MCP Отчёты»
+    (полный отчёт) и личку владельца (короткая сводка). raising=False — эти
+    функции появляются в tg_approval параллельной правкой, тест не должен
+    зависеть от порядка слияния веток."""
+    group, private = [], []
+
+    def _post(cfg, manifest_id, report_md, *, tool, verdict):
+        group.append({"manifest_id": manifest_id, "report_md": report_md,
+                      "tool": tool, "verdict": verdict})
+        return [1001]  # id доставленных сообщений — непустой список = ok
+
+    def _summarize(cfg, chat_id, message_id, short_md):
+        private.append((chat_id, message_id, short_md))
+
+    monkeypatch.setattr(tg, "post_report_to_group", _post, raising=False)
+    monkeypatch.setattr(tg, "summarize_in_owner_chat", _summarize, raising=False)
+    return group, private
 
 
 def test_find_candidates_empty_when_tg_disabled(monkeypatch):
@@ -315,29 +341,31 @@ def test_tick_auto_executes_approved_delete_and_reports(monkeypatch):
     monkeypatch.setattr(tg, "check_approval", lambda m: "approved" if m == mid else "none")
     monkeypatch.setattr(tg, "get_tg_approval",
                         lambda m: {"chat_id": "c1", "message_id": 7})
-    reports = []
-    monkeypatch.setattr(tg, "report_auto_execution_result",
-                        lambda cfg, chat_id, message_id, text: reports.append((chat_id, message_id, text)))
+    group, private = _fake_report_sinks(monkeypatch)
 
     asyncio.run(s._tg_auto_execute_tick())
 
     assert s._MANIFESTS[mid]["consumed"] is True
     assert "t1" not in live  # actually deleted
-    assert len(reports) == 1
-    chat_id, message_id, text = reports[0]
+    # ПОЛНЫЙ отчёт уходит в группу-архив, в личку — только короткая сводка
+    # (2026-08-06: раньше обе роли играло одно editMessageText).
+    assert len(group) == 1
+    assert group[0]["manifest_id"] == mid and group[0]["tool"] == "delete_tasks"
+    assert "Что сделал исполнитель" in group[0]["report_md"]
+    assert len(private) == 1
+    chat_id, message_id, short = private[0]
     assert chat_id == "c1" and message_id == 7
-    assert "🛑" not in text
+    assert "🛑" not in short
+    assert "MCP Отчёты" in short
 
 
 def test_tick_skips_when_no_candidates(monkeypatch):
     import asyncio
     _enable_tg(monkeypatch)
     monkeypatch.setattr(tg, "check_approval", lambda m: "none")
-    reports = []
-    monkeypatch.setattr(tg, "report_auto_execution_result",
-                        lambda *a, **k: reports.append(1))
+    group, private = _fake_report_sinks(monkeypatch)
     asyncio.run(s._tg_auto_execute_tick())
-    assert reports == []
+    assert group == [] and private == []
 
 
 def test_tick_reports_error_without_crashing(monkeypatch):
@@ -361,14 +389,17 @@ def test_tick_reports_error_without_crashing(monkeypatch):
         raise RuntimeError("kaboom")
 
     monkeypatch.setattr(s._AUTO_EXECUTORS["delete_tasks"], "execute", boom)
-    reports = []
-    monkeypatch.setattr(tg, "report_auto_execution_result",
-                        lambda cfg, chat_id, message_id, text: reports.append(text))
+    group, private = _fake_report_sinks(monkeypatch)
 
     asyncio.run(s._tg_auto_execute_tick())  # must not raise
-    assert len(reports) == 1
-    assert "🛑" in reports[0]
-    assert "kaboom" in reports[0]
+    # Ошибка исполнения идёт по тому же пути: полный текст — в группу как
+    # "failed", короткая сводка — в личку.
+    assert len(group) == 1
+    assert group[0]["verdict"] == "failed"
+    assert "🛑" in group[0]["report_md"]
+    assert "kaboom" in group[0]["report_md"]
+    assert len(private) == 1
+    assert "🛑" in private[0][2]
     # the manifest was consumed by try_auto_execute BEFORE execute() ran and
     # raised — no retry storm on a manifest that already "used" its one shot
     assert s._MANIFESTS[mid]["consumed"] is True
