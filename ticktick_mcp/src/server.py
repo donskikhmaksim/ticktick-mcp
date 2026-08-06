@@ -2958,14 +2958,14 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
 
 def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
                  names: Dict) -> Tuple[str, str]:
-    """One verdict for one journaled item, judged from CURRENT live state.
+    """Один вердикт по одной записи из журнала, по ТЕКУЩЕМУ живому состоянию.
 
-    Returns (status, line): status is exactly one of "ok"/"warn"/"bad" — the
-    ONLY thing the caller may tally on (see _build_operation_report). Never
-    derive the status by re-parsing `line`'s leading glyph: that indirection
-    is what let a printed ⚠️ discrepancy go uncounted before (the "0
-    расхождений while listing 4" bug). Every return statement below states
-    its status explicitly, right next to the line it belongs to.
+    Возвращает (status, line): status — строго одно из "ok"/"warn"/"bad", и
+    ЭТО ЕДИНСТВЕННОЕ, по чему вызывающий код имеет право считать статистику
+    (см. _build_operation_report). Статус НИКОГДА не восстанавливается заново
+    парсингом эмодзи в начале `line` — именно так раньше терялись расхождения
+    с пометкой ⚠️ (баг «расхождений: 0» при 4 напечатанных пунктах). Каждый
+    return ниже явно указывает статус рядом со строкой, к которой он относится.
     """
     tid = item.get("taskId")
     title = item.get("title") or (item.get("snapshot") or {}).get("title") \
@@ -3062,10 +3062,11 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
                 diffs.append(f"{field}: {got!r} ≠ {want!r}")
         return (("bad", f"- ❌ **«{title}»** — не применилось: " + "; ".join(diffs))
                 if diffs else ("ok", f"- ✅ **«{title}»** — все изменения на месте"))
-    # Op type without a dedicated verifier: NOT auto-verified — this is a
-    # warning, not a silent success, and must count as one. Also: the ASCII
-    # "✓" glyph is banned as a status marker by the frozen legend
-    # (output-format.md §7.2) — use ⚠️ like every other "not verified" case.
+    # Тип операции без выделенного проверятеля: автоматически НЕ проверяется —
+    # это предупреждение, а не молчаливый успех, и должно считаться как такое.
+    # Также: ASCII-символ "✓" запрещён как статусный маркер замороженной
+    # легендой (output-format.md §7.2) — используем ⚠️, как и в остальных
+    # случаях «не проверено».
     return ("warn", f"- ⚠️ **«{title}»** — записана в журнал (тип {op} не "
             "проверяется автоматически)")
 
@@ -3133,15 +3134,15 @@ def _build_operation_report(record_id: str) -> str:
             pass
         lines = [f"### 🧾 Независимый отчёт — `{record_id}`",
                  f"_{when} · журнал операции ⇄ живое состояние TickTick_", ""]
-        # Single source of truth: every verdict is collected here FIRST, as a
-        # (status, printed_line) pair. The lines printed below and the tally
-        # further down are both derived from THIS SAME list — never a
-        # separately-incremented counter re-parsing the printed text. That
-        # structurally rules out the printed bullets and the "Итог" count
-        # ever disagreeing (was the root cause of "0 расхождений" printed
-        # alongside 4 explicit ⚠️ discrepancy bullets: those bullets started
-        # with ⚠️, which the old head-substring counter never matched, so
-        # they were listed but never tallied).
+        # Единый источник истины: каждый вердикт сначала собирается сюда, в
+        # виде пары (status, напечатанная_строка). И строки, печатаемые ниже,
+        # и итоговый подсчёт дальше — оба выведены из ЭТОГО ЖЕ списка, а не
+        # из отдельного счётчика, заново распознающего эмодзи в тексте. Это
+        # структурно исключает расхождение между напечатанными пунктами и
+        # строкой «Итог» (именно так раньше получалось «0 расхождений» рядом
+        # с 4 явными пунктами ⚠️ — эти пункты начинались с ⚠️, а старый
+        # счётчик по первым символам строки его не распознавал, поэтому
+        # пункт печатался, но никогда не учитывался).
         verdicts: List[Tuple[str, str]] = []
         for rec in records:
             op = rec.get("op") or "delete"
@@ -3158,9 +3159,10 @@ def _build_operation_report(record_id: str) -> str:
         lines.append("")
         lines.append(f"**Итог: ✅ {ok} подтверждено, ⚠️ {warn} не проверено, "
                       f"❌ {bad} расхождений.**")
-        # Explicit, unambiguous overall verdict for headless/programmatic
-        # consumers (e.g. the tg-ai-assistant bot) that must not read a
-        # report with any discrepancy or unverified item as success.
+        # Явный, однозначный общий вердикт для headless/программных
+        # потребителей (например, бота tg-ai-assistant) — они не должны
+        # прочитать отчёт с хотя бы одним расхождением или непроверенным
+        # пунктом как успех.
         overall = "❌" if bad else ("⚠️" if warn else "✅")
         tail = ("есть расхождения — это НЕ успех." if bad else
                 "есть непроверенные пункты — это НЕ полный успех." if warn else

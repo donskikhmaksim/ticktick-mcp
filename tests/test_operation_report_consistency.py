@@ -1,21 +1,22 @@
-"""Regression coverage for the operation_report tally bug (nightly QA, 2026-08):
-`operation_report(record_id)` printed a "0 расхождений" verdict in the SAME
-response that also listed several explicit ⚠️ discrepancy bullets — an
-internal contradiction. Root cause: the old tally counted only lines whose
-leading glyph matched "✅"/"❌" by re-parsing the printed markdown text, so
-⚠️ verdicts (a mismatched-but-created task, an unreadable re-check, an
-unhandled op type) were printed in the body but never counted anywhere.
+"""Регрессионные тесты на баг подсчёта в operation_report (ночная QA, 2026-08):
+`operation_report(record_id)` печатал вердикт «0 расхождений» в ОДНОМ И ТОМ ЖЕ
+ответе, где были явно перечислены несколько пунктов с ⚠️ — внутреннее
+противоречие. Причина: старый подсчёт учитывал только строки, у которых
+ведущий эмодзи совпадал с "✅"/"❌" по заново распознанному напечатанному
+markdown-тексту, поэтому вердикты ⚠️ (создано не туда, куда просили;
+не удалось перечитать состояние для перепроверки; тип операции без
+выделенного проверятеля) печатались в теле отчёта, но нигде не учитывались.
 
-The fix makes `_verify_item` return an explicit (status, line) pair — status
-∈ {"ok", "warn", "bad"} — and makes `_build_operation_report`'s tally a
-len()/count() over that SAME list of verdicts it prints, never a
-separately-incremented counter. These tests assert that invariant holds:
-whatever is printed as a bullet is exactly what is counted in "Итог", for a
-mix of ok/warn/bad outcomes and for the all-clear case.
+Фикс делает так, что `_verify_item` возвращает явную пару (status, line) —
+status ∈ {"ok", "warn", "bad"} — а подсчёт в `_build_operation_report`
+считается через len()/count() по ТОМУ ЖЕ списку вердиктов, что и печатается,
+а не отдельным счётчиком. Эти тесты проверяют, что это свойство держится:
+что напечатано пунктом — то и учтено в «Итог», и для смеси ok/warn/bad,
+и для случая «всё чисто».
 
-Pure-logic: no network, no real TickTick — `_open_by_id`/`_v2_project_names`
-are monkeypatched to canned live state, same pattern as
-tests/test_delete_identity_binding.py.
+Чисто-логические тесты: без сети, без реального TickTick — `_open_by_id`/
+`_v2_project_names` замоканы на заготовленное живое состояние, тот же
+паттерн, что и в tests/test_delete_identity_binding.py.
 """
 import re
 
@@ -30,9 +31,9 @@ def _wire(monkeypatch, live, tmp_path, names=None):
 
 
 def _count_body_bullets(report: str) -> dict:
-    """Count verdict bullets by leading status glyph, straight from the
-    printed markdown — this is the independent ground truth the "Итог" tally
-    is checked against."""
+    """Считает пункты-вердикты по ведущему статусному эмодзи прямо из
+    напечатанного markdown — это независимая «эталонная правда», с которой
+    сверяется подсчёт в строке «Итог»."""
     lines = [l for l in report.splitlines() if l.startswith("- ")]
     return {
         "ok": sum(1 for l in lines if l.startswith("- ✅")),
@@ -54,17 +55,17 @@ def _parse_summary(report: str):
 
 async def test_mixed_ok_warn_bad_tally_matches_printed_bullets(
         monkeypatch, tmp_path):
-    """Reproduces the reported scenario: a batch with several ⚠️-flagged
-    items (a create landing in the wrong project, an op type with no
-    dedicated verifier) alongside a genuine ❌ and a genuine ✅. The printed
-    "Итог" numbers must equal what's actually listed — no discrepancy can be
-    invisible to the tally."""
+    """Воспроизводит репортнутый сценарий: батч с несколькими пунктами ⚠️
+    (создание попало не в тот проект; тип операции без выделенного
+    проверятеля) вместе с настоящим ❌ и настоящим ✅. Числа в «Итог» должны
+    точно совпадать с тем, что реально перечислено — ни одно расхождение не
+    должно быть невидимым для подсчёта."""
     live = {
-        # d1 absent from live -> delete confirmed (ok)
-        "d2": {"id": "d2", "title": "Ещё живая"},           # delete NOT applied -> bad
-        "u1": {"id": "u1", "title": "New U1"},               # update matches -> ok
-        "c1": {"id": "c1", "title": "C1", "projectId": "p2"},  # create wrong project -> warn
-        "h1": {"id": "h1", "title": "H1"},                   # unhandled op -> warn (fallback)
+        # d1 отсутствует в живом состоянии -> удаление подтверждено (ok)
+        "d2": {"id": "d2", "title": "Ещё живая"},              # удаление НЕ применилось -> bad
+        "u1": {"id": "u1", "title": "New U1"},                 # обновление совпало -> ok
+        "c1": {"id": "c1", "title": "C1", "projectId": "p2"},  # создание не в тот проект -> warn
+        "h1": {"id": "h1", "title": "H1"},                     # тип операции без проверятеля -> warn (fallback)
     }
     _wire(monkeypatch, live, tmp_path)
 
@@ -92,29 +93,32 @@ async def test_mixed_ok_warn_bad_tally_matches_printed_bullets(
     bullets = _count_body_bullets(report)
     summary = _parse_summary(report)
 
-    # The core regression: warn items (⚠️) are printed AND counted.
+    # Суть регрессии: пункты-предупреждения (⚠️) и напечатаны, и учтены.
     assert bullets == {"ok": 2, "warn": 2, "bad": 1, "total": 5}
     assert summary == {"ok": 2, "warn": 2, "bad": 1}
-    # Single source of truth, generically: tally == printed bullets, always.
+    # Единый источник истины в общем виде: подсчёт == напечатанные пункты,
+    # всегда.
     assert summary["ok"] == bullets["ok"]
     assert summary["warn"] == bullets["warn"]
     assert summary["bad"] == bullets["bad"]
 
-    # Machine-readable verdict: any discrepancy (bad>0 here) must NOT read
-    # as success.
+    # Машиночитаемый вердикт: при наличии расхождения (здесь bad>0) статус
+    # НЕ должен читаться как успех.
     assert "Статус операции: ❌" in report
     assert "Статус операции: ✅" not in report
 
-    # The frozen emoji legend bans ASCII "✓"/"✗" as status glyphs — the old
-    # fallback line used "✓"; make sure it's gone for good.
+    # Замороженная эмодзи-легенда запрещает ASCII "✓"/"✗" как статусные
+    # маркеры — старый fallback использовал "✓"; проверяем, что он ушёл
+    # окончательно.
     assert "✓" not in report
     assert "✗" not in report
 
 
 async def test_warn_only_batch_is_not_reported_as_full_success(
         monkeypatch, tmp_path):
-    """bad == 0 but warn > 0 must still not read as a clean ✅ — a headless
-    consumer checking only the ❌ count would otherwise miss it."""
+    """bad == 0, но warn > 0 — всё равно НЕ должно читаться как чистый ✅:
+    headless-потребитель, проверяющий только счётчик ❌, иначе пропустит
+    проблему."""
     live = {"c1": {"id": "c1", "title": "C1", "projectId": "p2"}}
     _wire(monkeypatch, live, tmp_path)
 
@@ -133,9 +137,9 @@ async def test_warn_only_batch_is_not_reported_as_full_success(
 
 async def test_zero_discrepancies_is_a_clean_and_honest_report(
         monkeypatch, tmp_path):
-    """The counterpart case: nothing wrong at all. "0 расхождений" must only
-    ever appear when there really is nothing to list."""
-    live = {}  # the deleted task is genuinely gone
+    """Обратный случай: реально всё в порядке. «0 расхождений» должно
+    появляться только тогда, когда перечислять действительно нечего."""
+    live = {}  # удалённая задача реально пропала
     _wire(monkeypatch, live, tmp_path)
 
     rid = "clean-test01"
@@ -151,9 +155,9 @@ async def test_zero_discrepancies_is_a_clean_and_honest_report(
     assert bullets == {"ok": 1, "warn": 0, "bad": 0, "total": 1}
     assert summary == {"ok": 1, "warn": 0, "bad": 0}
     assert "Статус операции: ✅" in report
-    # No stray discrepancy markers in the per-item body (the "Итог"/"Статус"
-    # summary lines legitimately spell out "❌ 0"/no ⚠️ mention — only the
-    # bullet body must be clean).
+    # В теле (построчных пунктах) не должно быть случайных маркеров
+    # расхождений (строки «Итог»/«Статус» законно содержат «❌ 0» — грязным
+    # не должно быть только тело с пунктами-буллетами).
     body = "\n".join(l for l in report.splitlines() if l.startswith("- "))
     assert "❌" not in body
     assert "⚠️" not in body
