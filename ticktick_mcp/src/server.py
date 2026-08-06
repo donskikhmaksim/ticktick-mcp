@@ -7454,6 +7454,20 @@ async def get_attachment_download_url(task_id: str, project_id: str = None,
         return f"Error building download link: {str(e)}"
 
 
+# DELIBERATELY NOT GATED (audit 2026-08-06). It looks like a mutator ("create
+# ...") but calling it changes NOTHING in TickTick: the whole body is local —
+# _public_base_url()/SECRET checks, _resolve_project_id() (a READ of cached
+# state), new_attachment_id() (a client-side uuid4 hex, see
+# ticktick_v2_client.py) and _sign_attachment_token() (an in-memory HMAC, kept
+# in no registry). There is not a single write call to ticktick/ticktick_v2 on
+# this path. The actual mutation happens later, in the separate PUT /ul/{token}
+# custom route, when a HUMAN (or their script) uploads bytes — which this MCP
+# client provably cannot do itself (no raw PUT). Wrapping it in a plan→confirm
+# gate would therefore make the user approve twice for one act of uploading and
+# would gate a call with no side effects — a UX regression, not a safety win.
+# What it DOES hand out is a short-lived (≤120 min) write capability, so the
+# docstring's "treat the link like a one-off secret" warning is the real
+# control here.
 @mcp.tool()
 async def create_attachment_upload_url(task_id: str, project_id: str = None,
                                        filename: str = None,
@@ -7686,10 +7700,40 @@ async def delete_tag(name: str) -> str:
 # Won't-do / duplicate (v2)
 # ---------------------------------------------------------------------------
 
+def _describe_abandon_task(p: Dict) -> str:
+    return p.get("summary") or (
+        f'Отмечаю «не буду делать» задачу «{p.get("task_title") or p.get("task_id")}»')
+
+
 @mcp.tool()
-async def abandon_task(summary: str, task_id: str, task_title: str = None) -> str:
+async def abandon_task(summary: str, task_id: str, task_title: str = None,
+                       manifest_id: str = "", user_reply: str = "",
+                       automation_key: str = "") -> str:
     """
-    Mark a task as 'Won't do' (requires v2 API).
+    Mark a task as 'Won't do' (requires v2 API). Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    marked on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is changed yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
+
+    When this server's Telegram approval layer is enabled, call #1 ALSO sends
+    the plan to the owner as a Telegram message carrying «✅ Подтвердить» /
+    «🛑 Отклонить» buttons, and pressing «✅ Подтвердить» makes THIS server
+    run the operation itself (a background poller executes the stored
+    manifest and reports back into the same Telegram message) — no external
+    relay is involved. In that mode a text user_reply alone is NOT enough:
+    without the button press call #2 is refused and nothing is changed.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
 
     summary (FIRST arg): one-line human sentence in the user's language shown
     at the TOP of the summary you show the user (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's), e.g. «Отмечаю «не буду делать»
@@ -7699,10 +7743,27 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None) -> st
         summary: Human-readable confirmation line (see above)
         task_id: ID of the task
         task_title: Title of the task (optional but recommended)
+        manifest_id: from call #1's response — pass on call #2 to actually mark it
+        user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
         return err
+    params = {"summary": summary, "task_id": task_id, "task_title": task_title}
+    outcome = _gate_single("abandon_task", "abandon_task",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_abandon_task,
+                           automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _abandon_task_impl(**outcome.extra)
+
+
+async def _abandon_task_impl(summary: str, task_id: str,
+                             task_title: str = None) -> str:
+    """Pure mutation logic for abandon_task — no consent gate. Called only by
+    the gated abandon_task() above once the plan is approved."""
     title = task_title or _lookup_task_title(task_id)
     g = _guard_task(task_id, task_title or "")
     if g.status == "unavailable":
@@ -7950,11 +8011,48 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str, co
 # Project update / archive
 # ---------------------------------------------------------------------------
 
+def _describe_update_project(p: Dict) -> str:
+    changes = []
+    if p.get("name") is not None:
+        changes.append(f'имя → «{p.get("name")}»')
+    if p.get("color") is not None:
+        changes.append(f'цвет → {p.get("color")}')
+    if p.get("view_mode") is not None:
+        changes.append(f'вид → {p.get("view_mode")}')
+    return (f'Обновляю проект «{p.get("project_name")}»: '
+            + (", ".join(changes) or "без изменений"))
+
+
 @mcp.tool()
 async def update_project(project_name: str, project_id: str, name: str = None,
-                         color: str = None, view_mode: str = None) -> str:
+                         color: str = None, view_mode: str = None,
+                         manifest_id: str = "", user_reply: str = "",
+                         automation_key: str = "") -> str:
     """
     Update a project's name, color, or view mode (uses the official API).
+    Gated 🟡 (docs/DESIGN_approval_gate.md): two calls, same tool name —
+    nothing is updated on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is changed yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
+
+    When this server's Telegram approval layer is enabled, call #1 ALSO sends
+    the plan to the owner as a Telegram message carrying «✅ Подтвердить» /
+    «🛑 Отклонить» buttons, and pressing «✅ Подтвердить» makes THIS server
+    run the operation itself (a background poller executes the stored
+    manifest and reports back into the same Telegram message) — no external
+    relay is involved. In that mode a text user_reply alone is NOT enough:
+    without the button press call #2 is refused and nothing is changed.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
 
     Args:
         project_name: Current name of the project (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
@@ -7962,20 +8060,43 @@ async def update_project(project_name: str, project_id: str, name: str = None,
         name: New name (optional)
         color: New color hex like '#F18181' (optional)
         view_mode: 'list', 'kanban', or 'timeline' (optional)
+        manifest_id: from call #1's response — pass on call #2 to actually update
+        user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_official()
     if err:
         return err
-    if name is None and color is None and view_mode is None:
-        return ("🛑 Нечего менять — все поля (name/color/view_mode) пусты. "
-                "Ничего не тронул.")
-    for label, val in (("name", name), ("color", color), ("view_mode", view_mode)):
-        if val is not None and not str(val).strip():
-            return (f"🛑 Пустая строка в поле {label} — клиент молча выбросил бы "
-                    "её и изменение не применилось бы. Передай значение или "
-                    "убери поле. Ничего не тронул.")
-    if view_mode is not None and view_mode not in ("list", "kanban", "timeline"):
-        return "Invalid view_mode. Must be one of: list, kanban, timeline."
+    if not manifest_id:
+        # Cheap, purely local sanity checks — kept BEFORE the gate so an
+        # obviously broken request is refused without ever building a plan.
+        # (They only look at the arguments; no network.)
+        if name is None and color is None and view_mode is None:
+            return ("🛑 Нечего менять — все поля (name/color/view_mode) пусты. "
+                    "Ничего не тронул.")
+        for label, val in (("name", name), ("color", color), ("view_mode", view_mode)):
+            if val is not None and not str(val).strip():
+                return (f"🛑 Пустая строка в поле {label} — клиент молча выбросил бы "
+                        "её и изменение не применилось бы. Передай значение или "
+                        "убери поле. Ничего не тронул.")
+        if view_mode is not None and view_mode not in ("list", "kanban", "timeline"):
+            return "Invalid view_mode. Must be one of: list, kanban, timeline."
+    params = {"project_name": project_name, "project_id": project_id,
+              "name": name, "color": color, "view_mode": view_mode}
+    outcome = _gate_single("update_project", "update_project",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_update_project,
+                           automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _update_project_impl(**outcome.extra)
+
+
+async def _update_project_impl(project_name: str, project_id: str,
+                               name: str = None, color: str = None,
+                               view_mode: str = None) -> str:
+    """Pure mutation logic for update_project — no consent gate. Called only
+    by the gated update_project() above once the plan is approved."""
     refuse = _guard_project(project_id, project_name, fresh=True,
                             require_known=True)
     if refuse:
@@ -8022,19 +8143,67 @@ async def update_project(project_name: str, project_id: str, name: str = None,
                 f"⚠️ {_UNVERIFIED_MSG} ({e})")
 
 
+def _describe_archive_project(p: Dict) -> str:
+    verb = "Архивирую" if p.get("archived", True) else "Разархивирую"
+    return f'{verb} проект «{p.get("project_name")}»'
+
+
 @mcp.tool()
-async def archive_project(project_name: str, project_id: str, archived: bool = True) -> str:
+async def archive_project(project_name: str, project_id: str, archived: bool = True,
+                          manifest_id: str = "", user_reply: str = "",
+                          automation_key: str = "") -> str:
     """
-    Archive (close) or unarchive a project (requires v2 API).
+    Archive (close) or unarchive a project (requires v2 API). Gated 🟡
+    (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
+    archived on call #1.
+
+    Call #1 (manifest_id omitted): builds a one-shot manifest and returns a
+    preview — nothing is changed yet. Call #2 (after the user actually
+    replied): repeat the call with manifest_id=<id from call #1> and
+    user_reply=<the user's literal last message> — the other arguments are
+    ignored on this call (the manifest's own stored values are used). Do NOT
+    make call #2 in the same turn as call #1.
+
+    When this server's Telegram approval layer is enabled, call #1 ALSO sends
+    the plan to the owner as a Telegram message carrying «✅ Подтвердить» /
+    «🛑 Отклонить» buttons, and pressing «✅ Подтвердить» makes THIS server
+    run the operation itself (a background poller executes the stored
+    manifest and reports back into the same Telegram message) — no external
+    relay is involved. In that mode a text user_reply alone is NOT enough:
+    without the button press call #2 is refused and nothing is changed.
+
+    automation_key (call #2 only) is ONLY for headless automation clients
+    (bots/pipelines): they pass their own connection secret to prove they are
+    automation, which bypasses the interactive user_reply requirement.
+    ⛔ INTERACTIVE ASSISTANTS: do NOT try to fill automation_key — you don't
+    know it and guessing is a protocol violation.
 
     Args:
         project_name: Name of the project (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         project_id: ID of the project
         archived: True to archive, False to restore it to active
+        manifest_id: from call #1's response — pass on call #2 to actually archive
+        user_reply: the user's literal reply approving the plan — required on call #2
+        automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
     """
     err = _ensure_ready()
     if err:
         return err
+    params = {"project_name": project_name, "project_id": project_id,
+              "archived": archived}
+    outcome = _gate_single("archive_project", "archive_project",
+                           params if not manifest_id else None,
+                           manifest_id, user_reply, _describe_archive_project,
+                           automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _archive_project_impl(**outcome.extra)
+
+
+async def _archive_project_impl(project_name: str, project_id: str,
+                                archived: bool = True) -> str:
+    """Pure mutation logic for archive_project — no consent gate. Called only
+    by the gated archive_project() above once the plan is approved."""
     if archived:
         # Archiving pulls the project out of the sync pool — destructive-
         # adjacent, so verify FRESH and fail closed on an unresolvable id.

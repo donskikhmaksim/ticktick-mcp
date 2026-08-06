@@ -13,7 +13,14 @@ No real network — the official (v1) and v2 clients are faked.
 calls, same tool name — the removed tier-🟢 exemption, see
 docs/DESIGN_approval_gate.md). Their tests now run the full plan->execute
 cycle before asserting on the outcome that used to come straight back from a
-single call."""
+single call.
+
+2026-08-06: update_project and archive_project joined them (they were the
+last two project-level mutators with no gate at all) — same treatment here,
+their calls go through _gated_call. Note their identity guard
+(_guard_project) now runs inside _update_project_impl/_archive_project_impl,
+i.e. on call #2 against state that is fresh at execute time — so a
+guard-refusal now surfaces from the execute phase, not the plan phase."""
 import re
 
 import ticktick_mcp.src.server as s
@@ -156,7 +163,7 @@ def _wire_update(monkeypatch, fake, names=None):
 async def test_update_project_success_is_post_verified(monkeypatch):
     fake = FakeOfficialUpdate({"id": "p1", "name": "Новое имя", "color": "#111111"})
     _wire_update(monkeypatch, fake)
-    result = await s.update_project("Работа", "p1", name="Новое имя", color="#111111")
+    result = await _gated_call(s.update_project, "Работа", "p1", name="Новое имя", color="#111111")
     assert result.startswith("### ✅")
     assert "Новое имя" in result
     assert "🧾" in result
@@ -167,7 +174,7 @@ async def test_update_project_refused_by_guard(monkeypatch):
     fake = FakeOfficialUpdate({"id": "p1", "name": "Работа"})
     monkeypatch.setattr(s, "ticktick", fake)
     monkeypatch.setattr(s, "_guard_project", lambda *a, **k: "🛑 Отказ — не та личность.")
-    result = await s.update_project("Совсем другое", "p1", name="X")
+    result = await _gated_call(s.update_project, "Совсем другое", "p1", name="X")
     assert result.startswith("🛑")
     assert fake.get_calls == 0
 
@@ -177,7 +184,7 @@ async def test_update_project_postverify_catches_field_that_did_not_stick(monkey
     # silently dropped the change; must be flagged, not reported as ✅.
     fake = FakeOfficialUpdate({"id": "p1", "name": "Старое имя"})
     _wire_update(monkeypatch, fake)
-    result = await s.update_project("Старое имя", "p1", name="Новое имя")
+    result = await _gated_call(s.update_project, "Старое имя", "p1", name="Новое имя")
     assert result.startswith("### ❌")
     assert "Новое имя" in result
     assert "Старое имя" in result
@@ -187,7 +194,7 @@ async def test_update_project_postverify_fetch_failure_is_unverified(monkeypatch
     fake = FakeOfficialUpdate({"id": "p1", "name": "Работа"})
     fake.get_project = lambda project_id: {"error": "down"}
     _wire_update(monkeypatch, fake)
-    result = await s.update_project("Работа", "p1", name="Новое имя")
+    result = await _gated_call(s.update_project, "Работа", "p1", name="Новое имя")
     assert result.startswith("### ⚠️")
     assert "НЕ подтверждён" in result
 
@@ -229,7 +236,7 @@ async def test_archive_project_success_is_post_verified(monkeypatch):
     projects = [{"id": "p1", "name": "Работа", "closed": False}]
     fake = FakeV2Archive(projects)
     _wire_archive(monkeypatch, fake, {"p1": "Работа"})
-    result = await s.archive_project("Работа", "p1", archived=True)
+    result = await _gated_call(s.archive_project, "Работа", "p1", archived=True)
     assert result.startswith("### ✅")
     assert "заархивирован" in result
     assert fake.force_calls == 1
@@ -242,7 +249,7 @@ async def test_archive_project_postverify_flags_stuck_flag(monkeypatch):
     fake = FakeV2Archive(projects)
     fake.archive_project = lambda project_id, closed=True: {}  # no-op, doesn't flip
     _wire_archive(monkeypatch, fake, {"p1": "Работа"})
-    result = await s.archive_project("Работа", "p1", archived=True)
+    result = await _gated_call(s.archive_project, "Работа", "p1", archived=True)
     assert result.startswith("### ❌")
     assert "расхождение" in result
 
@@ -250,7 +257,7 @@ async def test_archive_project_postverify_flags_stuck_flag(monkeypatch):
 async def test_archive_project_postverify_project_missing_is_unverified(monkeypatch):
     fake = FakeV2Archive([])  # project vanished from the live list
     _wire_archive(monkeypatch, fake, {"p1": "Работа"})
-    result = await s.archive_project("Работа", "p1", archived=True)
+    result = await _gated_call(s.archive_project, "Работа", "p1", archived=True)
     assert result.startswith("### ⚠️")
     assert "НЕ подтверждён" in result
 
@@ -259,7 +266,7 @@ async def test_archive_project_api_rejection_is_refused(monkeypatch):
     fake = FakeV2Archive([{"id": "p1", "name": "Работа", "closed": False}],
                          archive_error="rejected")
     _wire_archive(monkeypatch, fake, {"p1": "Работа"})
-    result = await s.archive_project("Работа", "p1", archived=True)
+    result = await _gated_call(s.archive_project, "Работа", "p1", archived=True)
     assert result.startswith("### ❌")
     assert "rejected" in result
 
