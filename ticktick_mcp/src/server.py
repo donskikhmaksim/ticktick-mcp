@@ -9528,8 +9528,10 @@ async def _create_project_column_impl(project_id: str, name: str,
 # runAutoExecutePoller. See tg_approval.py's block comment above
 # try_auto_execute() for the architectural difference (in-memory _MANIFESTS
 # here vs. one shared Postgres on the TS side) and why the candidate search
-# below (walk _MANIFESTS, ask tg_approval.check_approval per id) is a
-# per-item probe rather than a single SQL JOIN.
+# below cannot be one SQL JOIN: the manifests simply aren't in Postgres. It is
+# still ONE round-trip per pass, not one per manifest — the RAM walk collects
+# the live ids, and tg_approval.get_tg_approvals() reads all their approval
+# rows in a single `WHERE manifest_id = ANY(...)` query (2026-08-06).
 # ---------------------------------------------------------------------------
 
 class _AutoExecutorEntry:
@@ -9694,20 +9696,16 @@ def _auto_execute_tool_of(m: Dict) -> str:
             or _AUTO_EXECUTE_TOOL_FOR_KIND.get(m.get("kind") or "") or "")
 
 
-def _find_tg_auto_execute_candidates() -> List[Dict]:
-    """Candidates for auto-execution: this server's own (in-memory) manifests
-    that are AWAITING_CONSENT-equivalent (not consumed, not TTL-expired —
-    _prune_manifests already dropped anything past that) that resolve to an
-    executor (_resolve_auto_executor: explicit registry, else the generic
-    _gate_batch/_gate_single replay) AND whose Telegram approval row is
-    already APPROVED.
-    Unlike the TS side's single SQL JOIN (both tables live in one Postgres),
-    this walks _MANIFESTS in RAM and asks tg_approval.check_approval(id) —
-    one Postgres round-trip PER live manifest — which is fine because the
-    number of concurrently AWAITING_CONSENT manifests is always small
-    (single-owner bot, human-paced approvals)."""
+def _tg_auto_execute_pending() -> List[tuple]:
+    """RAM-часть поиска кандидатов: живые (не consumed, не просроченные)
+    манифесты, у которых есть авто-исполнитель и включён TG-гейт. НИ ОДНОГО
+    обращения к базе и к сети — специально, потому что это единственный кусок,
+    который трогает `_MANIFESTS`, и он обязан выполняться в event loop'е
+    (иначе `_prune_manifests()` итерировал бы dict, который другая корутина
+    в это же время пополняет → RuntimeError: dictionary changed size).
+    Возвращает [(manifest_id, tool), …]."""
     _prune_manifests()
-    out: List[Dict] = []
+    out: List[tuple] = []
     for mid, m in list(_MANIFESTS.items()):
         if m.get("consumed"):
             continue
@@ -9716,26 +9714,90 @@ def _find_tg_auto_execute_candidates() -> List[Dict]:
             continue
         if not tg_approval.enabled_for(_TG_CFG, tool):
             continue
-        try:
-            approval = tg_approval.check_approval(mid)
-        except Exception as e:
-            logger.warning(f"TG auto-execute: check_approval({mid}) failed: {e}")
-            continue
-        if approval != "approved":
-            continue
-        row = tg_approval.get_tg_approval(mid)
-        if not row:
+        out.append((mid, tool))
+    return out
+
+
+def _tg_auto_execute_approved(pending: List[tuple],
+                              rows: Dict[str, dict]) -> List[Dict]:
+    """Чистая (без БД и сети) вторая половина поиска: из списка живых
+    манифестов и УЖЕ прочитанных пачкой строк tg_approvals оставляет те, что
+    подтверждены кнопкой. Статус считает tg_approval.approval_status_of —
+    та же формула, что у одиночного check_approval на чат-пути."""
+    out: List[Dict] = []
+    for mid, tool in pending:
+        row = rows.get(mid)
+        if not row or tg_approval.approval_status_of(row) != "approved":
             continue
         out.append({"manifest_id": mid, "tool": tool,
                     "chat_id": row.get("chat_id"), "message_id": row.get("message_id")})
     return out
 
 
+def _find_tg_auto_execute_candidates() -> List[Dict]:
+    """Candidates for auto-execution: this server's own (in-memory) manifests
+    that are AWAITING_CONSENT-equivalent (not consumed, not TTL-expired —
+    _prune_manifests already dropped anything past that) that resolve to an
+    executor (_resolve_auto_executor: explicit registry, else the generic
+    _gate_batch/_gate_single replay) AND whose Telegram approval row is
+    already APPROVED.
+
+    ОДНО обращение к Postgres на весь проход, сколько бы живых планов ни было
+    (2026-08-06). До этого на КАЖДЫЙ живой манифест шли check_approval() и,
+    для одобренных, ещё get_tg_approval() — то есть 1–2 поездки на план. С 2
+    гейтованными тулами планов было единицы; с 22 их десятки, база ходит через
+    публичный прокси Railway, и проход переставал укладываться в 10-секундный
+    интервал — подтверждённое кнопкой действие ждало исполнения минутами.
+
+    Синхронная версия (её зовут тесты и любой не-async вызывающий); поллер
+    использует те же две половины напрямую, чтобы поездку в базу увести в
+    отдельный поток и не морозить event loop (см. _tg_auto_execute_tick)."""
+    pending = _tg_auto_execute_pending()
+    if not pending:
+        return []
+    try:
+        rows = tg_approval.get_tg_approvals([mid for mid, _ in pending])
+    except Exception as e:
+        logger.warning(f"TG auto-execute: get_tg_approvals failed: {e}")
+        return []
+    return _tg_auto_execute_approved(pending, rows)
+
+
+# Потолок на ОДНОГО кандидата: без него один зависший сетевой вызов к TickTick
+# держит очередь остальных подтверждённых планов бесконечно (манифест уже
+# погашен, повтора не будет — а человек так и сидит перед несработавшей
+# кнопкой). Щедрый по умолчанию: цель — не оборвать нормальную работу, а
+# гарантировать, что очередь ВСЕГДА двигается.
+_TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S = float(
+    os.environ.get("TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S", "120"))
+
+
 async def _tg_auto_execute_tick() -> None:
     """One pass: find candidates, execute each via its registered executor,
     report the result back into the Telegram message. Mirrors gmail-mcp's
-    runAutoExecutePoller — errors from ONE candidate never abort the others."""
-    for c in _find_tg_auto_execute_candidates():
+    runAutoExecutePoller — errors from ONE candidate never abort the others.
+
+    Три вещи, за которые здесь отвечает именно ЭТА функция (2026-08-06):
+    1. Поиск кандидатов разделён: RAM-часть (_tg_auto_execute_pending) идёт в
+       event loop'е, а ЕДИНСТВЕННАЯ поездка в Postgres — через _run_blocking,
+       то есть в отдельном потоке. psycopg2 синхронный: вызов из корутины
+       напрямую морозил ВЕСЬ сервер (не только поллер — и обычные MCP-запросы
+       модели) на всё время запроса.
+    2. Отчёт в Telegram (requests, timeout 8 c) — тоже через _run_blocking, по
+       той же причине.
+    3. `try_auto_execute` наоборот ОБЯЗАН остаться в event loop'е: его
+       атомарность («проверил consumed → выставил consumed» без await между)
+       держится ровно на однопоточности loop'а. В поток его выносить нельзя."""
+    pending = _tg_auto_execute_pending()
+    if not pending:
+        return
+    try:
+        rows = await _run_blocking(tg_approval.get_tg_approvals,
+                                   [mid for mid, _ in pending])
+    except Exception as e:
+        logger.warning(f"TG auto-execute: get_tg_approvals failed: {e}")
+        return
+    for c in _tg_auto_execute_approved(pending, rows):
         mid, tool = c["manifest_id"], c["tool"]
         entry = _resolve_auto_executor(tool, _MANIFESTS.get(mid) or {})
         if entry is None:
@@ -9749,16 +9811,24 @@ async def _tg_auto_execute_tick() -> None:
             )
             if consumed is None:
                 continue  # race/drift/already consumed — not an error
-            report_text = await entry.execute(mid, consumed)
-            tg_approval.report_auto_execution_result(
-                _TG_CFG, c["chat_id"], c["message_id"], report_text)
+            report_text = await asyncio.wait_for(
+                entry.execute(mid, consumed),
+                _TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S)
+            await _run_blocking(tg_approval.report_auto_execution_result,
+                                _TG_CFG, c["chat_id"], c["message_id"], report_text)
         except Exception as e:
+            if isinstance(e, asyncio.TimeoutError):
+                msg = (f"🛑 Автоисполнение «{tool}» не уложилось в "
+                       f"{_TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S:.0f} c и было "
+                       "прервано. План уже погашен — проверьте состояние в "
+                       "TickTick: часть операции могла успеть примениться.")
+            else:
+                msg = f"🛑 Ошибка при автоисполнении «{tool}»: {e}"
             logger.error(f"TG auto-execute: ошибка при исполнении "
-                        f"{tool}/{mid}: {e}")
+                        f"{tool}/{mid}: {e!r}")
             try:
-                tg_approval.report_auto_execution_result(
-                    _TG_CFG, c["chat_id"], c["message_id"],
-                    f"🛑 Ошибка при автоисполнении «{tool}»: {e}")
+                await _run_blocking(tg_approval.report_auto_execution_result,
+                                    _TG_CFG, c["chat_id"], c["message_id"], msg)
             except Exception:
                 pass
 
@@ -9787,14 +9857,27 @@ async def _tg_auto_execute_poller_loop() -> None:
     """Background loop started from main() (see _run_server() below) only
     when TG_APPROVAL_ENABLED — every ~10s (env-tunable), forever, for the
     life of the process. A single tick's exception must never kill the loop
-    (Maksim would then lose auto-execute silently until the next deploy)."""
+    (Maksim would then lose auto-execute silently until the next deploy).
+
+    Интервал отсчитывается ОТ НАЧАЛА прохода (2026-08-06). Раньше `sleep`
+    стоял ПЕРЕД работой, то есть реальный период = интервал + длительность
+    прохода: медленный проход (десятки живых планов × поездка в базу каждый)
+    молча растягивал заявленные «каждые 10 секунд» в разы. Проходы при этом
+    не накладываются и сейчас: они последовательны внутри одной корутины, а
+    отрицательный остаток обрезается до нуля."""
     logger.info(f"TG auto-execute: poller started (every {_TG_AUTO_EXECUTE_INTERVAL_S:.0f}s)")
     while True:
-        await asyncio.sleep(_TG_AUTO_EXECUTE_INTERVAL_S)
+        started = time.monotonic()
         try:
             await _tg_auto_execute_tick()
         except Exception as e:
             logger.error(f"TG auto-execute poller: unhandled error: {e}")
+        elapsed = time.monotonic() - started
+        if elapsed > _TG_AUTO_EXECUTE_INTERVAL_S:
+            logger.warning(
+                f"TG auto-execute: проход занял {elapsed:.1f} c — дольше "
+                f"интервала {_TG_AUTO_EXECUTE_INTERVAL_S:.0f} c")
+        await asyncio.sleep(max(0.0, _TG_AUTO_EXECUTE_INTERVAL_S - elapsed))
 
 
 def main():

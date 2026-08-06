@@ -388,10 +388,14 @@ async def test_generic_auto_execute_refuses_a_manifest_without_impl(monkeypatch)
 # ═══════ 8. Поллер видит новые манифесты ═══════
 
 def _approved(monkeypatch, mids):
-    monkeypatch.setattr(tg, "check_approval",
-                        lambda mid: "approved" if mid in mids else "none")
-    monkeypatch.setattr(tg, "get_tg_approval",
-                        lambda mid: {"chat_id": "c1", "message_id": 7})
+    """С 2026-08-06 поллер читает статусы ПАЧКОЙ (один get_tg_approvals на
+    проход) вместо check_approval+get_tg_approval на каждый живой манифест —
+    подменяем именно пакетную функцию. Одиночные никуда не делись, их всё так
+    же зовёт чат-путь (_require_consent), см. тесты выше в этом файле."""
+    monkeypatch.setattr(tg, "get_tg_approvals", lambda ids: {
+        mid: {"status": "APPROVED", "expires_at": tg._now_ms() + 3_600_000,
+              "chat_id": "c1", "message_id": 7}
+        for mid in ids if mid in mids})
 
 
 @pytest.mark.parametrize("tool", ["complete_tasks", "move_tasks", "create_tag",
@@ -416,7 +420,9 @@ async def test_poller_ignores_pending_gate_manifests(tool, monkeypatch):
     _tg_on(monkeypatch)
     _notify_ok(monkeypatch)
     _, mid = await _plan(tool, monkeypatch)
-    monkeypatch.setattr(tg, "check_approval", lambda m: "pending")
+    monkeypatch.setattr(tg, "get_tg_approvals", lambda ids: {
+        mid: {"status": "PENDING", "expires_at": tg._now_ms() + 3_600_000,
+              "chat_id": "c1", "message_id": 7} for mid in ids})
 
     ids = {c["manifest_id"] for c in s._find_tg_auto_execute_candidates()}
 
