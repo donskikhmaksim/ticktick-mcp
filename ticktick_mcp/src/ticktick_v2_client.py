@@ -343,6 +343,97 @@ class TickTickV2Client:
         return self._request("POST", "/habitCheckins/batch",
                              json={"add": [entry], "update": [], "delete": []})
 
+    # ---- habits: create / delete -----------------------------------------
+    # Habits live ONLY in this unofficial v2 API (the official Open API has no
+    # habit endpoints at all), and until 2026-08-06 this client could only read
+    # them and check them in. Creating/deleting turned out to be the SAME batch
+    # shape every other v2 collection uses (/batch/task, /batch/tag,
+    # /batch/project, /batch/projectGroup): POST /habits/batch with
+    # {"add": [...], "update": [...], "delete": [ids]}.
+    #
+    # Confirmed by a LIVE call against a throwaway habit (2026-08-06):
+    #   add    → HTTP 200, {"id2etag":{"<minted id>":"se0q2pba"},"id2error":{}}
+    #            and GET /habits went 11 → 12 with that exact id/name;
+    #   delete → HTTP 200, {"id2etag":{},"id2error":{}}
+    #            and GET /habits went 12 → 11 with the id gone.
+    # As with attachments and check-ins, the CLIENT mints the habit id.
+
+    # TickTick files every habit under a time-of-day section; the web app
+    # always picks one, so we do too (a habit with no section would be an
+    # object shape the real client never produces). Section names come back
+    # from /habitSections as "_morning" / "_afternoon" / "_night".
+    HABIT_SECTIONS = ("morning", "afternoon", "night")
+    HABIT_SECTION_NONE = "-1"
+
+    def get_habit_sections(self) -> List[Dict]:
+        """Time-of-day sections habits are grouped into (morning/afternoon/night)."""
+        data = self._request("GET", "/habitSections")
+        return data if isinstance(data, list) else []
+
+    def resolve_habit_section_id(self, section: str) -> str:
+        """Id of the "_morning"/"_afternoon"/"_night" section, or "-1" when the
+        account has no such section (best effort — never fails the create)."""
+        want = f"_{(section or '').strip().lower().lstrip('_')}"
+        try:
+            for s in self.get_habit_sections():
+                if str(s.get("name") or "").lower() == want:
+                    return str(s.get("id"))
+        except Exception as e:  # noqa: BLE001 - section is cosmetic, not identity
+            logger.warning("Could not resolve habit section %r: %s", section, e)
+        return self.HABIT_SECTION_NONE
+
+    def create_habit(self, name: str, *, goal: float = 1.0, step: float = 0.0,
+                     unit: str = "Count", habit_type: str = "Boolean",
+                     repeat_rule: str = "RRULE:FREQ=DAILY;INTERVAL=1",
+                     section: str = "morning", color: str = "#97E38B",
+                     icon: str = "habit_daily_check_in",
+                     encouragement: str = "") -> str:
+        """Create a habit; returns the new habit's id (minted client-side).
+
+        Raises RuntimeError when TickTick rejects the item in `id2error` —
+        that map is how /batch/* reports a per-item failure while still
+        answering HTTP 200 (see id2error_failures)."""
+        hid = uuid.uuid4().hex[:24]
+        now = self._now_iso()
+        habit = {
+            "id": hid,
+            "name": name,
+            "iconRes": icon,
+            "color": color,
+            "sortOrder": 0,
+            "status": 0,                 # 0 = active (1 = archived)
+            "encouragement": encouragement,
+            "totalCheckIns": 0,
+            "createdTime": now,
+            "modifiedTime": now,
+            "type": habit_type,          # "Boolean" | "Real"
+            "goal": float(goal),
+            "step": float(step),
+            "unit": unit,
+            "repeatRule": repeat_rule,
+            "reminders": [],
+            "recordEnable": False,
+            "sectionId": self.resolve_habit_section_id(section),
+            "targetDays": 0,
+            "targetStartDate": int(datetime.now().strftime("%Y%m%d")),
+            "completedCycles": 0,
+            "exDates": [],
+            "style": 0,
+        }
+        resp = self._request("POST", "/habits/batch",
+                             json={"add": [habit], "update": [], "delete": []})
+        err = id2error_failures(resp, [hid]).get(hid)
+        if err:
+            raise RuntimeError(f"TickTick rejected the habit: {err}")
+        return hid
+
+    def delete_habit(self, habit_id: str) -> Dict:
+        """Delete a habit by id — TickTick drops its check-in history with it
+        (irreversible; there is no habit trash). Caller is responsible for the
+        identity check: this method deletes exactly the id it is given."""
+        return self._request("POST", "/habits/batch",
+                             json={"add": [], "update": [], "delete": [habit_id]})
+
     # ---- subtasks (parent/child) -----------------------------------------
     def set_task_parent(self, task_id: str, parent_id: str, project_id: str) -> Dict:
         body = [{"parentId": parent_id, "taskId": task_id, "projectId": project_id}]

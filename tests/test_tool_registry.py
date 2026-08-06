@@ -8,14 +8,15 @@ import asyncio
 from ticktick_mcp.src import server
 
 
-# 74 = 78 authored tools MINUS the 4 declutter tools (plan_declutter,
+# 76 = 80 authored tools MINUS the 4 declutter tools (plan_declutter,
 # execute_declutter, resume_declutter, set_declutter_decision), whose
 # @mcp.tool() decorators are commented out on purpose — Maksim disabled the
 # declutter feature 2026-08-04/05 and it must stay disabled. The count was
 # left at 78 when that happened, so this test has been red on main ever
 # since; fixed here to the real number rather than silently ignored. Re-enabling
-# declutter means bumping this back to 78 in the same commit.
-_EXPECTED_TOOLS = 74
+# declutter means bumping this back by 4 in the same commit.
+# 2026-08-06: +2 — create_habit / delete_habit (74 → 76).
+_EXPECTED_TOOLS = 76
 
 
 def test_all_expected_tools_registered():

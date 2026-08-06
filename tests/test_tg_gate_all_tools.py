@@ -73,6 +73,16 @@ SINGLE_TOOLS = {
                            content="текст", priority=3),
     "checkin_habit": dict(habit_name="Зарядка", habit_id="h1", date="2026-08-06",
                           status=2, value=1.0),
+    # 2026-08-06: привычки стало можно не только отмечать, но и заводить/
+    # удалять (POST /habits/batch — тот же батч-эндпоинт, что у задач/тегов/
+    # проектов, подтверждён живым вызовом). Оба тула идут через _gate_single,
+    # значит кнопку получают автоматически — таблица обязана это закрепить.
+    "create_habit": dict(name="Зарядка", goal=1.0, unit="Count",
+                         habit_type="boolean",
+                         repeat_rule="RRULE:FREQ=DAILY;INTERVAL=1",
+                         section="morning", color="#97E38B",
+                         icon="habit_daily_check_in", encouragement=""),
+    "delete_habit": dict(habit_name="Зарядка", habit_id="h1"),
     "unset_task_parent": dict(task_title="A", parent_task_title="Родитель",
                               task_id="t1", parent_task_id="par1", project_id="p1"),
     "create_project_group": dict(name="Группа"),

@@ -504,15 +504,19 @@ m["items"]]`), то есть сверяется значение само с с�
 | 🔴 2 | `execute_declutter`, `resume_declutter`, `set_declutter_decision` | `_require_consent(tier=2)`; **инструменты отключены** (§6.4) |
 | 🟡 1 | `execute_task_creation` | `_require_consent(tier=1, tool="create_tasks")`, манифест от `plan_task_creation` |
 | 🟡 1 | `update_tasks`, `complete_tasks`, `move_tasks`, `set_task_parent`, `set_task_tags`, `restore_tasks` | `_gate_batch(...)` — 6 тулов |
-| 🟡 1 | `create_project`, `create_subtask`, `checkin_habit`, `unset_task_parent`, `create_project_group`, `delete_project_group`, `move_project_to_group`, `add_task_comment`, `attach_file_to_task`, `create_attachment_upload_url`, `create_tag`, `abandon_task`, `duplicate_task`, `update_task_comment`, `update_project`, `archive_project`, `create_project_column` | `_gate_single(...)` — 17 тулов |
+| 🟡 1 | `create_project`, `create_subtask`, `checkin_habit`, `create_habit`, `delete_habit`, `unset_task_parent`, `create_project_group`, `delete_project_group`, `move_project_to_group`, `add_task_comment`, `attach_file_to_task`, `create_attachment_upload_url`, `create_tag`, `delete_tag`, `delete_task_comment`, `abandon_task`, `duplicate_task`, `update_task_comment`, `update_project`, `archive_project`, `create_project_column` | `_gate_single(...)` — 21 тул |
 | — | `create_tasks` | текстового гейта нет: путь только для автоматики, требует `automation_key` (§6.3), иначе отказ |
 
 `plan_*` — read-only, гейта не требуют по определению.
 
-**Итого 27 имён тулов, у которых при включённом слое появляется кнопка** (§7.2):
-6 через `_gate_batch`, 17 через `_gate_single`, плюс `create_tasks`,
+**Итого 31 имя тулов, у которых при включённом слое появляется кнопка** (§7.2):
+6 через `_gate_batch`, 21 через `_gate_single`, плюс `create_tasks`,
 `delete_tasks`, `delete_project`, `rename_tag` со своими манифест-путями.
-(`execute_declutter` был бы 28-м, но отключён.)
+(`execute_declutter` был бы 32-м, но отключён.) Число сверяется с кодом
+тестом `tests/test_tg_gate_all_tools.py::test_the_table_covers_every_gated_tool_in_the_code`,
+а не поддерживается вручную: `delete_tag` / `delete_task_comment` уже
+переезжали на `_gate_single`, не попав сюда, а 2026-08-06 к ним добавились
+`create_habit` / `delete_habit`.
 
 **По какому принципу тул попадает под гейт.** Не «он мутирующий» — это
 следствие, а не критерий. Критерий: **гейт стоит не за то, что тул ДЕЛАЕТ, а
