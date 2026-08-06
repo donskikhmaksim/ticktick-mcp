@@ -7,6 +7,24 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Настоящий Postgres, а не двойник: тесты долговечных планов (#91)
+    # проверяют одноразовость при ОДНОВРЕМЕННОМ захвате, а это свойство самого
+    # движка (блокировка строки на UPDATE). Любой самодельный двойник
+    # исполняет запросы по очереди и делает такой тест зелёным всегда — см.
+    # шапку tests/pg_helper.py. Без этого сервиса они молча пропускаются.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ticktick_mcp_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,6 +35,8 @@ jobs:
       - name: Lint
         run: ruff check .
       - name: Test
+        env:
+          TICKTICK_TEST_PG_DSN: postgresql://postgres:postgres@127.0.0.1:5432/ticktick_mcp_test?sslmode=disable
         run: pytest
 
   guide:

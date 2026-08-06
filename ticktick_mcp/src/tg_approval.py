@@ -661,14 +661,29 @@ def init_store(database_url: str) -> None:
     """Ленивая инициализация — вызывается один раз при старте, если
     TG_APPROVAL_ENABLED=true и задан CONSENT_DATABASE_URL. psycopg2 — тот же
     выбор, что и остальной синхронный стиль этого сервера (requests вместо
-    httpx, никакого asyncio Postgres-драйвера не требовалось до сих пор)."""
+    httpx, никакого asyncio Postgres-драйвера не требовалось до сих пор).
+
+    Пул — `ThreadedConnectionPool`, а не `SimpleConnectionPool` (#91).
+    Simple-версия по собственной документации psycopg2 не рассчитана на
+    использование из разных потоков: её `getconn`/`putconn` не защищены
+    блокировкой. А обращения сюда идут через `_run_blocking`
+    (`asyncio.to_thread`), то есть ровно из разных потоков — до сих пор это не
+    выстреливало лишь потому, что поллер ходил в базу раз в 10 секунд."""
     global _pg_pool
     import psycopg2.pool
 
-    _pg_pool = psycopg2.pool.SimpleConnectionPool(
-        1, 5, dsn=database_url, sslmode="require",
+    # `sslmode` больше НЕ прибит гвоздями (#91). Прежний безусловный
+    # `sslmode="require"` перебивал то, что указано в самой строке подключения,
+    # и делал невозможным подключение к Postgres без TLS — в частности к
+    # локальному, на котором гоняются интеграционные тесты долговечных планов.
+    # В проде ничего не меняется: DSN от Railway идёт через публичный прокси, и
+    # если режим в нём не задан явно, мы по-прежнему требуем TLS.
+    extra = {} if "sslmode=" in database_url else {"sslmode": "require"}
+    _pg_pool = psycopg2.pool.ThreadedConnectionPool(
+        1, 5, dsn=database_url,
         connect_timeout=_PG_CONNECT_TIMEOUT_S,
         options=f"-c statement_timeout={_PG_STATEMENT_TIMEOUT_MS}",
+        **extra,
     )
     _ensure_schema()
 
