@@ -217,6 +217,42 @@ async def test_update_tasks_batch_path_uses_v2(monkeypatch):
     assert "🛑" not in result
 
 
+async def test_update_tasks_one_shot_holds_without_identity_guard(monkeypatch):
+    """Proves _gate_batch is a REAL one-shot (flips `consumed`) rather than
+    "accidentally" one-shot via the identity-guard tripping on a changed
+    title (that's what test_update_tasks_manifest_is_one_shot above actually
+    exercises — its retry fails identity-guard because title went A -> B, so
+    it would pass even on the old buggy _gate_batch that never sets
+    `consumed`). Here only `priority` changes and `title`/`projectId` stay
+    identical to live state on every call, so the identity-guard (which only
+    compares title + project) would happily approve a REPLAY too — the only
+    thing that can catch a replay here is the `consumed` flag itself.
+
+    A single-task update goes through the OFFICIAL client (see
+    _update_tasks_impl: `len(tasks) == 1` branch), not v2 batch — verified by
+    reading the code, not assumed — so the mutation counter here is
+    official.calls, unlike test_update_tasks_batch_path_uses_v2 (2 tasks ->
+    v2 batch -> fake.calls)."""
+    live = {"t1": {"id": "t1", "title": "A", "projectId": "p1", "priority": 0}}
+    fake, official = _wire(monkeypatch, live)
+    preview = await s.update_tasks("тест", [
+        {"taskId": "t1", "projectId": "p1", "title": "A", "priority": 3}])
+    mid = _extract_manifest_id(preview)
+
+    first = await s.update_tasks("тест", manifest_id=mid, user_reply="да")
+    assert "🛑" not in first
+    assert live["t1"]["priority"] == 3
+    calls_after_first = len(official.calls)
+    assert fake.calls == []  # confirms this went through the official path
+
+    second = await s.update_tasks("тест", manifest_id=mid, user_reply="да")
+    assert "🛑" in second
+    # The real assertion: no NEW mutation happened on the replay. On the old
+    # buggy _gate_batch (never sets consumed=True on success), the identity
+    # guard alone would have let this through again, growing official.calls.
+    assert len(official.calls) == calls_after_first
+
+
 # ===========================================================================
 # complete_tasks
 # ===========================================================================
