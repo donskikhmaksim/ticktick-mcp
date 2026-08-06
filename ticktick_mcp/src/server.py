@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import collections
 import hashlib
 import hmac
 import json
@@ -2166,8 +2167,10 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
     if manifest_id:
         m = _MANIFESTS.get(manifest_id)
         if not m or m.get("kind") != "delete":
-            return (f"🛑 Манифест удаления {manifest_id} не найден/истёк/уже "
-                    "исполнен. Начни заново: delete_tasks(summary, tasks).")
+            return _manifest_gone_msg(
+                manifest_id,
+                f"🛑 Манифест удаления {manifest_id} не найден/истёк/уже "
+                "исполнен. Начни заново: delete_tasks(summary, tasks).")
         cr = _require_consent(action="delete", tier=2, manifest=m,
                               user_reply=user_reply,
                               object_ids=[it["taskId"] for it in m["items"]],
@@ -2385,6 +2388,27 @@ def _maybe_tg_notify_plan(tool: str, manifest_id: str, preview_text: str) -> str
         return (f"🛑 Не смог отправить запрос подтверждения в Telegram ({err}). "
                 "Действие НЕ запланировано, ничего не изменено. Проверьте "
                 "бота/настройки Telegram-подтверждения и попробуйте снова.")
+    # УСПЕШНО отправлено → ПОМЕЧАЕМ САМ МАНИФЕСТ (2026-08-06, фикс
+    # недетерминированного гейта). До этой правки факт «план ушёл в Telegram»
+    # нигде не сохранялся: execute-фаза заново решала, нужен ли ТГ-фактор, по
+    # аргументу `tool`, который один путь передавал (delete_tasks), а другой
+    # (execute_task_deletion) — забывал, из-за чего ОДНА И ТА ЖЕ операция на
+    # одном сервере то требовала кнопку, то нет. Флаг переносит решение туда,
+    # где оно фактически принято — в фазу плана; execute-фаза больше не
+    # угадывает. Fail-closed: если план ушёл в TG, «да» в чате БЕЗ approved-
+    # строки не проходит НИКОГДА, чем бы ни был вызов execute.
+    m = _MANIFESTS.get(manifest_id)
+    if m is not None:
+        m["tg_notified"] = True
+        m["_tg_tool"] = tool
+        m["_tg_manifest_id"] = manifest_id
+    else:
+        # Не должно случаться (все вызывающие создают манифест ДО отправки).
+        # Не fail-closed-отказ: кнопка в TG всё равно ни к чему не приведёт —
+        # ни поллер, ни execute не найдут манифеста, — но это ошибка порядка
+        # вызовов, и она должна быть видна в логе.
+        logger.warning(f"TG approval: план {manifest_id} отправлен в Telegram, "
+                       f"но манифест не найден в _MANIFESTS (tool={tool})")
     return (preview_text + "\n\n_⏳ Запрос на подтверждение отправлен в "
             "Telegram — подтвердите кнопкой в боте, затем ответьте «да» "
             "здесь._")
@@ -2450,12 +2474,29 @@ def _require_consent(
         return ConsentResult(False, _NO_REPLY_INSTRUCTION)
 
     # Опциональный внеполосный ТГ-фактор (см. tg_approval.py) — ВЫКЛ по
-    # умолчанию (TG_APPROVAL_ENABLED=false) и НЕ задействуется вовсе, если
-    # вызывающий код не передал `tool` (пустая строка = совместимость
-    # побайтово с поведением до этой правки). Встаёт ПОСЛЕ дешёвой проверки
+    # умолчанию (TG_APPROVAL_ENABLED=false). Встаёт ПОСЛЕ дешёвой проверки
     # user_reply, ПЕРЕД таймером/consume — та же позиция, что в gmail-mcp's
     # requireConsent.
-    if tool and tg_approval.enabled_for(_TG_CFG, tool):
+    #
+    # ДВА независимых основания требовать кнопку (2026-08-06):
+    #   (а) манифест ПОМЕЧЕН `tg_notified` — план этой самой операции реально
+    #       ушёл в Telegram (пометку ставит `_maybe_tg_notify_plan` и только
+    #       он). Это ЖЁСТКОЕ, приоритетное основание: оно не зависит от того,
+    #       передал ли конкретный execute-путь аргумент `tool`, — именно
+    #       забытый `tool=` в `execute_task_deletion` делал самую опасную
+    #       операцию недетерминированной (chat-«да» без кнопки исполнял
+    #       удаление по-настоящему);
+    #   (б) старое основание `tool and enabled_for(tool)` — сохранено для
+    #       путей БЕЗ манифеста (inline-🔴 вроде rename_tag/delete_project),
+    #       где помечать нечего.
+    # Обратная совместимость: без `TG_APPROVAL_ENABLED=true` пометка не
+    # ставится НИКОГДА и `enabled_for` всегда False → поведение побайтово
+    # прежнее. Пути, чей план в Telegram не уходит (_gate_batch/_gate_single),
+    # намеренно НЕ передают `tool`: иначе `check_approval` вернул бы "none"
+    # (строки-то нет) и тулы отказывали бы навсегда даже на честное «да».
+    tg_required = bool((manifest or {}).get("tg_notified")) or bool(
+        tool and tg_approval.enabled_for(_TG_CFG, tool))
+    if tg_required:
         approval = tg_approval.check_approval(manifest_id or (manifest or {}).get("_tg_manifest_id", ""))
         if approval == "pending":
             return ConsentResult(False, "⏳ Подтвердите кнопкой в Telegram-боте, затем "
@@ -2534,6 +2575,39 @@ def _prune_manifests() -> None:
         _MANIFESTS.pop(mid, None)
 
 
+# «Надгробия» (tombstones) исполненных манифестов — крошечная память о том,
+# ПОЧЕМУ манифеста больше нет. Нужна ровно для одного человеческого случая:
+# Максим нажал кнопку в Telegram, фоновый поллер (_tg_auto_execute_tick) уже
+# всё исполнил и погасил манифест, а модель следом честно зовёт
+# execute_task_deletion — и раньше получала неотличимое «не найден/истёк/уже
+# исполнен», из которого нельзя понять, удалено ли что-то на самом деле.
+# Хранится только id + причина + время, без содержимого плана; кап на размер,
+# чтобы это не превращалось в утечку памяти.
+_MANIFEST_TOMBSTONES: "collections.OrderedDict[str, Dict]" = collections.OrderedDict()
+_MANIFEST_TOMBSTONE_CAP = 200
+
+
+def _tombstone_manifest(manifest_id: str, reason: str) -> None:
+    _MANIFEST_TOMBSTONES.pop(manifest_id, None)
+    _MANIFEST_TOMBSTONES[manifest_id] = {
+        "reason": reason, "ts": datetime.now(timezone.utc).isoformat()}
+    while len(_MANIFEST_TOMBSTONES) > _MANIFEST_TOMBSTONE_CAP:
+        _MANIFEST_TOMBSTONES.popitem(last=False)
+
+
+def _manifest_gone_msg(manifest_id: str, default: str) -> str:
+    """Внятный ответ вместо общего «не найден/истёк»: различает «уже исполнено
+    по кнопке в Telegram» и «истёк/не существовал»."""
+    t = _MANIFEST_TOMBSTONES.get(manifest_id)
+    if t and t.get("reason") == "tg_auto_executed":
+        return (f"✅ Этот план ({manifest_id}) УЖЕ исполнен — вы подтвердили его "
+                "кнопкой в Telegram, и сервер выполнил его сам "
+                f"({t.get('ts')}). Повторять нечего, ничего не потеряно: отчёт "
+                "об исполнении вписан в то же сообщение Telegram, где были "
+                "кнопки. Для новой операции построй план заново.")
+    return default
+
+
 # ---------------------------------------------------------------------------
 # Shared tier-🟡 gate for the batch-mutation tools (update_tasks/
 # complete_tasks/move_tasks/set_task_parent/set_task_tags/restore_tasks) —
@@ -2581,8 +2655,15 @@ def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
         ids = [str(t.get("taskId") or t.get("task_id") or "") for t in stored]
         # tier-🟡 per docs/DESIGN_approval_gate.md §5: no anti-duplet gap —
         # only 🔴 tools time-gate plan vs. execute.
+        # `tool=` здесь НАМЕРЕННО не передаётся: план batch-тулов в Telegram не
+        # уходит (нет вызова _maybe_tg_notify_plan), а с `tool=` гейт стал бы
+        # спрашивать approved-строку, которой не существует → "none" → вечный
+        # отказ даже на честное «да». ТГ-фактор всё равно включится сам, если
+        # план этого манифеста когда-нибудь начнёт уходить в Telegram: решает
+        # пометка `tg_notified` в самом манифесте, а не аргумент вызова.
         cr = _require_consent(action=kind, tier=1, manifest=m,
-                              user_reply=user_reply, object_ids=ids, min_gap=0)
+                              user_reply=user_reply, object_ids=ids, min_gap=0,
+                              manifest_id=manifest_id)
         if not cr.ok:
             return _GateOutcome(False, message=cr.reason)
         return _GateOutcome(True, tasks=stored, summary=m.get("summary") or summary,
@@ -2652,9 +2733,13 @@ def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
             return _GateOutcome(False, message=(
                 f"🛑 Манифест {manifest_id} не найден/истёк/уже исполнен. "
                 f"Начни заново: {tool_name}(...) без manifest_id."))
+        # `tool=` не передаётся по той же причине, что и в _gate_batch выше
+        # (план в Telegram не уходит); пометка `tg_notified` в манифесте
+        # включит ТГ-фактор автоматически, если это когда-нибудь изменится.
         cr = _require_consent(action=kind, tier=1, manifest=m,
                               user_reply=user_reply, min_gap=0,
-                              automation_key=automation_key)
+                              automation_key=automation_key,
+                              manifest_id=manifest_id)
         if not cr.ok:
             return _GateOutcome(False, message=cr.reason)
         m["consumed"] = True
@@ -2832,11 +2917,20 @@ async def execute_task_deletion(manifest_id: str, user_reply: str = "") -> str:
     _prune_manifests()
     m = _MANIFESTS.get(manifest_id)
     if not m or m.get("kind") != "delete":
-        return (f"🛑 Манифест удаления {manifest_id} не найден/истёк/уже "
-                "исполнен. Сначала plan_task_deletion.")
+        return _manifest_gone_msg(
+            manifest_id,
+            f"🛑 Манифест удаления {manifest_id} не найден/истёк/уже "
+            "исполнен. Сначала plan_task_deletion.")
+    # tool=/manifest_id= ОБЯЗАТЕЛЬНЫ здесь (2026-08-06): без них
+    # `_require_consent` молча пропускал ТГ-фактор целиком, и то же самое
+    # удаление, что через `delete_tasks` требовало кнопку, здесь исполнялось
+    # по одному лишь chat-«да». Имя тула — то, под которым план анонсирован в
+    # Telegram (`plan_task_deletion` шлёт его как "delete_tasks", тот же ключ
+    # в `_AUTO_EXECUTORS`/`TG_APPROVAL_TOOLS`), а не имя этой функции.
     cr = _require_consent(action="delete", tier=2, manifest=m,
                           user_reply=user_reply,
-                          object_ids=[it["taskId"] for it in m["items"]])
+                          object_ids=[it["taskId"] for it in m["items"]],
+                          tool="delete_tasks", manifest_id=manifest_id)
     if not cr.ok:
         return cr.reason
     return await _execute_task_deletion_impl(manifest_id, m)
@@ -8848,6 +8942,10 @@ def _consume_manifest_for_auto_execute(manifest_id: str) -> Optional[Dict]:
     if m is None or m.get("consumed"):
         return None
     m["consumed"] = True
+    # Оставляем «надгробие» ДО исполнения: если модель следом честно позовёт
+    # execute_task_deletion по тому же id, она получит внятное «уже исполнено
+    # по кнопке», а не безликое «не найден/истёк» (см. _manifest_gone_msg).
+    _tombstone_manifest(manifest_id, "tg_auto_executed")
     return m
 
 
