@@ -8802,7 +8802,14 @@ def _find_tg_auto_execute_candidates() -> List[Dict]:
         if not row:
             continue
         out.append({"manifest_id": mid, "tool": tool,
-                    "chat_id": row.get("chat_id"), "message_id": row.get("message_id")})
+                    "chat_id": row.get("chat_id"),
+                    "message_id": row.get("message_id"),
+                    # Предыдущие куски длинного плана. Нужны, чтобы после
+                    # исполнения убрать их из лички: наш reaper строки
+                    # APPROVED не трогает (архив решения), а уборщик gmail-mcp
+                    # знает только про message_id — без этого куски 1..N-1
+                    # оставались бы в личном чате навсегда.
+                    "extra_message_ids": list(row.get("extra_message_ids") or [])})
     return out
 
 
@@ -9062,17 +9069,29 @@ def _manifest_affected_count(m: Optional[Dict]) -> Optional[int]:
 def _short_auto_execute_summary(tool: str, verdict: str,
                                 affected: Optional[int],
                                 group_delivered: bool,
-                                fallback_to_dm: bool = False) -> str:
+                                fallback_to_dm: bool = False,
+                                partial: Optional[Tuple[int, int]] = None) -> str:
     """2-4 строки в ЛИЧКУ владельца. Максим просил не захламлять личный чат
     1:1 простынями — подробности живут в группе «MCP Отчёты», сюда идёт
     только вердикт. Если в группу отчёт НЕ доставился, сводка обязана сказать
     это вслух: молчаливая потеря подробностей — тот же самый оптимистичный
-    отчёт, только в другой обёртке."""
+    отчёт, только в другой обёртке.
+
+    `partial=(доставлено, всего)` — отдельный, ТРЕТИЙ исход между «дошло» и
+    «не дошло»: на затяжном флуд-лимите Telegram в группу ложатся, например,
+    2 части из 6. Раньше такой случай не отличался от полного успеха (список
+    id ведь непустой), и владельцу писали «Подробный отчёт — в группе», хотя
+    там лежала треть. Теперь это называется своими словами."""
     lines = [f"{_VERDICT_EMOJI.get(verdict, '❓')} Автоисполнение «{tool}» — "
              f"{_VERDICT_WORD.get(verdict, verdict)}."]
     if affected is not None:
         lines.append(f"Затронуто объектов: {affected}.")
-    if group_delivered:
+    if partial is not None:
+        got, total = partial
+        lines.append(f"⚠️ отчёт доставлен в группу частично ({got} из {total} "
+                     f"частей) — остальное не дошло, подробности в логах "
+                     f"сервера.")
+    elif group_delivered:
         lines.append("Подробный отчёт — в группе «MCP Отчёты».")
     elif fallback_to_dm:
         lines.append("⚠️ В группу отчёт не ушёл (проверь TG_REPORTS_CHAT_ID и "
@@ -9082,6 +9101,42 @@ def _short_auto_execute_summary(tool: str, verdict: str,
         lines.append("⚠️ отчёт в группу не доставлен, подробности в логах "
                      "сервера.")
     return "\n".join(lines)
+
+
+def _cleanup_plan_leftovers(candidate: Dict, tool: str) -> int:
+    """Удаляет из ЛИЧКИ владельца предыдущие куски длинного плана, оставшиеся
+    после того, как итог вписан в последнее сообщение. Возвращает, сколько
+    удалить удалось (для лога и тестов).
+
+    Три жёстких границы, каждая — из разбора реального инцидента:
+      1. НИКОГДА не трогаем последнее сообщение (`message_id`) — в нём теперь
+         живёт сводка; поэтому его id явно исключается, даже если он вдруг
+         продублирован в extra_message_ids.
+      2. НИКОГДА не трогаем группу-архив: чат берётся ТОЛЬКО из candidate
+         (личка), `report_chat_id` сюда не попадает ни при каком условии.
+      3. Best-effort целиком: любая неудача — только лог. Сообщение, стёртое
+         человеком руками, или старше 48 часов (Bot API их удалять не даёт) —
+         это не ошибка процесса и не повод менять вердикт."""
+    chat_id = candidate.get("chat_id")
+    extra = candidate.get("extra_message_ids") or []
+    if not chat_id or not extra:
+        return 0
+    keep = candidate.get("message_id")
+    removed = 0
+    for mid in extra:
+        if mid is None or (keep is not None and mid == keep):
+            continue
+        try:
+            if tg_approval.delete_message(_TG_CFG, str(chat_id), mid):
+                removed += 1
+        except Exception as e:
+            logger.warning(f"TG auto-execute: не смог удалить кусок плана "
+                           f"{mid} в чате {chat_id} ({tool}/"
+                           f"{candidate.get('manifest_id')}): {e}")
+    if removed:
+        logger.info(f"TG auto-execute: убрано лишних кусков плана в личке: "
+                    f"{removed} ({tool}/{candidate.get('manifest_id')})")
+    return removed
 
 
 def _publish_auto_execute_outcome(candidate: Dict, tool: str, full_md: str,
@@ -9097,11 +9152,17 @@ def _publish_auto_execute_outcome(candidate: Dict, tool: str, full_md: str,
     зависеть от чужих гарантий. Функция СИНХРОННАЯ (requests + time.sleep на
     429) и обязана вызываться через `_run_blocking` — вызов напрямую из
     корутины блокирует event loop на всё время отправки отчёта."""
-    delivered: List[int] = []
+    # ЧЕСТНАЯ проверка полноты доставки (2026-08-06). Раньше здесь лежал
+    # `delivered: List[int]`, и успех определялся как `bool(delivered)` —
+    # то есть «хоть одно сообщение дошло» читалось как «отчёт опубликован».
+    # На затяжном 429 в группу ложились 2 части из 6, а владелец получал в
+    # личку «Подробный отчёт — в группе «MCP Отчёты»». Теперь полнота берётся
+    # из `.ok`, а частичность называется вслух.
+    delivery = tg_approval.ReportDelivery([], 0, 0, False)
     try:
-        delivered = tg_approval.post_report_to_group(
+        delivery = tg_approval.post_report_to_group(
             _TG_CFG, candidate["manifest_id"], full_md,
-            tool=tool, verdict=verdict) or []
+            tool=tool, verdict=verdict)
     except Exception as e:
         logger.error(f"TG auto-execute: публикация отчёта в группу упала "
                      f"({tool}/{candidate['manifest_id']}): {e}")
@@ -9118,26 +9179,60 @@ def _publish_auto_execute_outcome(candidate: Dict, tool: str, full_md: str,
     fallback_ok = False
     reports_chat = str(getattr(_TG_CFG, "reports_chat_id", "") or "")
     owner_chat = str(candidate.get("chat_id") or "")
-    if not delivered and owner_chat and reports_chat != owner_chat:
+    if not delivery.message_ids and owner_chat and reports_chat != owner_chat:
         try:
-            fallback_ok, _fb_ids, fb_err = tg_approval.send_message_chunked(
-                _TG_CFG, owner_chat, full_md)
+            fb = tg_approval.send_message_chunked(_TG_CFG, owner_chat, full_md)
+            fallback_ok = bool(fb.ok)
             if not fallback_ok:
                 logger.error(f"TG auto-execute: отчёт не удалось доставить ни в "
                              f"группу, ни в личку ({tool}/"
-                             f"{candidate['manifest_id']}): {fb_err}")
+                             f"{candidate['manifest_id']}): {fb.error}")
         except Exception as e:
             logger.error(f"TG auto-execute: фолбэк-отправка отчёта в личку "
                          f"упала ({tool}/{candidate['manifest_id']}): {e}")
 
+    # Частичная доставка — отдельный исход, а не «успех» и не «ничего не
+    # дошло»: часть отчёта в группе ЕСТЬ, поэтому дублировать его целиком в
+    # личку (фолбэк выше) не надо, но и молчать об этом нельзя.
+    partial = None
+    if not delivery.ok and delivery.delivered > 0:
+        partial = (delivery.delivered, delivery.total_chunks)
     short_md = _short_auto_execute_summary(tool, verdict, affected,
-                                           bool(delivered), fallback_ok)
+                                           bool(delivery.ok), fallback_ok,
+                                           partial)
+    summary_ok = False
     try:
-        tg_approval.summarize_in_owner_chat(
-            _TG_CFG, candidate["chat_id"], candidate["message_id"], short_md)
+        summary_ok = bool(tg_approval.summarize_in_owner_chat(
+            _TG_CFG, candidate["chat_id"], candidate["message_id"], short_md))
     except Exception as e:
         logger.error(f"TG auto-execute: сводка в личку не отправилась "
                      f"({tool}/{candidate['manifest_id']}): {e}")
+
+    # Уборка «сирот» плана в ЛИЧКЕ (2026-08-06). Длинный план уходит
+    # несколькими сообщениями: последнее (с кнопками) лежит в message_id и
+    # именно в него вписана сводка, а куски 1..N-1 — в extra_message_ids.
+    # После исполнения по кнопке строка становится APPROVED, и её не трогает
+    # НИКТО: наш reaper обходит APPROVED сознательно (архив состоявшегося
+    # решения), а уборщик соседнего gmail-mcp удаляет только message_id.
+    # Итог — куски плана оставались в личном чате навсегда, вопреки прямому
+    # требованию «не захламляя личный чат 1:1».
+    #
+    # Только ПОСЛЕ успешно вписанной сводки: пока итога нет, удалять контекст
+    # нельзя — владелец остался бы вообще без информации о том, что случилось.
+    # Строго best-effort: неудача ничего не ломает и не меняет вердикт.
+    # Сообщения в ГРУППЕ-АРХИВЕ здесь не трогаются ни при каких условиях —
+    # используется только chat_id кандидата (личка) и только extra-куски.
+    #
+    # Внешний try — не паранойя: исключение, вылетевшее ОТСЮДА, поймал бы
+    # `except` в `_tg_auto_execute_tick`, и тот опубликовал бы ВТОРОЙ отчёт с
+    # вердиктом «🛑 ошибка исполнения» — про операцию, которая на самом деле
+    # успешно выполнена и уже отчиталась. Врать в эту сторону нельзя тем более.
+    if summary_ok:
+        try:
+            _cleanup_plan_leftovers(candidate, tool)
+        except Exception as e:
+            logger.warning(f"TG auto-execute: уборка кусков плана не удалась "
+                           f"({tool}/{candidate['manifest_id']}): {e}")
 
 
 async def _tg_auto_execute_tick() -> None:

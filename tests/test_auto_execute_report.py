@@ -328,20 +328,35 @@ def _tg_cfg(reports_chat_id):
         reap_enabled=True)
 
 
-def _publish_harness(monkeypatch, *, group_ids, reports_chat="-100777"):
-    """Подменяет три выхода наружу: публикацию в группу, фолбэк-отправку и
-    редактирование личного сообщения."""
+def _publish_harness(monkeypatch, *, group_ids, reports_chat="-100777",
+                     total_chunks=None, deleted=None):
+    """Подменяет четыре выхода наружу: публикацию в группу, фолбэк-отправку,
+    редактирование личного сообщения и удаление лишних кусков плана.
+
+    `total_chunks` (по умолчанию = числу доставленных) отвечает за ПОЛНОТУ
+    доставки: если он больше, чем доставлено, отчёт ушёл в группу частично, и
+    сводка обязана сказать это словами."""
     import ticktick_mcp.src.tg_approval as tg
     sent, chunked, edits = [], [], []
+    ids = list(group_ids)
+    total = len(ids) if total_chunks is None else total_chunks
     monkeypatch.setattr(s, "_TG_CFG", _tg_cfg(reports_chat))
     monkeypatch.setattr(tg, "post_report_to_group",
                         lambda cfg, mid, md, *, tool, verdict: (
-                            sent.append((mid, tool, verdict)) or list(group_ids)))
+                            sent.append((mid, tool, verdict))
+                            or tg.ReportDelivery(ids, total, len(ids),
+                                                 bool(ids) and len(ids) == total)))
     monkeypatch.setattr(tg, "send_message_chunked",
                         lambda cfg, chat, md, **kw: (
-                            chunked.append((chat, md)) or (True, [77], "")))
+                            chunked.append((chat, md))
+                            or tg.SendResult(True, [77], "", 1)))
     monkeypatch.setattr(tg, "summarize_in_owner_chat",
-                        lambda cfg, chat, mid, short: edits.append((chat, mid, short)))
+                        lambda cfg, chat, mid, short: (
+                            edits.append((chat, mid, short)) or True))
+    monkeypatch.setattr(tg, "delete_message",
+                        lambda cfg, chat, mid: (
+                            (deleted if deleted is not None else []).append(
+                                (chat, mid)) or True))
     return sent, chunked, edits
 
 
@@ -399,6 +414,125 @@ def test_summary_still_goes_out_when_group_publish_raises(monkeypatch):
 
     assert len(edits) == 1
     assert len(chunked) == 1  # фолбэк всё равно спасает текст отчёта
+
+
+def test_partial_group_delivery_is_never_presented_as_a_full_one(monkeypatch):
+    """РЕГРЕССИЯ (2026-08-06): на затяжном флуд-лимите в группу ложились 2
+    части из 6, `post_report_to_group` отдавал непустой список id, и в личку
+    уходило бодрое «Подробный отчёт — в группе «MCP Отчёты»». Ровно та
+    «оптимистичная неправда», которую Максим запретил дословно («честная
+    пост-верификация, не оптимистичный отчёт»)."""
+    _sent, chunked, edits = _publish_harness(monkeypatch, group_ids=[1, 2],
+                                             total_chunks=6)
+    candidate = {"manifest_id": "m1", "chat_id": "111", "message_id": 9}
+
+    s._publish_auto_execute_outcome(candidate, "delete_tasks", "отчёт", "ok", 3)
+
+    short = edits[0][2]
+    assert "частично (2 из 6 частей)" in short
+    assert "MCP Отчёты" not in short, "нельзя выдавать частичную доставку за полную"
+    # часть отчёта в группе ЕСТЬ — дублировать его целиком в личку не надо
+    assert chunked == []
+
+
+def test_full_group_delivery_still_reads_as_success(monkeypatch):
+    _sent, _chunked, edits = _publish_harness(monkeypatch, group_ids=[1, 2, 3],
+                                              total_chunks=3)
+    s._publish_auto_execute_outcome(
+        {"manifest_id": "m1", "chat_id": "111", "message_id": 9},
+        "delete_tasks", "отчёт", "ok", 3)
+    assert "MCP Отчёты" in edits[0][2]
+    assert "частично" not in edits[0][2]
+
+
+# ===========================================================================
+# Уборка «сирот» плана в личке (куски 1..N-1 длинного плана)
+# ===========================================================================
+
+def test_extra_plan_chunks_are_deleted_from_the_dm_after_the_summary(monkeypatch):
+    """Длинный план уходит несколькими сообщениями; после исполнения строка
+    становится APPROVED, и её не трогает НИКТО (наш reaper обходит APPROVED,
+    уборщик gmail-mcp знает только про message_id). Куски 1..N-1 оставались в
+    личке навсегда — вопреки требованию «не захламляя личный чат 1:1»."""
+    deleted = []
+    _sent, _chunked, edits = _publish_harness(monkeypatch, group_ids=[1],
+                                              deleted=deleted)
+    candidate = {"manifest_id": "m1", "chat_id": "111", "message_id": 9,
+                 "extra_message_ids": [6, 7, 8]}
+
+    s._publish_auto_execute_outcome(candidate, "delete_tasks", "отчёт", "ok", 3)
+
+    assert len(edits) == 1, "сводка обязана уйти первой"
+    assert deleted == [("111", 6), ("111", 7), ("111", 8)]
+
+
+def test_the_summary_message_itself_is_never_deleted(monkeypatch):
+    """В последнем сообщении теперь живёт сводка — его не трогаем, даже если
+    его id по какой-то причине продублирован в extra_message_ids."""
+    deleted = []
+    _publish_harness(monkeypatch, group_ids=[1], deleted=deleted)
+    candidate = {"manifest_id": "m1", "chat_id": "111", "message_id": 9,
+                 "extra_message_ids": [8, 9]}
+
+    s._publish_auto_execute_outcome(candidate, "delete_tasks", "отчёт", "ok", 3)
+
+    assert deleted == [("111", 8)]
+
+
+def test_leftovers_are_kept_when_the_summary_did_not_land(monkeypatch):
+    """Пока итог не вписан, стирать контекст нельзя: владелец остался бы
+    вообще без информации о том, что произошло."""
+    import ticktick_mcp.src.tg_approval as tg
+    deleted = []
+    _publish_harness(monkeypatch, group_ids=[1], deleted=deleted)
+    monkeypatch.setattr(tg, "summarize_in_owner_chat", lambda *a, **k: False)
+    candidate = {"manifest_id": "m1", "chat_id": "111", "message_id": 9,
+                 "extra_message_ids": [6, 7]}
+
+    s._publish_auto_execute_outcome(candidate, "delete_tasks", "отчёт", "ok", 3)
+
+    assert deleted == []
+
+
+def test_cleanup_never_touches_the_archive_group(monkeypatch):
+    """Чат для уборки берётся ТОЛЬКО из кандидата (личка). Сообщения отчёта в
+    группе-архиве не удаляются ни при каких условиях."""
+    deleted = []
+    _publish_harness(monkeypatch, group_ids=[500, 501], deleted=deleted)
+    candidate = {"manifest_id": "m1", "chat_id": "111", "message_id": 9,
+                 "extra_message_ids": [6]}
+
+    s._publish_auto_execute_outcome(candidate, "delete_tasks", "отчёт", "ok", 3)
+
+    assert {chat for chat, _ in deleted} == {"111"}
+    assert 500 not in [mid for _, mid in deleted]
+
+
+def test_cleanup_failure_does_not_break_the_flow(monkeypatch):
+    """Best-effort: сообщение, стёртое человеком руками или старше 48 часов
+    (Bot API их удалять не даёт), — не ошибка процесса."""
+    import ticktick_mcp.src.tg_approval as tg
+    _sent, _chunked, edits = _publish_harness(monkeypatch, group_ids=[1])
+
+    def boom(*a, **k):
+        raise RuntimeError("Telegram недоступен")
+
+    monkeypatch.setattr(tg, "delete_message", boom)
+    candidate = {"manifest_id": "m1", "chat_id": "111", "message_id": 9,
+                 "extra_message_ids": [6, 7]}
+
+    s._publish_auto_execute_outcome(candidate, "delete_tasks", "отчёт", "ok", 3)
+
+    assert len(edits) == 1  # вердикт и сводка не пострадали
+
+
+def test_candidate_without_extra_chunks_deletes_nothing(monkeypatch):
+    deleted = []
+    _publish_harness(monkeypatch, group_ids=[1], deleted=deleted)
+    s._publish_auto_execute_outcome(
+        {"manifest_id": "m1", "chat_id": "111", "message_id": 9},
+        "delete_tasks", "отчёт", "ok", 3)
+    assert deleted == []
 
 
 def test_manifest_affected_count():

@@ -50,7 +50,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, NamedTuple, Optional
 from zoneinfo import ZoneInfo
 
 import requests
@@ -479,7 +479,43 @@ _PARSE_ERROR_HINTS = (
     "wrong http url",  # то же семейство: ссылка внутри разметки не распарсилась
 )
 
-_SEND_ATTEMPTS = 3
+# Сколько раз повторяем ОДИН кусок, прежде чем сдаться. Было 3 — живой прогон
+# 2026-08-06 показал, что этого мало: отчёт по 200 задачам — это 9-13 сообщений
+# подряд, и Telegram начинает отвечать «429 retry after 37» примерно на 13-м.
+# Три 429 подряд по одному куску обрывали ВЕСЬ отчёт на середине. Пять попыток
+# переживают серию флуд-отказов, не превращая доставку в бесконечную.
+_SEND_ATTEMPTS = 5
+
+# Профилактическая пауза МЕЖДУ соседними кусками. Это не магическое число и не
+# «подождём на всякий случай»: Telegram душит именно ПЛОТНУЮ серию сообщений в
+# один чат (лимит порядка 20 сообщений в минуту на группу и ~30 в секунду
+# суммарно), и 0.5 с растягивает 13 сообщений на ~6 секунд — этого хватает,
+# чтобы серия вообще не упёрлась в 429, вместо того чтобы честно отсиживать по
+# 37 секунд ПОСЛЕ отказа. Дешевле предупредить, чем отлежать.
+_INTER_CHUNK_PAUSE_S = 0.5
+
+# Потолок СУММАРНОГО ожидания на ОДИН кусок (не на весь отчёт): даже при пяти
+# попытках Telegram теоретически может каждый раз просить «retry after 60», и
+# без потолка отправка одного сообщения растянулась бы на пять минут, держа
+# поток пула занятым. 180 секунд = разумный максимум: типичный retry_after у
+# бота — 1-40 с, так что реальные серии сюда не упираются, а патология
+# обрывается предсказуемо и честно (ok=False + описание в error).
+_MAX_SEND_WAIT_S = 180
+
+
+class SendResult(NamedTuple):
+    """Результат `send_message_chunked`.
+
+    Раньше это был голый кортеж `(ok, message_ids, error)`, и вызывающий не мог
+    отличить «доставлено 6 кусков из 6» от «доставлено 2 из 6»: и там, и там
+    список id непустой. Именно из-за этого в личку владельца уходило бодрое
+    «Подробный отчёт — в группе», когда в группу легли две части из шести.
+    `total_chunks` закрывает эту дыру, не требуя пересчитывать нарезку
+    заново."""
+    ok: bool               # дошли ВСЕ куски
+    message_ids: list      # id реально доставленных сообщений (и при ok=False)
+    error: str             # текст последней ошибки Telegram ("" при успехе)
+    total_chunks: int      # на сколько сообщений текст был разбит
 
 
 def _is_parse_error(res: dict) -> bool:
@@ -503,22 +539,26 @@ def _retry_after_s(res: dict) -> Optional[int]:
 
 def send_message_chunked(cfg: TgApprovalConfig, chat_id: str, md_text: str,
                          *, reply_markup_on_last: dict | None = None,
-                         disable_notification: bool = False) -> tuple[bool, list[int], str]:
+                         disable_notification: bool = False) -> SendResult:
     """Доставляет текст любой длины: режет на куски, шлёт по одному, кнопки
     вешает только на ПОСЛЕДНЕЕ сообщение (иначе вебхук gmail-mcp снимет их не
     с того сообщения, а «активной» останется висеть кнопка на обрубке плана).
 
-    Возвращает (ok, message_ids, error). ok=True — только если дошли ВСЕ куски;
-    message_ids содержит id всех реально доставленных сообщений даже при
-    ok=False, чтобы вызывающий мог прибрать за собой.
+    Возвращает `SendResult(ok, message_ids, error, total_chunks)`. ok=True —
+    только если дошли ВСЕ куски; message_ids содержит id всех реально
+    доставленных сообщений даже при ok=False, чтобы вызывающий мог прибрать за
+    собой, а `total_chunks` — сколько кусков ПЛАНИРОВАЛОСЬ, чтобы он же мог
+    сказать человеку честное «доставлено 2 из 6», а не молча выдать частичную
+    доставку за полную.
 
     Защита от главного silent-fail Telegram: при 400 «can't parse entities»
     (кривая разметка внутри текста) кусок повторяется БЕЗ parse_mode —
     plain-текстом исходного markdown. Лучше некрасивое сообщение, чем
-    потерянное. При 429 — сон на retry_after и повтор."""
+    потерянное. При 429 — сон на retry_after и повтор (до `_SEND_ATTEMPTS`
+    попыток и не дольше `_MAX_SEND_WAIT_S` суммарно на один кусок)."""
     chunks = split_for_telegram(md_text, TELEGRAM_TEXT_LIMIT)
     if not chunks:
-        return False, [], "пустой текст — отправлять нечего"
+        return SendResult(False, [], "пустой текст — отправлять нечего", 0)
     if len(chunks) > 1:
         # пересчитываем с местом под «(часть N/M)»
         chunks = split_for_telegram(md_text, TELEGRAM_TEXT_LIMIT - _PART_SUFFIX_RESERVE)
@@ -527,15 +567,23 @@ def send_message_chunked(cfg: TgApprovalConfig, chat_id: str, md_text: str,
     message_ids: list[int] = []
     for idx, chunk in enumerate(chunks, start=1):
         is_last = idx == total
+        # Пауза ПЕРЕД каждым куском, кроме первого: одиночное сообщение (самый
+        # частый случай — короткая сводка, план на пару задач) не тормозится
+        # вообще, а серия растягивается ровно настолько, чтобы не влететь в
+        # флуд-лимит. Идёт через time.sleep того же модуля, что и сон на 429, —
+        # значит тестовый monkeypatch на time.sleep накрывает и её.
+        if idx > 1 and _INTER_CHUNK_PAUSE_S > 0:
+            time.sleep(_INTER_CHUNK_PAUSE_S)
+
+        sent = None
+        use_plain = False
+        error = ""
+        waited_s = 0.0  # сколько уже отсидели по 429 ИМЕННО на этом куске
         html = md_to_telegram_html(chunk)
         plain = chunk
         if total > 1:
             html += f"\n\n<i>(часть {idx}/{total})</i>"
             plain += f"\n\n(часть {idx}/{total})"
-
-        sent = None
-        use_plain = False
-        error = ""
         for attempt in range(1, _SEND_ATTEMPTS + 1):
             body: Dict[str, Any] = {"chat_id": chat_id,
                                     "text": plain if use_plain else html}
@@ -552,9 +600,20 @@ def send_message_chunked(cfg: TgApprovalConfig, chat_id: str, md_text: str,
             error = res.get("description") or "Telegram sendMessage failed"
             wait_s = _retry_after_s(res)
             if wait_s is not None and attempt < _SEND_ATTEMPTS:
+                if waited_s + wait_s > _MAX_SEND_WAIT_S:
+                    # Потолок: дальше ждать дороже, чем честно сказать «не
+                    # доставлено». Вызывающий увидит частичную доставку по
+                    # total_chunks и напишет об этом владельцу словами.
+                    error = (f"{error} (суммарное ожидание превысило "
+                             f"{_MAX_SEND_WAIT_S}s — бросаю повторы)")
+                    logger.warning(f"TG: кусок {idx}/{total} не отправлен: "
+                                   f"Telegram просит ещё {wait_s}s, а уже "
+                                   f"отсижено {waited_s:.0f}s")
+                    break
                 logger.warning(f"TG: 429 от Telegram, жду {wait_s}s и повторяю "
                                f"кусок {idx}/{total}")
                 time.sleep(wait_s)
+                waited_s += wait_s
                 continue
             if _is_parse_error(res) and not use_plain and attempt < _SEND_ATTEMPTS:
                 logger.warning(f"TG: Telegram не распарсил HTML куска {idx}/{total} "
@@ -563,11 +622,11 @@ def send_message_chunked(cfg: TgApprovalConfig, chat_id: str, md_text: str,
                 continue
             break
         if sent is None:
-            return False, message_ids, error
+            return SendResult(False, message_ids, error, total)
         mid = (sent.get("result") or {}).get("message_id")
         if mid is not None:
             message_ids.append(mid)
-    return True, message_ids, ""
+    return SendResult(True, message_ids, "", total)
 
 
 def delete_message(cfg: TgApprovalConfig, chat_id: str, message_id: int) -> bool:
@@ -668,7 +727,12 @@ def create_tg_approval(manifest_id: str, chat_id: str, message_id: Optional[int]
                         extra_message_ids: Optional[list[int]] = None) -> None:
     """`message_id` — сообщение С КНОПКАМИ (последнее), `extra_message_ids` —
     предшествующие куски того же плана. Разделение не косметическое: вебхук
-    gmail-mcp правит именно `message_id`, а reaper обязан прибрать все."""
+    gmail-mcp правит именно `message_id`, а reaper обязан прибрать все.
+
+    `message_id=None` — штатный случай, а не заглушка: строка создаётся ДО
+    отправки сообщений (см. `notify_plan`), чтобы нажатие кнопки не могло
+    попасть в зазор «сообщение уже висит, строки ещё нет». Схема это
+    допускает — колонка BIGINT без NOT NULL."""
     conn = _pg_pool.getconn()
     try:
         with conn, conn.cursor() as cur:
@@ -679,6 +743,57 @@ def create_tg_approval(manifest_id: str, chat_id: str, message_id: Optional[int]
                 (manifest_id, "ticktick", chat_id, message_id, _now_ms(), expires_at_ms,
                  list(extra_message_ids or [])),
             )
+    finally:
+        _pg_pool.putconn(conn)
+
+
+def attach_plan_messages(manifest_id: str, message_id: Optional[int],
+                         extra_message_ids: Optional[list[int]] = None) -> bool:
+    """Дописывает в УЖЕ созданную строку id доставленных сообщений плана.
+
+    Второй шаг схемы «INSERT → отправка → UPDATE» из `notify_plan`: строка
+    существует с самого начала (иначе нажатие кнопки в зазоре пропало бы
+    впустую), а реальные message_id известны только после отправки.
+
+    Возвращает True, если запись прошла. False (и только лог) означает
+    деградацию, а НЕ провал гейта: строка на месте и статус ей проставит
+    вебхук, кнопки он снимет по message_id из самого callback_query — просто
+    сводку в личку потом будет некуда вписать."""
+    if not store_ready():
+        return False
+    conn = _pg_pool.getconn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE tg_approvals SET message_id = %s, extra_message_ids = %s "
+                "WHERE manifest_id = %s AND server = 'ticktick'",
+                (message_id, list(extra_message_ids or []), manifest_id),
+            )
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"TG: не смог записать message_id для {manifest_id}: {e}")
+        return False
+    finally:
+        _pg_pool.putconn(conn)
+
+
+def delete_tg_approval(manifest_id: str) -> None:
+    """Убирает строку подтверждения. Нужна ровно в одном месте — откат
+    `notify_plan`, когда строку уже вставили, а сообщения в Telegram уйти не
+    смогли: без этого в таблице осталась бы сирота, живущая до TTL и
+    подтверждающая план, которого владелец никогда не видел."""
+    if not store_ready():
+        return
+    conn = _pg_pool.getconn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM tg_approvals WHERE manifest_id = %s AND server = 'ticktick'",
+                (manifest_id,),
+            )
+    except Exception as e:  # noqa: BLE001 — откат best-effort: строка всё равно
+        # умрёт по TTL, а бросать отсюда нельзя (мы уже в ветке ошибки)
+        logger.warning(f"TG: не смог удалить строку подтверждения {manifest_id}: {e}")
     finally:
         _pg_pool.putconn(conn)
 
@@ -711,13 +826,17 @@ def get_tg_approval(manifest_id: str) -> Optional[dict]:
     должен читать чужие approval-строки (та же дисциплина, что у TS-серверов'
     getTgApproval; см. tg_approval.ts's комментарий про cross-server read).
     chat_id/message_id (добавлены 2026-08-05) нужны авто-исполнению по
-    кнопке, чтобы знать, КУДА писать итог (report_auto_execution_result)."""
+    кнопке, чтобы знать, КУДА писать итог (report_auto_execution_result).
+    extra_message_ids (добавлен 2026-08-06) — предыдущие куски длинного плана:
+    после исполнения их надо УДАЛИТЬ из лички, иначе они остаются там навсегда
+    (наш reaper строки APPROVED не трогает — это архив решения, а уборщик
+    gmail-mcp знает только про message_id)."""
     conn = _pg_pool.getconn()
     try:
         with conn, conn.cursor() as cur:
             cur.execute(
-                "SELECT status, expires_at, chat_id, message_id FROM tg_approvals "
-                "WHERE manifest_id = %s AND server = 'ticktick'",
+                "SELECT status, expires_at, chat_id, message_id, extra_message_ids "
+                "FROM tg_approvals WHERE manifest_id = %s AND server = 'ticktick'",
                 (manifest_id,),
             )
             row = cur.fetchone()
@@ -726,7 +845,11 @@ def get_tg_approval(manifest_id: str) -> Optional[dict]:
     if not row:
         return None
     return {"status": row[0], "expires_at": row[1], "chat_id": row[2],
-            "message_id": row[3]}
+            "message_id": row[3],
+            # У старых строк колонки может не быть в выборке (или быть NULL) —
+            # приводим к списку здесь, чтобы вызывающему не приходилось
+            # проверять None на каждом шаге.
+            "extra_message_ids": list(row[4] or []) if len(row) > 4 else []}
 
 
 # ───────────────────────── Публичное API для server.py ─────────────────────
@@ -736,11 +859,28 @@ def notify_plan(cfg: TgApprovalConfig, manifest_id: str, preview_body: str,
     """Отправляет план в Telegram с кнопками [✅ Подтвердить][🛑 Отклонить],
     пишет строку в tg_approvals. Fail-closed по духу gmail-mcp: если это
     вернуло (False, ...), вызывающий код ОБЯЗАН инвалидировать манифест — тот
-    же контракт, что requireConsent's notifyPlan в TS."""
+    же контракт, что requireConsent's notifyPlan в TS.
+
+    ПОРЯДОК ШАГОВ ВАЖЕН (исправлено 2026-08-06): сначала INSERT строки
+    (message_id ещё NULL), потом отправка, потом UPDATE строки реальными id.
+    Раньше было наоборот — сообщение с кнопками уходило РАНЬШЕ, чем в БД
+    появлялась строка. Владелец, нажавший кнопку в этот зазор (доли секунды,
+    но кнопка видна сразу и человек сидит в чате именно ради неё), терял
+    нажатие впустую: вебхук gmail-mcp делает `UPDATE … WHERE manifest_id = …
+    AND status = 'PENDING'`, строки не находил, обновлять было нечего — и
+    сообщение оставалось висеть с живыми кнопками, а действие не наступало
+    никогда. Теперь любое нажатие попадает в существующую строку."""
     if not store_ready():
         return False, "Postgres для TG-approval не настроен (CONSENT_DATABASE_URL)"
+    expires_at = _now_ms() + cfg.ttl_s * 1000
+    try:
+        create_tg_approval(manifest_id, cfg.owner_chat_id, None, expires_at, [])
+    except Exception as e:  # noqa: BLE001 — не смогли создать строку = гейта нет
+        logger.warning(f"TG: не смог создать строку подтверждения {manifest_id}: {e}")
+        return False, f"не удалось создать строку подтверждения в Postgres: {e}"
+
     text = f"{preview_body}\n\n{tool} · ticktick"
-    ok, message_ids, err = send_message_chunked(
+    res = send_message_chunked(
         cfg, cfg.owner_chat_id, text,
         reply_markup_on_last={
             "inline_keyboard": [[
@@ -749,19 +889,29 @@ def notify_plan(cfg: TgApprovalConfig, manifest_id: str, preview_body: str,
             ]]
         },
     )
-    if not ok:
+    if not res.ok:
         # Обрубок плана без кнопок в чате опаснее, чем ничего: человек может
         # принять его за полный и «подтвердить» в чате то, чего не видел.
         # Поэтому уже доставленные куски убираем и честно проваливаем гейт.
-        for mid in message_ids:
+        for mid in res.message_ids:
             delete_message(cfg, cfg.owner_chat_id, mid)
-        return False, err or "Telegram sendMessage failed"
+        # ...и обязательно сносим строку, которую вставили первым шагом: иначе
+        # осталась бы сирота PENDING без единого сообщения в чате — живая до
+        # TTL и способная «подтвердить» план, которого никто не видел.
+        delete_tg_approval(manifest_id)
+        return False, res.error or "Telegram sendMessage failed"
     # Кнопки — на ПОСЛЕДНЕМ сообщении, его id и есть «тот самый» message_id,
     # с которым работает вебхук gmail-mcp; предыдущие куски идут в extra_*.
-    message_id = message_ids[-1] if message_ids else None
-    extra_ids = message_ids[:-1]
-    expires_at = _now_ms() + cfg.ttl_s * 1000
-    create_tg_approval(manifest_id, cfg.owner_chat_id, message_id, expires_at, extra_ids)
+    message_id = res.message_ids[-1] if res.message_ids else None
+    extra_ids = list(res.message_ids[:-1])
+    if not attach_plan_messages(manifest_id, message_id, extra_ids):
+        # Гейт НЕ проваливаем: план доставлен, строка есть, нажатие сработает
+        # (вебхук снимает кнопки по message_id из самого callback_query, а не
+        # из БД). Потеряна только уборка — сводку будет некуда вписать, а
+        # лишние куски плана некому удалить. Это несоразмерно меньшая беда,
+        # чем отменить уже показанный человеку план из-за сбоя UPDATE.
+        logger.warning(f"TG: план {manifest_id} доставлен, но message_id в БД не "
+                       f"записан — сводка в личку и уборка кусков не сработают")
     return True, ""
 
 
@@ -892,10 +1042,33 @@ def _owner_now_str() -> str:
     return datetime.now(_resolve_owner_tz()).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+class ReportDelivery(NamedTuple):
+    """Чем закончилась публикация отчёта в группу-архив.
+
+    Раньше функция возвращала голый `list[int]`, и вызывающий проверял его
+    через `if delivered:` — то есть считал УСПЕХОМ любую непустую доставку.
+    На затяжном флуд-лимите Telegram это давало прямую неправду: в группу
+    легли, скажем, 2 части из 6, а в личку владельца уходило бодрое
+    «Подробный отчёт — в группе «MCP Отчёты»». Требование Максима дословно —
+    «честная пост-верификация, не оптимистичный отчёт», поэтому полноту
+    доставки теперь видно по полям, а не угадывают по длине списка.
+
+    Осознанно НЕ притворяемся списком ради «дешёвой обратной совместимости»:
+    у NamedTuple из четырёх полей `bool()` ВСЕГДА True, а `== []` ВСЕГДА
+    False, так что старый код (`if delivered:`) молча читал бы неудачу как
+    успех — ровно тот баг, который здесь и чинится. Поэтому все места вызова
+    и все тесты обновлены явно."""
+    message_ids: list      # id реально доставленных сообщений
+    total_chunks: int      # на сколько частей отчёт был разбит
+    delivered: int         # сколько частей реально дошло
+    ok: bool               # дошло ВСЁ
+
+
 def post_report_to_group(cfg: TgApprovalConfig, manifest_id: str, report_md: str,
-                         *, tool: str, verdict: str) -> list[int]:
+                         *, tool: str, verdict: str) -> ReportDelivery:
     """Публикует ПОЛНЫЙ отчёт об исполнении в группу-архив и запоминает в БД,
-    куда он ушёл. Возвращает id доставленных сообщений ([] — не доставлено).
+    куда он ушёл. Возвращает `ReportDelivery` — вызывающий обязан смотреть на
+    `.ok`, а не на непустоту `.message_ids` (см. докстринг ReportDelivery).
 
     НИКОГДА не бросает: мутация в TickTick к этому моменту уже произошла, и
     падение на отправке отчёта не должно превращаться в ошибку тула — иначе
@@ -905,37 +1078,44 @@ def post_report_to_group(cfg: TgApprovalConfig, manifest_id: str, report_md: str
         if not chat_id:
             logger.warning("TG: некуда публиковать отчёт — ни TG_REPORTS_CHAT_ID, "
                            "ни TG_OWNER_CHAT_ID не заданы")
-            return []
+            return ReportDelivery([], 0, 0, False)
         header = _VERDICT_HEADERS.get(verdict) or _VERDICT_HEADERS["unverified"]
         text = (f"### {header}\n"
                 f"{tool} · `{manifest_id}` · {_owner_now_str()}\n\n"
                 f"{report_md}")
-        ok, message_ids, err = send_message_chunked(cfg, chat_id, text)
-        if not ok:
+        res = send_message_chunked(cfg, chat_id, text)
+        if not res.ok:
             # Частичная доставка — не повод «забыть» id: их всё равно надо
             # записать, иначе reaper не найдёт эти сообщения.
             logger.warning(f"TG: отчёт по {manifest_id} доставлен не полностью "
-                           f"({len(message_ids)} сообщ.): {err}")
-        if message_ids:
-            record_report_messages(manifest_id, chat_id, message_ids)
-        return message_ids
+                           f"({len(res.message_ids)} из {res.total_chunks} "
+                           f"частей): {res.error}")
+        if res.message_ids:
+            record_report_messages(manifest_id, chat_id, res.message_ids)
+        return ReportDelivery(list(res.message_ids), res.total_chunks,
+                              len(res.message_ids), bool(res.ok))
     except Exception as e:  # noqa: BLE001 — отчёт best-effort по определению
         logger.warning(f"TG: не смог опубликовать отчёт по {manifest_id}: {e}")
-        return []
+        return ReportDelivery([], 0, 0, False)
 
 
 def summarize_in_owner_chat(cfg: TgApprovalConfig, chat_id: str,
-                            message_id: Optional[int], short_md: str) -> None:
+                            message_id: Optional[int], short_md: str) -> bool:
     """Заменяет план в личке КОРОТКОЙ сводкой и снимает кнопки одним
     `editMessageText` (Telegram позволяет менять текст и reply_markup вместе).
     Текст сводки формирует вызывающий — здесь только транспорт.
 
+    Возвращает True, только если Telegram реально принял правку. Это не
+    косметика: вызывающий по этому признаку решает, можно ли теперь удалять
+    ПРЕДЫДУЩИЕ куски длинного плана (пока итог не вписан, стирать контекст
+    нельзя — владелец остался бы вообще без информации).
+
     Best-effort: если человек стёр сообщение руками или оно старше суток —
-    просто лог, исключений наружу нет (мутация уже произошла)."""
+    просто лог и False, исключений наружу нет (мутация уже произошла)."""
     if message_id is None:
         logger.warning(f"TG: message_id отсутствует, сводку некуда вписать "
                        f"(chat={chat_id})")
-        return
+        return False
     # Бюджет сужен на длину приписки «(сводка сокращена…)»: без этого запаса
     # кусок ровно в лимит + приписка давали текст ДЛИННЕЕ 4096, Telegram
     # отвечал 400, и сводка не появлялась вовсе — а кнопки на исполненном
@@ -944,7 +1124,7 @@ def summarize_in_owner_chat(cfg: TgApprovalConfig, chat_id: str,
     _CUT_NOTE = "\n\n_(сводка сокращена — полный отчёт в группе)_"
     chunks = split_for_telegram(short_md, TELEGRAM_TEXT_LIMIT - len(_CUT_NOTE) - 8)
     if not chunks:
-        return
+        return False
     text = chunks[0]
     if len(chunks) > 1:
         # Сводка по контракту короткая; если вызывающий прислал длинную —
@@ -960,16 +1140,18 @@ def summarize_in_owner_chat(cfg: TgApprovalConfig, chat_id: str,
     if not res.get("ok"):
         logger.warning(f"TG: editMessageText для сообщения {message_id} не удался: "
                        f"{res.get('description')}")
+        return False
+    return True
 
 
 def report_auto_execution_result(cfg: TgApprovalConfig, chat_id: str,
-                                  message_id: Optional[int], report_text: str) -> None:
+                                  message_id: Optional[int], report_text: str) -> bool:
     """DEPRECATED (2026-08-06): осталась только ради обратной совместимости с
     существующими вызовами в server.py. Раньше вписывала ВЕСЬ отчёт в то же
     сообщение с кнопками (и резала его на 3500 символах); теперь полный отчёт
     уходит в группу через post_report_to_group(), а сюда идёт короткая сводка.
     Новый код должен звать summarize_in_owner_chat() напрямую."""
-    summarize_in_owner_chat(cfg, chat_id, message_id, report_text)
+    return summarize_in_owner_chat(cfg, chat_id, message_id, report_text)
 
 
 # ───────────────────────── TTL-уборка (reaper) ─────────────────────────
@@ -990,6 +1172,12 @@ def reap_expired(cfg: TgApprovalConfig) -> int:
       • 'APPROVED'/'REJECTED' не трогаем СОЗНАТЕЛЬНО: кнопку нажали, значит
         отчёт в группе — это архив состоявшегося решения, он должен жить; те
         строки после TTL приберёт sweep gmail-mcp.
+      • `message_id IS NULL` — штатная, а не битая строка: `notify_plan`
+        вставляет её ДО отправки сообщений, поэтому сюда может попасть
+        манифест, у которого отправка так и не состоялась (упал процесс,
+        отвалилась сеть). Удалять в Telegram нечего — просто убираем строку,
+        без единого лишнего вызова и без исключений (см. проверку
+        `tgt_msg is not None` ниже).
     """
     if not cfg.reap_enabled or not store_ready():
         return 0

@@ -215,10 +215,14 @@ def _fake_report_sinks(monkeypatch):
     def _post(cfg, manifest_id, report_md, *, tool, verdict):
         group.append({"manifest_id": manifest_id, "report_md": report_md,
                       "tool": tool, "verdict": verdict})
-        return [1001]  # id доставленных сообщений — непустой список = ok
+        # ПОЛНАЯ доставка: 1 кусок из 1. С 2026-08-06 полнота выражается
+        # полями ReportDelivery, а не непустотой списка id — частичная
+        # доставка больше не может притвориться успехом.
+        return tg.ReportDelivery([1001], 1, 1, True)
 
     def _summarize(cfg, chat_id, message_id, short_md):
         private.append((chat_id, message_id, short_md))
+        return True  # правка принята Telegram — сводка вписана
 
     monkeypatch.setattr(tg, "post_report_to_group", _post, raising=False)
     monkeypatch.setattr(tg, "summarize_in_owner_chat", _summarize, raising=False)
@@ -296,6 +300,26 @@ def test_find_candidates_finds_approved_delete(monkeypatch):
     assert out[0]["tool"] == "delete_tasks"
     assert out[0]["chat_id"] == "c1"
     assert out[0]["message_id"] == 99
+    # старая строка без колонки extra — не повод падать
+    assert out[0]["extra_message_ids"] == []
+
+
+def test_find_candidates_carries_extra_plan_chunk_ids(monkeypatch):
+    """id предыдущих кусков длинного плана обязаны доехать до кандидата —
+    иначе после исполнения их некому удалить из лички (наш reaper строки
+    APPROVED не трогает, а gmail-mcp знает только про message_id)."""
+    _enable_tg(monkeypatch)
+    s._MANIFESTS["cand7"] = {"kind": "delete", "consumed": False,
+                             "created": time.monotonic(),
+                             "items": [{"taskId": "t1", "title": "X"}]}
+    monkeypatch.setattr(tg, "check_approval",
+                        lambda mid: "approved" if mid == "cand7" else "none")
+    monkeypatch.setattr(tg, "get_tg_approval",
+                        lambda mid: {"chat_id": "c1", "message_id": 99,
+                                     "extra_message_ids": [96, 97, 98]})
+    out = [c for c in s._find_tg_auto_execute_candidates()
+           if c["manifest_id"] == "cand7"]
+    assert out[0]["extra_message_ids"] == [96, 97, 98]
 
 
 # ===========================================================================

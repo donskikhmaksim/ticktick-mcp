@@ -29,6 +29,19 @@ def _html_len(chunk):
     return len(tg.md_to_telegram_html(chunk))
 
 
+@pytest.fixture(autouse=True)
+def _never_sleep_for_real(monkeypatch):
+    """Между соседними кусками теперь есть профилактическая пауза
+    (`_INTER_CHUNK_PAUSE_S`, защита от 429), а на 429 — сон на retry_after.
+    Тесты не имеют права спать по-настоящему: отчёт на 13 сообщений добавил бы
+    к прогону 6 секунд на ровном месте. Патчим САМ модуль time (именно его
+    видит tg_approval), поэтому мок накрывает оба вида сна сразу.
+
+    Тесты, которым важны конкретные значения сна, ставят свой monkeypatch
+    поверх — он применяется позже и выигрывает."""
+    monkeypatch.setattr(tg.time, "sleep", lambda s: None)
+
+
 # ===========================================================================
 # split_for_telegram — границы, инвариант длины, целостность разметки
 # ===========================================================================
@@ -247,12 +260,12 @@ def test_buttons_are_attached_only_to_the_last_message(monkeypatch):
     long_text = "\n".join(f"- **задача {i}** — описание `id_{i}`" for i in range(400))
     markup = {"inline_keyboard": [[{"text": "✅", "callback_data": "a:m1"}]]}
 
-    ok, ids, err = tg.send_message_chunked(_cfg(), "111", long_text,
-                                           reply_markup_on_last=markup)
+    ok, ids, err, total = tg.send_message_chunked(_cfg(), "111", long_text,
+                                                  reply_markup_on_last=markup)
 
     assert ok is True and err == ""
     assert len(fake.bodies) > 1, "текст обязан разбиться на несколько сообщений"
-    assert len(ids) == len(fake.bodies)
+    assert len(ids) == len(fake.bodies) == total
     for _, body in fake.bodies[:-1]:
         assert "reply_markup" not in body
     assert fake.bodies[-1][1]["reply_markup"] == markup
@@ -266,8 +279,8 @@ def test_buttons_are_attached_only_to_the_last_message(monkeypatch):
 def test_single_chunk_gets_no_part_marker(monkeypatch):
     fake = _FakeTelegram()
     monkeypatch.setattr(tg, "_tg_call", fake)
-    ok, ids, err = tg.send_message_chunked(_cfg(), "111", "коротко")
-    assert ok is True and len(ids) == 1
+    res = tg.send_message_chunked(_cfg(), "111", "коротко")
+    assert res.ok is True and len(res.message_ids) == 1 and res.total_chunks == 1
     assert "часть" not in fake.bodies[0][1]["text"]
 
 
@@ -280,7 +293,8 @@ def test_parse_entities_error_retries_as_plain_text(monkeypatch):
     ])
     monkeypatch.setattr(tg, "_tg_call", fake)
 
-    ok, ids, err = tg.send_message_chunked(_cfg(), "111", "**сломанная <разметка")
+    ok, ids, err, _total = tg.send_message_chunked(_cfg(), "111",
+                                                   "**сломанная <разметка")
 
     assert ok is True, "сообщение обязано дойти вторым заходом"
     assert len(ids) == 1
@@ -300,10 +314,10 @@ def test_rate_limit_waits_retry_after_and_retries(monkeypatch):
     monkeypatch.setattr(tg, "_tg_call", fake)
     monkeypatch.setattr(tg.time, "sleep", lambda s: slept.append(s))
 
-    ok, ids, err = tg.send_message_chunked(_cfg(), "111", "отчёт")
+    ok, ids, err, _total = tg.send_message_chunked(_cfg(), "111", "отчёт")
 
     assert ok is True and len(ids) == 1
-    assert slept == [7]
+    assert slept == [7], "один кусок — пауз между кусками быть не должно"
     assert len(fake.bodies) == 2
 
 
@@ -316,19 +330,73 @@ def test_fatal_error_reports_delivered_ids_so_caller_can_clean_up(monkeypatch):
     monkeypatch.setattr(tg, "_tg_call", fake)
     long_text = "\n".join(f"строка {i} " + "x" * 100 for i in range(200))
 
-    ok, ids, err = tg.send_message_chunked(_cfg(), "111", long_text)
+    ok, ids, err, total = tg.send_message_chunked(_cfg(), "111", long_text)
 
     assert ok is False
     assert len(ids) == 1, "id уже доставленных кусков обязан вернуться наружу"
     assert "Forbidden" in err
+    assert total > 1, "вызывающий обязан узнать, СКОЛЬКО частей планировалось"
 
 
 def test_empty_text_is_a_failure_not_a_silent_success(monkeypatch):
     fake = _FakeTelegram()
     monkeypatch.setattr(tg, "_tg_call", fake)
-    ok, ids, err = tg.send_message_chunked(_cfg(), "111", "   ")
-    assert ok is False and ids == [] and "пуст" in err
+    ok, ids, err, total = tg.send_message_chunked(_cfg(), "111", "   ")
+    assert ok is False and ids == [] and "пуст" in err and total == 0
     assert fake.bodies == []
+
+
+# ===========================================================================
+# send_message_chunked — устойчивость к флуд-лимиту (429)
+# ===========================================================================
+
+def test_pause_between_chunks_is_taken_before_every_chunk_but_the_first(monkeypatch):
+    """Профилактика 429: отчёт на 200 задач — это 9-13 сообщений подряд, и
+    Telegram отвечает «retry after 37» примерно на 13-м. Дешевле выдержать
+    паузу заранее, чем отсиживать штраф после отказа."""
+    slept = []
+    fake = _FakeTelegram()
+    monkeypatch.setattr(tg, "_tg_call", fake)
+    monkeypatch.setattr(tg.time, "sleep", lambda s: slept.append(s))
+    long_text = "\n".join(f"строка {i} " + "y" * 120 for i in range(200))
+
+    res = tg.send_message_chunked(_cfg(), "111", long_text)
+
+    assert res.ok is True and res.total_chunks > 1
+    assert slept == [tg._INTER_CHUNK_PAUSE_S] * (res.total_chunks - 1)
+
+
+def test_five_attempts_survive_a_streak_of_flood_limits(monkeypatch):
+    """Было 3 попытки — три 429 подряд по ОДНОМУ куску обрывали весь отчёт."""
+    too_many = {"ok": False, "error_code": 429, "parameters": {"retry_after": 5},
+                "description": "Too Many Requests: retry after 5"}
+    fake = _FakeTelegram(responses=[too_many, too_many, too_many, too_many])
+    monkeypatch.setattr(tg, "_tg_call", fake)
+    slept = []
+    monkeypatch.setattr(tg.time, "sleep", lambda s: slept.append(s))
+
+    res = tg.send_message_chunked(_cfg(), "111", "отчёт")
+
+    assert tg._SEND_ATTEMPTS == 5
+    assert res.ok is True, "пятая попытка обязана дойти"
+    assert slept == [5, 5, 5, 5]
+
+
+def test_total_wait_per_message_is_capped(monkeypatch):
+    """Потолок суммарного ожидания на ОДИН кусок: без него пять подряд
+    «retry after 60» держали бы поток пять минут."""
+    huge = {"ok": False, "error_code": 429, "parameters": {"retry_after": 100},
+            "description": "Too Many Requests: retry after 100"}
+    fake = _FakeTelegram(responses=[huge, huge, huge, huge, huge])
+    monkeypatch.setattr(tg, "_tg_call", fake)
+    slept = []
+    monkeypatch.setattr(tg.time, "sleep", lambda s: slept.append(s))
+
+    res = tg.send_message_chunked(_cfg(), "111", "отчёт")
+
+    assert res.ok is False
+    assert sum(slept) <= tg._MAX_SEND_WAIT_S
+    assert "ожидание" in res.error
 
 
 def test_delete_message_is_best_effort(monkeypatch):
@@ -375,60 +443,103 @@ def test_reaper_is_on_by_default_and_off_only_on_explicit_false(monkeypatch):
 
 
 # ===========================================================================
-# notify_plan — чанкинг, id последнего сообщения, fail-closed
+# notify_plan — порядок «строка раньше сообщения», id последнего куска,
+# fail-closed
 # ===========================================================================
 
-def test_notify_plan_stores_last_message_id_and_extras(monkeypatch):
+def _notify_harness(monkeypatch, send_result):
+    """Подменяет три выхода notify_plan наружу: отправку, INSERT строки и
+    последующий UPDATE её реальными message_id. Возвращает журнал вызовов В
+    ПОРЯДКЕ их совершения — порядок здесь и есть предмет проверки."""
+    calls = []
     monkeypatch.setattr(tg, "store_ready", lambda: True)
     monkeypatch.setattr(tg, "send_message_chunked",
-                        lambda cfg, chat, text, **kw: (True, [10, 11, 12], ""))
-    saved = {}
+                        lambda cfg, chat, text, **kw: calls.append(
+                            ("send", text, kw.get("reply_markup_on_last")))
+                        or send_result)
     monkeypatch.setattr(tg, "create_tg_approval",
-                        lambda mid, chat, msg, exp, extra=None: saved.update(
-                            dict(mid=mid, chat=chat, msg=msg, extra=extra)))
+                        lambda mid, chat, msg, exp, extra=None: calls.append(
+                            ("insert", mid, chat, msg, extra)))
+    monkeypatch.setattr(tg, "attach_plan_messages",
+                        lambda mid, msg, extra=None: calls.append(
+                            ("attach", mid, msg, list(extra or []))) or True)
+    monkeypatch.setattr(tg, "delete_tg_approval",
+                        lambda mid: calls.append(("delete_row", mid)))
+    return calls
+
+
+def test_notify_plan_inserts_row_before_sending_the_message(monkeypatch):
+    """РЕГРЕССИЯ (найдено ревью 2026-08-06): сообщение с кнопками уходило
+    РАНЬШЕ, чем в БД появлялась строка. Нажатие в этот зазор пропадало
+    впустую — вебхук gmail-mcp делает `UPDATE … WHERE manifest_id=… AND
+    status='PENDING'`, строки не находил, а сообщение оставалось висеть с
+    живыми кнопками. Порядок обязан быть INSERT → отправка → UPDATE."""
+    calls = _notify_harness(monkeypatch, tg.SendResult(True, [10, 11, 12], "", 3))
 
     ok, err = tg.notify_plan(_cfg(), "m1", "### план", "delete_tasks")
 
     assert (ok, err) == (True, "")
-    assert saved["msg"] == 12, "кнопки на последнем — его id и есть message_id"
-    assert saved["extra"] == [10, 11]
+    assert [c[0] for c in calls] == ["insert", "send", "attach"]
+    # строка создаётся ДО отправки, поэтому message_id ещё не известен
+    assert calls[0][1:] == ("m1", "111", None, [])
+    # кнопки на последнем куске — его id и есть «тот самый» message_id
+    assert calls[2] == ("attach", "m1", 12, [10, 11])
 
 
 def test_notify_plan_puts_buttons_on_last_chunk_only(monkeypatch):
-    seen = {}
-
-    def fake_send(cfg, chat, text, **kw):
-        seen["markup"] = kw.get("reply_markup_on_last")
-        seen["text"] = text
-        return True, [7], ""
-
-    monkeypatch.setattr(tg, "store_ready", lambda: True)
-    monkeypatch.setattr(tg, "send_message_chunked", fake_send)
-    monkeypatch.setattr(tg, "create_tg_approval", lambda *a, **k: None)
+    calls = _notify_harness(monkeypatch, tg.SendResult(True, [7], "", 1))
 
     tg.notify_plan(_cfg(), "m1", "### план", "delete_tasks")
 
-    buttons = seen["markup"]["inline_keyboard"][0]
+    _kind, text, markup = calls[1]
+    buttons = markup["inline_keyboard"][0]
     assert buttons[0]["callback_data"] == "a:m1"
     assert buttons[1]["callback_data"] == "r:m1"
-    assert seen["text"].endswith("delete_tasks · ticktick")
+    assert text.endswith("delete_tasks · ticktick")
 
 
-def test_notify_plan_partial_send_deletes_stubs_and_fails_closed(monkeypatch):
-    """Обрубок плана без кнопок опаснее пустоты: его убираем, гейт — закрыт."""
+def test_notify_plan_partial_send_deletes_stubs_row_and_fails_closed(monkeypatch):
+    """Обрубок плана без кнопок опаснее пустоты: его убираем, гейт — закрыт.
+    Вставленную первым шагом строку тоже сносим — иначе осталась бы сирота
+    PENDING, подтверждающая план, которого владелец никогда не видел."""
     deleted = []
-    monkeypatch.setattr(tg, "store_ready", lambda: True)
-    monkeypatch.setattr(tg, "send_message_chunked",
-                        lambda cfg, chat, text, **kw: (False, [5, 6], "boom"))
+    calls = _notify_harness(monkeypatch, tg.SendResult(False, [5, 6], "boom", 3))
     monkeypatch.setattr(tg, "delete_message",
                         lambda cfg, chat, mid: deleted.append(mid) or True)
-    monkeypatch.setattr(tg, "create_tg_approval",
-                        lambda *a, **k: pytest.fail("строку писать нельзя"))
 
     ok, err = tg.notify_plan(_cfg(), "m1", "### план", "delete_tasks")
 
     assert ok is False and err == "boom"
     assert deleted == [5, 6]
+    assert [c[0] for c in calls] == ["insert", "send", "delete_row"]
+    assert calls[-1] == ("delete_row", "m1")
+
+
+def test_notify_plan_survives_a_failed_update_of_message_ids(monkeypatch):
+    """UPDATE упал: план доставлен, строка есть, кнопка сработает (вебхук
+    снимает разметку по message_id из самого callback_query). Гейт валить из-за
+    этого нельзя — потеряна только последующая уборка."""
+    _calls = _notify_harness(monkeypatch, tg.SendResult(True, [9], "", 1))
+    monkeypatch.setattr(tg, "attach_plan_messages", lambda *a, **k: False)
+
+    assert tg.notify_plan(_cfg(), "m1", "### план", "delete_tasks") == (True, "")
+
+
+def test_notify_plan_fails_closed_when_the_row_cannot_be_created(monkeypatch):
+    """Нет строки — нет гейта: отправлять план с кнопками, которые физически
+    не смогут ничего подтвердить, нельзя."""
+    monkeypatch.setattr(tg, "store_ready", lambda: True)
+    monkeypatch.setattr(tg, "send_message_chunked",
+                        lambda *a, **k: pytest.fail("слать было нельзя"))
+
+    def boom(*a, **k):
+        raise RuntimeError("Postgres недоступен")
+
+    monkeypatch.setattr(tg, "create_tg_approval", boom)
+
+    ok, err = tg.notify_plan(_cfg(), "m1", "### план", "delete_tasks")
+
+    assert ok is False and "Postgres недоступен" in err
 
 
 # ===========================================================================
@@ -446,15 +557,16 @@ def test_report_header_matches_verdict(monkeypatch, verdict, marker):
 
     def fake_send(cfg, chat, text, **kw):
         seen["chat"], seen["text"] = chat, text
-        return True, [99], ""
+        return tg.SendResult(True, [99], "", 1)
 
     monkeypatch.setattr(tg, "send_message_chunked", fake_send)
     monkeypatch.setattr(tg, "record_report_messages", lambda *a: None)
 
-    ids = tg.post_report_to_group(_cfg(), "m1", "тело отчёта",
+    out = tg.post_report_to_group(_cfg(), "m1", "тело отчёта",
                                   tool="delete_tasks", verdict=verdict)
 
-    assert ids == [99]
+    assert out.message_ids == [99] and out.ok is True
+    assert (out.delivered, out.total_chunks) == (1, 1)
     assert seen["chat"] == "-1004357150083"
     assert marker in seen["text"]
     assert "delete_tasks" in seen["text"] and "m1" in seen["text"]
@@ -465,7 +577,8 @@ def test_report_timestamp_is_owner_timezone_not_utc(monkeypatch):
     """Жёсткое требование: время в отчёте — America/Los_Angeles."""
     seen = {}
     monkeypatch.setattr(tg, "send_message_chunked",
-                        lambda cfg, chat, text, **kw: seen.update(text=text) or (True, [1], ""))
+                        lambda cfg, chat, text, **kw: seen.update(text=text)
+                        or tg.SendResult(True, [1], "", 1))
     monkeypatch.setattr(tg, "record_report_messages", lambda *a: None)
     tg.post_report_to_group(_cfg(), "m1", "тело", tool="t", verdict="ok")
     assert any(tzname in seen["text"] for tzname in ("PDT", "PST")), seen["text"]
@@ -474,7 +587,7 @@ def test_report_timestamp_is_owner_timezone_not_utc(monkeypatch):
 def test_report_records_message_ids_for_later_cleanup(monkeypatch):
     recorded = {}
     monkeypatch.setattr(tg, "send_message_chunked",
-                        lambda cfg, chat, text, **kw: (True, [4, 5], ""))
+                        lambda cfg, chat, text, **kw: tg.SendResult(True, [4, 5], "", 2))
     monkeypatch.setattr(tg, "record_report_messages",
                         lambda mid, chat, ids: recorded.update(
                             dict(mid=mid, chat=chat, ids=ids)))
@@ -482,18 +595,41 @@ def test_report_records_message_ids_for_later_cleanup(monkeypatch):
     assert recorded == {"mid": "m9", "chat": "-1004357150083", "ids": [4, 5]}
 
 
+def test_partial_report_delivery_is_reported_as_partial_not_success(monkeypatch):
+    """ГЛАВНОЕ свойство честности (2026-08-06): на затяжном 429 в группу
+    ложатся, например, 2 части из 6. Раньше наружу отдавался просто непустой
+    список id, и вызывающий читал это как полный успех — в личку уходило
+    бодрое «Подробный отчёт — в группе». Теперь неполнота видна явно."""
+    monkeypatch.setattr(tg, "send_message_chunked",
+                        lambda cfg, chat, text, **kw: tg.SendResult(
+                            False, [1, 2], "Too Many Requests: retry after 37", 6))
+    recorded = {}
+    monkeypatch.setattr(tg, "record_report_messages",
+                        lambda mid, chat, ids: recorded.update(ids=ids))
+
+    out = tg.post_report_to_group(_cfg(), "m1", "тело", tool="t", verdict="ok")
+
+    assert out.ok is False
+    assert (out.delivered, out.total_chunks) == (2, 6)
+    assert out.message_ids == [1, 2]
+    # id доставленных кусков всё равно записываются — иначе reaper их не найдёт
+    assert recorded == {"ids": [1, 2]}
+
+
 def test_report_never_raises_even_if_transport_explodes(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("сеть отвалилась")
 
     monkeypatch.setattr(tg, "send_message_chunked", boom)
-    assert tg.post_report_to_group(_cfg(), "m1", "тело", tool="t", verdict="ok") == []
+    out = tg.post_report_to_group(_cfg(), "m1", "тело", tool="t", verdict="ok")
+    assert out.ok is False and out.message_ids == [] and out.delivered == 0
 
 
 def test_summary_edits_message_and_strips_buttons(monkeypatch):
     fake = _FakeTelegram()
     monkeypatch.setattr(tg, "_tg_call", fake)
-    tg.summarize_in_owner_chat(_cfg(), "111", 55, "**Готово** — 3 задачи удалены")
+    assert tg.summarize_in_owner_chat(_cfg(), "111", 55,
+                                      "**Готово** — 3 задачи удалены") is True
     method, body = fake.bodies[0]
     assert method == "editMessageText"
     assert body["message_id"] == 55
@@ -501,10 +637,18 @@ def test_summary_edits_message_and_strips_buttons(monkeypatch):
     assert "<b>Готово</b>" in body["text"]
 
 
+def test_summary_reports_failure_so_caller_keeps_the_plan_chunks(monkeypatch):
+    """Возврат — не косметика: по нему вызывающий решает, можно ли удалять
+    предыдущие куски плана. Пока итог не вписан, стирать контекст нельзя."""
+    monkeypatch.setattr(tg, "_tg_call", lambda cfg, m, b: {
+        "ok": False, "description": "Bad Request: message to edit not found"})
+    assert tg.summarize_in_owner_chat(_cfg(), "111", 55, "сводка") is False
+
+
 def test_summary_without_message_id_is_a_noop(monkeypatch):
     fake = _FakeTelegram()
     monkeypatch.setattr(tg, "_tg_call", fake)
-    tg.summarize_in_owner_chat(_cfg(), "111", None, "сводка")
+    assert tg.summarize_in_owner_chat(_cfg(), "111", None, "сводка") is False
     assert fake.bodies == []
 
 
@@ -559,6 +703,55 @@ def test_reap_claims_rows_atomically_and_spares_decided_ones(monkeypatch):
     assert "RETURNING" in sql
     assert "status IN ('PENDING', 'EXPIRED')" in sql
     assert "APPROVED" not in sql and "REJECTED" not in sql
+
+
+def test_reap_never_touches_an_archive_of_a_decided_operation(monkeypatch):
+    """ГЛАВНОЕ свойство архива (Максим сказал это отдельно и прямо): отчёт об
+    УЖЕ ИСПОЛНЕННОЙ операции не удаляется НИКОГДА — удаляется только план, на
+    который так и не ответили.
+
+    Проверяем на мини-эмуляции Postgres, а не на строке SQL: фейковый курсор
+    применяет ровно ту семантику, которую декларирует запрос (status IN
+    ('PENDING','EXPIRED') AND expires_at <= now), и падает, если фильтр из
+    запроса исчезнет. Так тест ловит и «забыли WHERE», и «добавили APPROVED в
+    список», а не только опечатку в тексте."""
+    now = tg._now_ms()
+    store = _FakeStatusStore([
+        # (manifest_id, status, expires_at, chat, msg, extra, rchat, rids)
+        ("m-pending", "PENDING", now - 1, "111", 900, [898, 899], "-100777", [500]),
+        ("m-expired", "EXPIRED", now - 1, "111", 910, [], None, None),
+        ("m-approved", "APPROVED", now - 1, "111", 920, [918], "-100777", [600, 601]),
+        ("m-rejected", "REJECTED", now - 1, "111", 930, [928], "-100777", [700]),
+    ])
+    monkeypatch.setattr(tg, "store_ready", lambda: True)
+    monkeypatch.setattr(tg, "_pg_pool", store)
+    deleted = []
+    monkeypatch.setattr(tg, "delete_message",
+                        lambda cfg, chat, mid: deleted.append((chat, mid)) or True)
+
+    assert tg.reap_expired(_cfg()) == 2
+
+    # неотвеченный план сносится целиком: кнопки + куски + сообщения отчёта
+    assert deleted == [("111", 900), ("111", 898), ("111", 899),
+                       ("-100777", 500), ("111", 910)]
+    # ни одного удаления в архиве решённых операций
+    archive_ids = {918, 920, 928, 930, 600, 601, 700}
+    assert not [d for d in deleted if d[1] in archive_ids]
+    # и сами строки решённых операций остались в таблице
+    assert {r[0] for r in store.rows} == {"m-approved", "m-rejected"}
+
+
+def test_reap_survives_a_row_without_a_message_id(monkeypatch):
+    """`message_id IS NULL` — штатная строка, а не битая: `notify_plan`
+    вставляет её ДО отправки, и если отправка не состоялась (упал процесс),
+    убирать в Telegram нечего. Удаляем только строку, без вызовов и без
+    исключений."""
+    rows = [("m-null", "111", None, None, None, None)]
+    monkeypatch.setattr(tg, "store_ready", lambda: True)
+    monkeypatch.setattr(tg, "_pg_pool", _FakePool(rows))
+    monkeypatch.setattr(tg, "delete_message",
+                        lambda *a, **k: pytest.fail("удалять было нечего"))
+    assert tg.reap_expired(_cfg()) == 1
 
 
 def test_reap_survives_a_broken_row(monkeypatch):
@@ -616,6 +809,65 @@ class _FakeConn:
 class _FakePool:
     def __init__(self, rows):
         self.cursor_obj = _FakeCursor(rows)
+        self.conn = _FakeConn(self.cursor_obj)
+
+    def getconn(self):
+        return self.conn
+
+    def putconn(self, conn):
+        pass
+
+
+# --- мини-эмуляция таблицы со СТАТУСАМИ (для проверки, что архив не трогают) -
+#
+# Обычный _FakePool отдаёт заранее заготовленные строки и не смотрит на SQL —
+# на нём нельзя доказать, что решённые операции уцелели: он вернул бы что
+# угодно. Этот стор хранит строки со статусом и ПРИМЕНЯЕТ фильтр запроса.
+# Семантику не «парсим» (это был бы свой недо-Postgres), а требуем дословно:
+# исчезнет условие — упадёт assert прямо в execute.
+
+class _StatusAwareCursor:
+    _COLUMNS = ("manifest_id", "chat_id", "message_id", "extra_message_ids",
+                "report_chat_id", "report_message_ids")
+
+    def __init__(self, store):
+        self._store = store
+        self.sql = ""
+        self._returned = []
+
+    def execute(self, sql, params=None):
+        self.sql = sql
+        flat = " ".join(sql.split())
+        assert flat.startswith("DELETE FROM tg_approvals"), flat
+        assert "status IN ('PENDING', 'EXPIRED')" in flat, (
+            "уборка обязана ограничиваться неотвеченными планами")
+        assert "expires_at <= %s" in flat
+        now = (params or (0,))[0]
+        keep, taken = [], []
+        for row in self._store.rows:
+            _mid, status, expires_at = row[0], row[1], row[2]
+            if status in ("PENDING", "EXPIRED") and expires_at <= now:
+                taken.append(row)
+            else:
+                keep.append(row)
+        self._store.rows = keep
+        # RETURNING отдаёт колонки в порядке из запроса (см. _COLUMNS)
+        self._returned = [(r[0], r[3], r[4], r[5], r[6], r[7]) for r in taken]
+
+    def fetchall(self):
+        return self._returned
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeStatusStore:
+    def __init__(self, rows):
+        self.rows = list(rows)
+        self.cursor_obj = _StatusAwareCursor(self)
         self.conn = _FakeConn(self.cursor_obj)
 
     def getconn(self):
