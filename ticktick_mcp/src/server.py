@@ -8743,7 +8743,13 @@ async def _auto_execute_declutter(manifest_id: str, m: Dict) -> str:
 
 
 _register_auto_executor("delete_tasks", _rehash_delete_manifest, _auto_execute_delete_tasks)
-_register_auto_executor("execute_declutter", _rehash_declutter_manifest, _auto_execute_declutter)
+# DISABLED 2026-08-04/05 together with the @mcp.tool() decorators above — the
+# TG-button auto-execute poller (_tg_auto_execute_tick) dispatches through
+# THIS registry directly, bypassing the MCP tool layer entirely. Commenting
+# out only the decorators (first pass) left this path live: pressing the
+# button on an already-computed declutter manifest would still have executed
+# it for real. Both layers must stay disabled together.
+# _register_auto_executor("execute_declutter", _rehash_declutter_manifest, _auto_execute_declutter)
 # resume_declutter deliberately has NO separate registry entry: every
 # sheet-persist declutter plan is tagged tool="execute_declutter" at the ONE
 # place its manifest is created (plan_declutter, via _maybe_tg_notify_plan) —
