@@ -25,6 +25,7 @@ import re
 import pytest
 
 import ticktick_mcp.src.server as s
+import ticktick_mcp.src.tg_approval as tg
 
 
 @pytest.fixture(autouse=True)
@@ -1198,3 +1199,535 @@ async def test_changes_invisible_in_the_open_list_are_reported_as_unchecked(
     assert "⚠️ не проверяется автоматически: 1" in out
     assert "✅ Выполнено 0 из 1" in out
     assert "не проверить" in out
+
+
+# ═══════ 12. Telegram-кнопка не имеет права подтверждать ОБРЕЗАННЫЙ план ════
+# `tg_approval._clip` режет превью по PREVIEW_CAP перед отправкой, а кнопка ✅
+# исполняет ВЕСЬ манифест: план на 50 операций доезжает до владельца двумя
+# десятками строк, а подтверждается целиком. Кнопка — единственный внеполосный
+# фактор согласия, поэтому здесь fail-closed на своей стороне: такой план не
+# строится вовсе. Общий слой `tg_approval.py` при этом НЕ трогаем (его
+# параллельно переделывает другая ветка).
+
+def _tg_on(monkeypatch, allowlist=None):
+    monkeypatch.setattr(s, "_TG_CFG", tg.TgApprovalConfig(
+        enabled=True, bot_token="x", owner_chat_id="1", server="ticktick",
+        tools_allowlist=allowlist, ttl_s=3600))
+
+
+def _tg_off(monkeypatch):
+    monkeypatch.setattr(s, "_TG_CFG", tg.TgApprovalConfig(
+        enabled=False, bot_token="", owner_chat_id="", server="ticktick",
+        tools_allowlist=None, ttl_s=3600))
+
+
+def _notify_recorder(monkeypatch):
+    """Подменяет отправку в Telegram записывающей заглушкой: сети нет, а факт
+    «что именно ушло бы владельцу» становится проверяемым."""
+    seen = []
+
+    def _notify(cfg, manifest_id, preview, tool):
+        seen.append({"manifest_id": manifest_id, "preview": preview, "tool": tool})
+        return True, ""
+
+    monkeypatch.setattr(tg, "notify_plan", _notify)
+    return seen
+
+
+def _long_plan(n=50):
+    """n удалений с реалистично длинными названиями и обоснованиями — ровно
+    та форма разбора, ради которой тул и написан («я сам себе деклатер»)."""
+    live, ops = {}, []
+    for i in range(n):
+        tid = f"L{i:03d}"
+        live[tid] = {"id": tid, "title": f"Позвонить по объявлению №{i} "
+                                          "и уточнить условия аренды",
+                     "projectId": "p_in"}
+        ops.append({"op": "delete", "task_id": tid,
+                    "title": f"Позвонить по объявлению №{i} и уточнить условия аренды",
+                    "said": f"объявление №{i} уже неактуально, снимаю с контроля"})
+    return live, ops
+
+
+async def test_plan_too_long_for_telegram_is_refused_and_builds_no_manifest(
+        monkeypatch, tmp_path):
+    live, ops = _long_plan(50)
+    _wire(monkeypatch, live, tmp_path)
+    calls = _stub_sub_impls(monkeypatch, live)
+    _tg_on(monkeypatch)
+    seen = _notify_recorder(monkeypatch)
+
+    out = await s.manual_triage("Разбираю входящие", ops)
+
+    assert "🛑" in out and "не помещается" in out
+    assert "Манифест" not in out, "отказ не имеет права строить план"
+    assert s._MANIFESTS == {}, "манифест пережил отказ — его можно было бы дожать"
+    assert seen == [], "в Telegram ушёл план, который там не поместится"
+    assert calls == []
+    # Текст отказа обязан быть действенным: сколько передали, сколько влезает.
+    assert "50" in out and "Разбей разбор на части" in out
+
+
+async def test_the_same_long_plan_is_fine_when_telegram_layer_is_off(
+        monkeypatch, tmp_path):
+    """Зеркало предыдущего: ограничение — следствие ЛИМИТА TELEGRAM, а не
+    самоцель. Без этого слоя длинный план виден в чате целиком и строится."""
+    live, ops = _long_plan(50)
+    _wire(monkeypatch, live, tmp_path)
+    _tg_off(monkeypatch)
+
+    preview = await s.manual_triage("Разбираю входящие", ops)
+
+    assert "🛑" not in preview
+    m = s._MANIFESTS[_mid(preview)]
+    assert len(m["tasks"]) == 50
+    # …и он ДЕЙСТВИТЕЛЬНО длиннее телеграмного лимита — иначе тест выше
+    # проверял бы несуществующий сценарий.
+    assert len(preview) > tg.PREVIEW_CAP, len(preview)
+
+
+async def test_short_plan_still_goes_to_telegram_untouched(monkeypatch, tmp_path):
+    """Проверка на переусердствование: обычный разбор из пяти операций слоем
+    длины не задет и уходит в Telegram как раньше."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    _tg_on(monkeypatch)
+    seen = _notify_recorder(monkeypatch)
+
+    preview = await s.manual_triage("Разбираю входящие", _mixed_ops())
+
+    assert len(seen) == 1 and seen[0]["tool"] == "manual_triage"
+    assert len(seen[0]["preview"]) <= tg.PREVIEW_CAP
+    assert s._MANIFESTS[_mid(preview)]["tg_notified"] is True
+
+
+# ═══════ 13. Типы внутри `changes` — отказ ДО единой мутации ════════════════
+# Схема `operations` типизации не несёт: JSON позволяет положить в due_date
+# число. Раньше это проезжало превью, отправляло update, доводило план до
+# необратимого удаления — и падало УЖЕ ПОСЛЕ него, на разборе даты в сверке.
+# Человек получал traceback вместо отчёта и делал вывод «упало, значит ничего
+# не сделано», хотя задачи были удалены.
+
+async def test_numeric_due_date_is_refused_at_plan_time(monkeypatch, tmp_path):
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+
+    out = await _assert_refused_outright(monkeypatch, live, [
+        {"op": "update", "task_id": "b2", "title": "Отчёт",
+         "changes": {"due_date": 20260810}, "said": "поставь на 10 августа"}],
+        "due_date")
+    assert "строкой" in out and "int" in out
+
+
+async def test_non_string_tags_are_refused_at_plan_time(monkeypatch, tmp_path):
+    """Раньше этот случай ронял ФАЗУ ПЛАНА traceback'ом (`', '.join([1, 2])`)
+    — то есть тул падал ещё до всякой мутации, но с невнятной ошибкой."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+
+    out = await _assert_refused_outright(monkeypatch, live, [
+        {"op": "update", "task_id": "b2", "title": "Отчёт",
+         "changes": {"tags": [1, 2]}, "said": "перетегируй"}], "tags")
+    assert "списком СТРОК" in out
+
+
+@pytest.mark.parametrize("bad", [2, 4, "5", 5.0, True])
+async def test_out_of_range_priority_is_refused(bad, monkeypatch, tmp_path):
+    """`_update_tasks_impl` проверяет приоритет только на одиночном пути; в
+    батче он уходит в API как есть, поэтому ловим на фазе плана."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+
+    await _assert_refused_outright(monkeypatch, live, [
+        {"op": "update", "task_id": "b2", "title": "Отчёт",
+         "changes": {"priority": bad}, "said": "подними приоритет"}], "priority")
+
+
+@pytest.mark.parametrize("key,value", [("new_title", 42), ("content", ["a"]),
+                                        ("start_date", 20260810),
+                                        ("reminders", "09:00")])
+async def test_wrongly_typed_change_values_are_refused(key, value, monkeypatch,
+                                                        tmp_path):
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+
+    await _assert_refused_outright(monkeypatch, live, [
+        {"op": "update", "task_id": "b2", "title": "Отчёт",
+         "changes": {key: value}, "said": "поправь"}], key)
+
+
+# ═══════ 14. `changes` с ключами, которых сервер не применяет ═══════════════
+# `changes={"foo":"bar"}` раньше проходил валидацию: превью печатало «(поля
+# изменений не распознаны)» — человек одобрял неизвестно что, — исполнялся
+# пустой update, а отчёт противоречил сам себе («✅ Выполнено 0 из 1» в шапке
+# и «✏️ «Отчёт» обновлено (проверено)» в секции исполнителя).
+
+async def test_unknown_change_keys_are_refused(monkeypatch, tmp_path):
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+
+    out = await _assert_refused_outright(monkeypatch, live, [
+        {"op": "update", "task_id": "b2", "title": "Отчёт",
+         "changes": {"foo": "bar"}, "said": "поправь"}], "foo")
+    # Отказ обязан быть действенным: перечисляет, что МОЖНО.
+    assert "new_title" in out and "due_date" in out
+
+
+async def test_a_typo_next_to_a_valid_key_is_refused_too(monkeypatch, tmp_path):
+    """Опечатка рядом с рабочим ключом опаснее одиночной: человек видит в
+    превью корректную часть, одобряет её — и молча не получает вторую."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+
+    await _assert_refused_outright(monkeypatch, live, [
+        {"op": "update", "task_id": "b2", "title": "Отчёт",
+         "changes": {"new_title": "Сдать отчёт", "duedate": "2026-08-10"},
+         "said": "переименуй и поставь срок"}], "duedate")
+
+
+async def test_reminders_and_repeat_are_named_in_the_preview(monkeypatch, tmp_path):
+    """Оборотная сторона того же: ключи, которые исполнитель РЕАЛЬНО применяет,
+    обязаны быть названы в превью, а не сворачиваться в «поля изменений не
+    распознаны»."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "update", "task_id": "b2", "title": "Отчёт",
+         "changes": {"reminders": ["09:00"], "repeat_flag": "RRULE:FREQ=WEEKLY"},
+         "said": "напоминай раз в неделю утром"}])
+
+    assert "напоминания меняются" in preview and "повтор меняется" in preview
+    assert "поля изменений не распознаны" not in preview
+
+
+# ═══════ 15. Исключение в финальной сверке не имеет права скрыть мутации ════
+
+async def test_verification_crash_still_reports_that_mutations_were_sent(
+        monkeypatch, tmp_path):
+    """Мутации уже отправлены (часть необратима). Если независимая сверка
+    падает, тул обязан вернуть ЧЕСТНЫЙ отчёт «отправлено, сверка не удалась»,
+    а не traceback: traceback читается как «упало, значит ничего не сделано»."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    calls = _stub_sub_impls(monkeypatch, live)
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "сделал"},
+        {"op": "delete", "task_id": "a1", "title": "Купить молоко",
+         "said": "не нужно"}])
+    mid = _mid(preview)
+
+    def _boom(op, live_map, names):
+        raise AttributeError("'int' object has no attribute 'strip'")
+
+    monkeypatch.setattr(s, "_verify_triage_op", _boom)
+
+    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+
+    assert [c[0] for c in calls] == ["complete", "delete"]
+    assert "МУТАЦИИ УЖЕ ОТПРАВЛЕНЫ" in out
+    assert "сверка НЕ УДАЛАСЬ" in out and "strip" in out
+    assert "вручную" in out
+    # Ни намёка на успех и ни намёка на «ничего не сделано».
+    assert "✅ Выполнено" not in out
+    assert "НИЧЕГО НЕ ВЫПОЛНЕНО" not in out
+    # Сырые ответы исполнителей всё равно на месте — они и есть то, что можно
+    # прочитать глазами, раз машинная сверка отказала.
+    assert "заглушка _execute_task_deletion_impl" in out
+
+
+# ═══════ 16. Инструкция «начни заново» называет СВОЙ аргумент ═══════════════
+
+async def test_manifest_gone_message_names_the_operations_argument(
+        monkeypatch, tmp_path):
+    """`{tool_name}(summary, tasks, ...)` было захардкожено: у manual_triage
+    аргумента `tasks` нет, и модель, послушавшись, получила бы ошибку
+    валидации MCP вместо повторного плана."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+
+    out = await s.manual_triage("Разбираю", _mixed_ops(),
+                                manifest_id="deadbeef1234", user_reply="да")
+
+    assert "manual_triage(summary, operations, ...)" in out
+    assert "tasks" not in out
+
+
+# ═══════ 17. Синтетический манифест удаления вообще не попадает в реестр ════
+
+async def test_synthetic_deletion_manifest_is_never_put_into_the_registry(
+        monkeypatch, tmp_path):
+    """Сильнее прежнего «его удаляют в finally»: манифеста НЕТ в `_MANIFESTS`
+    ни в один момент, даже пока идёт удаление. Иначе публичный
+    `execute_task_deletion("triage-…")` мог бы исполнить удаление, которого
+    человеку не показывали, по одному чат-«да»."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    seen_ids, dele = [], []
+
+    async def _del(manifest_id, m=None):
+        # Снимок реестра ИЗНУТРИ исполнения — то самое окно, где раньше жил
+        # синтетический манифест.
+        seen_ids.append((manifest_id, sorted(s._MANIFESTS)))
+        dele.append([i["taskId"] for i in (m or {}).get("items") or []])
+        for i in (m or {}).get("items") or []:
+            live.pop(i["taskId"], None)
+        return "### заглушка удаления"
+
+    monkeypatch.setattr(s, "_execute_task_deletion_impl", _del)
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "delete", "task_id": "a1", "title": "Купить молоко",
+         "said": "не нужно"}])
+    mid = _mid(preview)
+
+    await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+
+    assert dele == [["a1"]], "удаление всё-таки должно было произойти"
+    synth_id, registry_during = seen_ids[0]
+    assert synth_id.startswith("triage-")
+    assert not [k for k in registry_during if k.startswith("triage-")], \
+        f"синтетический манифест был виден в реестре: {registry_during}"
+    assert synth_id not in s._MANIFESTS
+
+    # …и публичный тул его не подхватит ни во время, ни после.
+    out = await s.execute_task_deletion(manifest_id=synth_id, user_reply="да")
+    assert "🛑" in out and "не найден" in out
+    assert dele == [["a1"]], "публичный execute повторил удаление"
+
+
+# ═══════ 18. Удаление/закрытие родителя честно говорит про подзадачи ════════
+# Подзадачи НЕ удаляются вместе с родителем (план не имеет права разрастаться
+# сверх названного человеком) — но они останутся сиротами, и человек обязан
+# узнать об этом ДО «да», а не после.
+
+def _live_with_subtasks():
+    return {
+        "P1": {"id": "P1", "title": "Ремонт квартиры", "projectId": "p_in"},
+        "S1": {"id": "S1", "title": "Выбрать плитку", "projectId": "p_in",
+               "parentId": "P1"},
+        "S2": {"id": "S2", "title": "Вызвать замерщика", "projectId": "p_in",
+               "parentId": "P1"},
+        "P2": {"id": "P2", "title": "Отпуск", "projectId": "p_in"},
+        "S3": {"id": "S3", "title": "Купить билеты", "projectId": "p_in",
+               "parentId": "P2"},
+        "d4": {"id": "d4", "title": "Оплатить интернет", "projectId": "p_in"},
+    }
+
+
+async def test_deleting_a_parent_warns_about_its_open_subtasks(monkeypatch, tmp_path):
+    live = _live_with_subtasks()
+    _wire(monkeypatch, live, tmp_path)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "delete", "task_id": "P1", "title": "Ремонт квартиры",
+         "said": "ремонт отменился"}])
+
+    assert "у неё 2 открытые подзадачи — они останутся без родителя" in preview
+    # …и при этом дети НЕ добрались до плана: тул не разрастается сам.
+    m = s._MANIFESTS[_mid(preview)]
+    assert [o["task_id"] for o in m["tasks"]] == ["P1"]
+
+
+async def test_completing_a_parent_warns_about_one_subtask(monkeypatch, tmp_path):
+    live = _live_with_subtasks()
+    _wire(monkeypatch, live, tmp_path)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "complete", "task_id": "P2", "title": "Отпуск",
+         "said": "съездил уже"}])
+
+    assert "у неё 1 открытая подзадача — она останется без родителя" in preview
+
+
+async def test_a_childless_task_gets_no_subtask_note(monkeypatch, tmp_path):
+    live = _live_with_subtasks()
+    _wire(monkeypatch, live, tmp_path)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "delete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "не нужно"}])
+
+    assert "подзадач" not in preview
+
+
+async def test_merge_warns_about_the_duplicates_subtasks_too(monkeypatch, tmp_path):
+    """merge — это то же необратимое удаление, только под другим словом:
+    у дубля дети осиротеют ровно так же."""
+    live = _live_with_subtasks()
+    live["P1b"] = {"id": "P1b", "title": "Ремонт квартиры", "projectId": "p_work"}
+    live["S9"] = {"id": "S9", "title": "Смета", "projectId": "p_work",
+                  "parentId": "P1b"}
+    _wire(monkeypatch, live, tmp_path)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "merge", "task_id": "P1b", "title": "Ремонт квартиры",
+         "keep_task_id": "P1", "keep_title": "Ремонт квартиры",
+         "said": "это одно и то же"}])
+
+    assert "у неё 1 открытая подзадача — она останется без родителя" in preview
+
+
+# ═══════ 19. Кап, который нельзя поднять снаружи ═══════════════════════════
+
+async def test_max_items_cannot_be_raised_above_the_hard_cap(monkeypatch, tmp_path):
+    """Кап, который волен поднять сам вызывающий, — не кап. `max_items=10000`
+    строил план на 200 удалений; для фичи, родившейся из «слишком большой
+    готовый к исполнению план», это существенно."""
+    live, ops = _long_plan(s._TRIAGE_HARD_CAP + 1)
+    _wire(monkeypatch, live, tmp_path)
+
+    out = await _assert_refused_outright(monkeypatch, live, ops, "больше капа",
+                                         max_items=10000)
+
+    assert f"больше капа {s._TRIAGE_HARD_CAP}" in out
+    assert "max_items=10000" in out and "НЕ поднимает" in out
+
+
+async def test_max_items_can_still_be_lowered(monkeypatch, tmp_path):
+    """Опустить кап вызывающий по-прежнему может — это осторожность, а не
+    обход."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+
+    out = await _assert_refused_outright(monkeypatch, live, _mixed_ops(),
+                                         "больше капа", max_items=2)
+    assert "больше капа 2" in out
+
+
+async def test_the_hard_cap_is_fifty():
+    assert s._TRIAGE_HARD_CAP == 50
+
+
+# ═══════ 20. Повторяющееся обоснование — заметное предупреждение ════════════
+# Докстринг требует, чтобы в `said` были слова человека про ЭТУ задачу, но
+# машинно это непроверяемо. Жёсткий отказ был бы ложноположительным на честном
+# «эти пять удали» (одна фраза действительно про пять задач), поэтому —
+# предупреждение, зато видное в ОБОИХ каналах согласия.
+
+async def test_repeated_said_adds_a_visible_warning_to_the_preview(
+        monkeypatch, tmp_path):
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "delete", "task_id": "a1", "title": "Купить молоко",
+         "said": "разобрать инбокс"},
+        {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "разобрать инбокс"},
+        {"op": "delete", "task_id": "e5", "title": "Позвонить в банк",
+         "said": "Разобрать   инбокс"}])   # регистр/пробелы не спасают
+
+    assert "⚠️ Одно и то же обоснование у 3 строк" in preview
+    assert "разобрать инбокс" in preview
+    # Это ПРЕДУПРЕЖДЕНИЕ, а не отказ: план строится, человек решает сам.
+    assert "🛑" not in preview
+    assert len(s._MANIFESTS[_mid(preview)]["tasks"]) == 3
+
+
+async def test_the_repeated_said_warning_also_reaches_telegram(monkeypatch, tmp_path):
+    """Главное требование к этому предупреждению: оно должно быть видно и в
+    чате, и на кнопке — иначе внеполосный фактор согласия его не покажет."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    _tg_on(monkeypatch)
+    seen = _notify_recorder(monkeypatch)
+
+    await s.manual_triage("Разбираю", [
+        {"op": "delete", "task_id": "a1", "title": "Купить молоко",
+         "said": "эти две мне не нужны"},
+        {"op": "delete", "task_id": "e5", "title": "Позвонить в банк",
+         "said": "эти две мне не нужны"}])
+
+    assert len(seen) == 1
+    assert "⚠️ Одно и то же обоснование у 2 строк" in seen[0]["preview"]
+
+
+async def test_distinct_said_produces_no_warning(monkeypatch, tmp_path):
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+
+    preview = await s.manual_triage("Разбираю входящие", _mixed_ops())
+
+    assert "Одно и то же обоснование" not in preview
+
+
+async def test_the_warning_sits_before_the_call2_instruction(monkeypatch, tmp_path):
+    """Предупреждение печатается после списка операций и ДО инструкции «когда
+    он согласится — позови снова», чтобы не разрывать инструкцию и не потерять
+    хвост, по которому модель понимает протокол."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "delete", "task_id": "a1", "title": "Купить молоко",
+         "said": "обе не нужны"},
+        {"op": "delete", "task_id": "e5", "title": "Позвонить в банк",
+         "said": "обе не нужны"}])
+
+    assert preview.index("⚠️ Одно и то же обоснование") < preview.index("Покажи это")
+    assert preview.rstrip().endswith("Манифест одноразовый, действует 1 час.")
+
+
+# ═══════ 21. Мелочи, которые видит человек ═════════════════════════════════
+
+async def test_nothing_executed_says_the_plan_is_already_burned(monkeypatch, tmp_path):
+    """«НИЧЕГО НЕ ВЫПОЛНЕНО» без слова о судьбе манифеста подталкивает
+    повторить «да» по тому же id — а он уже погашен."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    _stub_sub_impls(monkeypatch, live)
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "delete", "task_id": "a1", "title": "Купить молоко",
+         "said": "не нужно"}])
+    mid = _mid(preview)
+
+    live["a1"]["title"] = "Купить молоко и хлеб"
+
+    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+
+    assert "НИЧЕГО НЕ ВЫПОЛНЕНО" in out
+    assert "уже погашен" in out and "заново" in out
+    assert s._MANIFESTS[mid]["consumed"] is True
+
+
+async def test_move_from_an_unknown_project_says_so(monkeypatch, tmp_path):
+    """`«» → «Работа»` не говорит человеку ничего о том, откуда едет задача."""
+    live = {"c3": {"id": "c3", "title": "Позвонить Ивану", "projectId": "p_ghost"}}
+    _wire(monkeypatch, live, tmp_path)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "move", "task_id": "c3", "title": "Позвонить Ивану",
+         "to_project_id": "p_work", "said": "это рабочее"}])
+
+    assert "«неизвестный проект» → «Работа»" in preview
+    assert "«» →" not in preview
+
+
+async def test_merge_preview_admits_the_duplicates_fields_are_lost(
+        monkeypatch, tmp_path):
+    """«Объединить» обещает слияние, а код удаляет дубль: его заметки, срок и
+    теги исчезают вместе с ним. Пока настоящего слияния нет, это обязано быть
+    написано в плане, а не подразумеваться."""
+    live = _live_inbox()
+    live["e5"]["content"] = "спросить про рефинансирование, номер 8-800-…"
+    live["e5"]["dueDate"] = "2026-08-10T12:00:00.000+0000"
+    _wire(monkeypatch, live, tmp_path)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "merge", "task_id": "e5", "title": "Позвонить в банк",
+         "keep_task_id": "e6", "keep_title": "Позвонить в банк",
+         "said": "это одно и то же, оставь одну"}])
+
+    assert "🔗 Объединить дубли: удалить «Позвонить в банк»" in preview
+    assert "его заметки, срок и теги НЕ переносятся" in preview
+    assert "оставить «Позвонить в банк» (проект «Работа»)" in preview
+
+
+def test_docstring_matches_the_runtime_instruction_about_call2():
+    """Докстринг говорил «Do NOT re-send operations», а рантайм-текст гейта —
+    «список можно повторить как есть». Модель не должна выбирать, кому верить."""
+    doc = s.manual_triage.__doc__
+    assert "IGNORED on call #2" in doc
+    assert "Do NOT re-send" not in doc
+    assert "may be repeated verbatim" in doc
