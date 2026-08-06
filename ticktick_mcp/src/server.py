@@ -30,6 +30,7 @@ from .ticktick_v2_client import (ATTACHMENT_MAX_BYTES, TickTickAuthError,
                                  TickTickV2Client, id2error_failures,
                                  new_attachment_id)
 from . import declutter_sheet
+from . import log_redaction
 from . import tg_approval
 
 # Set up logging
@@ -13564,6 +13565,13 @@ async def _tg_auto_execute_poller_loop() -> None:
 
 def main():
     """Main entry point for the MCP server."""
+    # ПЕРВЫМ ДЕЛОМ, до любой строки лога (#119): секрет доступа лежит в пути
+    # (`/mcp/<SECRET>`), а uvicorn печатает путь в каждой access-строке —
+    # без этого фильтра секрет открытым текстом оседает в логах Railway
+    # навсегда, и доступ к логам равен доступу к серверу. Ставится ДО
+    # uvicorn'овской настройки логирования; почему фильтр её переживает —
+    # см. log_redaction.install().
+    log_redaction.install(SECRET)
     if _TG_CFG.enabled:
         db_url = os.environ.get("CONSENT_DATABASE_URL", "").strip()
         if not db_url:
