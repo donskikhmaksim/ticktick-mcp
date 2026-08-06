@@ -54,7 +54,16 @@ class FakeSheet:
         return ids
 
     def read_manifest_rows(self, manifest_id):
-        return [dict(r) for r in self._rows.values()
+        """Значения — СТРОКИ, как из настоящей таблицы.
+
+        Google Sheets отдаёт ячейки текстом (`declutter_sheet._row_to_dict`
+        раскладывает сырые строки ответа), а сам модуль пишет их через
+        `str(...)`. Двойник раньше возвращал `row_id` питоновским `int` —
+        такого источника в бою не существует, и любая забытая нормализация
+        `str→int` выглядела рабочей: `1 in {1}` в тестах против `1 in {"1"}`
+        на живом листе."""
+        return [{k: ("" if v is None else str(v)) for k, v in r.items()}
+                for r in self._rows.values()
                 if r.get("manifest_id") == manifest_id]
 
     def batch_update_rows(self, updates):
@@ -289,7 +298,8 @@ async def test_execute_from_sheet_deletes_and_writes_done(monkeypatch, sheet_env
     row = fs.read_manifest_rows(mid)[0]
     assert row["status"] == "done"
     assert row["applied_ts"]
-    assert row["row_id"] == ids[0]
+    # лист отдаёт ячейки текстом — сравниваем с тем же типом, что придёт живьём
+    assert row["row_id"] == str(ids[0])
 
     # ---- idempotency: a second run must NOT re-delete ---------------------
     result2 = await s._execute_declutter_from_sheet(mid)

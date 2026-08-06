@@ -23,6 +23,7 @@
 Зеркальный инвариант везде: `TG_APPROVAL_ENABLED` не задан (дефолт
 самохостера) → `tg_approval` не трогается ни разу, поведение прежнее.
 """
+import re
 import time
 
 import pytest
@@ -105,9 +106,27 @@ def _tasks():
     return [{"title": "Позвонить маме", "project_id": "p1"}]
 
 
-def _only_manifest():
+_MID_RE = re.compile(r"Манифест `([0-9a-f]{6,})`")
+
+
+def _only_manifest(plan_out):
+    """Возвращает (id плана, его внутреннее состояние).
+
+    Адресация идёт ТОЛЬКО через текст ответа: id вынимается из напечатанной
+    клиенту строки, и лишь потом по нему берётся состояние манифеста (его
+    проверять законно — это инвариант сервера, а не канал связи).
+
+    Раньше id брался прямо из реестра планов в памяти процесса. Это ровно тот
+    приём, из-за которого дыра «id снаружи не печатается» жила незамеченной:
+    у сетевого клиента такой памяти нет, а тест ею пользовался и оставался
+    зелёным."""
+    m = _MID_RE.search(plan_out)
+    assert m, f"в ответе нет id плана — снаружи его нечем назвать:\n{plan_out}"
+    mid = m.group(1)
+    assert mid in s._MANIFESTS, (
+        f"напечатанный клиенту id {mid} не адресует ни один живой план")
     assert len(s._MANIFESTS) == 1, s._MANIFESTS
-    return next(iter(s._MANIFESTS.items()))
+    return mid, s._MANIFESTS[mid]
 
 
 # ---- 1. Обратная совместимость: слой выключен ----
@@ -122,7 +141,7 @@ async def test_plan_creation_unchanged_when_tg_off(monkeypatch):
     assert "План создания" in out
     assert "Telegram" not in out          # ни слова про кнопки
     assert seen == []                     # отправки не было вовсе
-    _, m = _only_manifest()
+    _, m = _only_manifest(out)
     assert "tg_notified" not in m
 
 
@@ -132,8 +151,8 @@ async def test_execute_creation_passes_on_plain_yes_when_tg_off(monkeypatch):
     _capture_notify(monkeypatch)
     calls = _count_approval_calls(monkeypatch)
 
-    await s.plan_task_creation("Создаю 1", _tasks())
-    mid, _ = _only_manifest()
+    plan_out = await s.plan_task_creation("Создаю 1", _tasks())
+    mid, _ = _only_manifest(plan_out)
     out = await s.execute_task_creation(mid, user_reply="да")
 
     assert created and created[0][1][0]["title"] == "Позвонить маме"
@@ -150,7 +169,7 @@ async def test_plan_creation_notifies_telegram_as_create_tasks(monkeypatch):
 
     out = await s.plan_task_creation("Создаю 1", _tasks())
 
-    mid, m = _only_manifest()
+    mid, m = _only_manifest(out)
     assert len(seen) == 1
     assert seen[0][0] == mid
     assert seen[0][1] == "create_tasks"          # имя тула в TG_APPROVAL_TOOLS
@@ -167,8 +186,8 @@ async def test_execute_creation_refuses_chat_yes_while_button_pending(monkeypatc
     _tg_on(monkeypatch)
     _capture_notify(monkeypatch)
 
-    await s.plan_task_creation("Создаю 1", _tasks())
-    mid, m = _only_manifest()
+    plan_out = await s.plan_task_creation("Создаю 1", _tasks())
+    mid, m = _only_manifest(plan_out)
     # Пометка — ЖЁСТКОЕ основание требовать кнопку: она переживает даже
     # забытый `tool=` в execute (ровно та поломка, что была в
     # execute_task_deletion). Проверяем её здесь же, иначе тест зелёный и
@@ -194,8 +213,8 @@ async def test_execute_creation_after_button_approved_is_left_to_the_poller(
     _tg_on(monkeypatch)
     _capture_notify(monkeypatch)
 
-    await s.plan_task_creation("Создаю 1", _tasks())
-    mid, m = _only_manifest()
+    plan_out = await s.plan_task_creation("Создаю 1", _tasks())
+    mid, m = _only_manifest(plan_out)
     _count_approval_calls(monkeypatch, verdict="approved")
 
     out = await s.execute_task_creation(mid, user_reply="да")
@@ -216,8 +235,8 @@ async def test_execute_creation_passes_tool_and_manifest_id_to_the_gate(monkeypa
     _wire_create(monkeypatch)
     _tg_on(monkeypatch)
     _capture_notify(monkeypatch)
-    await s.plan_task_creation("Создаю 1", _tasks())
-    mid, _ = _only_manifest()
+    plan_out = await s.plan_task_creation("Создаю 1", _tasks())
+    mid, _ = _only_manifest(plan_out)
 
     seen = {}
 
@@ -239,8 +258,8 @@ async def test_execute_creation_rejected_button_kills_the_plan(monkeypatch):
     _tg_on(monkeypatch)
     _capture_notify(monkeypatch)
 
-    await s.plan_task_creation("Создаю 1", _tasks())
-    mid, m = _only_manifest()
+    plan_out = await s.plan_task_creation("Создаю 1", _tasks())
+    mid, m = _only_manifest(plan_out)
     _count_approval_calls(monkeypatch, verdict="rejected")
 
     out = await s.execute_task_creation(mid, user_reply="да")
@@ -262,7 +281,13 @@ async def test_plan_creation_fails_closed_when_telegram_send_fails(monkeypatch):
     assert "Не смог отправить" in out
     assert "bot blocked" in out
     assert "План создания" not in out     # план наружу НЕ ушёл
-    mid, m = _only_manifest()
+    assert not _MID_RE.search(out), (
+        "план не отправлен и погашен — печатать его id наружу незачем")
+    # ЕДИНСТВЕННОЕ место в файле, где id берётся из памяти процесса, и это
+    # намеренно: снаружи его нет вовсе, а проверить надо обратное — что даже
+    # клиент, каким-то образом узнавший id, ничего им не исполнит. Двойник
+    # здесь СИЛЬНЕЕ реальности, а не добрее её.
+    mid, m = next(iter(s._MANIFESTS.items()))
     assert m["consumed"] is True          # манифест инвалидирован
 
     # и он больше не исполним даже с честным «да»
@@ -278,8 +303,8 @@ async def test_rehash_create_manifest_matches_the_stored_hash(monkeypatch):
     _wire_create(monkeypatch)
     _tg_off(monkeypatch)
 
-    await s.plan_task_creation("Создаю 1", _tasks())
-    _, m = _only_manifest()
+    plan_out = await s.plan_task_creation("Создаю 1", _tasks())
+    _, m = _only_manifest(plan_out)
 
     assert m.get("object_hash")                       # он вообще есть
     assert s._rehash_create_manifest(m) == m["object_hash"]
@@ -289,8 +314,8 @@ async def test_rehash_create_manifest_detects_tampering(monkeypatch):
     _wire_create(monkeypatch)
     _tg_off(monkeypatch)
 
-    await s.plan_task_creation("Создаю 1", _tasks())
-    _, m = _only_manifest()
+    plan_out = await s.plan_task_creation("Создаю 1", _tasks())
+    _, m = _only_manifest(plan_out)
     stored = m["object_hash"]
 
     m["raw"][0]["title"] = "Перевести деньги мошеннику"
@@ -305,8 +330,8 @@ async def test_tampered_create_manifest_is_not_auto_executed(monkeypatch):
     _tg_on(monkeypatch)
     _capture_notify(monkeypatch)
 
-    await s.plan_task_creation("Создаю 1", _tasks())
-    mid, m = _only_manifest()
+    plan_out = await s.plan_task_creation("Создаю 1", _tasks())
+    mid, m = _only_manifest(plan_out)
     m["raw"].append({"title": "Лишняя задача", "project_id": "p1"})
 
     consumed = tg.try_auto_execute(
@@ -331,8 +356,8 @@ async def test_auto_executor_creates_exactly_the_planned_tasks(monkeypatch):
     created = _wire_create(monkeypatch)
     _tg_off(monkeypatch)
 
-    await s.plan_task_creation("Создаю 1", _tasks())
-    mid, m = _only_manifest()
+    plan_out = await s.plan_task_creation("Создаю 1", _tasks())
+    mid, m = _only_manifest(plan_out)
 
     out = await s._AUTO_EXECUTORS["create_tasks"].execute(mid, m)
 
@@ -417,7 +442,7 @@ async def test_delete_project_plan_goes_to_telegram_when_on(monkeypatch, tmp_pat
     assert len(seen) == 1
     assert seen[0][1] == "delete_project"
     assert "Telegram" in preview
-    mid, m = _only_manifest()
+    mid, m = _only_manifest(preview)
     assert m["kind"] == "delete_project"
     assert m["tg_notified"] is True
     assert seen[0][0] == mid
@@ -466,8 +491,8 @@ async def test_delete_project_after_button_approved_is_left_to_the_poller(
     _tg_on(monkeypatch)
     _capture_notify(monkeypatch)
 
-    await s.delete_project("Работа", "p1")            # фаза плана
-    _, m = _only_manifest()
+    plan_out = await s.delete_project("Работа", "p1")            # фаза плана
+    _, m = _only_manifest(plan_out)
     _count_approval_calls(monkeypatch, verdict="approved")
 
     out = await s.delete_project("Работа", "p1", user_reply="да")
@@ -482,8 +507,8 @@ async def test_delete_project_rejected_button_kills_the_plan(monkeypatch, tmp_pa
     _tg_on(monkeypatch)
     _capture_notify(monkeypatch)
 
-    await s.delete_project("Работа", "p1")
-    _, m = _only_manifest()
+    plan_out = await s.delete_project("Работа", "p1")
+    _, m = _only_manifest(plan_out)
     _count_approval_calls(monkeypatch, verdict="rejected")
 
     out = await s.delete_project("Работа", "p1", user_reply="да")
@@ -574,7 +599,7 @@ async def test_rename_tag_merge_plan_goes_to_telegram_when_on(monkeypatch):
     assert len(seen) == 1
     assert seen[0][1] == "rename_tag"
     assert "Telegram" in out
-    _, m = _only_manifest()
+    _, m = _only_manifest(out)
     assert m["kind"] == "rename_tag_merge"
     assert m["tg_notified"] is True
 
@@ -615,8 +640,8 @@ async def test_rename_tag_merge_after_button_approved_is_left_to_the_poller(
     _tg_on(monkeypatch)
     _capture_notify(monkeypatch)
 
-    await s.rename_tag("a", "b", allow_merge=True)     # фаза плана
-    _, m = _only_manifest()
+    plan_out = await s.rename_tag("a", "b", allow_merge=True)     # фаза плана
+    _, m = _only_manifest(plan_out)
     _count_approval_calls(monkeypatch, verdict="approved")
 
     out = await s.rename_tag("a", "b", allow_merge=True, user_reply="да, сливай")
@@ -631,8 +656,8 @@ async def test_rename_tag_merge_rejected_button_kills_the_plan(monkeypatch):
     _tg_on(monkeypatch)
     _capture_notify(monkeypatch)
 
-    await s.rename_tag("a", "b", allow_merge=True)
-    _, m = _only_manifest()
+    plan_out = await s.rename_tag("a", "b", allow_merge=True)
+    _, m = _only_manifest(plan_out)
     _count_approval_calls(monkeypatch, verdict="rejected")
 
     out = await s.rename_tag("a", "b", allow_merge=True, user_reply="да, сливай")

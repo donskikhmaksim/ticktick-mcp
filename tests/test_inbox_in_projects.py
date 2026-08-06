@@ -64,13 +64,22 @@ class FakeOfficialV1:
         return {"project": p, "tasks": [{"id": "t-x", "title": "Обычная задача",
                                          "projectId": project_id}]}
 
-    def create_task(self, title, project_id, **kw):
+    # Сигнатура — дословная копия TickTickClient.create_task, а не `**kw`:
+    # проглатывающий двойник не заметил бы ни опечатки в имени параметра, ни
+    # потерянного поля.
+    def create_task(self, title, project_id, content=None, start_date=None,
+                    due_date=None, priority=0, is_all_day=False,
+                    repeat_flag=None, reminders=None):
         known = any(x["id"] == project_id for x in self._projects)
         landed = project_id if known else self._inbox_id
+        # `requestedProjectId` фиксирует то, что сервер РЕАЛЬНО отправил. Без
+        # него проверка доставки в Inbox была тавтологией: двойник сам
+        # подменял неизвестный id на inbox_id, и тест сверял этот же inbox_id
+        # — то есть остался бы зелёным на любом, даже мусорном, id.
         task = {"id": f"new-{len(self.created) + 1}", "title": title,
-                "projectId": landed}
+                "projectId": landed, "requestedProjectId": project_id}
         self.created.append(task)
-        return dict(task)
+        return {k: v for k, v in task.items() if k != "requestedProjectId"}
 
 
 class FakeV2:
@@ -255,6 +264,10 @@ async def test_create_into_inbox_id_from_listing_is_delivered(monkeypatch):
     assert "Отказ" not in out and "Ошибки" not in out
     assert "а НЕ в запрошенный" not in out          # post-verify не ругается
     assert official.created and official.created[0]["projectId"] == inbox_id
+    # Главное: сервер отправил ИМЕННО тот id, который сам же напечатал в
+    # листинге, а не какой угодно, который двойник потом «поправил» бы.
+    assert official.created[0]["requestedProjectId"] == inbox_id, (
+        "сервер отправил в Open API не тот id, который показал человеку")
 
 
 # ─────────────── 3. Не дублировать и не выдумывать Inbox ───────────────
