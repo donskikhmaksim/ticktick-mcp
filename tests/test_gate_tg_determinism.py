@@ -105,15 +105,40 @@ async def test_execute_task_deletion_refuses_chat_yes_when_plan_went_to_telegram
     assert s._MANIFESTS["mid-tg"]["consumed"] is False  # план ещё жив
 
 
-async def test_execute_task_deletion_proceeds_when_button_approved(
+async def test_execute_task_deletion_does_not_run_on_text_after_button_approved(
         monkeypatch, tmp_path):
+    """ПЕРЕПИСАН 2026-08-06 (button-only). Раньше здесь утверждалось обратное:
+    «кнопка нажата → текстовое «да» исполняет». Теперь план, реально ушедший в
+    Telegram (`tg_notified`), исполняет ТОЛЬКО фоновый поллер — текстовый путь
+    закрыт даже при уже нажатой кнопке, а манифест обязан остаться живым,
+    иначе поллеру нечего будет исполнять."""
     live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
     fake = _wire(monkeypatch, live, tmp_path)
     _tg_on(monkeypatch)
     monkeypatch.setattr(tg, "check_approval", lambda manifest_id: "approved")
-    _plan_manifest("mid-tg-ok")
+    m = _plan_manifest("mid-tg-ok", notified=True)
 
     out = await s.execute_task_deletion("mid-tg-ok", user_reply="да")
+
+    assert fake.deleted_ids == []          # текстом НЕ исполнено
+    assert "t1" in live
+    assert "исполняет" in out and "САМ" in out
+    assert m["consumed"] is False          # поллер ещё должен его забрать
+
+
+async def test_unnotified_manifest_with_tool_still_proceeds_when_approved(
+        monkeypatch, tmp_path):
+    """Остаточная ветка (б) в `_require_consent`: манифест НЕ помечен (плана в
+    Telegram не было), но вызывающий передал `tool=`. Такой план button-only
+    не касается — он исполняется по chat-«да», как и раньше. Тест держит
+    границу изменения: закрыт ровно помеченный путь, не все подряд."""
+    live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
+    fake = _wire(monkeypatch, live, tmp_path)
+    _tg_on(monkeypatch)
+    monkeypatch.setattr(tg, "check_approval", lambda manifest_id: "approved")
+    _plan_manifest("mid-tg-ok2")           # notified=False
+
+    out = await s.execute_task_deletion("mid-tg-ok2", user_reply="да")
 
     assert fake.deleted_ids == ["t1"]
     assert "Купить молоко" in out
@@ -227,7 +252,11 @@ def test_require_consent_honours_the_flag_even_without_tool_arg(monkeypatch):
 
 def test_require_consent_flag_uses_manifest_own_id_for_lookup(monkeypatch):
     """`manifest_id=` не передали — id для check_approval берётся из самой
-    пометки (`_tg_manifest_id`), а не теряется в пустую строку."""
+    пометки (`_tg_manifest_id`), а не теряется в пустую строку.
+
+    ПЕРЕПИСАН 2026-08-06: проверяемый факт (id для поиска строки берётся из
+    манифеста) прежний, изменился только исход — при button-only даже
+    approved не открывает текстовый путь."""
     _tg_on(monkeypatch)
     seen = []
     monkeypatch.setattr(tg, "check_approval",
@@ -237,7 +266,7 @@ def test_require_consent_flag_uses_manifest_own_id_for_lookup(monkeypatch):
     cr = s._require_consent(action="delete", tier=2, manifest=m,
                             user_reply="да", object_ids=["t1"])
 
-    assert cr.ok is True
+    assert cr.ok is False
     assert seen == ["mid-lookup"]
 
 

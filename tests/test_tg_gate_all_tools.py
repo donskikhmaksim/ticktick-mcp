@@ -269,9 +269,13 @@ async def test_rejected_button_kills_the_plan(tool, monkeypatch):
     assert s._MANIFESTS[mid]["consumed"] is True
 
 
-async def test_approved_button_plus_chat_yes_executes(monkeypatch):
-    """Зеркало теста 3: с нажатой кнопкой обычный execute проходит — иначе
-    фикс превратил бы все 19 тулов в вечный отказ."""
+async def test_approved_button_does_not_reopen_the_text_path(monkeypatch):
+    """ПЕРЕПИСАН 2026-08-06 (button-only). Раньше здесь утверждалось «с
+    нажатой кнопкой обычный execute проходит». Теперь нажатие исполняет
+    операцию само (фоновый поллер, тест 8 ниже), а текстовый вызов отвергается
+    — и, что критично, НЕ гасит манифест, иначе поллеру нечего было бы
+    исполнять. Страх «вечного отказа», ради которого тест писался, снят не
+    исполнением из чата, а тем, что операция всё равно происходит."""
     _no_client_checks(monkeypatch)
     _tg_on(monkeypatch)
     _notify_ok(monkeypatch)
@@ -279,8 +283,11 @@ async def test_approved_button_plus_chat_yes_executes(monkeypatch):
         rec = _stub_impl(monkeypatch, tool, [])
         _, mid = await _plan(tool, monkeypatch)
         monkeypatch.setattr(tg, "check_approval", lambda manifest_id: "approved")
-        await getattr(s, tool)(**ALL_TOOLS[tool], manifest_id=mid, user_reply="да")
-        assert len(rec) == 1, tool
+        out = await getattr(s, tool)(**ALL_TOOLS[tool], manifest_id=mid,
+                                     user_reply="да")
+        assert rec == [], f"{tool} исполнился текстовым путём"
+        assert "исполняет" in out and "САМ" in out, tool
+        assert s._MANIFESTS[mid]["consumed"] is False, tool
 
 
 # ═══════ 5. Отправка в Telegram упала → fail-closed ═══════

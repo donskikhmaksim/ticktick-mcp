@@ -1517,8 +1517,9 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     factor. Pressing "Подтвердить" makes the server execute the creation
     ITSELF (a background poller does it) and rewrites the report into that
     same Telegram message — no second tool call is needed for it to happen.
-    In that mode a text `user_reply` alone is NOT enough: without the button,
-    execute_task_creation refuses and the plan stays alive.
+    In that mode the text path is CLOSED: execute_task_creation refuses ANY
+    `user_reply`, before the press and after it alike. Do not call it — show
+    the plan and let the owner tap the button.
 
     Args:
         summary: one-line human sentence describing the batch
@@ -1659,9 +1660,10 @@ async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
     message with [✅ Подтвердить]/[🛑 Отклонить] buttons itself. Pressing
     "Подтвердить" makes the server run the creation on its own (background
     poller) and write the report back into that same message — you do not
-    have to call this tool again for it to happen. Until the button is
-    pressed, a text `user_reply` alone is NOT sufficient here: this call is
-    refused with "⏳ Подтвердите кнопкой", and the plan stays alive.
+    have to call this tool again for it to happen. For such a plan the text
+    path is CLOSED: this call is refused whatever `user_reply` says, both
+    before the press ("⏳ ждём кнопку", plan stays alive) and after it
+    ("✅ сервер уже исполняет"). Calling it again changes nothing.
 
     Args:
         manifest_id: id from plan_task_creation
@@ -1761,8 +1763,10 @@ async def update_tasks(
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_official()
     if err:
@@ -2086,8 +2090,10 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]] = None,
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_official()
     if err:
@@ -2681,9 +2687,67 @@ def _maybe_tg_notify_plan(tool: str, manifest_id: str, preview_text: str) -> str
         # вызовов, и она должна быть видна в логе.
         logger.warning(f"TG approval: план {manifest_id} отправлен в Telegram, "
                        f"но манифест не найден в _MANIFESTS (tool={tool})")
+    # Приписка честно отражает, что произойдёт ДАЛЬШЕ, а не то, что было
+    # написано здесь до 2026-08-06 («…затем ответьте «да» здесь»). Для планов,
+    # которые сервер умеет исполнить сам по нажатию (есть авто-исполнитель),
+    # текстовый путь ЗАКРЫТ (см. `_tg_button_only`), и звать инструмент второй
+    # раз не нужно — прежняя формулировка подталкивала и владельца, и модель
+    # ровно к тому действию, которое теперь отвергается. Для двух планов без
+    # авто-исполнителя (delete_project / rename_tag-слияние) повторный вызов
+    # ПО-ПРЕЖНЕМУ нужен — им нельзя обещать «выполнится само».
+    if _resolve_auto_executor(_auto_execute_tool_of(m or {}), m or {}) is not None:
+        return (preview_text + "\n\n_⏳ Запрос на подтверждение отправлен в "
+                "Telegram. Подтвердите кнопкой ✅ в боте — операция выполнится "
+                "автоматически, отчёт придёт в то же сообщение. Повторно "
+                "вызывать этот инструмент НЕ нужно, текстовое «да» для этого "
+                "плана не принимается._")
     return (preview_text + "\n\n_⏳ Запрос на подтверждение отправлен в "
-            "Telegram — подтвердите кнопкой в боте, затем ответьте «да» "
-            "здесь._")
+            "Telegram. Подтвердите кнопкой ✅ в боте — этот план сервер сам не "
+            "исполняет, после нажатия повторите вызов инструмента._")
+
+
+_TG_BUTTON_ONLY_PENDING_MSG = (
+    "⏳ Этот план подтверждается ТОЛЬКО кнопкой в Telegram — текстовое "
+    "подтверждение для него отключено, что бы пользователь ни написал в чате. "
+    "Нажмите ✅ в боте: операция выполнится сама, отчёт придёт в то же "
+    "сообщение с кнопками. Повторно вызывать этот инструмент НЕ нужно — "
+    "просто скажи пользователю, что ждёшь его нажатия. План активен."
+)
+
+_TG_BUTTON_ONLY_APPROVED_MSG = (
+    "✅ Уже подтверждено кнопкой в Telegram — сервер исполняет эту операцию "
+    "САМ (фоновый поллер, обычно в течение ~10 секунд). Ничего повторять не "
+    "надо и этот инструмент больше звать не надо: результат будет вписан в то "
+    "же сообщение Telegram, где были кнопки."
+)
+
+
+def _tg_button_only(manifest: Optional[Dict]) -> bool:
+    """Закрыт ли для ЭТОГО плана текстовый путь исполнения (2026-08-06).
+
+    Два условия, оба обязательны:
+      1. План реально ушёл в Telegram — пометку `tg_notified` ставит ТОЛЬКО
+         `_maybe_tg_notify_plan`, и только при УСПЕШНОЙ отправке сообщения с
+         кнопками. Решение принимается по СОСТОЯНИЮ МАНИФЕСТА, а не по
+         текущему значению `TG_APPROVAL_ENABLED`: выключить настройку между
+         планом и исполнением и тем «растворить» требование кнопки нельзя.
+      2. У плана есть авто-исполнитель (`_resolve_auto_executor`), то есть
+         нажатие кнопки действительно приведёт к исполнению фоновым поллером.
+         Без этого условия закрытие текстового пути означало бы, что
+         операцию нельзя выполнить ВООБЩЕ никак. Сегодня мимо проходят ровно
+         два плана — `delete_project` и слияние в `rename_tag` (их манифесты
+         помечены собственными `_gate`, поллер их не исполняет; так и написано
+         в их докстрингах). Для них остаётся прежняя двухфакторная схема:
+         кнопка ОБЯЗАТЕЛЬНА, но исполняет повторный вызов инструмента. Как
+         только у такого плана появится авто-исполнитель, он автоматически
+         перейдёт в button-only — отдельного списка тулов здесь намеренно нет.
+
+    Возвращает False для всего остального (слой выключен, план в Telegram не
+    уходил, вызов без манифеста) → путь через chat-«да» работает как раньше.
+    """
+    if not (manifest or {}).get("tg_notified"):
+        return False
+    return _resolve_auto_executor(_auto_execute_tool_of(manifest), manifest) is not None
 
 
 _NO_REPLY_INSTRUCTION = (
@@ -2720,8 +2784,14 @@ def _require_consent(
 
     if manifest is not None:
         if manifest.get("consumed"):
-            return ConsentResult(False, "🛑 Манифест уже исполнен (one-shot) — "
-                                  "план протух. Вызови plan_* заново.")
+            # `_manifest_gone_msg` различает «погашен поллером по кнопке» и
+            # «просто протух»: без него модель, позвавшая execute сразу после
+            # нажатия кнопки (пока `_prune_manifests` ещё не выбросил запись),
+            # получала безликое «протух» и не понимала, исполнено ли что-то.
+            return ConsentResult(False, _manifest_gone_msg(
+                manifest_id or manifest.get("_tg_manifest_id", ""),
+                "🛑 Манифест уже исполнен (one-shot) — план протух. Вызови "
+                "plan_* заново."))
         created = manifest.get("created")
         if created is not None and time.monotonic() - created > _MANIFEST_TTL:
             manifest["consumed"] = True
@@ -2757,6 +2827,45 @@ def _require_consent(
                                  "Ответ похож на отказ/отмену; при необходимости "
                                  "перепланируй."))
 
+    # ─────────── BUTTON-ONLY: текстовый путь исполнения ЗАКРЫТ ───────────
+    # Максим, 2026-08-06: «зачем вообще ждать текстовое да? нужно убрать для
+    # Клода возможность видеть и тыкать методы экзекют».
+    #
+    # Почему это не «ещё одна проверка формулировок», а закрытие класса дыр:
+    # сервер физически НЕ может отличить сочинённое моделью «да» от реального
+    # ответа человека — он видит только строку. Всю ночь до этого затыкались
+    # формулировки («делай, я передумал насчёт третьей» регуляркой не
+    # ловится). Если план УЖЕ ушёл в Telegram и сервер умеет исполнить его сам
+    # по нажатию, то текстовому пути исполнения просто нечего здесь делать:
+    # исполняет фоновый поллер по факту нажатия, а любой вызов execute с
+    # текстом отвергается — независимо от того, что в этом тексте написано.
+    # Дыра не уменьшается, а исчезает: способа исполнить операцию текстом
+    # больше не существует.
+    #
+    # Стоит ДО проверки `_is_affirmative_reply` намеренно: для такого плана
+    # содержание реплики уже ни на что не влияет, и требовать «пришли
+    # дословное да» (`_NO_REPLY_INSTRUCTION`) было бы враньём — модель пошла
+    # бы добывать текст, который всё равно ничего не откроет. Проверка
+    # ОТРИЦАНИЯ выше при этом сохранена: «нет» в чате по-прежнему гасит план,
+    # не дожидаясь кнопки.
+    if _tg_button_only(manifest):
+        mid_for_lookup = manifest_id or (manifest or {}).get("_tg_manifest_id", "")
+        approval = tg_approval.check_approval(mid_for_lookup)
+        if approval == "approved":
+            # Кнопка нажата, поллер ещё не добрался (интервал ~10 c). НЕ
+            # исполняем здесь и НЕ гасим манифест — иначе поллер найдёт его
+            # уже погашенным и операция не произойдёт вовсе.
+            return ConsentResult(False, _TG_BUTTON_ONLY_APPROVED_MSG)
+        if approval == "rejected":
+            if manifest is not None:
+                manifest["consumed"] = True
+            return ConsentResult(False, "🛑 Отклонено кнопкой в Telegram. План отменён, "
+                                  "ничего не сделано. Чтобы повторить — построй план заново.")
+        if approval == "none":
+            return ConsentResult(False, "🛑 Запрос подтверждения в Telegram не найден или "
+                                  "истёк по TTL. Построй план заново.")
+        return ConsentResult(False, _TG_BUTTON_ONLY_PENDING_MSG)
+
     if not _is_affirmative_reply(user_reply):
         return ConsentResult(False,
                              _consent_refusal_reason(user_reply) or _NO_REPLY_INSTRUCTION)
@@ -2775,13 +2884,23 @@ def _require_consent(
     #       операцию недетерминированной (chat-«да» без кнопки исполнял
     #       удаление по-настоящему);
     #   (б) старое основание `tool and enabled_for(tool)` — сохранено для
-    #       путей БЕЗ манифеста (inline-🔴 вроде rename_tag/delete_project),
-    #       где помечать нечего.
+    #       путей БЕЗ манифеста (inline-🔴), где помечать нечего.
     # Обратная совместимость: без `TG_APPROVAL_ENABLED=true` пометка не
     # ставится НИКОГДА и `enabled_for` всегда False → поведение побайтово
     # прежнее. Пути, чей план в Telegram не уходит (_gate_batch/_gate_single),
     # намеренно НЕ передают `tool`: иначе `check_approval` вернул бы "none"
     # (строки-то нет) и тулы отказывали бы навсегда даже на честное «да».
+    #
+    # ЧТО СЮДА ЕЩЁ ДОХОДИТ ПОСЛЕ button-only (блок выше). Планы, у которых
+    # есть авто-исполнитель, до этой строки не добираются вовсе — им текстовый
+    # путь закрыт целиком. Здесь остаются:
+    #   • `delete_project` и слияние в `rename_tag` — помеченные, но НЕ
+    #     авто-исполняемые: кнопка обязательна (иначе "pending"/"none"), а
+    #     исполняет повторный вызов инструмента с «да». Единственные, для кого
+    #     ниже возможен проход при approved;
+    #   • непомеченные манифесты с переданным `tool` (план в Telegram не
+    #     уходил — слой был выключен или тул вне allowlist): здесь
+    #     `check_approval` вернёт "none", то есть отказ, ровно как и раньше.
     tg_required = bool((manifest or {}).get("tg_notified")) or bool(
         tool and tg_approval.enabled_for(_TG_CFG, tool))
     if tg_required:
@@ -3107,6 +3226,12 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
 
     Nothing is deleted by this tool. Manifests are one-shot and expire in 1 h.
 
+    TELEGRAM CONFIRMATION LAYER (optional, off by default): when it is on this
+    plan ALSO goes to the owner as a message with ✅/🛑 buttons, and ✅ makes
+    the SERVER delete on its own (background poller), reporting into that same
+    message. Then do NOT call execute_task_deletion at all — for such a plan
+    the text path is closed and every call is refused.
+
     Args:
         summary: one-line human sentence (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         tasks: List of {"taskId","title","projectId","with_subtasks"} — title recommended
@@ -3223,6 +3348,12 @@ async def execute_task_deletion(manifest_id: str, user_reply: str = "") -> str:
     against live state (renamed since planning → skipped); full task
     snapshots are appended to the deletion journal before the delete; the
     effect is post-verified against fresh state.
+
+    TELEGRAM CONFIRMATION LAYER (optional, off by default): when the plan was
+    announced there, the text path is CLOSED for it — this call is refused
+    whatever `user_reply` says. Pressing ✅ makes the SERVER delete on its own
+    (background poller) and write the report into that same message; there is
+    nothing for you to do afterwards.
 
     Args:
         manifest_id: id returned by plan_task_deletion
@@ -5118,8 +5249,10 @@ async def create_project(
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_official()
     if err:
@@ -5220,11 +5353,11 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
     TELEGRAM CONFIRMATION LAYER (optional, off by default): with it on, the
     1st call ALSO makes this server send the plan to the owner as a Telegram
     message with [✅ Подтвердить]/[🛑 Отклонить] buttons — the server's own
-    out-of-band second factor, not an external relay. While the button is
-    untouched, the 2nd call is refused however genuine `user_reply` is
-    («⏳ Подтвердите кнопкой в Telegram-боте»), and a press of "🛑 Отклонить"
-    kills the plan outright. Deletion of a project is NOT auto-executed by
-    the button poller — after approving, repeat the 2nd call.
+    out-of-band second factor, not an external relay. In that mode the TEXT
+    path is CLOSED: the 2nd call is refused however genuine `user_reply` is,
+    before the press and after it alike. Pressing ✅ makes the SERVER delete
+    the project on its own (background poller) and report into that same
+    message; a press of "🛑 Отклонить" kills the plan outright.
 
     Args:
         project_name: Name of the project (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
@@ -5332,9 +5465,30 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
     if m is not None:
         m["consumed"] = True  # one-shot: план сгорел вместе с исполнением
 
-    # Confirmed — journal a pre-delete snapshot of the project AND every
-    # contained task BEFORE the actual delete call, same convention as
-    # delete_tasks/execute_task_deletion (snapshot first, mutate second).
+    return await _delete_project_impl(project_id, live_name, tasks)
+
+
+async def _delete_project_impl(project_id: str, project_name: str,
+                               tasks: List[Dict[str, Any]]) -> str:
+    """Само удаление проекта, БЕЗ гейта — согласие к этому моменту уже
+    получено вызывающим (`delete_project` после `_require_consent`, либо
+    фоновый поллер по нажатой кнопке через `_auto_execute_delete_project`).
+
+    Вынесена 2026-08-06 вместе с button-only: до этого тело мутации жило
+    прямо в теле тула, из-за чего нажатие кнопки на плане удаления ПРОЕКТА
+    не приводило ни к чему (поллеру нечего было позвать), и операцию можно
+    было завершить только вторым текстовым вызовом. С закрытым текстовым
+    путём это означало бы «кнопка есть, а исполнить нечем» — поэтому обе
+    половины (исполнитель + регистрация) едут вместе.
+
+    `tasks` — содержимое проекта, прочитанное вызывающим (нужно для журнала
+    и для счётчика в отчёте); функция сама в TickTick за ним не ходит, чтобы
+    оба пути журналировали ровно то, что было показано человеку/поллеру."""
+    live_name = project_name
+    count = len(tasks)
+    # Journal a pre-delete snapshot of the project AND every contained task
+    # BEFORE the actual delete call, same convention as delete_tasks/
+    # execute_task_deletion (snapshot first, mutate second).
     record_id = "delete_project-" + uuid.uuid4().hex[:8]
     snap_fields = ("title", "content", "desc", "dueDate", "startDate",
                    "priority", "tags", "parentId", "isAllDay")
@@ -5995,8 +6149,10 @@ async def create_subtask(
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_official()
     if err:
@@ -6206,8 +6362,10 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]] = None,
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -6383,8 +6541,10 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -6600,8 +6760,10 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -6763,8 +6925,10 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -6863,8 +7027,10 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -7085,8 +7251,10 @@ async def create_project_group(name: str, manifest_id: str = "",
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -7160,8 +7328,10 @@ async def delete_project_group(group_name: str, group_id: str,
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -7243,8 +7413,10 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -7375,8 +7547,10 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -7503,8 +7677,10 @@ async def restore_tasks(summary: str, tasks: List[Dict[str, str]] = None,
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -7643,8 +7819,10 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -8018,8 +8196,10 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -8119,8 +8299,10 @@ async def create_tag(name: str, color: str = None, manifest_id: str = "",
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -8177,11 +8359,12 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
     only: the refusal that describes the merge is ALSO sent by this server to
     the owner in Telegram, as a message with [✅ Подтвердить]/[🛑 Отклонить]
     buttons; that is the server's own second factor, not an external relay
-    wrapped around MCP. Until "Подтвердить" is pressed, repeating the call
-    with allow_merge=true and a genuine `user_reply` is still refused — one
-    text reply is not enough in that mode. A tag merge is not auto-executed
-    by the button poller: after approving, repeat the call. The plain-rename
-    branch (no existing target tag) is not gated at all and never notifies.
+    wrapped around MCP. In that mode the TEXT path is CLOSED: repeating the
+    call with allow_merge=true and a genuine `user_reply` is refused whether
+    or not the button was pressed. Pressing ✅ makes the SERVER merge the tags
+    on its own (background poller) and report into that same message. The
+    plain-rename branch (no existing target tag) is not gated at all and never
+    notifies.
 
     Args:
         old_name: current tag name
@@ -8255,20 +8438,33 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
                 return _maybe_tg_notify_plan("rename_tag", new_mid, msg)
             if m is not None:
                 m["consumed"] = True  # one-shot
-        await _run_blocking(lambda: ticktick_v2.rename_tag(old_name, new_name))
-        # Post-verify against a fresh tag list.
-        after = await _live_tag_names()
-        if old_name.lower() in after:
-            return (f"❌ Тег «{old_name}» ВСЁ ЕЩЁ существует — переименование "
-                    "не сработало.")
-        if new_name.lower() not in after:
-            return (f"❌ Тега «{new_name}» нет после переименования — исход "
-                    "не подтверждён, проверь вручную.")
-        merged = " (слито с существующим)" if allow_merge and new_name.lower() in existing else ""
-        return f"Tag '{old_name}' renamed to '{new_name}' (проверено){merged}."
+        return await _rename_tag_impl(old_name, new_name,
+                                      merged=bool(allow_merge and will_merge))
     except Exception as e:
         logger.error(f"Error in rename_tag: {e}")
         return f"Error renaming tag: {str(e)}"
+
+
+async def _rename_tag_impl(old_name: str, new_name: str,
+                           merged: bool = False) -> str:
+    """Само переименование/слияние тега, БЕЗ гейта — согласие уже получено
+    вызывающим (`rename_tag` после `_require_consent` в merge-ветке, обычное
+    переименование гейта не имеет вовсе, либо фоновый поллер по нажатой
+    кнопке через `_auto_execute_rename_tag`).
+
+    Вынесена 2026-08-06 по той же причине, что и `_delete_project_impl`: без
+    неё нажатие кнопки на плане СЛИЯНИЯ тегов не приводило ни к чему."""
+    await _run_blocking(lambda: ticktick_v2.rename_tag(old_name, new_name))
+    # Post-verify against a fresh tag list.
+    after = await _live_tag_names()
+    if old_name.lower() in after:
+        return (f"❌ Тег «{old_name}» ВСЁ ЕЩЁ существует — переименование "
+                "не сработало.")
+    if new_name.lower() not in after:
+        return (f"❌ Тега «{new_name}» нет после переименования — исход "
+                "не подтверждён, проверь вручную.")
+    note = " (слито с существующим)" if merged else ""
+    return f"Tag '{old_name}' renamed to '{new_name}' (проверено){note}."
 
 
 @mcp.tool()
@@ -8435,8 +8631,10 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -8534,8 +8732,10 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -9525,8 +9725,10 @@ async def create_project_column(project_id: str, name: str,
     built by call #1 is also sent to the owner as a Telegram message with
     ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
     this tool is NOT called a second time, and the result is written back
-    into that same message. While that is in effect, a text user_reply alone
-    is not enough: without the pressed button call #2 is refused.
+    into that same message. While that is in effect the TEXT path is CLOSED:
+    call #2 is refused whatever `user_reply` says — before the press (wait for
+    it) and after it too (the server is already running the operation). Do not
+    retry it; just tell the user to tap the button.
     """
     err = _ensure_ready()
     if err:
@@ -9651,8 +9853,66 @@ async def _auto_execute_create_tasks(manifest_id: str, m: Dict) -> str:
     return await _create_tasks_impl(m.get("summary") or "", m.get("raw") or [])
 
 
+def _rehash_delete_project_manifest(m: Dict) -> str:
+    """Та же формула, что в фазе плана delete_project (см. её `object_hash`)."""
+    return _manifest_object_hash("delete_project", [m.get("project_id") or ""])
+
+
+async def _auto_execute_delete_project(manifest_id: str, m: Dict) -> str:
+    """Исполнение плана удаления ПРОЕКТА по нажатой кнопке (2026-08-06).
+
+    Содержимое проекта перечитывается ЗАНОВО: журнал должен отражать то, что
+    удаляется сейчас, а не снимок часовой давности. Не смогли прочитать —
+    отказ, а не удаление вслепую (та же дисциплина, что на чат-пути)."""
+    project_id = m.get("project_id") or ""
+    name = m.get("project_name") or ""
+    if not project_id:
+        return ("🛑 Автоисполнение отменено: в манифесте нет id проекта — "
+                "ничего не удалено. Построй план заново.")
+    try:
+        data = await _run_blocking(lambda: ticktick.get_project_with_data(project_id))
+    except Exception as e:
+        return (f"🛑 Автоисполнение отменено: не смог прочитать содержимое "
+                f"проекта «{name}» ({e}) — не удаляю вслепую. Ничего не "
+                "изменено, построй план заново.")
+    if isinstance(data, dict) and data.get("error"):
+        return (f"🛑 Автоисполнение отменено: не смог прочитать содержимое "
+                f"проекта «{name}» ({data['error']}) — не удаляю вслепую. "
+                "Ничего не изменено, построй план заново.")
+    return await _delete_project_impl(project_id, name,
+                                      (data or {}).get("tasks") or [])
+
+
+def _rehash_rename_tag_manifest(m: Dict) -> str:
+    """Та же формула, что в merge-ветке rename_tag (её `object_hash`)."""
+    return _manifest_object_hash(
+        "rename_tag_merge",
+        [(m.get("old_name") or "").lower(), (m.get("new_name") or "").lower()])
+
+
+async def _auto_execute_rename_tag(manifest_id: str, m: Dict) -> str:
+    """Исполнение СЛИЯНИЯ тегов по нажатой кнопке (2026-08-06). Кнопка
+    существует только у merge-ветки — обычное переименование гейта не имеет и
+    манифеста не заводит, поэтому `merged=True` здесь всегда верно."""
+    old_name, new_name = m.get("old_name") or "", m.get("new_name") or ""
+    if not (old_name and new_name):
+        return ("🛑 Автоисполнение отменено: в манифесте нет пары имён тегов — "
+                "ничего не изменено. Построй план заново.")
+    return await _rename_tag_impl(old_name, new_name, merged=True)
+
+
 _register_auto_executor("delete_tasks", _rehash_delete_manifest, _auto_execute_delete_tasks)
 _register_auto_executor("create_tasks", _rehash_create_manifest, _auto_execute_create_tasks)
+# 2026-08-06 (button-only): без этих двух регистраций нажатие кнопки на плане
+# удаления ПРОЕКТА и на плане СЛИЯНИЯ тегов не приводило ни к чему — поллеру
+# нечего было позвать, а с закрытым текстовым путём операция стала бы
+# неисполнимой вообще. Их манифесты строятся своим путём (естественный ключ +
+# `_find_live_inline_manifest`), поэтому generic-исполнитель их не подхватывает
+# (он умеет только `_gate` in batch/single) — нужна явная регистрация.
+_register_auto_executor("delete_project", _rehash_delete_project_manifest,
+                        _auto_execute_delete_project)
+_register_auto_executor("rename_tag", _rehash_rename_tag_manifest,
+                        _auto_execute_rename_tag)
 # DISABLED 2026-08-04/05 together with the @mcp.tool() decorators above — the
 # TG-button auto-execute poller (_tg_auto_execute_tick) dispatches through
 # THIS registry directly, bypassing the MCP tool layer entirely. Commenting

@@ -183,21 +183,26 @@ async def test_execute_creation_refuses_chat_yes_while_button_pending(monkeypatc
     assert m["consumed"] is False         # план ещё активен
 
 
-async def test_execute_creation_proceeds_after_button_approved(monkeypatch):
-    """Вторая половина ловушки: включённый слой НЕ должен превращать тул в
-    вечный отказ — нажали кнопку, «да» проходит."""
+async def test_execute_creation_after_button_approved_is_left_to_the_poller(
+        monkeypatch):
+    """ПЕРЕПИСАН 2026-08-06 (button-only). Раньше проверялось «нажали кнопку →
+    текстовое «да» проходит»; теперь исполняет ТОЛЬКО фоновый поллер, а
+    текстовый вызов отвергается с объяснением. «Вечного отказа», ради страха
+    перед которым тест и писался, не возникает: операция всё равно случится —
+    просто без участия модели."""
     created = _wire_create(monkeypatch)
     _tg_on(monkeypatch)
     _capture_notify(monkeypatch)
 
     await s.plan_task_creation("Создаю 1", _tasks())
-    mid, _ = _only_manifest()
+    mid, m = _only_manifest()
     _count_approval_calls(monkeypatch, verdict="approved")
 
     out = await s.execute_task_creation(mid, user_reply="да")
 
-    assert len(created) == 1
-    assert "Создано" in out
+    assert created == []                  # текстом ничего не создано
+    assert "исполняет" in out and "САМ" in out
+    assert m["consumed"] is False         # план ждёт поллера, не сожжён
 
 
 async def test_execute_creation_passes_tool_and_manifest_id_to_the_gate(monkeypatch):
@@ -449,20 +454,27 @@ async def test_delete_project_without_a_plan_falls_back_to_planning(
     assert "Telegram" in out
 
 
-async def test_delete_project_proceeds_after_button_approved(monkeypatch, tmp_path):
-    """Вторая половина ловушки «none → отказ навсегда»: включённый слой НЕ
-    делает тул вечно отказывающим."""
+async def test_delete_project_after_button_approved_is_left_to_the_poller(
+        monkeypatch, tmp_path):
+    """ПЕРЕПИСАН 2026-08-06 (button-only). Раньше: «нажали кнопку → текстовое
+    «да» удаляет проект». Теперь у delete_project есть собственный
+    авто-исполнитель, поэтому исполняет поллер, а текстовый вызов отвергается.
+    Сам факт «тул не отказывает навсегда» проверяется в
+    tests/test_button_only_execution.py — там кнопка доводится до реального
+    удаления."""
     fake = _wire_delete_project(monkeypatch, tmp_path)
     _tg_on(monkeypatch)
     _capture_notify(monkeypatch)
 
     await s.delete_project("Работа", "p1")            # фаза плана
+    _, m = _only_manifest()
     _count_approval_calls(monkeypatch, verdict="approved")
 
     out = await s.delete_project("Работа", "p1", user_reply="да")
 
-    assert fake.deleted_ids == ["p1"]
-    assert "удалён вместе с" in out
+    assert fake.deleted_ids == []
+    assert "САМ" in out
+    assert m["consumed"] is False                     # план ждёт поллера
 
 
 async def test_delete_project_rejected_button_kills_the_plan(monkeypatch, tmp_path):
@@ -593,19 +605,25 @@ async def test_rename_tag_merge_without_a_plan_falls_back_to_planning(monkeypatc
     assert "Telegram" in out
 
 
-async def test_rename_tag_merge_proceeds_after_button_approved(monkeypatch):
-    """Ловушка «отказывает всегда» закрыта и здесь."""
+async def test_rename_tag_merge_after_button_approved_is_left_to_the_poller(
+        monkeypatch):
+    """ПЕРЕПИСАН 2026-08-06 (button-only), как и delete_project выше: слияние
+    тегов теперь исполняет поллер по нажатию, текстовый вызов отвергается.
+    Доведение кнопки до реального слияния — в
+    tests/test_button_only_execution.py."""
     fake = _wire_tags(monkeypatch, ["a", "b"])
     _tg_on(monkeypatch)
     _capture_notify(monkeypatch)
 
     await s.rename_tag("a", "b", allow_merge=True)     # фаза плана
+    _, m = _only_manifest()
     _count_approval_calls(monkeypatch, verdict="approved")
 
     out = await s.rename_tag("a", "b", allow_merge=True, user_reply="да, сливай")
 
-    assert "renamed" in out
-    assert fake._names == ["b"]
+    assert fake._names == ["a", "b"]                   # НЕ слито текстом
+    assert "САМ" in out
+    assert m["consumed"] is False
 
 
 async def test_rename_tag_merge_rejected_button_kills_the_plan(monkeypatch):
