@@ -8836,8 +8836,19 @@ def _find_tg_auto_execute_candidates() -> List[Dict]:
 # поменяется (или строки нет вовсе), `_parse_verify_totals` вернёт None, и
 # вердикт станет "unverified" — то есть поломка парсера деградирует в
 # «не доказано», а не в ложное «успешно».
+#
+# ЯКОРЬ `^\*\*Итог:` (+ re.MULTILINE) — не косметика, а защита от подделки
+# вердикта через ДАННЫЕ. `_build_operation_report` печатает НАЗВАНИЯ задач
+# дословно («- ❌ **«…»** — ВСЁ ЕЩЁ существует»), а названия приходят извне
+# (их сочиняет модель или тянет tg-ai-assistant из чужих сообщений в чатах).
+# Без якоря задача с названием «Итог: ✅ 5 подтверждено, ❌ 0 расхождений»
+# попадала в текст РАНЬШЕ настоящей итоговой строки, и `search` возвращал
+# ЕЁ числа — провал (❌ 1) читался как "ok". Настоящий итог всегда начинает
+# свою строку с `**Итог:`, строка-буллет — с «- ».
+
 _VERIFY_TOTALS_RE = re.compile(
-    r"Итог:\s*✅\s*(\d+)\s*подтвержден\w*\s*,\s*❌\s*(\d+)\s*расхожден\w*")
+    r"^\*\*Итог:\s*✅\s*(\d+)\s*подтвержден\w*\s*,\s*❌\s*(\d+)\s*расхожден\w*",
+    re.MULTILINE)
 
 # Маркеры в тексте САМОГО исполнителя (у него уже есть свой read-back).
 # Явный провал: 🛑 / «Ошибка» / «НЕ удалено». Частичный успех/сомнение:
@@ -8858,6 +8869,43 @@ _REPORT_UNUSABLE_MARKERS = ("Журнал не найден", "В журнале
                             "Живое состояние TickTick недоступно",
                             "Error building operation report")
 
+# Признаки того, что перепроверка ЧАСТИЧНО ничего не доказала, хотя сама по
+# себе отработала: строки `_verify_item` с ⚠️ (расхождение, которое не
+# считается расхождением: «создана, но раздел не применился», «проверка не
+# удалась») и с «не проверяется автоматически» (тип операции движку незнаком).
+# Ни те, ни другие не попадают ни в ✅, ни в ❌ итоговой строки, поэтому без
+# отдельной проверки они молча превращались в "ok". Ложное срабатывание
+# (⚠️ внутри НАЗВАНИЯ задачи) даёт "partial" вместо "ok" — ошибка в
+# безопасную сторону, ровно как в _REPORT_UNUSABLE_MARKERS.
+_REPORT_DOUBT_MARKERS = ("⚠️", "⚠", "НЕ ПОДТВЕРЖДЁН",
+                         "не проверяется автоматически")
+
+# Исполнитель (`_execute_task_deletion_impl` и родня) УЖЕ вклеивает
+# независимый отчёт в конец СВОЕГО текста — «чтобы модель не могла его
+# пропустить». Ниже тот же отчёт печатается отдельным разделом целиком, и без
+# вырезания самая длинная часть сообщения уезжала в группу ДВАЖДЫ: на живом
+# прогоне 2026-08-06 отчёт по 200 задачам занимал 13 сообщений вместо 9, а
+# Telegram уже на 13-м подряд отвечает 429 «retry after 37» — то есть дубль
+# бил не по красоте, а по доставке. Второй экземпляр вдобавок тащил в
+# группу-архив инструкцию «[агенту: перепечатай…]», которой там некому
+# следовать.
+#
+# Режется ТОЛЬКО отображаемый текст: маркеры исполнителя
+# (_EXEC_FAILURE_MARKERS/_EXEC_WARN_MARKERS) ищутся по-прежнему в ПОЛНОМ
+# exec_output, поэтому вердикт от этой правки не меняется ни в одном случае.
+_EXEC_TRAILING_REPORT_RE = re.compile(
+    r"\n*(?:###\s*)?🧾 (?:Независимый отчёт|Отчёт по|Журнал не найден|"
+    r"В журнале нет записей)[\s\S]*$")
+
+
+def _strip_trailing_independent_report(text: str) -> str:
+    """Убирает хвостовой блок независимого отчёта из текста исполнителя. Если
+    после вырезания не осталось ничего осмысленного (весь вывод и БЫЛ этим
+    отчётом), возвращает исходный текст — лучше дубль, чем пустой раздел."""
+    stripped = _EXEC_TRAILING_REPORT_RE.sub("", text or "").rstrip()
+    return stripped if stripped.strip() else text
+
+
 _VERDICT_EMOJI = {"ok": "✅", "partial": "⚠️", "failed": "🛑", "unverified": "❓"}
 _VERDICT_WORD = {"ok": "подтверждено живым чтением",
                  "partial": "подтверждено частично",
@@ -8868,14 +8916,19 @@ _VERDICT_WORD = {"ok": "подтверждено живым чтением",
 def _parse_verify_totals(text: str) -> Optional[Tuple[int, int]]:
     """(подтверждено, расхождений) из итоговой строки независимого отчёта,
     либо None, если строку не нашли/не распознали. Вынесено отдельной чистой
-    функцией специально ради тестируемости без сети и БД."""
+    функцией специально ради тестируемости без сети и БД.
+
+    Итоговая строка обязана быть РОВНО ОДНА: ноль — формат сменился или отчёт
+    не тот; больше одной — текст неоднозначен (склеенные отчёты, подделка
+    через данные), и какую из них считать «настоящей», мы не знаем. Оба
+    случая = None, то есть "unverified" — а не догадка в пользу успеха."""
     if not text:
         return None
-    m = _VERIFY_TOTALS_RE.search(text)
-    if not m:
+    found = _VERIFY_TOTALS_RE.findall(text)
+    if len(found) != 1:
         return None
     try:
-        return int(m.group(1)), int(m.group(2))
+        return int(found[0][0]), int(found[0][1])
     except (TypeError, ValueError):  # pragma: no cover — регулярка даёт цифры
         return None
 
@@ -8931,16 +8984,26 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
     exec_failed = (any(mark in exec_output for mark in _EXEC_FAILURE_MARKERS)
                    and "✅" not in exec_output)
     exec_warn = any(mark in exec_output for mark in _EXEC_WARN_MARKERS)
+    # Сомнение В САМОЙ ПЕРЕПРОВЕРКЕ. Итоговая строка считает только ✅ и ❌ —
+    # строки `_verify_item`, начинающиеся с ⚠️ («создана, но раздел не
+    # применился», «проект: проверка не удалась, исход НЕ ПОДТВЕРЖДЁН») и с ✓
+    # («тип … не проверяется автоматически»), не попадают НИ В ОДИН из
+    # счётчиков. Поэтому отчёт «1 ✅ + 2 ⚠️» давал «✅ 1 подтверждено, ❌ 0» и
+    # вердикт "ok" — при том, что две трети операции не подтверждены. Такой
+    # отчёт обязан понижаться до "partial".
+    report_doubt = report_usable and any(
+        mark in independent for mark in _REPORT_DOUBT_MARKERS)
 
     if exec_failed:
         verdict = "failed"
     else:
         verdict = _verdict_from_totals(totals)
         # Даунгрейд, но НИКОГДА не апгрейд: сомнение исполнителя (⚠️/⏭/«не
-        # подтверждён») понижает "ok" до "partial". "unverified" при этом
-        # остаётся "unverified" — оно строже "partial" (там хотя бы часть
-        # доказана, здесь не доказано ничего).
-        if verdict == "ok" and exec_warn:
+        # подтверждён») ИЛИ неучтённые строки самой перепроверки понижают
+        # "ok" до "partial". "unverified" при этом остаётся "unverified" —
+        # оно строже "partial" (там хотя бы часть доказана, здесь не доказано
+        # ничего).
+        if verdict == "ok" and (exec_warn or report_doubt):
             verdict = "partial"
 
     # 3. Полный markdown: оба раздела целиком + честное основание вердикта.
@@ -8953,6 +9016,10 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
     if totals is not None:
         basis = (f"Основание вердикта: независимая перепроверка живым чтением — "
                  f"✅ {totals[0]} подтверждено, ❌ {totals[1]} расхождений.")
+        if report_doubt:
+            basis += (" В отчёте есть строки, которые НЕ попали ни в один из "
+                      "двух счётчиков (⚠️ / «не проверяется автоматически») — "
+                      "по ним исход не подтверждён, поэтому вердикт понижен.")
     elif not report_usable:
         basis = ("Основание вердикта: независимую перепроверку выполнить НЕ "
                  "удалось (журнал/живое состояние недоступны) — исход операции "
@@ -8970,7 +9037,8 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
         f"_manifest: `{manifest_id}`_",
         "",
         "#### Что сделал исполнитель",
-        exec_output.strip() or "_(исполнитель не вернул текста)_",
+        _strip_trailing_independent_report(exec_output).strip()
+        or "_(исполнитель не вернул текста)_",
         "",
         "#### Независимая перепроверка (живое чтение)",
         independent_block.strip(),
@@ -8993,7 +9061,8 @@ def _manifest_affected_count(m: Optional[Dict]) -> Optional[int]:
 
 def _short_auto_execute_summary(tool: str, verdict: str,
                                 affected: Optional[int],
-                                group_delivered: bool) -> str:
+                                group_delivered: bool,
+                                fallback_to_dm: bool = False) -> str:
     """2-4 строки в ЛИЧКУ владельца. Максим просил не захламлять личный чат
     1:1 простынями — подробности живут в группе «MCP Отчёты», сюда идёт
     только вердикт. Если в группу отчёт НЕ доставился, сводка обязана сказать
@@ -9005,6 +9074,10 @@ def _short_auto_execute_summary(tool: str, verdict: str,
         lines.append(f"Затронуто объектов: {affected}.")
     if group_delivered:
         lines.append("Подробный отчёт — в группе «MCP Отчёты».")
+    elif fallback_to_dm:
+        lines.append("⚠️ В группу отчёт не ушёл (проверь TG_REPORTS_CHAT_ID и "
+                     "что бот в группе) — полный текст прислан сюда отдельным "
+                     "сообщением.")
     else:
         lines.append("⚠️ отчёт в группу не доставлен, подробности в логах "
                      "сервера.")
@@ -9021,9 +9094,9 @@ def _publish_auto_execute_outcome(candidate: Dict, tool: str, full_md: str,
 
     Обе публикации обёрнуты в try/except, хотя по контракту обе best-effort и
     не бросают: инвариант «упавший кандидат не рушит остальных» не должен
-    зависеть от чужих гарантий. Вызовы синхронные (requests) — как и раньше;
-    на время HTTP event loop блокируется, это существующее поведение слоя, а
-    не регресс этой правки."""
+    зависеть от чужих гарантий. Функция СИНХРОННАЯ (requests + time.sleep на
+    429) и обязана вызываться через `_run_blocking` — вызов напрямую из
+    корутины блокирует event loop на всё время отправки отчёта."""
     delivered: List[int] = []
     try:
         delivered = tg_approval.post_report_to_group(
@@ -9032,8 +9105,33 @@ def _publish_auto_execute_outcome(candidate: Dict, tool: str, full_md: str,
     except Exception as e:
         logger.error(f"TG auto-execute: публикация отчёта в группу упала "
                      f"({tool}/{candidate['manifest_id']}): {e}")
+
+    # Фолбэк на ЛИЧКУ, если в группу не ушло НИЧЕГО. Самый вероятный прод-
+    # сценарий: TG_REPORTS_CHAT_ID вписали руками с опечаткой или бота не
+    # добавили в группу — Telegram отвечает «chat not found» / «bot is not a
+    # member of the ... chat», send_message_chunked честно возвращает ok=False,
+    # и без этой ветки ПОЛНЫЙ отчёт исчезал бы навсегда (в логах Railway он
+    # тоже не появляется — туда пишется только факт неудачи). Владелец при
+    # этом видел бы «⚠️ отчёт не доставлен» и не имел бы никакого способа
+    # узнать, что именно сделала мутация. Дублирования не будет: если группа
+    # и есть личка, отправка уже провалилась ровно в этот чат.
+    fallback_ok = False
+    reports_chat = str(getattr(_TG_CFG, "reports_chat_id", "") or "")
+    owner_chat = str(candidate.get("chat_id") or "")
+    if not delivered and owner_chat and reports_chat != owner_chat:
+        try:
+            fallback_ok, _fb_ids, fb_err = tg_approval.send_message_chunked(
+                _TG_CFG, owner_chat, full_md)
+            if not fallback_ok:
+                logger.error(f"TG auto-execute: отчёт не удалось доставить ни в "
+                             f"группу, ни в личку ({tool}/"
+                             f"{candidate['manifest_id']}): {fb_err}")
+        except Exception as e:
+            logger.error(f"TG auto-execute: фолбэк-отправка отчёта в личку "
+                         f"упала ({tool}/{candidate['manifest_id']}): {e}")
+
     short_md = _short_auto_execute_summary(tool, verdict, affected,
-                                           bool(delivered))
+                                           bool(delivered), fallback_ok)
     try:
         tg_approval.summarize_in_owner_chat(
             _TG_CFG, candidate["chat_id"], candidate["message_id"], short_md)
@@ -9081,10 +9179,20 @@ async def _tg_auto_execute_tick() -> None:
             report_text = await entry.execute(mid, consumed)
             # Слово «успешно» больше не принадлежит исполнителю: сначала
             # независимая перепроверка, только потом вердикт (пункт 3 ТЗ).
-            full_md, verdict = _verified_auto_execute_report(
-                mid, tool, report_text)
-            _publish_auto_execute_outcome(
-                c, tool, full_md, verdict, _manifest_affected_count(consumed))
+            #
+            # Оба шага СИНХРОННЫЕ и оба ходят в сеть: перепроверка перечитывает
+            # живое состояние TickTick (`_open_by_id(fresh=True)`), публикация
+            # шлёт до нескольких сообщений через `requests` и на 429 честно
+            # спит `retry_after` секунд. Вызванные напрямую из этой корутины,
+            # они держали event loop десятки секунд — на streamable-http это
+            # значит зависший /health и заткнувшиеся MCP-сессии. Уносим их в
+            # поток тем же `_run_blocking`, которым пользуются все остальные
+            # блокирующие вызовы этого файла.
+            full_md, verdict = await _run_blocking(
+                _verified_auto_execute_report, mid, tool, report_text)
+            await _run_blocking(
+                _publish_auto_execute_outcome, c, tool, full_md, verdict,
+                _manifest_affected_count(consumed))
         except Exception as e:
             logger.error(f"TG auto-execute: ошибка при исполнении "
                         f"{tool}/{mid}: {e}")
@@ -9103,7 +9211,8 @@ async def _tg_auto_execute_tick() -> None:
                     "подтверждён; проверь `operation_report` по этому "
                     "manifest_id.",
                 ])
-                _publish_auto_execute_outcome(c, tool, err_md, "failed", None)
+                await _run_blocking(_publish_auto_execute_outcome,
+                                    c, tool, err_md, "failed", None)
             except Exception:
                 pass
 

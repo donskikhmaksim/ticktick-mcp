@@ -305,6 +305,30 @@ def _finalize_chunk(lines: list[str], limit: int) -> tuple[str, list[str], list[
     return text, [], _open_markers(text)
 
 
+def _emergency_cut(line: str, limit: int) -> tuple[str, str]:
+    """Аварийный рубеж — когда обычная дорезка НЕ СХОДИТСЯ.
+
+    Режем строку по символам БЕЗ дозакрытия и переоткрытия разметки:
+    возвращаем максимальный префикс, чей HTML укладывается в лимит, и остаток.
+    Разметка в таком куске может остаться незакрытой — это осознанный размен,
+    и он безопасен: `send_message_chunked` при ответе Telegram «can't parse
+    entities» повторяет кусок plain-текстом, так что сообщение всё равно
+    доходит. Терять данные или зависать — хуже, чем потерять жирный шрифт.
+
+    Минимум один символ: иначе вызывающий цикл не сдвинется."""
+    lo, hi, best = 1, len(line), 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if _html_len(line[:mid]) <= limit:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    while best > 1 and _html_len(line[:best]) > limit:
+        best -= 1
+    return line[:best], line[best:]
+
+
 def split_for_telegram(md_text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
     """Режет markdown так, чтобы КАЖДЫЙ кусок ПОСЛЕ md_to_telegram_html()
     укладывался в `limit` символов. Инвариант, который держит весь модуль:
@@ -333,7 +357,20 @@ def split_for_telegram(md_text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[s
         (есть продолжение или кусок начат с переоткрытой пары) — изначально
         кривой markdown («**» без пары в исходнике) правкой не «чиним», чтобы
         не менять смысл текста автора."""
-        text, leftover, opened = _finalize_chunk(lines, limit)
+        whole = "\n".join(lines)
+        if not more_ahead and _html_len(whole + _closing_for(whole)) <= limit:
+            # Резать НЕЧЕГО: продолжения нет и весь остаток влезает целиком.
+            # _finalize_chunk в этом случае всё равно пытался «сбалансировать»
+            # кусок, отдавая хвостовые строки следующему, — и на кривом
+            # исходнике (одиночный `**`/`` ` `` в НЕ-первой строке: «Купить
+            # 2**2 доски», «не забыть про ` в скрипте») это дробило короткий
+            # отчёт на два сообщения с маркерами «(часть 1/2)» на пустом
+            # месте. Живой прогон 2026-08-06: текст в 47 символов уезжал
+            # двумя сообщениями. Отдавать хвост имеет смысл только когда
+            # кусок реально переполнен.
+            text, leftover, opened = whole, [], _open_markers(whole)
+        else:
+            text, leftover, opened = _finalize_chunk(lines, limit)
         if opened and (more_ahead or leftover or reopened):
             text += "".join(reversed(opened))
             nxt = list(opened)
@@ -361,11 +398,39 @@ def split_for_telegram(md_text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[s
         if not cur:
             # Строка не влезла в ПУСТОЙ кусок (обычно из-за переоткрытой
             # разметки, добавленной к уже нарезанному фрагменту) — дорезаем.
+            #
+            # ЗАЩИТА ОТ ВЕЧНОГО ЦИКЛА (найдено фаззингом 2026-08-06). На
+            # несбалансированной разметке `_split_long_line` может вернуть
+            # фрагменты НЕ КОРОЧЕ входа: сколько отрезали — столько же
+            # добавило дозакрытие в конце куска и переоткрытие в начале
+            # следующего (вход 8 символов → части [6, 8, 8]). Такая строка
+            # возвращалась в очередь снова и снова, и `split_for_telegram`
+            # крутилась ВЕЧНО, съедая память под `units`. Воспроизводится на
+            # БОЕВОМ лимите 4096: строка из ~1000 повторов «`**» — стек
+            # открытых маркеров растёт линейно, потому что `` ` `` внутри
+            # `**` не образует пары. Прод-цена была тяжёлой: этот же код
+            # зовёт `notify_plan` (тул никогда не вернётся) и поллер
+            # автоисполнения, а до выноса в поток — вешал весь event loop.
+            # Текст такой формы реален: отчёт печатает НАЗВАНИЯ задач
+            # дословно, а они приходят извне.
+            #
+            # Инвариант, который гарантирует завершение: в очередь уходят
+            # только фрагменты СТРОГО КОРОЧЕ исходной строки. Иначе — грубая
+            # посимвольная резка (`_emergency_cut`), которая тоже всегда
+            # укорачивает остаток минимум на один символ.
             parts = _split_long_line(line, limit)
-            if len(parts) <= 1:
-                cur.append(line)  # дорезать нечего — принимаем как есть
+            if len(parts) > 1 and max(len(p) for p in parts) < len(line):
+                units.extendleft(reversed(parts))
                 continue
-            units.extendleft(reversed(parts))
+            head, tail = _emergency_cut(line, limit)
+            logger.warning(
+                f"TG: строку длиной {len(line)} не удалось разбить по словам "
+                f"(несбалансированная разметка) — режу аварийно по символам, "
+                f"разметка в куске может остаться открытой")
+            if head.strip():
+                chunks.append(head)
+            if tail:
+                units.appendleft(tail)
             continue
         carry, leftover = _emit(cur, more_ahead=True)
         cur, reopened = [], bool(carry)

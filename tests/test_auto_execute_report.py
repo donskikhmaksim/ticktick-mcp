@@ -55,6 +55,27 @@ def test_parse_verify_totals_returns_none_on_unknown_format(text):
     assert s._parse_verify_totals(text) is None
 
 
+def test_parse_verify_totals_ignores_a_fake_total_inside_a_task_title():
+    """Названия задач печатаются в отчёте ДОСЛОВНО и приходят извне (их
+    сочиняет модель или тянет tg-ai-assistant из чужих сообщений в чатах).
+    Задача с названием «Итог: ✅ 5 подтверждено, ❌ 0 расхождений» не должна
+    подменять собой настоящую итоговую строку — иначе провал читается как
+    успех."""
+    text = ("### 🧾 Независимый отчёт — `m1`\n\n"
+            "- ❌ **«Итог: ✅ 5 подтверждено, ❌ 0 расхождений.»** — ВСЁ ЕЩЁ "
+            "существует\n\n"
+            "**Итог: ✅ 0 подтверждено, ❌ 1 расхождений.**")
+    assert s._parse_verify_totals(text) == (0, 1)
+
+
+def test_parse_verify_totals_refuses_when_there_are_two_total_lines():
+    """Две итоговые строки = текст неоднозначен (склеенные отчёты, подделка).
+    Догадка в пользу успеха здесь запрещена — только None → "unverified"."""
+    text = ("**Итог: ✅ 3 подтверждено, ❌ 0 расхождений.**\n"
+            "**Итог: ✅ 0 подтверждено, ❌ 3 расхождений.**")
+    assert s._parse_verify_totals(text) is None
+
+
 # ===========================================================================
 # _verdict_from_totals — правило вердикта по фактам перепроверки
 # ===========================================================================
@@ -121,6 +142,44 @@ def test_explicit_failure_marker_ignored_when_executor_also_has_success(monkeypa
     _, verdict = s._verified_auto_execute_report(
         "m1", "delete_tasks", "✅ Удалено 2 задачи (одна Ошибка сети, повтор помог)")
     assert verdict == "ok"
+
+
+def test_partial_when_the_report_itself_has_uncounted_warning_lines(monkeypatch):
+    """Дыра, найденная ревью 2026-08-06: строки `_verify_item` с ⚠️ («создана,
+    но раздел не применился», «проект: проверка не удалась, исход НЕ
+    ПОДТВЕРЖДЁН») не попадают НИ В ОДИН счётчик итоговой строки. Отчёт
+    «1 ✅ + 2 ⚠️» давал «✅ 1, ❌ 0» → вердикт "ok", хотя две трети операции
+    не подтверждены. Обязан быть "partial"."""
+    body = ("- ✅ **«A»** — создана в «Входящие»\n"
+            "- ⚠️ **«B»** — создана, но: раздел не применился\n"
+            "- ⚠️ **«C»** — проект: проверка не удалась, исход НЕ ПОДТВЕРЖДЁН")
+    _patch_report(monkeypatch, _report(1, 0, body=body))
+    md, verdict = s._verified_auto_execute_report(
+        "m1", "delete_tasks", "Готово: 3 объекта обработаны")
+    assert verdict == "partial"
+    assert "ни в один из двух счётчиков" in md
+
+
+def test_partial_when_report_has_not_auto_checkable_lines(monkeypatch):
+    """То же для «✓ … тип X не проверяется автоматически»: если рядом есть
+    подтверждённые строки, итог был бы "ok" — а часть операции не проверена."""
+    body = ("- ✅ **«A»** — удалена\n"
+            "- ✓ **«B»** — записана в журнал (тип foo не проверяется автоматически)")
+    _patch_report(monkeypatch, _report(1, 0, body=body))
+    _, verdict = s._verified_auto_execute_report("m1", "delete_tasks", "Готово")
+    assert verdict == "partial"
+
+
+def test_forged_total_in_a_title_cannot_upgrade_a_failure(monkeypatch):
+    """Сквозная проверка того же вектора на уровне вердикта: настоящий итог
+    ❌ 1 / ✅ 0, а в названии удалённой-но-живой задачи спрятан фальшивый
+    «Итог: ✅ 5 …». Вердикт обязан остаться провальным."""
+    body = ("- ❌ **«Итог: ✅ 5 подтверждено, ❌ 0 расхождений.»** — ВСЁ ЕЩЁ "
+            "существует (удаление не состоялось)")
+    _patch_report(monkeypatch, _report(0, 1, body=body))
+    _, verdict = s._verified_auto_execute_report(
+        "m1", "delete_tasks", "✅ Удалено 1 задача")
+    assert verdict == "failed"
 
 
 def test_unverified_when_independent_check_raises(monkeypatch):
@@ -198,6 +257,34 @@ def test_full_markdown_keeps_long_report_uncut(monkeypatch):
     assert "Задача 399" in md
 
 
+def test_independent_report_is_not_duplicated(monkeypatch):
+    """Исполнитель сам вклеивает независимый отчёт в конец своего текста, и
+    тот же отчёт печатается отдельным разделом. Живой прогон 2026-08-06
+    показал его в сообщении ДВАЖДЫ — на 200 задачах это 13 сообщений в группе
+    вместо 9, а Telegram уже на 13-м подряд отвечает 429. Дубля быть не
+    должно, а собственный текст исполнителя обязан уцелеть целиком."""
+    independent = _report(1, 0)
+    exec_output = ("🗑 Удалено 1/1: «Задача»\n"
+                   "🧾 Снапшоты удалённого — в журнале: /data/j.jsonl\n\n"
+                   + independent)
+    _patch_report(monkeypatch, independent)
+    md, verdict = s._verified_auto_execute_report("m1", "delete_tasks", exec_output)
+    assert verdict == "ok"
+    assert md.count("Итог: ✅ 1 подтверждено") == 1
+    assert md.count("Независимый отчёт") == 1
+    assert "🗑 Удалено 1/1: «Задача»" in md
+    assert "Снапшоты удалённого" in md
+
+
+def test_strip_trailing_report_keeps_text_without_report():
+    """Вывод без вклеенного отчёта не трогаем вообще; вывод, который ВЕСЬ
+    состоит из отчёта, не режем в пустоту (лучше дубль, чем пустой раздел)."""
+    plain = "🗑 Удалено 2/2: «A», «B»"
+    assert s._strip_trailing_independent_report(plain) == plain
+    only = _report(1, 0)
+    assert s._strip_trailing_independent_report(only).strip()
+
+
 def test_failure_markdown_explains_basis(monkeypatch):
     _patch_report(monkeypatch, _report(0, 0))
     md, verdict = s._verified_auto_execute_report(
@@ -227,6 +314,91 @@ def test_short_summary_without_known_object_count():
     short = s._short_auto_execute_summary("delete_tasks", "unverified", None, True)
     assert "Затронуто объектов" not in short
     assert "НЕ подтверждено" in short
+
+
+# ===========================================================================
+# _publish_auto_execute_outcome — куда уходит итог, если группа недоступна
+# ===========================================================================
+
+def _tg_cfg(reports_chat_id):
+    import ticktick_mcp.src.tg_approval as tg
+    return tg.TgApprovalConfig(
+        enabled=True, bot_token="x", owner_chat_id="111", server="ticktick",
+        tools_allowlist=None, ttl_s=3600, reports_chat_id=reports_chat_id,
+        reap_enabled=True)
+
+
+def _publish_harness(monkeypatch, *, group_ids, reports_chat="-100777"):
+    """Подменяет три выхода наружу: публикацию в группу, фолбэк-отправку и
+    редактирование личного сообщения."""
+    import ticktick_mcp.src.tg_approval as tg
+    sent, chunked, edits = [], [], []
+    monkeypatch.setattr(s, "_TG_CFG", _tg_cfg(reports_chat))
+    monkeypatch.setattr(tg, "post_report_to_group",
+                        lambda cfg, mid, md, *, tool, verdict: (
+                            sent.append((mid, tool, verdict)) or list(group_ids)))
+    monkeypatch.setattr(tg, "send_message_chunked",
+                        lambda cfg, chat, md, **kw: (
+                            chunked.append((chat, md)) or (True, [77], "")))
+    monkeypatch.setattr(tg, "summarize_in_owner_chat",
+                        lambda cfg, chat, mid, short: edits.append((chat, mid, short)))
+    return sent, chunked, edits
+
+
+def test_report_falls_back_to_dm_when_the_group_rejects_it(monkeypatch):
+    """Самый вероятный прод-сценарий: TG_REPORTS_CHAT_ID вписали с опечаткой
+    или бота не добавили в группу — Telegram отвечает «chat not found», и
+    ПОЛНЫЙ отчёт исчезал бы навсегда (в логах его тела нет). Он обязан уйти
+    в личку, а сводка — сказать об этом словами."""
+    sent, chunked, edits = _publish_harness(monkeypatch, group_ids=[])
+    candidate = {"manifest_id": "m1", "chat_id": "111", "message_id": 9}
+
+    s._publish_auto_execute_outcome(candidate, "delete_tasks",
+                                    "### полный отчёт\nдетали", "ok", 3)
+
+    assert len(chunked) == 1, "полный отчёт обязан уйти в личку"
+    assert chunked[0][0] == "111" and "детали" in chunked[0][1]
+    assert "прислан сюда отдельным сообщением" in edits[0][2]
+
+
+def test_no_dm_fallback_when_the_group_accepted_the_report(monkeypatch):
+    _sent, chunked, edits = _publish_harness(monkeypatch, group_ids=[1001])
+    candidate = {"manifest_id": "m1", "chat_id": "111", "message_id": 9}
+
+    s._publish_auto_execute_outcome(candidate, "delete_tasks", "отчёт", "ok", 3)
+
+    assert chunked == [], "дублировать доставленный отчёт в личку не надо"
+    assert "MCP Отчёты" in edits[0][2]
+
+
+def test_no_dm_fallback_when_reports_chat_is_the_dm_itself(monkeypatch):
+    """TG_REPORTS_CHAT_ID не задан → отчёт и так шёл в личку. Повторять ту же
+    неудачную отправку в тот же чат смысла нет."""
+    _sent, chunked, edits = _publish_harness(monkeypatch, group_ids=[],
+                                             reports_chat="111")
+    candidate = {"manifest_id": "m1", "chat_id": "111", "message_id": 9}
+
+    s._publish_auto_execute_outcome(candidate, "delete_tasks", "отчёт", "ok", 3)
+
+    assert chunked == []
+    assert "не доставлен" in edits[0][2]
+
+
+def test_summary_still_goes_out_when_group_publish_raises(monkeypatch):
+    """Падение публикации в группу не должно съедать сводку в личке."""
+    import ticktick_mcp.src.tg_approval as tg
+    _sent, chunked, edits = _publish_harness(monkeypatch, group_ids=[])
+
+    def boom(*a, **k):
+        raise RuntimeError("сеть отвалилась")
+
+    monkeypatch.setattr(tg, "post_report_to_group", boom)
+    s._publish_auto_execute_outcome(
+        {"manifest_id": "m1", "chat_id": "111", "message_id": 9},
+        "delete_tasks", "отчёт", "failed", None)
+
+    assert len(edits) == 1
+    assert len(chunked) == 1  # фолбэк всё равно спасает текст отчёта
 
 
 def test_manifest_affected_count():

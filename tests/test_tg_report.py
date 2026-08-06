@@ -123,6 +123,58 @@ def test_single_giant_line_is_split_by_chars_with_markup_reopened():
     assert "".join(c.replace("**", "") for c in chunks) == "z" * 400
 
 
+def test_unbalanced_markup_storm_terminates_at_the_real_telegram_limit():
+    """РЕГРЕССИЯ (найдено фаззингом 2026-08-06): строка из повторов «`**»
+    растит стек открытых маркеров линейно (`` ` `` внутри `**` не образует
+    пары), и дорезка переставала сходиться — сколько отрезали, столько же
+    возвращало переоткрытие разметки. `split_for_telegram` крутилась ВЕЧНО
+    на БОЕВОМ лимите 4096, съедая память. Прод-цена: `notify_plan` не
+    возвращается (тул висит), поллер автоисполнения встаёт навсегда.
+
+    Такой текст не экзотика: отчёт печатает названия задач дословно, а они
+    приходят извне. Тест обязан завершиться — и соблюсти оба инварианта."""
+    text = "`**" * 1000
+    chunks = tg.split_for_telegram(text, tg.TELEGRAM_TEXT_LIMIT)
+    assert chunks, "текст не должен исчезнуть"
+    for chunk in chunks:
+        assert _html_len(chunk) <= tg.TELEGRAM_TEXT_LIMIT
+    # ничего не потеряно (маркеры разметки при переоткрытии могут
+    # ДОБАВИТЬСЯ — это штатно, а вот исчезнуть текст не имеет права)
+    assert len("".join(chunks)) >= len(text)
+
+
+def test_unbalanced_markup_storm_inside_a_realistic_report_terminates():
+    """Тот же вход, но спрятанный в НАЗВАНИИ задачи внутри обычного отчёта —
+    ровно так он и попадёт в прод."""
+    report = ("### 🧾 Независимый отчёт\n"
+              + "\n".join(f"- ✅ **«Задача {i}»** — удалена" for i in range(50))
+              + "\n- ❌ **«" + "`**" * 2000 + "»** — ВСЁ ЕЩЁ существует\n"
+              + "**Итог: ✅ 50 подтверждено, ❌ 1 расхождений.**")
+    chunks = tg.split_for_telegram(report, tg.TELEGRAM_TEXT_LIMIT)
+    for chunk in chunks:
+        assert _html_len(chunk) <= tg.TELEGRAM_TEXT_LIMIT
+    assert "Итог: ✅ 50 подтверждено" in "".join(chunks)
+
+
+def test_emergency_cut_never_returns_an_oversized_or_empty_head():
+    head, tail = tg._emergency_cut("&" * 100, 20)   # каждый & = 5 символов HTML
+    assert 0 < len(head) <= 4
+    assert _html_len(head) <= 20
+    assert head + tail == "&" * 100
+
+
+def test_short_text_with_unpaired_markup_is_not_split_for_nothing():
+    """Найдено живым прогоном 2026-08-06: короткий текст с одиночной `**`
+    (или `` ` ``) НЕ в первой строке уезжал ДВУМЯ сообщениями с маркерами
+    «(часть 1/2)» — балансировка отдавала хвост следующему куску, хотя резать
+    было нечего. Такие названия приходят извне («Купить 2**2 доски»), так что
+    случай бытовой, а лишние сообщения бьют по флуд-лимиту Telegram."""
+    for text in ("строка один\nОтчёт: **начали жирный и не закрыли",
+                 "### ✅ Исполнено\n\n🗑 Удалено 1/1: «не забыть про ` в скрипте»",
+                 "шапка\nвторая\n- пункт с 2**2 внутри"):
+        assert tg.split_for_telegram(text) == [text], text
+
+
 def test_long_lines_are_split_on_line_boundaries_when_possible():
     text = "\n".join(f"строка номер {i} с небольшим текстом" for i in range(200))
     chunks = tg.split_for_telegram(text, 500)
