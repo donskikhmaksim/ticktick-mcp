@@ -30,6 +30,7 @@ from .ticktick_v2_client import (ATTACHMENT_MAX_BYTES, TickTickAuthError,
                                  TickTickV2Client, id2error_failures,
                                  new_attachment_id)
 from . import declutter_sheet
+from . import manifest_store
 from . import tg_approval
 
 # Set up logging
@@ -1974,6 +1975,9 @@ async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
     if err:
         return err
     _prune_manifests()
+    # План мог быть построен ДРУГИМ процессом (перезапуск между планом и
+    # исполнением). Если этот его не знает — поднимаем из базы (#91).
+    await _rehydrate_manifest(manifest_id)
     m = _MANIFESTS.get(manifest_id)
     if not m or m.get("kind") != "create":
         return _manifest_gone_msg(
@@ -1990,7 +1994,7 @@ async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
                           manifest_id=manifest_id)
     if not cr.ok:
         return cr.reason
-    m["consumed"] = True
+    _mark_manifest_consumed(m, manifest_id)
     result = await _create_tasks_impl(m.get("summary") or "Создание по манифесту",
                                       m["raw"])
     # Independent verification is NOT optional: append the server-built report
@@ -2579,6 +2583,9 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
     _prune_manifests()
 
     if manifest_id:
+    # План мог быть построен ДРУГИМ процессом (перезапуск между планом и
+    # исполнением). Если этот его не знает — поднимаем из базы (#91).
+        await _rehydrate_manifest(manifest_id)
         m = _MANIFESTS.get(manifest_id)
         if not m or m.get("kind") != "delete":
             return _manifest_gone_msg(
@@ -2689,6 +2696,164 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
 _MANIFESTS: Dict[str, Dict] = {}
 _MANIFEST_TTL = 3600.0  # seconds; a stale plan must be re-planned
 _JOURNAL_DIR = os.environ.get("TICKTICK_DATA_DIR", "/data")
+
+
+# ───────────────── Долговечность планов: RAM ⇄ Postgres (#91) ─────────────────
+#
+# `_MANIFESTS` остаётся кэшем ЭТОГО процесса, а источником истины для планов,
+# ушедших в Telegram с кнопками, становится таблица `mcp_manifests`. Ниже —
+# весь стык между двумя представлениями, в одном месте, чтобы правки формы
+# манифеста не расползались по файлу.
+#
+# ЧТО ЗДЕСЬ САМОЕ НЕОЧЕВИДНОЕ — ВРЕМЯ. Поля `created`/`plan_shown_at` хранят
+# `time.monotonic()`, то есть отсчёт от старта КОНКРЕТНОГО процесса. В базу их
+# класть бессмысленно, а после рестарта просто подставить «сейчас» — прямая
+# ошибка сразу в две стороны:
+#   • план часовой давности выглядел бы только что созданным, и проверка TTL
+#     перестала бы его отбраковывать (исполнили бы протухшее);
+#   • анти-дуплетный зазор (§4.3.4 DESIGN_approval_gate: между показом плана и
+#     подтверждением должно пройти минимальное время) наоборот решил бы, что
+#     план показан секунду назад, и ОТКАЗАЛ бы живому подтверждению.
+# Поэтому в базу едут абсолютные `_created_ms`/`_plan_shown_ms` (epoch), а при
+# восстановлении из них пересчитывается монотоника ТЕКУЩЕГО процесса.
+
+def _manifest_ttl_ms() -> int:
+    return int(_MANIFEST_TTL * 1000)
+
+
+def _durable_payload(m: Dict) -> Dict:
+    """Форма манифеста для базы: монотонные метки времени заменены на
+    абсолютные, всё остальное — как есть (в манифестах ticktick-mcp лежат
+    только литералы dict/list/str/int/bool, никаких вызываемых объектов)."""
+    now_ms = int(time.time() * 1000)
+    now_mono = time.monotonic()
+    out = {k: v for k, v in m.items() if k not in ("created", "plan_shown_at")}
+    created = m.get("created")
+    shown = m.get("plan_shown_at", created)
+    out["_created_ms"] = (now_ms if created is None
+                          else now_ms - int((now_mono - created) * 1000))
+    out["_plan_shown_ms"] = (out["_created_ms"] if shown is None
+                             else now_ms - int((now_mono - shown) * 1000))
+    return out
+
+
+def _manifest_from_payload(payload: Dict) -> Dict:
+    """Обратное преобразование: абсолютные метки → монотоника этого процесса.
+
+    `consumed` выставляется в False намеренно: строку нам отдали только если
+    в базе `consumed_at IS NULL`, то есть план ЖИВ, а флаг в payload — это
+    снимок RAM-состояния чужого процесса на момент записи."""
+    m = {k: v for k, v in payload.items()
+         if k not in ("_created_ms", "_plan_shown_ms")}
+    now_ms = int(time.time() * 1000)
+    now_mono = time.monotonic()
+    created_ms = payload.get("_created_ms", now_ms)
+    shown_ms = payload.get("_plan_shown_ms", created_ms)
+    m["created"] = now_mono - max(0.0, (now_ms - created_ms) / 1000.0)
+    m["plan_shown_at"] = now_mono - max(0.0, (now_ms - shown_ms) / 1000.0)
+    m["consumed"] = False
+    return m
+
+
+def _persist_manifest(manifest_id: str, tool: str, m: Dict) -> bool:
+    """СИНХРОННАЯ запись плана в базу — зовётся только через `_run_blocking`.
+
+    Возвращает False, если долговечным план не стал (базы нет, план слишком
+    велик, сбой записи). Это НЕ провал гейта: план продолжает жить в памяти
+    процесса ровно так же, как до появления этой таблицы."""
+    payload = _durable_payload(m)
+    return manifest_store.save(
+        manifest_id, tool, payload,
+        created_at_ms=payload["_created_ms"],
+        expires_at_ms=payload["_created_ms"] + _manifest_ttl_ms())
+
+
+def _restore_manifests_from_db(rows: Dict[str, Dict]) -> List[str]:
+    """Кладёт восстановленные из базы планы в `_MANIFESTS`.
+
+    ВЫЗЫВАТЬ ТОЛЬКО ИЗ EVENT LOOP'а. Это единственная точка, где ключи
+    появляются в `_MANIFESTS` не по ходу обработки запроса, и вставка из
+    рабочего потока столкнулась бы с итерацией по тому же словарю в
+    `_prune_manifests`/`_tg_auto_execute_pending` (RuntimeError: dictionary
+    changed size during iteration). Само чтение из базы остаётся в потоке.
+
+    Уже живущий в памяти план НЕ перетирается: RAM свежее (в ней могли
+    появиться пометки, которых нет в снимке)."""
+    restored: List[str] = []
+    for mid, row in (rows or {}).items():
+        if mid in _MANIFESTS:
+            continue
+        _MANIFESTS[mid] = _manifest_from_payload(row.get("payload") or {})
+        restored.append(mid)
+    return restored
+
+
+async def _rehydrate_manifest(manifest_id: str) -> None:
+    """Подтягивает план из базы, если ЭТОТ процесс его не знает.
+
+    Нужна на чат-пути: модель зовёт `execute_*`/второй вызов гейтованного тула
+    с `manifest_id`, а процесс между планом и исполнением успел
+    перезапуститься. Без этого ответом было бы «манифест не найден/истёк» на
+    совершенно живой план.
+
+    Дешёвая по построению: при попадании в память (обычный случай — тот же
+    процесс) не делает ничего вообще, ни одного обращения к базе."""
+    if not manifest_id or manifest_id in _MANIFESTS:
+        return
+    if not manifest_store.store_ready():
+        return
+    try:
+        rows = await _run_blocking(manifest_store.load_live, [manifest_id])
+    except Exception as e:  # noqa: BLE001 — база недоступна: ведём себя как раньше
+        logger.warning(f"Манифесты: не смог поднять план {manifest_id} из базы: {e}")
+        return
+    if _restore_manifests_from_db(rows):
+        logger.info(f"Манифесты: план {manifest_id} восстановлен из базы "
+                    "(процесс его не знал — перезапуск)")
+
+
+def _invalidate_manifest_in_db(manifest_id: str) -> None:
+    """Доносит до базы гашение, случившееся в памяти (отказ пользователя,
+    истёкший TTL, исполнение по чат-«да»).
+
+    БЕЗ ЭТОГО ПОЛУЧИЛАСЬ БЫ НОВАЯ ДЫРА, которой в памяти-режиме не было:
+    пользователь говорит «нет» в чате → в RAM план погашен → процесс
+    перезапускается → RAM пуста, а в базе план всё ещё жив → нажатие ✅ на
+    висящем в Telegram сообщении исполнит то, от чего человек уже отказался.
+
+    Синхронная и вызывается прямо из event loop'а — сознательно, по той же
+    логике, по которой в нём остаётся `tg_approval.check_approval`: это один
+    индексируемый `UPDATE` по первичному ключу (миллисекунды), а вынести его
+    в поток нельзя, не разорвав ту самую атомарность «проверил → погасил»,
+    на которой держится одноразовость на чат-пути. Никогда не бросает: не
+    доехавшее гашение хуже, чем ничего, но ронять из-за него ответ модели
+    нельзя."""
+    if not manifest_id or not manifest_store.store_ready():
+        return
+    try:
+        manifest_store.mark_consumed(manifest_id)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Манифесты: гашение {manifest_id} не доехало до базы: {e}")
+
+
+def _mark_manifest_consumed(m: Optional[Dict], manifest_id: str = "") -> None:
+    """ЕДИНСТВЕННАЯ формула «план израсходован» для всех путей, кроме
+    кнопочного (у того свой атомарный захват в базе).
+
+    Раньше это была одна строка `m["consumed"] = True`, повторённая в
+    одиннадцати местах. После #91 гашение обязано доехать ещё и до базы, и
+    размножать пару строк по всем одиннадцати — верный способ однажды забыть
+    в двенадцатом. Порядок внутри — сначала память, потом база: между ними нет
+    `await`, поэтому промежуточного состояния «в памяти жив, в базе погашен»
+    никто не наблюдает.
+
+    `manifest_id` можно не передавать, если план уходил в Telegram: свой id он
+    помнит сам (`_tg_manifest_id`, ставится в `_maybe_tg_notify_plan`), а
+    именно такие планы и лежат в базе."""
+    if m is None:
+        return
+    m["consumed"] = True
+    _invalidate_manifest_in_db(manifest_id or m.get("_tg_manifest_id") or "")
 
 
 def _plan_id_line(manifest_id: str, tail: str = "ничего ещё не изменено") -> str:
@@ -3266,9 +3431,41 @@ async def _maybe_tg_notify_plan(tool: str, manifest_id: str,
         m["tg_notified"] = True
         m["_tg_tool"] = tool
         m["_tg_manifest_id"] = manifest_id
+    # ПЛАН В БАЗУ — ПЕРВЫМ ШАГОМ, ДО отправки чего бы то ни было (#91).
+    # Порядок целиком: план (mcp_manifests) → строка подтверждения
+    # (tg_approvals, внутри notify_plan) → сообщение с кнопками → дописать в
+    # строку id сообщений. Он выстроен так, что нажатие кнопки НИКОГДА не
+    # приходит в пустоту: к моменту, когда кнопка вообще появилась в чате, уже
+    # существуют обе половины механизма — и «что делать», и «куда записать
+    # решение». Обратный порядок дал бы окно, в котором нажатие видит решение,
+    # но не находит плана.
+    #
+    # Пометки `tg_notified`/`_tg_tool` выставлены ВЫШЕ, до этой записи, и
+    # поэтому едут в базу вместе с планом. Это существенно: именно
+    # `tg_notified` закрывает для плана текстовый путь исполнения
+    # (`_tg_button_only`). Сохранись план без неё — после перезапуска та же
+    # операция проходила бы по одному лишь чат-«да», то есть требование
+    # кнопки молча ослабло бы.
+    if m is not None and manifest_store.store_ready() and not await _run_blocking(
+            _persist_manifest, manifest_id, tool, m):
+        # Не отказ: план просто не стал долговечным (слишком велик / сбой
+        # записи) — ровно то поведение, что было до #91. Отменять из-за этого
+        # уже построенный план человеку несоразмерно, но знать об этом надо:
+        # именно такие планы и теряются при выкатке.
+        #
+        # Условие `store_ready()` — не оптимизация, а тишина в логе: при
+        # ВЫКЛЮЧЕННОЙ долговечности (её нет вовсе) жаловаться не на что, иначе
+        # предупреждение сыпалось бы на каждый показанный план.
+        logger.warning(f"Манифесты: план {manifest_id} ({tool}) НЕ сохранён в "
+                       "базу — перезапуск процесса его потеряет")
     ok, err = await _run_blocking(tg_approval.notify_plan, _TG_CFG,
                                   manifest_id, preview_text, tool)
     if not ok:
+        # Отправка провалилась — план не должен пережить даже эту секунду:
+        # `notify_plan` уже убрал за собой строку подтверждения, убираем и
+        # план, иначе в базе осталась бы сирота, которую нечем подтвердить.
+        if manifest_store.store_ready():
+            await _run_blocking(manifest_store.delete, manifest_id)
         m = _MANIFESTS.get(manifest_id)
         if m is not None:
             # Сначала гасим (fail-closed), только потом снимаем
@@ -3421,7 +3618,7 @@ def _require_consent(
                 "plan_* заново."))
         created = manifest.get("created")
         if created is not None and time.monotonic() - created > _MANIFEST_TTL:
-            manifest["consumed"] = True
+            _mark_manifest_consumed(manifest, manifest_id)
             return ConsentResult(False, "🛑 Манифест истёк (>1ч с момента "
                                   "плана) — вызови plan_* заново.")
         stored_hash = manifest.get("object_hash")
@@ -3442,8 +3639,10 @@ def _require_consent(
     # набор, а не переспросить то же самое. Пустая строка (объяснять нечего) →
     # прежние общие формулировки, поведение не меняется.
     if _is_negative_reply(user_reply):
-        if manifest is not None:
-            manifest["consumed"] = True
+        # Отказ ОБЯЗАН доехать до базы (#91): иначе перезапуск процесса
+        # «воскресил» бы отменённый план, и висящая в Telegram кнопка ✅
+        # исполнила бы то, от чего человек уже отказался вслух.
+        _mark_manifest_consumed(manifest, manifest_id)
         detail = _consent_refusal_reason(user_reply)
         # Ведущая фраза «Пользователь НЕ подтвердил» сохранена дословно: на неё
         # опираются существующие тесты и, возможно, внешние интеграции, читающие
@@ -3484,8 +3683,7 @@ def _require_consent(
             # уже погашенным и операция не произойдёт вовсе.
             return ConsentResult(False, _TG_BUTTON_ONLY_APPROVED_MSG)
         if approval == "rejected":
-            if manifest is not None:
-                manifest["consumed"] = True
+            _mark_manifest_consumed(manifest, manifest_id)
             return ConsentResult(False, "🛑 Отклонено кнопкой в Telegram. План отменён, "
                                   "ничего не сделано. Чтобы повторить — построй план заново.")
         if approval == "none":
@@ -3536,8 +3734,7 @@ def _require_consent(
             return ConsentResult(False, "⏳ Подтвердите кнопкой в Telegram-боте, затем "
                                   "повторите. План ещё активен.")
         if approval == "rejected":
-            if manifest is not None:
-                manifest["consumed"] = True
+            _mark_manifest_consumed(manifest, manifest_id)
             return ConsentResult(False, "🛑 Отклонено кнопкой в Telegram. План отменён, "
                                   "ничего не сделано. Чтобы повторить — построй план заново.")
         if approval == "none":
@@ -3808,6 +4005,9 @@ async def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
     по-прежнему держится на однопоточности event loop'а."""
     _prune_manifests()
     if manifest_id:
+    # План мог быть построен ДРУГИМ процессом (перезапуск между планом и
+    # исполнением). Если этот его не знает — поднимаем из базы (#91).
+        await _rehydrate_manifest(manifest_id)
         m = _MANIFESTS.get(manifest_id)
         if not m or m.get("kind") != kind:
             return _GateOutcome(False, message=_manifest_gone_msg(manifest_id, (
@@ -3833,7 +4033,7 @@ async def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
                               manifest_id=manifest_id)
         if not cr.ok:
             return _GateOutcome(False, message=cr.reason)
-        m["consumed"] = True
+        _mark_manifest_consumed(m, manifest_id)
         return _GateOutcome(True, tasks=stored, summary=m.get("summary") or summary,
                             extra=m.get("extra") or {})
 
@@ -3903,6 +4103,9 @@ async def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
     call #1; ветка call #2 синхронна от проверки согласия до `consumed`."""
     _prune_manifests()
     if manifest_id:
+    # План мог быть построен ДРУГИМ процессом (перезапуск между планом и
+    # исполнением). Если этот его не знает — поднимаем из базы (#91).
+        await _rehydrate_manifest(manifest_id)
         m = _MANIFESTS.get(manifest_id)
         if not m or m.get("kind") != kind:
             return _GateOutcome(False, message=_manifest_gone_msg(manifest_id, (
@@ -3918,7 +4121,7 @@ async def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
                               manifest_id=manifest_id)
         if not cr.ok:
             return _GateOutcome(False, message=cr.reason)
-        m["consumed"] = True
+        _mark_manifest_consumed(m, manifest_id)
         return _GateOutcome(True, extra=m.get("params") or {})
 
     if not params:
@@ -4120,6 +4323,9 @@ async def execute_task_deletion(manifest_id: str, user_reply: str = "") -> str:
     if err:
         return err
     _prune_manifests()
+    # План мог быть построен ДРУГИМ процессом (перезапуск между планом и
+    # исполнением). Если этот его не знает — поднимаем из базы (#91).
+    await _rehydrate_manifest(manifest_id)
     m = _MANIFESTS.get(manifest_id)
     if not m or m.get("kind") != "delete":
         return _manifest_gone_msg(
@@ -4159,7 +4365,7 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
         if by_id is None:
             # Do NOT consume the manifest: nothing was verified or deleted.
             return _STATE_UNAVAILABLE_MSG
-        m["consumed"] = True
+        _mark_manifest_consumed(m, manifest_id)
         names = _v2_project_names()
         ready, drifted = [], []
         for it in m["items"]:
@@ -5760,6 +5966,9 @@ async def execute_declutter(manifest_id: str, user_reply: str = "") -> str:
     if err:
         return err
     _prune_manifests()
+    # План мог быть построен ДРУГИМ процессом (перезапуск между планом и
+    # исполнением). Если этот его не знает — поднимаем из базы (#91).
+    await _rehydrate_manifest(manifest_id)
     m = _MANIFESTS.get(manifest_id)
     if m and m.get("kind") == "declutter" and m.get("persist") == "sheet":
         cr = _require_consent(action="declutter", tier=2, manifest=m,
@@ -5807,7 +6016,7 @@ async def _execute_declutter_ram_impl(manifest_id: str, m: Dict) -> str:
     mutation path a manually-confirmed «да» would have run, once consent has
     already been granted by the caller (_require_consent, or the poller's
     try_auto_execute — see tg_approval.py)."""
-    m["consumed"] = True
+    _mark_manifest_consumed(m, manifest_id)
     try:
         actions = m["actions"]
         summary = m.get("summary") or "Разбор помойки"
@@ -6286,7 +6495,8 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
                                            "\n".join(lines))
 
     if m is not None:
-        m["consumed"] = True  # one-shot: план сгорел вместе с исполнением
+        # one-shot: план сгорел вместе с исполнением (и в памяти, и в базе)
+        _mark_manifest_consumed(m, mid)
 
     return await _delete_project_impl(project_id, live_name, tasks)
 
@@ -9825,7 +10035,7 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
                 msg += "\n" + _plan_id_line(new_mid, "ничего ещё не тронуто")
                 return await _maybe_tg_notify_plan("rename_tag", new_mid, msg)
             if m is not None:
-                m["consumed"] = True  # one-shot
+                _mark_manifest_consumed(m, mid)  # one-shot
         return await _rename_tag_impl(old_name, new_name,
                                       merged=bool(allow_merge and will_merge))
     except Exception as e:
@@ -12343,15 +12553,26 @@ def _tg_auto_execute_pending() -> List[tuple]:
     _prune_manifests()
     out: List[tuple] = []
     for mid, m in list(_MANIFESTS.items()):
-        if m.get("consumed"):
-            continue
-        tool = _auto_execute_tool_of(m)
-        if _resolve_auto_executor(tool, m) is None:
-            continue
-        if not tg_approval.enabled_for(_TG_CFG, tool):
-            continue
-        out.append((mid, tool))
+        tool = _auto_executable_tool(m)
+        if tool:
+            out.append((mid, tool))
     return out
+
+
+def _auto_executable_tool(m: Optional[Dict]) -> str:
+    """Имя тула, если этот живой план сервер УМЕЕТ исполнить по кнопке сам, и
+    пустая строка иначе. Один предикат на два места: обычный обход памяти
+    (`_tg_auto_execute_pending`) и планы, только что поднятые из базы после
+    перезапуска, — разойдись эти два отбора, восстановленный план молча не
+    попал бы в кандидаты."""
+    if not m or m.get("consumed"):
+        return ""
+    tool = _auto_execute_tool_of(m)
+    if _resolve_auto_executor(tool, m) is None:
+        return ""
+    if not tg_approval.enabled_for(_TG_CFG, tool):
+        return ""
+    return tool
 
 
 def _tg_auto_execute_approved(pending: List[tuple],
@@ -13259,6 +13480,47 @@ def _announce_lost_manifests(candidates: List[Dict]) -> int:
     return told
 
 
+async def _rehydrate_approved_candidates(pending: List[tuple],
+                                         rows: Dict[str, dict]) -> List[tuple]:
+    """Планы, подтверждённые кнопкой, о которых ЭТОТ процесс ничего не знает,
+    — поднять из базы и вернуть как обычных кандидатов [(manifest_id, tool)].
+
+    Это и есть лечение того, что механизм «подтверждено, но исполнять нечего»
+    (`_tg_lost_manifest_rows`) до сих пор мог только КОНСТАТИРОВАТЬ. Строки,
+    для которых план нашёлся, до разбора потерянных уже не доживут: они будут
+    исполнены здесь же, в этом проходе, а живой манифест в памяти сделает их
+    «известными» (`_tg_manifest_is_known`). «Потерянными» остаются только те,
+    чей план в базу так и не попал (долговечность выключена, план был слишком
+    велик, сбой записи) — то есть механизм честно сузился до реальных потерь.
+
+    Разделение труда прежнее: единственное обращение к базе — в потоке,
+    запись в `_MANIFESTS` — в event loop'е."""
+    if not manifest_store.store_ready():
+        return []
+    known = {mid for mid, _ in pending}
+    missing = [mid for mid, row in (rows or {}).items()
+               if mid not in known and mid not in _MANIFESTS
+               and tg_approval.approval_status_of(row) == "approved"]
+    if not missing:
+        return []
+    try:
+        found = await _run_blocking(manifest_store.load_live, missing)
+    except Exception as e:  # noqa: BLE001 — база подвела: ведём себя как раньше
+        logger.warning(f"Манифесты: не смог поднять подтверждённые планы: {e}")
+        return []
+    restored = _restore_manifests_from_db(found)
+    out: List[tuple] = []
+    for mid in restored:
+        tool = _auto_executable_tool(_MANIFESTS.get(mid))
+        if tool:
+            out.append((mid, tool))
+    if out:
+        logger.info("Манифесты: подняты из базы и готовы к исполнению планы, "
+                    f"подтверждённые кнопкой: {[m for m, _ in out]} "
+                    "(процесс перезапускался между планом и нажатием)")
+    return out
+
+
 async def _tg_auto_execute_tick() -> None:
     """One pass: find candidates, execute each via its registered executor,
     verify the outcome INDEPENDENTLY, then publish (full report → the «MCP
@@ -13274,9 +13536,13 @@ async def _tg_auto_execute_tick() -> None:
        модели) на всё время запроса.
     2. Перепроверка и публикация отчёта в Telegram (requests + сон на 429) —
        тоже через _run_blocking, по той же причине.
-    3. `try_auto_execute` наоборот ОБЯЗАН остаться в event loop'е: его
-       атомарность («проверил consumed → выставил consumed» без await между)
-       держится ровно на однопоточности loop'а. В поток его выносить нельзя.
+    3. `try_auto_execute` тоже уходит В ПОТОК — и это ПЕРЕВЁРНУТОЕ правило
+       (#91). Пока планы жили в памяти, его атомарность («проверил consumed →
+       выставил consumed» без await между) держалась на однопоточности loop'а,
+       и вынос был прямо запрещён. Теперь захват плана — это `UPDATE … WHERE
+       consumed_at IS NULL … RETURNING` в Postgres, атомарный сам по себе и
+       переживающий перезапуск процесса; зато он синхронный, и оставить его в
+       loop'е значило бы морозить сервер на каждое нажатие кнопки.
 
     Пункт 5 ТЗ («несколько параллельных подтверждений») архитектурно уже
     поддержан, и это НЕ случайность, а свойство четырёх мест сразу:
@@ -13320,13 +13586,27 @@ async def _tg_auto_execute_tick() -> None:
     except Exception as e:
         logger.warning(f"TG auto-execute: get_tg_approvals failed: {e}")
         return
+    # ГЛАВНЫЙ СМЫСЛ #91 ЖИВЁТ ЗДЕСЬ. До этой правки кандидаты искались ТОЛЬКО
+    # среди планов в памяти, и после перезапуска процесса подтверждённая
+    # кнопкой строка не имела шанса быть исполненной: памяти нет — кандидата
+    # нет. Теперь строки, одобренные кнопкой, но неизвестные этому процессу,
+    # поднимают свой план из базы и становятся обычными кандидатами.
+    pending += await _rehydrate_approved_candidates(pending, rows)
     for c in _tg_auto_execute_approved(pending, rows):
         mid, tool = c["manifest_id"], c["tool"]
         entry = _resolve_auto_executor(tool, _MANIFESTS.get(mid) or {})
         if entry is None:
             continue
         try:
-            consumed = tg_approval.try_auto_execute(
+            # В ПОТОК (#91): захват плана — это теперь `UPDATE … RETURNING` в
+            # Postgres, а не переключение флага в памяти. Прежний комментарий
+            # на этом месте требовал обратного — держать `try_auto_execute` в
+            # event loop'е, потому что на его однопоточности держалась
+            # одноразовость. С переездом планов в базу одноразовость
+            # обеспечивает сам SQL (см. `_consume_manifest_for_auto_execute`),
+            # а синхронный psycopg2 в event loop'е морозил бы весь сервер.
+            consumed = await _run_blocking(
+                tg_approval.try_auto_execute,
                 manifest_id=mid, tool=tool,
                 get_manifest=lambda i: _MANIFESTS.get(i),
                 consume_manifest=_consume_manifest_for_auto_execute,
@@ -13461,13 +13741,55 @@ async def _tg_auto_execute_tick() -> None:
 
 
 def _consume_manifest_for_auto_execute(manifest_id: str) -> Optional[Dict]:
-    """The atomic one-shot step try_auto_execute() needs (see its docstring):
-    called with NO `await` between the `consumed` check and the flip, so
-    under asyncio's single-threaded event loop nothing else can interleave —
-    this IS the atomic compare-and-set (the Python-side equivalent of the TS
-    store's `UPDATE ... WHERE status = 'AWAITING_CONSENT' ... RETURNING`)."""
+    """Атомарный захват плана — один раз и только один, чего бы ни случилось.
+
+    ЧТО ИЗМЕНИЛОСЬ В #91. Раньше одноразовость держалась на однопоточности
+    event loop'а: между проверкой `consumed` и его простановкой не было ни
+    одного `await`, значит перебить друг друга два тика физически не могли.
+    Эта гарантия работала ровно в границах ОДНОГО процесса — а именно их
+    задача #91 и ломает: план теперь переживает перезапуск, и претендовать на
+    него могут старый и новый контейнеры во время выкатки или две реплики.
+
+    Поэтому решает теперь ОДИН SQL-оператор `UPDATE … WHERE consumed_at IS
+    NULL … RETURNING` (`manifest_store.claim`), а не флаг в памяти: Postgres
+    блокирует строку, второй претендент дожидается коммита первого и уходит
+    ни с чем. Флаг в RAM остаётся, но уже как кэш решения, а не как сам
+    механизм.
+
+    ЗОВЁТСЯ ИЗ РАБОЧЕГО ПОТОКА (`_run_blocking`), потому что ходит в базу, —
+    в отличие от прежней версии, которой полагалось быть в event loop'е.
+    Ключей в `_MANIFESTS` эта функция НЕ добавляет и НЕ удаляет (только правит
+    поля уже существующего плана), поэтому итерации по словарю в event loop'е
+    она не ломает.
+
+    Три исхода захвата:
+      • CLAIM_WON    — план наш, исполняем;
+      • CLAIM_TAKEN  — строка есть, но занята (соседний тик, вторая реплика,
+                       старый контейнер) или просрочена → молча пропускаем;
+      • CLAIM_ABSENT — строки в базе нет вовсе (долговечность отключена или
+                       план не сохранился): падаем на прежнюю проверку по
+                       памяти, которая для видимого только нам плана и есть
+                       полноценная защита."""
+    outcome, payload = manifest_store.claim(manifest_id)
+    if outcome == manifest_store.CLAIM_TAKEN:
+        return None
     m = _MANIFESTS.get(manifest_id)
-    if m is None or m.get("consumed"):
+    if m is None:
+        if outcome != manifest_store.CLAIM_WON:
+            return None
+        # Плана нет в памяти, но он есть в базе и достался нам: этот процесс
+        # его не строил (перезапуск между планом и нажатием). Работаем по
+        # восстановленной копии; в `_MANIFESTS` её кладёт event loop —
+        # см. `_restore_manifests_from_db`.
+        m = _manifest_from_payload(payload or {})
+    elif m.get("consumed"):
+        # Память говорит «уже израсходован», база — «свободен». Такое
+        # расхождение возможно, если гашение по чат-пути не доехало до базы.
+        # Верим ПАМЯТИ (fail-closed): пропустить исполнение безопаснее, чем
+        # выполнить дважды. Строка при этом уже помечена израсходованной, что
+        # и требуется — план больше никого не соблазнит.
+        logger.warning(f"Манифесты: план {manifest_id} свободен в базе, но "
+                       "погашен в памяти — исполнять не буду")
         return None
     m["consumed"] = True
     # Надгробие ставится и здесь, ДО исполнения, — но со статусом «ЗАХВАЧЕН,
@@ -13551,6 +13873,19 @@ async def _tg_auto_execute_poller_loop() -> None:
                     if n:
                         logger.info("TG reaper: прибрано просроченных "
                                     f"подтверждений: {n}")
+                    # Уборка просроченных ПЛАНОВ — в том же такте и тем же
+                    # потоком (#91). Без неё таблица растёт вечно, а в ней
+                    # лежит полное содержимое каждой показанной операции.
+                    # Отсрочка ровно та же, с какой разбор потерянных планов
+                    # ещё смотрит на строки подтверждений
+                    # (`_TG_LOST_LOOKBACK_S`): снеси план раньше — и владелец
+                    # вместо внятного объяснения получил бы «операция
+                    # неизвестна».
+                    gone = await _run_blocking(
+                        manifest_store.purge_expired,
+                        int(_TG_LOST_LOOKBACK_S * 1000))
+                    if gone:
+                        logger.info(f"Манифесты: убрано просроченных планов: {gone}")
                 except Exception as e:
                     logger.error(f"TG reaper: уборка упала (поллер продолжает "
                                  f"работать): {e}")
@@ -13573,8 +13908,14 @@ def main():
                 "drive-mcp) для таблицы tg_approvals."
             )
         tg_approval.init_store(db_url)
+        # ТОТ ЖЕ DSN, отдельная таблица: план подтверждения обязан жить там же,
+        # где решение по нему, иначе рестарт процесса обесценивает висящие
+        # кнопки (см. шапку manifest_store.py). Миграция применяется здесь же,
+        # кодом при старте, как и схема tg_approvals.
+        manifest_store.init_store(db_url)
         logger.info("TG approval: Postgres подключен, слой активен "
                     "(server=ticktick, webhook НЕ регистрируется — владелец gmail-mcp)")
+        logger.info("Долговечные планы подтверждения: таблица mcp_manifests готова")
 
     if not initialize_client():
         # Don't stop the server: on streamable-http this leaves /health
