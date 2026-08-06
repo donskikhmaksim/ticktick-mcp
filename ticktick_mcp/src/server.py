@@ -1677,6 +1677,13 @@ async def update_tasks(
         tasks: List of task change objects — required on call #1, ignored on call #2
         manifest_id: from call #1's response — pass on call #2 to actually update
         user_reply: the user's literal reply approving the plan — required on call #2
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_official()
     if err:
@@ -1995,6 +2002,13 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]] = None,
             call #1, ignored on call #2
         manifest_id: from call #1's response — pass on call #2 to actually complete
         user_reply: the user's literal reply approving the plan — required on call #2
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_official()
     if err:
@@ -2359,6 +2373,21 @@ def _manifest_object_hash(action: str, ids: List[str]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _manifest_params_hash(action: str, params: Dict) -> str:
+    """Аналог _manifest_object_hash для _gate_single-манифестов, у которых нет
+    списка id объектов — привязывает манифест к точному набору параметров.
+
+    Нужен из-за TG-кнопки: авто-исполнение по кнопке (try_auto_execute)
+    сверяет `object_hash` перед тем, как что-то сделать, и БЕЗ сохранённого
+    хэша эта сверка просто пропускается — кнопка оказалась бы слабее
+    чат-подтверждения. Чат-путь при этом не меняется: `_require_consent`
+    трогает `object_hash` только когда ему передали `object_ids`, а
+    `_gate_single` их не передаёт."""
+    payload = action + "|" + json.dumps(params or {}, sort_keys=True,
+                                        ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 class ConsentResult:
     __slots__ = ("ok", "reason")
 
@@ -2647,20 +2676,24 @@ def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
     if manifest_id:
         m = _MANIFESTS.get(manifest_id)
         if not m or m.get("kind") != kind:
-            return _GateOutcome(False, message=(
+            return _GateOutcome(False, message=_manifest_gone_msg(manifest_id, (
                 f"🛑 Манифест {manifest_id} не найден/истёк/уже исполнен. "
                 f"Начни заново: {tool_name}(summary, tasks, ...) без "
-                "manifest_id."))
+                "manifest_id.")))
         stored = m.get("tasks") or []
         ids = [str(t.get("taskId") or t.get("task_id") or "") for t in stored]
         # tier-🟡 per docs/DESIGN_approval_gate.md §5: no anti-duplet gap —
         # only 🔴 tools time-gate plan vs. execute.
-        # `tool=` здесь НАМЕРЕННО не передаётся: план batch-тулов в Telegram не
-        # уходит (нет вызова _maybe_tg_notify_plan), а с `tool=` гейт стал бы
-        # спрашивать approved-строку, которой не существует → "none" → вечный
-        # отказ даже на честное «да». ТГ-фактор всё равно включится сам, если
-        # план этого манифеста когда-нибудь начнёт уходить в Telegram: решает
-        # пометка `tg_notified` в самом манифесте, а не аргумент вызова.
+        # `tool=` здесь НАМЕРЕННО не передаётся, хотя с 2026-08-06 план ЭТИХ
+        # тулов тоже уходит в Telegram (см. _maybe_tg_notify_plan в конце
+        # ветки call #1). Причина прежняя: `tool=` включал бы ТГ-проверку
+        # БЕЗУСЛОВНО — в том числе для манифестов, чей план в Telegram по
+        # какой-то причине НЕ ушёл (тул вне TG_APPROVAL_TOOLS, слой выключен),
+        # и тогда check_approval вернул бы "none" → вечный отказ даже на
+        # честное «да». Решает пометка `tg_notified` в САМОМ манифесте: она
+        # стоит тогда и только тогда, когда сообщение с кнопками реально
+        # отправлено — то есть требование кнопки включается ровно вместе с
+        # существованием кнопки.
         cr = _require_consent(action=kind, tier=1, manifest=m,
                               user_reply=user_reply, object_ids=ids, min_gap=0,
                               manifest_id=manifest_id)
@@ -2675,7 +2708,12 @@ def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
     mid = uuid.uuid4().hex[:12]
     now = time.monotonic()
     ids = [str(t.get("taskId") or t.get("task_id") or "") for t in tasks]
-    _MANIFESTS[mid] = {"kind": kind, "tasks": tasks, "summary": summary,
+    # `tool`/`_gate` (2026-08-06) — то, что нужно фоновому TG-поллеру, чтобы
+    # ИСПОЛНИТЬ этот план по нажатию кнопки, не заводя по ручной регистрации
+    # на каждый тул: `tool` даёт имя `_<tool>_impl`, `_gate` — форму вызова
+    # (batch: impl(summary, tasks, **extra)). См. _generic_gate_auto_execute.
+    _MANIFESTS[mid] = {"kind": kind, "tool": tool_name, "_gate": "batch",
+                       "tasks": tasks, "summary": summary,
                        "created": now, "plan_shown_at": now, "consumed": False,
                        "object_hash": _manifest_object_hash(kind, ids),
                        "extra": extra or {}}
@@ -2692,7 +2730,8 @@ def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
         "— НЕ в этом же ходе (сам список tasks можно повторить как есть, на "
         "2-м вызове он игнорируется — используются данные из манифеста). "
         "Манифест одноразовый, действует 1 час.")
-    return _GateOutcome(False, message="\n".join(lines))
+    return _GateOutcome(False, message=_maybe_tg_notify_plan(
+        tool_name, mid, "\n".join(lines)))
 
 
 # ---------------------------------------------------------------------------
@@ -2716,9 +2755,13 @@ def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
     same headless-bypass contract as create_tasks/_gate_batch — see
     references/automation-secrets.md §8), then the STORED params (never call
     #2's own arguments) are handed back via `.extra` — same no-swap contract
-    as _gate_batch. No object_hash/binding here (mirrors plan_task_creation,
-    which also skips it
-    for brand-new objects that don't exist yet to re-hash against).
+    as _gate_batch. The stored `object_hash` here is a hash of the PARAMS
+    (_manifest_params_hash) — there is no list of object ids to bind to (many
+    of these tools create brand-new objects that don't exist yet). It is NOT
+    consulted on the chat path: _require_consent only compares object_hash
+    when the caller passes `object_ids`, and this gate never does. It exists
+    for the Telegram-button path, whose auto-executor re-hashes the manifest
+    before touching anything and would otherwise skip that check entirely.
 
     NOTE on one-shot: this function marks `consumed = True` itself right
     here on the SUCCESS path, matching docs/DESIGN_approval_gate.md §4.3.3
@@ -2730,12 +2773,13 @@ def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
     if manifest_id:
         m = _MANIFESTS.get(manifest_id)
         if not m or m.get("kind") != kind:
-            return _GateOutcome(False, message=(
+            return _GateOutcome(False, message=_manifest_gone_msg(manifest_id, (
                 f"🛑 Манифест {manifest_id} не найден/истёк/уже исполнен. "
-                f"Начни заново: {tool_name}(...) без manifest_id."))
-        # `tool=` не передаётся по той же причине, что и в _gate_batch выше
-        # (план в Telegram не уходит); пометка `tg_notified` в манифесте
-        # включит ТГ-фактор автоматически, если это когда-нибудь изменится.
+                f"Начни заново: {tool_name}(...) без manifest_id.")))
+        # `tool=` не передаётся по той же причине, что и в _gate_batch выше:
+        # ТГ-фактор включает пометка `tg_notified` в самом манифесте (её
+        # ставит _maybe_tg_notify_plan только при реально отправленном
+        # сообщении с кнопками), а не аргумент этого вызова.
         cr = _require_consent(action=kind, tier=1, manifest=m,
                               user_reply=user_reply, min_gap=0,
                               automation_key=automation_key,
@@ -2749,8 +2793,17 @@ def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
         return _GateOutcome(False, message="Нечего делать — пустые параметры.")
     mid = uuid.uuid4().hex[:12]
     now = time.monotonic()
-    _MANIFESTS[mid] = {"kind": kind, "params": params, "created": now,
-                       "plan_shown_at": now, "consumed": False}
+    # `tool`/`_gate` — см. тот же комментарий в _gate_batch (single:
+    # impl(**params)). `object_hash` здесь считается по ПАРАМЕТРАМ
+    # (_manifest_params_hash): у single-плана нет списка id объектов, но
+    # авто-исполнению по TG-кнопке всё равно нужна привязка к тому, ЧТО
+    # именно было показано человеку. На чат-путь это не влияет —
+    # `_require_consent` сверяет object_hash только когда ему передан
+    # `object_ids`, а этот гейт его не передаёт.
+    _MANIFESTS[mid] = {"kind": kind, "tool": tool_name, "_gate": "single",
+                       "params": params, "created": now,
+                       "plan_shown_at": now, "consumed": False,
+                       "object_hash": _manifest_params_hash(kind, params)}
     lines = [f"### 📋 План — {describe_fn(params)}",
              f"_Манифест `{mid}` · ничего ещё не изменено_", "",
              "Покажи это пользователю дословно и ДОЖДИСЬ его отдельного "
@@ -2761,7 +2814,8 @@ def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
              "повторить как есть, на 2-м вызове они игнорируются — "
              "используются данные из манифеста). Манифест одноразовый, "
              "действует 1 час."]
-    return _GateOutcome(False, message="\n".join(lines))
+    return _GateOutcome(False, message=_maybe_tg_notify_plan(
+        tool_name, mid, "\n".join(lines)))
 
 
 @mcp.tool(annotations=READONLY)
@@ -4796,6 +4850,13 @@ async def create_project(
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_official()
     if err:
@@ -5587,6 +5648,13 @@ async def create_subtask(
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_official()
     if err:
@@ -5791,6 +5859,13 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]] = None,
         to_project_name: Destination list name (shown in the dialog)
         manifest_id: from call #1's response — pass on call #2 to actually move
         user_reply: the user's literal reply approving the plan — required on call #2
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_ready()
     if err:
@@ -5961,6 +6036,13 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
         manifest_id: from call #1's response — pass on call #2 to actually record
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_ready()
     if err:
@@ -6171,6 +6253,13 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
         parent_task_title: Title of the parent (shown in the dialog)
         manifest_id: from call #1's response — pass on call #2 to actually nest
         user_reply: the user's literal reply approving the plan — required on call #2
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_ready()
     if err:
@@ -6327,6 +6416,13 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
         manifest_id: from call #1's response — pass on call #2 to actually detach
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_ready()
     if err:
@@ -6420,6 +6516,13 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
             #1, ignored on call #2
         manifest_id: from call #1's response — pass on call #2 to actually retag
         user_reply: the user's literal reply approving the plan — required on call #2
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_ready()
     if err:
@@ -6635,6 +6738,13 @@ async def create_project_group(name: str, manifest_id: str = "",
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_ready()
     if err:
@@ -6703,6 +6813,13 @@ async def delete_project_group(group_name: str, group_id: str,
         manifest_id: from call #1's response — pass on call #2 to actually delete
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_ready()
     if err:
@@ -6779,6 +6896,13 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
         manifest_id: from call #1's response — pass on call #2 to actually move
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_ready()
     if err:
@@ -6904,6 +7028,13 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
         manifest_id: from call #1's response — pass on call #2 to actually add
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_ready()
     if err:
@@ -7025,6 +7156,13 @@ async def restore_tasks(summary: str, tasks: List[Dict[str, str]] = None,
             ignored on call #2
         manifest_id: from call #1's response — pass on call #2 to actually restore
         user_reply: the user's literal reply approving the plan — required on call #2
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_ready()
     if err:
@@ -7158,6 +7296,13 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
         manifest_id: from call #1's response — pass on call #2 to actually attach
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_ready()
     if err:
@@ -7570,6 +7715,13 @@ async def create_tag(name: str, color: str = None, manifest_id: str = "",
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_ready()
     if err:
@@ -7827,6 +7979,13 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
         manifest_id: from call #1's response — pass on call #2 to actually duplicate
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_ready()
     if err:
@@ -7919,6 +8078,13 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
         manifest_id: from call #1's response — pass on call #2 to actually edit
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_ready()
     if err:
@@ -8903,6 +9069,13 @@ async def create_project_column(project_id: str, name: str,
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — bypasses user_reply on call #2 (see above); interactive assistants leave this empty
+
+    Telegram approval layer (when it is enabled on this server): the plan
+    built by call #1 is also sent to the owner as a Telegram message with
+    ✅/🛑 buttons, and pressing ✅ makes the SERVER run the operation itself —
+    this tool is NOT called a second time, and the result is written back
+    into that same message. While that is in effect, a text user_reply alone
+    is not enough: without the pressed button call #2 is refused.
     """
     err = _ensure_ready()
     if err:
@@ -9031,14 +9204,83 @@ _register_auto_executor("delete_tasks", _rehash_delete_manifest, _auto_execute_d
 # the ONE spot below that needs to go from "found a _MANIFESTS entry" to
 # "which _AUTO_EXECUTORS key" without re-deriving it from scratch. Extend
 # this (and _AUTO_EXECUTORS) together when a future kind gets TG wiring.
+# NOTE: since 2026-08-06 this is only the FALLBACK — _gate_batch/_gate_single
+# manifests carry their own "tool" key, so they need no entry here at all.
 _AUTO_EXECUTE_TOOL_FOR_KIND = {"delete": "delete_tasks", "declutter": "execute_declutter"}
+
+
+# ───────────────── generic executor for the _gate_batch/_gate_single tools ──
+# 2026-08-06: instead of 19 hand-written _register_auto_executor() calls (one
+# per gated tool, each a copy of the same two lines and each a chance to get
+# the argument order wrong), ONE pair of functions covers every manifest that
+# _gate_batch/_gate_single created. That is possible because those two gates
+# store everything needed to replay the call: `tool` (→ the `_<tool>_impl`
+# function that the gated tool itself calls on the chat path — the SAME
+# executor, not a second implementation) and `_gate` (→ the call shape).
+
+async def _generic_gate_auto_execute(manifest_id: str, m: Dict) -> str:
+    """Replays a _gate_batch/_gate_single plan through the tool's own
+    `_<tool>_impl`, exactly as the gated tool would have after a chat «да»."""
+    tool = m.get("tool") or m.get("_tg_tool") or ""
+    impl = globals().get(f"_{tool}_impl")
+    if not callable(impl):
+        raise RuntimeError(f"нет исполнителя _{tool}_impl для манифеста {manifest_id}")
+    if m.get("_gate") == "single":
+        return await impl(**(m.get("params") or {}))
+    return await impl(m.get("summary") or "", m.get("tasks") or [],
+                      **(m.get("extra") or {}))
+
+
+def _generic_gate_rehash(m: Dict) -> str:
+    """MUST reproduce, byte for byte, the formula the hash was computed with
+    at plan time (_gate_batch: _manifest_object_hash(kind, ids) over the same
+    id-extraction expression; _gate_single: _manifest_params_hash(kind,
+    params)) — a mismatch here silently disables the binding check, i.e. the
+    button's protection against the plan drifting between show and press."""
+    if m.get("_gate") == "single":
+        return _manifest_params_hash(m.get("kind") or "", m.get("params") or {})
+    ids = [str(t.get("taskId") or t.get("task_id") or "") for t in (m.get("tasks") or [])]
+    return _manifest_object_hash(m.get("kind") or "", ids)
+
+
+_GENERIC_GATE_ENTRY = _AutoExecutorEntry(_generic_gate_rehash,
+                                         _generic_gate_auto_execute)
+
+
+def _resolve_auto_executor(tool: str, m: Dict) -> Optional[_AutoExecutorEntry]:
+    """Which executor runs this manifest: an explicitly registered one wins
+    (delete_tasks today — its manifest shape predates the shared gates), the
+    generic gate executor covers anything _gate_batch/_gate_single produced,
+    and everything else returns None (candidate skipped, nothing happens).
+    Deliberately does NOT resolve declutter: its registration stays commented
+    out above, and a declutter manifest has no `_gate` key, so it falls
+    through to None here too — both layers stay disabled together."""
+    if not tool:
+        return None
+    entry = _AUTO_EXECUTORS.get(tool)
+    if entry is not None:
+        return entry
+    if m.get("_gate") in ("batch", "single") and callable(
+            globals().get(f"_{tool}_impl")):
+        return _GENERIC_GATE_ENTRY
+    return None
+
+
+def _auto_execute_tool_of(m: Dict) -> str:
+    """Tool name a live manifest belongs to: the TG notification's own tag
+    first (set by _maybe_tg_notify_plan, the one place a button ever appears),
+    then the gate's stored `tool`, then the legacy kind→tool map."""
+    return (m.get("_tg_tool") or m.get("tool")
+            or _AUTO_EXECUTE_TOOL_FOR_KIND.get(m.get("kind") or "") or "")
 
 
 def _find_tg_auto_execute_candidates() -> List[Dict]:
     """Candidates for auto-execution: this server's own (in-memory) manifests
     that are AWAITING_CONSENT-equivalent (not consumed, not TTL-expired —
-    _prune_manifests already dropped anything past that) whose `kind` maps to
-    a registered tool AND whose Telegram approval row is already APPROVED.
+    _prune_manifests already dropped anything past that) that resolve to an
+    executor (_resolve_auto_executor: explicit registry, else the generic
+    _gate_batch/_gate_single replay) AND whose Telegram approval row is
+    already APPROVED.
     Unlike the TS side's single SQL JOIN (both tables live in one Postgres),
     this walks _MANIFESTS in RAM and asks tg_approval.check_approval(id) —
     one Postgres round-trip PER live manifest — which is fine because the
@@ -9049,8 +9291,8 @@ def _find_tg_auto_execute_candidates() -> List[Dict]:
     for mid, m in list(_MANIFESTS.items()):
         if m.get("consumed"):
             continue
-        tool = _AUTO_EXECUTE_TOOL_FOR_KIND.get(m.get("kind") or "")
-        if not tool or tool not in _AUTO_EXECUTORS:
+        tool = _auto_execute_tool_of(m)
+        if _resolve_auto_executor(tool, m) is None:
             continue
         if not tg_approval.enabled_for(_TG_CFG, tool):
             continue
@@ -9075,7 +9317,7 @@ async def _tg_auto_execute_tick() -> None:
     runAutoExecutePoller — errors from ONE candidate never abort the others."""
     for c in _find_tg_auto_execute_candidates():
         mid, tool = c["manifest_id"], c["tool"]
-        entry = _AUTO_EXECUTORS.get(tool)
+        entry = _resolve_auto_executor(tool, _MANIFESTS.get(mid) or {})
         if entry is None:
             continue
         try:
