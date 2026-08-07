@@ -603,6 +603,21 @@ def _v2_project_names_or_none() -> Optional[Dict]:
     return None
 
 
+def _v2_habits_or_none() -> Optional[List[Dict]]:
+    """def-119 (2026-08-07): свежий список привычек для post-verify, или
+    None (никогда []) когда чтение упало — тот же контракт «не путать пусто
+    с недоступно», что у _v2_project_names_or_none чуть выше (см. её
+    докстринг): нужен _verify_item's "delete_habit" branch, чтобы пустой
+    список честно означал «привычки нет», а не «чтение не состоялось».
+    Привычки есть только в v2 API — фолбэка на v1 нет."""
+    if not ticktick_v2:
+        return None
+    try:
+        return ticktick_v2.get_habits()
+    except Exception:
+        return None
+
+
 def _v2_project_names() -> Dict:
     """Map projectId -> name (incl. Inbox) from the cached v2 state,
     falling back to the official v1 API so results stay human-readable
@@ -2840,9 +2855,11 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
                        manifest_id: str = "", user_reply: str = "",
                        automation_key: str = "") -> str:
     """
-    ⚠️ Delete one or more tasks permanently. Gated (🔴 — even a SINGLE
-    deletion): this is now a two-call plan → user says yes → execute flow,
-    same shape as plan_task_deletion/execute_task_deletion.
+    ⚠️ Delete one or more tasks (removed to TickTick's trash — recoverable
+    via restore_tasks, NOT permanent; def-114, 2026-08-07 — was wrongly
+    documented here as "permanently"). Gated (🔴 — even a SINGLE deletion):
+    this is now a two-call plan → user says yes → execute flow, same shape
+    as plan_task_deletion/execute_task_deletion.
 
     Call #1 (manifest_id omitted): resolves `tasks` against live state and
     returns a one-shot manifest — nothing is deleted yet. Show that manifest
@@ -2857,7 +2874,9 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
     summary (FIRST arg): one-line human sentence in the user's language,
     Destructive — START WITH ⚠️, e.g.
     «⚠️ Удаляю задачу „Купить молоко" из „Покупки"» or
-    «⚠️ Удаляю 5 задач из „Inbox"».
+    «⚠️ Удаляю 5 задач из „Inbox"». It is echoed VERBATIM as the plan card's
+    header (call #1's response) — this IS what the user reads, not
+    decoration, so make it accurate and specific.
 
     Put the human title and project name INSIDE each task object (call #1)
     so the manifest shows what's being deleted:
@@ -2990,8 +3009,22 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
             # превью не печатает, поэтому они едут прямо в ответ, иначе
             # автоматика молча не узнала бы, что часть списка не тронута.
             return "\n".join([done] + lines) if lines else done
-        preview = [f"### 📋 Готов удалить — {len(items)}",
-                  _plan_id_line(mid, "ничего ещё не удалено"), ""]
+        # def-114 (2026-08-07): заголовок раньше был обезличен («Готов
+        # удалить — N») и полностью отбрасывал `summary`, переданный
+        # вызывающим — а докстринг ТРЕБУЕТ от вызывающего начинать summary с
+        # ⚠️ и называть объект(ы) («⚠️ Удаляю задачу «Купить молоко» из
+        # «Покупки»»). У безопасных операций заголовок называет объект — у
+        # необратимой удаления был хуже, чем у безобидной. Теперь заголовок
+        # — сам `summary` (несёт и ⚠️, и названия — это ответственность
+        # вызывающего, как и раньше, только теперь она не выбрасывается), а
+        # следом честная строка про обратимость: удалённые задачи реально
+        # уходят в корзину TickTick (проверено живьём) и восстановимы через
+        # restore_tasks — молчание об этом раньше не давало Максиму понять,
+        # что удаление не окончательное.
+        preview = [f"### 📋 {summary} — {len(items)}",
+                  _plan_id_line(mid, "ничего ещё не удалено"),
+                  "- задачи уходят в корзину TickTick — можно вернуть через "
+                  "restore_tasks", ""]
         for i, it in enumerate(items, 1):
             preview.append(f"{i}. **«{it['title']}»** — {it['project']} (`{it['taskId']}`)")
         preview.extend(lines)
@@ -4967,6 +5000,20 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         return (("bad", f"- ❌ **«{title}»** — проект ВСЁ ЕЩЁ существует "
                  "(удаление не подтвердилось)") if still else
                 ("ok", f"- ✅ **«{title}»** — проект удалён"))
+    if op == "delete_habit":
+        # def-119 (2026-08-07), часть 2: `tid` — id ПРИВЫЧКИ, не задачи. Тот
+        # же приём, что у delete_project чуть выше (CONFIRMED ABSENCE): фреш-
+        # чтение через хелпер, различающий «пусто» и «не смогли прочитать»,
+        # иначе неудачный фетч читался бы как подтверждённое удаление.
+        fresh_habits = _v2_habits_or_none()
+        if fresh_habits is None:
+            return ("warn", f"- ⚠️ **«{title}»** — привычка: проверка не "
+                    "удалась (не получилось перечитать список привычек), "
+                    "исход НЕ ПОДТВЕРЖДЁН")
+        still = any(h.get("id") == tid for h in fresh_habits)
+        return (("bad", f"- ❌ **«{title}»** — привычка ВСЁ ЕЩЁ существует "
+                 "(удаление не подтвердилось)") if still else
+                ("ok", f"- ✅ **«{title}»** — привычка удалена"))
     if live is None:
         return ("bad", f"- ❌ **«{title}»** — не найдена среди открытых "
                 "(ожидалась живой)")
@@ -5066,10 +5113,22 @@ def _compute_op_verdicts(records: List[Dict], live: Dict[str, Dict],
     verdicts: List[Tuple[str, str]] = []
     for rec in records:
         op = rec.get("op") or "delete"
-        items = rec.get("items") or [
-            {"taskId": s.get("taskId"), "title": s.get("title"), "snapshot": s}
-            for s in rec.get("deleted", [])
-        ]
+        if op == "delete_habit":
+            # def-119 (2026-08-07), часть 2: журнальная запись delete_habit
+            # (см. _delete_habit_impl) несёт ОДИНОЧНЫЙ "snapshot" — не
+            # "items"/"deleted" списком, как у остальных операций. Без этой
+            # ветки `items` ниже молчаливо получался пустым: цикл
+            # `_verify_item` не вызывался НИ РАЗУ, verdicts оставался
+            # пустым, и итог читался как «0/0/0» — вакуумная истина (см.
+            # часть 1 def-119 чуть выше по файлу).
+            snap = rec.get("snapshot") or {}
+            items = ([{"taskId": snap.get("id"), "title": snap.get("name")}]
+                     if snap.get("id") else [])
+        else:
+            items = rec.get("items") or [
+                {"taskId": s.get("taskId"), "title": s.get("title"), "snapshot": s}
+                for s in rec.get("deleted", [])
+            ]
         for item in items:
             verdicts.append(_verify_item(op, item, live, names))
     return verdicts
@@ -5186,10 +5245,26 @@ def _build_operation_report(record_id: str) -> str:
         # потребителей (например, бота tg-ai-assistant) — они не должны
         # прочитать отчёт с хотя бы одним расхождением или непроверенным
         # пунктом как успех.
-        overall = "❌" if bad else ("⚠️" if warn else "✅")
-        tail = ("есть расхождения — это НЕ успех." if bad else
-                "есть непроверенные пункты — это НЕ полный успех." if warn else
-                "всё подтверждено.")
+        #
+        # def-119 (2026-08-07), часть 1: ПУСТОЙ список проверок (ok=warn=
+        # bad=0 — не было ни одной строки `_verify_item`, например журнальная
+        # запись есть, но `_compute_op_verdicts` не смогла извлечь из неё ни
+        # одного объекта) раньше читался как «✅ — всё подтверждено»: и bad,
+        # и warn были falsy, а условие ниже не отличало «нечего проверять» от
+        # «проверили и всё чисто». Это вакуумная истина — «Итог: ✅ 0
+        # подтверждено…» само по себе уже говорит, что подтверждать было
+        # нечего, а следующая строка утверждала обратное. Живой пример:
+        # delete_habit (см. часть 2 ниже) — заголовок «❓ НЕ подтверждено»
+        # соседствовал с «Статус операции: ✅ — всё подтверждено» в одном
+        # сообщении.
+        if bad:
+            overall, tail = "❌", "есть расхождения — это НЕ успех."
+        elif warn:
+            overall, tail = "⚠️", "есть непроверенные пункты — это НЕ полный успех."
+        elif ok:
+            overall, tail = "✅", "всё подтверждено."
+        else:
+            overall, tail = "❓", "проверять было нечего — исход НЕ подтверждён."
         lines.append(f"**Статус операции: {overall}** — {tail}")
         lines.append("[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО — "
                      "это серверная проверка, не заменяй её своим пересказом]")
@@ -8442,10 +8517,16 @@ async def delete_habit(habit_name: str, habit_id: str, manifest_id: str = "",
     know it and guessing is a protocol violation.
 
     Both habit_name AND habit_id are required and must describe the SAME
-    habit: before deleting, the server re-reads the live habit list and
-    refuses when the id resolves to a different name (protection against
-    deleting the wrong habit). A snapshot of the habit is written to the
-    mutation journal first, since nothing else can bring it back.
+    habit: the server re-reads the live habit list and refuses when the id
+    resolves to a different name — TWICE (def-116, 2026-08-07): once while
+    BUILDING the plan (call #1, before anything is shown to the owner — a
+    mismatched name never reaches the plan card at all) and again,
+    independently, right before the actual delete (call #2). If the live
+    read itself fails while building the plan, the plan still gets built
+    (a read hiccup must not block every deletion), but its text says so
+    honestly — the call #2 check is unconditional and still guards the
+    mutation either way. A snapshot of the habit is written to the mutation
+    journal first, since nothing else can bring it back.
 
     Args:
         habit_name: Name of the habit (shown first in the summary you show the user, see get_habits) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
@@ -8469,10 +8550,59 @@ async def delete_habit(habit_name: str, habit_id: str, manifest_id: str = "",
     if not (habit_name or "").strip() or not (habit_id or "").strip():
         return ("🛑 Нужны И имя, И id привычки — удаление вслепую по одному id "
                 "не делаю (см. get_habits). Ничего не изменено.")
+    # def-116 (2026-08-07): та же сверка habit_id↔habit_name, что уже стоит
+    # в _delete_habit_impl НА ИСПОЛНЕНИИ (identity guard), но здесь — ДО
+    # построения плана. Живой пример: подали habit_name реальной привычки
+    # («Растяжка», 18 отметок) вместе с habit_id ДРУГОЙ (тестовой) —
+    # владельцу ушла карточка «Удаляю привычку «Растяжка»…», хотя id вёл не
+    # туда. Гейт на исполнении это ловит, но к тому моменту человек уже
+    # читал (и мог одобрить) непроверенное имя — по образцу
+    # `_resolve_triage_ops` в manual_triage ("название не совпало — по
+    # этому id сейчас «X», а в плане «Y»"), сверка сдвинута на ПОСТРОЕНИЕ.
+    #
+    # Действует только на call #1 (не manifest_id): call #2 обслуживает
+    # СОХРАНЁННЫЕ параметры плана, а не свежие аргументы вызова (тот же
+    # анти-подмен контракт, что у всех гейтов), и identity guard на
+    # исполнении там уже стоит, не тронут. automation_key НЕ пропускает эту
+    # проверку — она стоит раньше самого гейта, поэтому и headless-путь
+    # (карточки вообще не видит) защищён, а не только интерактивный.
+    name_warning = ""
+    if not manifest_id:
+        try:
+            habits = await _run_blocking(lambda: ticktick_v2.get_habits())
+        except Exception as e:
+            # Живое чтение недоступно ВРЕМЕННО — не блокируем удаление
+            # наглухо (fail-closed здесь стоил бы дороже, чем однократный
+            # непроверенный план: исполнение всё равно перепроверит), но и
+            # не выдаём непроверенное имя за факт — карточка честно скажет
+            # об этом сама (см. name_warning ниже).
+            habits = None
+            logger.warning(f"delete_habit: не удалось прочитать список "
+                           f"привычек на этапе плана ({e}) — план всё равно "
+                           "строится, сверка имени повторится на исполнении.")
+        if habits is not None:
+            habit = next((h for h in habits if h.get("id") == habit_id), None)
+            if habit is None:
+                return (f"🛑 План НЕ построен — привычки с id "
+                        f"{str(habit_id)[:12]}… нет в живом списке (уже "
+                        "удалена или неверный id, см. get_habits). Ничего не "
+                        "изменено.")
+            real_name = habit.get("name") or ""
+            if not _names_agree(habit_name, real_name):
+                return (f"🛑 План НЕ построен — habit_id указывает на "
+                        f"«{real_name}», а НЕ «{habit_name}» (защита от «не "
+                        "той привычки»). Ничего не изменено.")
+        else:
+            name_warning = (" ⚠️ Имя НЕ удалось сверить с живым списком "
+                            "привычек (чтение не удалось) — сверка "
+                            "повторится при подтверждении, и расхождение "
+                            "остановит удаление.")
     params = {"habit_name": habit_name, "habit_id": habit_id}
+    describe_fn = ((lambda p: _describe_delete_habit(p) + name_warning)
+                   if name_warning else _describe_delete_habit)
     outcome = await _gate_single("delete_habit", "delete_habit",
                                  params if not manifest_id else None,
-                                 manifest_id, user_reply, _describe_delete_habit,
+                                 manifest_id, user_reply, describe_fn,
                                  automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
@@ -13822,7 +13952,8 @@ def _short_auto_execute_summary(tool: str, verdict: str,
                                 group_delivered: bool,
                                 fallback_to_dm: bool = False,
                                 partial: Optional[Tuple[int, int]] = None,
-                                totals: Optional[Tuple[int, int, int]] = None) -> str:
+                                totals: Optional[Tuple[int, int, int]] = None,
+                                group_configured: bool = True) -> str:
     """2-4 строки в ЛИЧКУ владельца. Максим просил не захламлять личный чат
     1:1 простынями — подробности живут в группе «MCP Отчёты», сюда идёт
     только вердикт. Если в группу отчёт НЕ доставился, сводка обязана сказать
@@ -13834,6 +13965,21 @@ def _short_auto_execute_summary(tool: str, verdict: str,
     2 части из 6. Раньше такой случай не отличался от полного успеха (список
     id ведь непустой), и владельцу писали «Подробный отчёт — в группе», хотя
     там лежала треть. Теперь это называется своими словами.
+
+    def-118 (2026-08-07): `group_delivered` = `bool(delivery.ok)` — «ушло
+    туда, куда сейчас указывает reports_chat_id» — а НЕ «ушло в РЕАЛЬНУЮ
+    группу». Когда `TG_REPORTS_CHAT_ID` не задана, `load_tg_approval_config`
+    (tg_approval.py) подставляет `reports_chat_id = owner_chat_id` — то есть
+    «группа» технически ЭТО ЖЕ личка. Telegram успешно отправляет туда
+    сообщение (`delivery.ok=True`), но группы «MCP Отчёты», о которой
+    говорит следующая строка, не существует — владелец шёл искать отчёт не
+    там. `group_configured` — честный флаг «группа реально отличается от
+    лички» (то же сравнение `reports_chat != owner_chat`, что уже стоит в
+    `_publish_auto_execute_outcome` для fallback_ok чуть ниже), передаётся
+    вызывающей стороной. Дефолт `True` — для существующих прямых вызовов
+    этой функции (тесты и любой будущий вызывающий, который явно не думал
+    про этот кейс) ничего не меняет; единственный боевой вызывающий
+    (`_publish_auto_execute_outcome`) передаёт настоящее значение явно.
 
     def-111 (2026-08-07): `affected` (см. `_manifest_affected_count`) — размер
     ПЛАНА, захваченного ДО исполнения, а не факт того, что реально изменилось
@@ -13857,8 +14003,15 @@ def _short_auto_execute_summary(tool: str, verdict: str,
         lines.append(f"⚠️ отчёт доставлен в группу частично ({got} из {total} "
                      f"частей) — остальное не дошло, подробности в логах "
                      f"сервера.")
-    elif group_delivered:
+    elif group_delivered and group_configured:
         lines.append("Подробный отчёт — в группе «MCP Отчёты».")
+    elif group_delivered:
+        # def-118: доставлено, но НЕ в группу (её нет — reports_chat_id ==
+        # owner_chat_id) — ушло отдельным сообщением в этот же личный чат,
+        # позже отредактированной сводки по времени отправки (см. порядок
+        # вызовов в _publish_auto_execute_outcome: post_report_to_group идёт
+        # ДО summarize_in_owner_chat) — «ниже» здесь честно, а не «в группе».
+        lines.append("Подробный отчёт — ниже.")
     elif fallback_to_dm:
         lines.append("⚠️ В группу отчёт не ушёл (проверь TG_REPORTS_CHAT_ID и "
                      "что бот в группе) — полный текст прислан сюда отдельным "
@@ -13968,6 +14121,12 @@ def _publish_auto_execute_outcome(candidate: Dict, tool: str, full_md: str,
     fallback_ok = False
     reports_chat = str(getattr(_TG_CFG, "reports_chat_id", "") or "")
     owner_chat = str(candidate.get("chat_id") or "")
+    # def-118: «группа реально настроена ОТДЕЛЬНО от лички» — то же сравнение,
+    # что чуть ниже решает нужен ли фолбэк на личку, но здесь оно нужно И для
+    # случая, когда TG_REPORTS_CHAT_ID пуст, а post_report_to_group всё равно
+    # технически «доставил» (Telegram просто отправил в тот же личный чат, а
+    # не провалился) — тогда fallback_ok ниже даже не вычисляется.
+    group_configured = bool(reports_chat) and reports_chat != owner_chat
     if not delivery.message_ids and owner_chat and reports_chat != owner_chat:
         try:
             fb = tg_approval.send_message_chunked(_TG_CFG, owner_chat, full_md)
@@ -13998,7 +14157,8 @@ def _publish_auto_execute_outcome(candidate: Dict, tool: str, full_md: str,
     totals = _parse_verify_totals(full_md)
     short_md = _short_auto_execute_summary(tool, verdict, affected,
                                            bool(delivery.ok), fallback_ok,
-                                           partial, totals)
+                                           partial, totals,
+                                           group_configured=group_configured)
     summary_ok = False
     try:
         summary_ok = bool(tg_approval.summarize_in_owner_chat(

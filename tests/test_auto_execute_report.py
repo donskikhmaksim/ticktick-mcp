@@ -675,6 +675,59 @@ def test_full_group_delivery_still_reads_as_success(monkeypatch):
 
 
 # ===========================================================================
+# def-118 (2026-08-07): TG_REPORTS_CHAT_ID не задан → tg_approval.py:175
+# подставляет reports_chat_id = owner_chat_id ДО того, как _publish_auto_
+# execute_outcome вообще узнаёт о доставке. post_report_to_group формально
+# «доставляет» (Telegram шлёт в личку — тот же чат, delivery.ok=True), и
+# раньше сводка всё равно радостно сообщала «Подробный отчёт — в группе
+# «MCP Отчёты»» — группы, которую владелец шёл искать, не существует.
+# ===========================================================================
+
+def test_group_line_not_shown_when_reports_chat_is_the_dm_itself(monkeypatch):
+    """Живой прод-сценарий def-118: TG_REPORTS_CHAT_ID не задан, поэтому
+    reports_chat_id == owner_chat_id (candidate['chat_id']). group_ids
+    непустой ⇒ delivery.ok=True («доставлено»), но реальной группы нет."""
+    _sent, chunked, edits = _publish_harness(monkeypatch, group_ids=[1001],
+                                             reports_chat="111")
+    candidate = {"manifest_id": "m1", "chat_id": "111", "message_id": 9}
+
+    s._publish_auto_execute_outcome(candidate, "delete_tasks", "отчёт", "ok", 3)
+
+    short = edits[0][2]
+    assert "MCP Отчёты" not in short, "группы нет — нельзя утверждать, что она есть"
+    assert "ниже" in short
+    assert chunked == [], "доставлено (пусть и в личку) — дублировать не нужно"
+
+
+def test_group_line_shown_when_reports_chat_is_a_real_group(monkeypatch):
+    """Контрольный случай: TG_REPORTS_CHAT_ID реально отличается от лички —
+    фраза про группу обязана остаться (regression guard на саму фичу)."""
+    _sent, chunked, edits = _publish_harness(monkeypatch, group_ids=[1001],
+                                             reports_chat="-100777")
+    candidate = {"manifest_id": "m1", "chat_id": "111", "message_id": 9}
+
+    s._publish_auto_execute_outcome(candidate, "delete_tasks", "отчёт", "ok", 3)
+
+    short = edits[0][2]
+    assert "MCP Отчёты" in short
+    assert chunked == []
+
+
+def test_short_summary_group_configured_gate(monkeypatch):
+    """Юнит-уровень (без _publish_auto_execute_outcome): group_delivered=True
+    печатает «в группе» ТОЛЬКО когда group_configured тоже True; иначе —
+    честное «ниже», а не имя несуществующей группы."""
+    configured = s._short_auto_execute_summary(
+        "delete_tasks", "ok", 3, True, group_configured=True)
+    assert "MCP Отчёты" in configured
+
+    not_configured = s._short_auto_execute_summary(
+        "delete_tasks", "ok", 3, True, group_configured=False)
+    assert "MCP Отчёты" not in not_configured
+    assert "ниже" in not_configured
+
+
+# ===========================================================================
 # Уборка «сирот» плана в личке (куски 1..N-1 длинного плана)
 # ===========================================================================
 

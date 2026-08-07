@@ -19,6 +19,28 @@ delete→ HTTP 200, {"id2etag":{},"id2error":{}},           GET /habits 12→11.
   • post-verify: успех объявляется только после ОТДЕЛЬНОГО свежего чтения
     списка привычек, а расхождение/пропажа дают ⚠️/❌, а не ✅;
   • защита от близнеца: одноимённая привычка второй раз не заводится.
+
+def-116 (2026-08-07) — ВАЖНАЯ ПРАВКА ПОВЕДЕНИЯ, не просто новый тест.
+До этой правки identity-guard delete_habit срабатывал ТОЛЬКО на исполнении
+(call #2/_delete_habit_impl) — фаза ПЛАНА (call #1) печатала карточку с
+именем ИЗ ЗАПРОСА, не сверяя его с habit_id вообще. Три теста ниже раньше
+явно ЗАКРЕПЛЯЛИ это как ожидаемое поведение (все использовали общий
+хелпер `_delete()`, который требует, чтобы call #1 НЕ отказывал):
+  • test_delete_habit_identity_guard_blocks_wrong_name — раньше ждал, что
+    `_delete(habit_name="Медитация", habit_id="h2")` (чужой id) пройдёт
+    ЧЕРЕЗ фазу плана без единого 🛑 и откажет только на call #2;
+  • test_delete_habit_unknown_id_is_refused — тот же паттерн для
+    несуществующего id;
+  • test_call1_previews_and_mutates_nothing[delete_habit] — явно
+    утверждал `fake.get_habits_calls == 0` с комментарием «фаза плана в
+    TickTick не ходит вовсе» — то есть план-фаза programmatically не имела
+    ПРАВА проверить состояние, даже если бы захотела.
+Тесты были зелёными НА БАГЕ: они не защищали от регрессии в эту сторону,
+а фиксировали её как норму — найдено не аудитом кода, а живым прогоном
+(Максим подал `habit_name` реальной привычки + `habit_id` другой,
+получил карточку с чужим именем). Три теста ниже переписаны под новое,
+ПРАВИЛЬНОЕ поведение (отказ уже на call #1); история — в def-116
+коммите.
 """
 import re
 
@@ -273,29 +295,128 @@ async def test_delete_habit_success_is_post_verified(monkeypatch):
     assert result.startswith("### ✅ Привычка «Медитация» удалена")
     assert "**7**" in result            # радиус поражения: история отметок
     assert fake.delete_calls == ["h1"]
-    assert fake.get_habits_calls == 2   # identity-guard + отдельная пост-проверка
+    # def-116: +1 к прежним двум (identity-guard на исполнении + отдельная
+    # пост-проверка) — теперь ЕЩЁ одно чтение на этапе ПЛАНА (call #1).
+    assert fake.get_habits_calls == 3
 
 
 async def test_delete_habit_identity_guard_blocks_wrong_name(monkeypatch):
+    """def-116 (2026-08-07): было — `_delete()` (план #1 → исполнение #2)
+    отказывал только на #2, план #1 «Удаляю привычку «Медитация»…» уходил
+    владельцу непроверенным (см. module docstring выше). Стало — отказ уже
+    на #1, ДО того как карточка с (возможно) чужим именем вообще
+    построена: план для чужого id не строится вовсе, ни одного вызова
+    delete_calls."""
     fake = FakeHabitsV2(HABITS)
     _wire(monkeypatch, fake)
 
     # id чужой привычки под именем другой — ровно тот промах, ради которого
     # существует identity-guard
-    result = await _delete(habit_name="Медитация", habit_id="h2")
+    result = await s.delete_habit(habit_name="Медитация", habit_id="h2")
 
+    assert result.startswith("🛑")
+    assert "«Бег»" in result
+    assert "manifest_id" not in result, "план для несовпавшей пары строиться не должен"
+    assert fake.delete_calls == []
+
+
+async def test_delete_habit_unknown_id_is_refused(monkeypatch):
+    """def-116: тот же перенос на call #1, что и в тесте выше — было:
+    отказ только на исполнении; стало: план не строится вовсе."""
+    fake = FakeHabitsV2(HABITS)
+    _wire(monkeypatch, fake)
+
+    result = await s.delete_habit(habit_name="Медитация", habit_id="h-нет-такой")
+
+    assert result.startswith("🛑")
+    assert "manifest_id" not in result
+    assert fake.delete_calls == []
+
+
+# ===========================================================================
+# def-116 (2026-08-07): сверка habit_id↔habit_name перенесена с ИСПОЛНЕНИЯ
+# (call #2, _delete_habit_impl — не тронуто, работает как раньше) на
+# ПОСТРОЕНИЕ ПЛАНА (call #1) — по образцу _resolve_triage_ops/_names_agree
+# в manual_triage. Живой пример: habit_name="Растяжка" (реальная привычка)
+# + habit_id тестовой — карточка ушла бы с именем «Растяжка», хотя id вёл
+# не туда.
+# ===========================================================================
+
+async def test_delete_habit_plan_read_failure_does_not_block_but_warns(
+        monkeypatch):
+    """Осторожность из ТЗ: временная недоступность live-чтения на этапе
+    плана НЕ должна блокировать удаление наглухо (fail-open здесь дешевле,
+    чем отказ ВСЕМ, у кого сейчас барахлит сеть) — но и не должна выдавать
+    непроверенное имя за факт. План строится, честно предупреждает, а
+    настоящая защита (call #2, identity guard на исполнении) остаётся
+    активной и НЕ ослаблена этим путём."""
+    fake = FakeHabitsV2(HABITS, raise_on_get=1)  # 1-е чтение (план) падает
+    _wire(monkeypatch, fake)
+
+    preview = await s.delete_habit(habit_name="Медитация", habit_id="h1")
+
+    assert "🛑" not in preview, "временный сбой чтения не должен блокировать план"
+    assert "НЕ удалось сверить" in preview
+    mid = re.search(r'manifest_id="([0-9a-f]+)"', preview).group(1)
+
+    # Исполнение (call #2) — 2-е и 3-е чтения (identity-guard + пост-
+    # проверка), raise_on_get=1 их не касается: настоящая пара, удаление
+    # проходит нормально.
+    result = await s.delete_habit(habit_name="Медитация", habit_id="h1",
+                                  manifest_id=mid, user_reply="да")
+    assert result.startswith("### ✅ Привычка «Медитация» удалена")
+    assert fake.delete_calls == ["h1"]
+
+
+async def test_delete_habit_plan_read_failure_still_lets_execution_catch_a_real_mismatch(
+        monkeypatch):
+    """Тот же сбой чтения на плане, но пара В ДЕЙСТВИТЕЛЬНОСТИ не совпадает
+    (habit_id="h2" = «Бег», а не «Медитация»): раз план-проверка не
+    выполнилась, план строится с предупреждением, НО identity-guard на
+    исполнении (не тронут этой правкой) обязан всё равно поймать
+    расхождение — сеть, недоступная только на планировании, не должна
+    ослаблять защиту при исполнении."""
+    fake = FakeHabitsV2(HABITS, raise_on_get=1)
+    _wire(monkeypatch, fake)
+
+    preview = await s.delete_habit(habit_name="Медитация", habit_id="h2")
+    assert "🛑" not in preview
+    mid = re.search(r'manifest_id="([0-9a-f]+)"', preview).group(1)
+
+    result = await s.delete_habit(habit_name="Медитация", habit_id="h2",
+                                  manifest_id=mid, user_reply="да")
     assert result.startswith("🛑")
     assert "«Бег»" in result
     assert fake.delete_calls == []
 
 
-async def test_delete_habit_unknown_id_is_refused(monkeypatch):
+async def test_delete_habit_automation_key_mismatch_is_refused_before_execution(
+        monkeypatch):
+    """def-116 специально для headless-пути: карточки с кнопками там нет
+    ВООБЩЕ (см. docstring), поэтому если бы сверка стояла только внутри
+    _gate_single/исполнения, ложная пара имя+id прошла бы молча по одному
+    valid-ключу. Проверка стоит ДО _gate_single — значит применяется и
+    здесь.
+
+    ВАЖНО для мутационного тестирования: `_delete_habit_impl`'s СОБСТВЕННЫЙ
+    identity-guard (не тронут этой правкой) тоже поймал бы это расхождение,
+    если бы automation_key-путь дошёл до исполнения — поэтому одного
+    `startswith("🛑")` мало, чтобы доказать, что именно ПЛАН-СТАДИЯ (не
+    execution-стадия) отказала первой: обе ветки печатают разный текст
+    («План НЕ построен» здесь vs «НЕ удалил» у _delete_habit_impl) и
+    execution-путь вообще не должен быть достигнут (delete_calls пуст,
+    ровно одно чтение — то самое, план-стадийное)."""
     fake = FakeHabitsV2(HABITS)
     _wire(monkeypatch, fake)
+    monkeypatch.setattr(s, "SECRET", "test-secret")
 
-    result = await _delete(habit_name="Медитация", habit_id="h-нет-такой")
+    result = await s.delete_habit(habit_name="Медитация", habit_id="h2",
+                                  automation_key="test-secret")
 
-    assert result.startswith("🛑")
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Бег»" in result
+    assert fake.delete_calls == []
+    assert fake.get_habits_calls == 1
     assert fake.delete_calls == []
 
 
@@ -360,11 +481,16 @@ async def test_delete_habit_says_so_when_the_journal_is_unwritable(monkeypatch):
 
 # ────────────────────────────── гейт ──────────────────────────────
 
-@pytest.mark.parametrize("tool,kwargs", [
-    ("create_habit", dict(name="Зарядка")),
-    ("delete_habit", dict(habit_name="Медитация", habit_id="h1")),
+@pytest.mark.parametrize("tool,kwargs,expected_plan_reads", [
+    ("create_habit", dict(name="Зарядка"), 0),
+    # def-116: delete_habit's план-фаза ТЕПЕРЬ читает живой список привычек
+    # ровно один раз (сверка habit_id↔habit_name ДО построения плана) — было
+    # 0 («фаза плана в TickTick не ходит вовсе»), пока это и было багом
+    # def-116 (см. module docstring). create_habit этой правкой не тронут.
+    ("delete_habit", dict(habit_name="Медитация", habit_id="h1"), 1),
 ])
-async def test_call1_previews_and_mutates_nothing(monkeypatch, tool, kwargs):
+async def test_call1_previews_and_mutates_nothing(monkeypatch, tool, kwargs,
+                                                   expected_plan_reads):
     fake = FakeHabitsV2(HABITS)
     _wire(monkeypatch, fake)
 
@@ -372,7 +498,7 @@ async def test_call1_previews_and_mutates_nothing(monkeypatch, tool, kwargs):
 
     assert "manifest_id" in preview
     assert fake.create_calls == [] and fake.delete_calls == []
-    assert fake.get_habits_calls == 0   # фаза плана в TickTick не ходит вовсе
+    assert fake.get_habits_calls == expected_plan_reads
 
 
 @pytest.mark.parametrize("tool,kwargs", [
