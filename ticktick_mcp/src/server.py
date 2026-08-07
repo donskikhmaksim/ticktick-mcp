@@ -5884,7 +5884,12 @@ async def _dc_analyze(tasks: List[Dict], names: Dict, judge_fn=None, smart_fn=No
             out["flag_obsolete"].append({
                 "taskId": t.get("id"), "title": t.get("title") or "",
                 "project": names.get(t.get("projectId"), ""),
-                "due": str(t.get("dueDate"))[:10] if t.get("dueDate") else "",
+                # Печатает это plan_declutter: «срок X (просрочено N дней)».
+                # Счётчик N уже считался в зоне владельца
+                # (_dc_is_obsolete → _task_due_local_date), а срок рядом
+                # брался сырым срезом — строка противоречила сама себе на
+                # день, и по ней человек решает, добивать задачу или нет.
+                "due": _local_date_str(t, "dueDate") if t.get("dueDate") else "",
                 "overdue_days": info["overdue_days"], "age_days": info["age_days"],
             })
 

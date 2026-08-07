@@ -363,3 +363,29 @@ def test_verify_item_create_all_day_verbatim(monkeypatch):
     _, line = s._verify_item("create", {"taskId": "t1", "title": "x"},
                              {"t1": live}, {"p1": "Работа"})
     assert f"срок {day.isoformat()}" in line, line
+
+
+# ==========================================================================
+# Место 7 — _dc_analyze → plan_declutter: «срок …» во флаге «протухшее»
+# ==========================================================================
+
+async def test_declutter_obsolete_flag_uses_owner_day(monkeypatch):
+    """Второй текст решения: «срок X, просрочено N дней». Сам счётчик
+    просрочки уже считался в зоне владельца (`_task_due_local_date`), а
+    напечатанный рядом срок брался сырым срезом — то есть строка сама себе
+    противоречила на день."""
+    monkeypatch.setattr(s, "_USER_TZ", ZoneInfo(LA))
+    due, local_d, utc_d = _at_local(LA, 23, 59, -120)
+    old = (datetime.now(timezone.utc) - timedelta(days=200)
+           ).strftime("%Y-%m-%dT%H:%M:%S.000+0000")
+    task = {"id": "t1", "projectId": "p1", "title": "Забрать дверь",
+            "dueDate": due, "createdTime": old, "modifiedTime": old,
+            "priority": 0, "content": ""}
+
+    out = await s._dc_analyze([task], {"p1": "Работа"}, judge_fn=None,
+                              smart_fn=None, fuzzy=False)
+
+    assert len(out["flag_obsolete"]) == 1, out
+    got = out["flag_obsolete"][0]["due"]
+    assert got == local_d.isoformat(), got
+    assert got != utc_d.isoformat(), got
