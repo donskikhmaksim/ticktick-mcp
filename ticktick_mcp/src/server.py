@@ -452,37 +452,60 @@ async def attachment_upload_link(request: Request) -> Response:
 # Single source of truth for TickTick's priority levels (0/1/3/5).
 PRIORITY_MAP = {0: "None", 1: "Low", 3: "Medium", 5: "High"}
 
+# ...and for its task statuses. -1 ("won't do" / abandoned) is absent from the
+# official API docs but very much present in the data — get_task_info's v2
+# branch already mapped it. format_task used to test `status == 2` and call
+# EVERYTHING else "Active", so an abandoned task was reported as active. Any
+# status this map doesn't know must stay visible as unknown rather than fall
+# into the same silent "Active" bucket.
+STATUS_MAP = {0: "Active", 2: "Completed", -1: "Won't do (abandoned)"}
+
 
 # Format a task object from TickTick for better display
-def format_task(task: Dict) -> str:
-    """Format a task into a human-readable string (title first, ids at the end)."""
+def format_task(task: Dict, trash_state: Optional[bool] = None) -> str:
+    """Format a task into a human-readable string (title first, ids at the end).
+
+    trash_state: True = caller VERIFIED the task sits in the trash, False =
+    verified it does not, None = not checked (the default — the official v1
+    API carries no deletion flag at all, so most callers simply cannot know).
+    """
     formatted = f"Title: {task.get('title', 'No title')}\n"
 
-    # Add dates if available
+    # Dates are printed in the OWNER's zone (_local_datetime_str), never as the
+    # raw UTC instant TickTick stores. A deadline near local midnight otherwise
+    # renders as the wrong calendar day: 23:59 America/Los_Angeles is 06:59 UTC
+    # the NEXT day, so the raw value contradicted the very filter that selected
+    # the task (an "overdue" list showing today's date).
     if task.get('startDate'):
-        formatted += f"Start Date: {task.get('startDate')}\n"
+        formatted += f"Start Date: {_local_datetime_str(task, 'startDate')}\n"
     if task.get('dueDate'):
-        formatted += f"Due Date: {task.get('dueDate')}\n"
-    
+        formatted += f"Due Date: {_local_datetime_str(task, 'dueDate')}\n"
+
     # Add priority if available
     priority = task.get('priority', 0)
     formatted += f"Priority: {PRIORITY_MAP.get(priority, str(priority))}\n"
     
-    # Add status if available
-    status = "Completed" if task.get('status') == 2 else "Active"
-    formatted += f"Status: {status}\n"
-    
+    # Status. A trashed task keeps whatever status it had before deletion, so
+    # printing that field alone ("Active") is a lie about a task in the bin —
+    # the deletion has to lead, with the raw field kept for reference.
+    raw_status = task.get('status', 0)
+    status = STATUS_MAP.get(raw_status, f"Unknown (raw: {raw_status})")
+    if trash_state is True:
+        formatted += f"Status: IN TRASH (deleted) — status field says «{status}»\n"
+    else:
+        formatted += f"Status: {status}\n"
+
     # Add content if available
     if task.get('content'):
         formatted += f"\nContent:\n{task.get('content')}\n"
-    
+
     # Add subtasks if available
     items = task.get('items', [])
     if items:
         formatted += f"\nSubtasks ({len(items)}):\n"
         for i, item in enumerate(items, 1):
-            status = "✓" if item.get('status') == 1 else "□"
-            formatted += f"{i}. [{status}] {item.get('title', 'No title')}\n"
+            mark = "✓" if item.get('status') == 1 else "□"
+            formatted += f"{i}. [{mark}] {item.get('title', 'No title')}\n"
 
     # Ids last — needed for follow-up calls, but not the headline.
     formatted += f"(id: {task.get('id', '?')} | project: {task.get('projectId', '?')})\n"
@@ -566,7 +589,10 @@ def format_task_line(task: Dict, project_name: str = None) -> str:
     bits.append(task.get("title") or "(no title)")
     meta = []
     if task.get("dueDate"):
-        meta.append("due " + str(task["dueDate"])[:10])
+        # Owner's calendar day, not dueDate[:10] of the raw UTC instant — see
+        # _local_calendar_date(). The old slice made a task due 23:59 local
+        # print as tomorrow, inside a list titled "overdue".
+        meta.append("due " + _local_date_str(task, "dueDate"))
     pr = _PRIO_SHORT.get(task.get("priority", 0))
     if pr:
         meta.append(pr)
@@ -1475,11 +1501,55 @@ async def get_project_tasks(project_id: str) -> str:
         logger.error(f"Error in get_project_tasks: {e}")
         return f"Error retrieving project tasks: {str(e)}"
 
+# v2's trash endpoint caps a page at 500; ask for the whole page so "not in the
+# trash" is as close to a full answer as one request can be.
+_TRASH_SCAN_LIMIT = 500
+
+
+async def _trash_state(task_id: str) -> tuple:
+    """Is this task in the trash — and could that even be checked?
+
+    The official v1 API does not know. GET /project/{pid}/task/{tid} happily
+    returns a DELETED task's object with no deletion flag anywhere in it, which
+    is exactly how get_task came to print "Status: Active" about two tasks
+    sitting in the bin. The only source of truth is the v2 trash listing, and it
+    costs ONE extra GET /project/all/trash/pagination per get_task call.
+
+    That price is paid on purpose: get_task is the point-lookup tool people use
+    as PROOF about a single task (not a loop over a list — format_task's other
+    callers get trash_state=None and pay nothing), and staying silent here reads
+    as "definitely not deleted", a claim the source never made.
+
+    Returns (in_trash, note):
+      (True,  "")     found in the trash;
+      (False, "")     trash read in full, not there;
+      (False, note)   only the most recent page was read — older trash unchecked;
+      (None,  note)   could not check at all (v2 unavailable / read failed).
+    """
+    unknown = ("Trash: NOT CHECKED — the official API carries no deletion flag, "
+               "so this task could be in the trash and still read as above.\n")
+    if not ticktick_v2:
+        return None, unknown
+    try:
+        trashed = await _run_blocking(lambda: ticktick_v2.get_trash(_TRASH_SCAN_LIMIT))
+    except Exception as e:
+        logger.warning(f"get_task: trash check failed: {e}")
+        return None, unknown
+    if any(t.get("id") == task_id for t in (trashed or [])):
+        return True, ""
+    if len(trashed or []) >= _TRASH_SCAN_LIMIT:
+        return False, (f"Trash: not among the {_TRASH_SCAN_LIMIT} most recently "
+                       "deleted tasks; older trash was not checked.\n")
+    return False, ""
+
+
 @mcp.tool(annotations=READONLY)
 async def get_task(project_id: str, task_id: str) -> str:
     """
-    Get details about a specific task.
-    
+    Get details about a specific task. The Status line is cross-checked against
+    the trash (v2), because the official API reports a deleted task as if it
+    were still live; when that check is impossible the output says so.
+
     Args:
         project_id: ID of the project
         task_id: ID of the task
@@ -1487,13 +1557,14 @@ async def get_task(project_id: str, task_id: str) -> str:
     err = _ensure_official()
     if err:
         return err
-    
+
     try:
         task = await _run_blocking(lambda: ticktick.get_task(project_id, task_id))
         if 'error' in task:
             return f"Error fetching task: {task['error']}"
-        
-        return format_task(task)
+
+        in_trash, note = await _trash_state(task_id)
+        return format_task(task, trash_state=in_trash) + note
     except Exception as e:
         logger.error(f"Error in get_task: {e}")
         return f"Error retrieving task: {str(e)}"
@@ -7243,6 +7314,58 @@ def _task_due_local_date(task: Dict[str, Any]):
     return dt.astimezone(_USER_TZ).date()
 
 
+# ---- date RENDERING (what a human reads) --------------------------------
+# The filters above already think in _USER_TZ; the formatters used to print the
+# raw stored string instead, so the two disagreed by a whole calendar day for
+# any deadline near local midnight (23:59 America/Los_Angeles == 06:59 UTC the
+# NEXT day). That produced output that contradicted itself — an "overdue" list
+# whose first line showed today's date. Rendering goes through these two
+# helpers so display and classification can never drift apart again.
+# Used by format_task_line() / format_task(), defined far above: Python resolves
+# them at call time, so the ordering is fine.
+
+def _is_all_day_value(task: Dict[str, Any], value: Any) -> bool:
+    """All-day for THIS field: the task-wide isAllDay flag, or a bare
+    YYYY-MM-DD (a zone-independent calendar date — never .astimezone() it,
+    that is the #36 off-by-one)."""
+    if task.get("isAllDay"):
+        return True
+    return isinstance(value, str) and _DATE_ONLY.match(value.strip()) is not None
+
+
+def _local_calendar_date(task: Dict[str, Any], field: str = "dueDate") -> Optional[date]:
+    """Calendar date of `field` (dueDate/startDate) in the OWNER's zone.
+    Same rules as _task_due_local_date, but for any date field."""
+    value = task.get(field)
+    if not value:
+        return None
+    if _is_all_day_value(task, value):
+        return _all_day_date(str(value))
+    dt = _parse_ticktick_datetime(str(value))
+    return dt.astimezone(_USER_TZ).date() if dt else None
+
+
+def _local_date_str(task: Dict[str, Any], field: str = "dueDate") -> str:
+    """Compact 'YYYY-MM-DD' in the owner's zone for one-line listings. An
+    unparseable value falls back to the raw text rather than vanishing."""
+    d = _local_calendar_date(task, field)
+    return d.isoformat() if d else str(task.get(field))[:10]
+
+
+def _local_datetime_str(task: Dict[str, Any], field: str = "dueDate") -> str:
+    """Full rendering for detail views: local day + clock time + the zone it is
+    stated in, so the reader never has to convert an offset in their head.
+    All-day values keep their bare date (no fake 00:00) and say so."""
+    raw = task.get(field)
+    if _is_all_day_value(task, raw):
+        d = _all_day_date(str(raw))
+        return f"{d.isoformat()} (all-day)" if d else f"{raw} (unparsed)"
+    dt = _parse_ticktick_datetime(str(raw))
+    if dt is None:
+        return f"{raw} (unparsed)"
+    return f"{dt.astimezone(_USER_TZ).strftime('%Y-%m-%d %H:%M')} ({_USER_TZ.key})"
+
+
 def _today_local():
     return datetime.now(_USER_TZ).date()
 
@@ -12417,8 +12540,22 @@ async def get_task_info(task_id: str) -> str:
         tasks = state.get("syncTaskBean", {}).get("update", []) or []
         t = next((x for x in tasks if x.get("id") == task_id), None)
         if not t:
-            return (f"Task {task_id} not found among open tasks "
-                    "(it may be completed or in the trash).")
+            # Three distinct causes hide behind "not in the open sync": the task
+            # is completed, it is in the trash, or it lives in an archived/closed
+            # project. The old one-liner named two of them and guessed. The trash
+            # one can be ANSWERED — one extra request, paid only on this branch
+            # (a miss), never on a successful read.
+            in_trash, _ = await _trash_state(task_id)
+            if in_trash:
+                return (f"Task {task_id} is IN THE TRASH (deleted). "
+                        "restore_tasks can bring it back.")
+            if in_trash is False:
+                return (f"Task {task_id} not found among open tasks and it is NOT in "
+                        "the trash — it is either completed, or in an archived/closed "
+                        "project.")
+            return (f"Task {task_id} not found among open tasks; the trash could NOT "
+                    "be checked. It may be completed, in the trash, or in an "
+                    "archived/closed project.")
 
         pr = PRIORITY_MAP.get(t.get("priority", 0))
         status = {0: "Active", 2: "Completed", -1: "Won't do"}.get(t.get("status", 0), t.get("status"))
