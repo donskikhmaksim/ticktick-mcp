@@ -11239,14 +11239,57 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None,
         manifest_id: from call #1's response — pass on call #2 to actually mark it
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
+
+    task_id (and task_title, when given) is cross-checked against the LIVE
+    task list TWICE (same pattern as delete_habit, def-116, 2026-08-07): once
+    while BUILDING the plan (call #1, before anything is shown to the owner)
+    and again, independently, right before the actual abandon (call #2,
+    unchanged). If the live read itself fails while building the plan, the
+    plan still gets built (a read hiccup must not block every abandon), but
+    its text says so honestly — the call #2 check is unconditional and still
+    guards the mutation either way. Only an OPEN task can be abandoned — a
+    task not among open tasks (already completed/deleted/wrong id) refuses
+    the plan outright, matching _abandon_task_impl's own severity on
+    execution.
     """
     err = _ensure_ready()
     if err:
         return err
+    # Перенос identity-guard (task_id↔task_title) на построение плана — тот
+    # же _guard_task, что уже стоит в _abandon_task_impl НА ИСПОЛНЕНИИ (той
+    # же формой вызова, что duplicate_task: project_id не передаётся —
+    # abandon_task его и не принимает). mismatch И missing здесь блокируют
+    # план целиком — _abandon_task_impl уже трактует ОБА как 🛑 на исполнении
+    # (в отличие от add_task_comment, где missing мягче): «не буду делать»
+    # можно пометить ТОЛЬКО открытую задачу, а не любую, найденную по id —
+    # перенос это не ужесточает, он лишь воспроизводит существующую
+    # политику раньше по времени. Временная недоступность живого чтения —
+    # fail-open с предупреждением, исполнение (не тронуто) перепроверяет
+    # заново. automation_key НЕ пропускает эту проверку — она стоит раньше
+    # самого гейта.
+    name_warning = ""
+    if not manifest_id:
+        g = _guard_task(task_id, task_title or "")
+        if g.status == "mismatch":
+            return (f"🛑 План НЕ построен — id это «{g.title}», а НЕ "
+                    f"«{task_title}» (защита от «не той задачи»). Ничего не "
+                    "изменено.")
+        elif g.status == "missing":
+            shown = task_title or _lookup_task_title(task_id)
+            return (f"🛑 План НЕ построен — «{shown}» не среди открытых "
+                    "задач (завершена/удалена/неверный id). Ничего не "
+                    "изменено.")
+        elif g.status == "unavailable":
+            name_warning = (" ⚠️ Задачу НЕ удалось сверить с живым "
+                            "состоянием (чтение не удалось) — сверка "
+                            "повторится при подтверждении, и расхождение "
+                            "остановит исполнение.")
     params = {"summary": summary, "task_id": task_id, "task_title": task_title}
+    describe_fn = ((lambda p: _describe_abandon_task(p) + name_warning)
+                   if name_warning else _describe_abandon_task)
     outcome = await _gate_single("abandon_task", "abandon_task",
                                  params if not manifest_id else None,
-                                 manifest_id, user_reply, _describe_abandon_task,
+                                 manifest_id, user_reply, describe_fn,
                                  automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message

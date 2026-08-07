@@ -483,3 +483,124 @@ async def test_archive_project_automation_key_mismatch_is_refused_before_plan(mo
     assert "«Личное»" in result
     assert "manifest_id" not in result
     assert spy.calls == []
+
+
+# ===========================================================================
+# 2026-08-07: plan-phase identity-guard (def-116 follow-up, group B) —
+# abandon_task's task_id↔task_title is now cross-checked BEFORE the plan is
+# built too, same _guard_task shape as duplicate_task (mismatch AND missing
+# both block — "не буду делать" can only be marked on an OPEN task;
+# _abandon_task_impl already treats a non-open id as a hard 🛑 on execution,
+# unlike e.g. add_task_comment where a missing task only warns). Unlike
+# _guard_project (used by update_project/archive_project above), _guard_task
+# DOES have a soft "unavailable" branch, so this block also covers the
+# read-failure-warns/still-catches pair — same shape as the analogous tests
+# in tests/test_slice1_real_gates.py for set_task_parent.
+# ===========================================================================
+
+async def test_abandon_task_plan_identity_guard_blocks_wrong_title(monkeypatch):
+    """task_id resolves to a REAL task ("Купить хлеб"), caller's task_title
+    claims a DIFFERENT one ("Купить молоко") — before this fix, call #1
+    would have built and shown a plan card describing the WRONG task."""
+    spy = _wire(monkeypatch, "abandon_task",
+               tasks=[{"id": "t1", "title": "Купить хлеб", "projectId": "p1"}])
+
+    result = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Купить хлеб»" in result
+    assert "manifest_id" not in result
+    assert spy.calls == []
+
+
+async def test_abandon_task_plan_identity_guard_blocks_missing_task(monkeypatch):
+    """_abandon_task_impl treats a task NOT among open tasks as a hard 🛑 too
+    (в отличие от add_task_comment, где комментировать завершённую задачу
+    разрешено) — «не буду делать» можно пометить только ОТКРЫТУЮ задачу, и
+    the plan-phase transfer must reproduce that same severity."""
+    spy = _wire(monkeypatch, "abandon_task", tasks=[])
+
+    result = await s.abandon_task("Отказываюсь", "t-нет-такой", task_title="Купить молоко")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "manifest_id" not in result
+    assert spy.calls == []
+
+
+async def test_abandon_task_plan_read_failure_does_not_block_but_warns(monkeypatch):
+    """A live-read hiccup while BUILDING the plan (call #1) must not block
+    every abandon — fail-open here is cheaper than refusing everyone whose
+    network is briefly flaky. The plan is still built, honestly warns that
+    the task was not verified, and call #2 still reaches the (stubbed)
+    execution normally."""
+    spy = _wire(monkeypatch, "abandon_task",
+               tasks=[{"id": "t1", "title": "Купить молоко", "projectId": "p1"}])
+    real_open_by_id = s._open_by_id
+    calls = {"n": 0}
+
+    def _flaky(fresh=False):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return real_open_by_id(fresh=fresh)
+    monkeypatch.setattr(s, "_open_by_id", _flaky)
+
+    preview = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко")
+    assert "🛑" not in preview, "временный сбой чтения не должен блокировать план"
+    assert "НЕ удалось сверить" in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко",
+                                  manifest_id=mid, user_reply="да")
+    assert "🛑" not in result
+    assert spy.calls == [{"summary": "Отказываюсь", "task_id": "t1",
+                          "task_title": "Купить молоко"}]
+
+
+async def test_abandon_task_plan_read_failure_still_lets_execution_catch_a_real_mismatch(
+        monkeypatch):
+    """Same read failure on the plan as above, but this time the pair
+    actually DOESN'T match. The plan-phase check couldn't run (so it warns
+    instead of refusing), but the execution-phase guard inside the REAL
+    `_abandon_task_impl` (NOT stubbed in this one test, unlike the rest of
+    this file — needed to prove the real guard, not a spy, catches it) still
+    catches the real mismatch: a network blip on planning must not weaken
+    the protection at execution time."""
+    _wire_clients(monkeypatch,
+                 tasks=[{"id": "t1", "title": "Купить хлеб", "projectId": "p1"}])
+    real_open_by_id = s._open_by_id
+    calls = {"n": 0}
+
+    def _flaky(fresh=False):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return real_open_by_id(fresh=fresh)
+    monkeypatch.setattr(s, "_open_by_id", _flaky)
+
+    preview = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко")
+    assert "🛑" not in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко",
+                                  manifest_id=mid, user_reply="да")
+    assert result.startswith("🛑")
+    assert "«Купить хлеб»" in result
+
+
+async def test_abandon_task_automation_key_mismatch_is_refused_before_plan(monkeypatch):
+    """Headless path (#118): a valid automation_key runs on the FIRST call,
+    with no plan card and no Telegram button ever shown — so if the identity
+    check only lived inside _gate_single/execution, a false name+id pair
+    would sail through silently on a single valid key."""
+    spy = _wire(monkeypatch, "abandon_task",
+               tasks=[{"id": "t1", "title": "Купить хлеб", "projectId": "p1"}])
+    monkeypatch.setattr(s, "SECRET", "test-secret")
+
+    result = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко",
+                                  automation_key="test-secret")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Купить хлеб»" in result
+    assert "manifest_id" not in result
+    assert spy.calls == []
