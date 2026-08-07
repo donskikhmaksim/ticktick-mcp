@@ -571,6 +571,15 @@ def format_task_line(task: Dict, project_name: str = None) -> str:
         meta.append(pr)
     if task.get("tags"):
         meta.append(" ".join("#" + t for t in task["tags"]))
+    # def-D5: статус не печатался НИКОГДА, поэтому в выводе
+    # search_all_tasks(include_completed=True) сделанная задача выглядела
+    # ровно как активная. Метка ставится только для НЕ-активных статусов,
+    # чтобы обычные списки не раздувались.
+    _status = task.get("status", 0)
+    if _status == 2:
+        meta.append("✅ completed")
+    elif _status == -1:
+        meta.append("✖ won't do")
     line = "- " + " ".join(bits)
     if meta:
         line += " · " + ", ".join(meta)
