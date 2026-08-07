@@ -7356,13 +7356,17 @@ def _task_matches_search(task: Dict[str, Any], search_term: str) -> bool:
     
     return False
 
-def _get_project_tasks_by_filter(filter_func, filter_name: str) -> str:
+def _get_project_tasks_by_filter(filter_func, filter_name: str,
+                                 limit: int = 200, offset: int = 0) -> str:
     """
     Helper function to filter tasks across all projects.
 
     Args:
         filter_func: Function that takes a task and returns True if it matches the filter
         filter_name: Name of the filter for output formatting
+        limit: Page size on the v2 path (default 200 — the historical cut-off)
+        offset: How many matches to skip, so the tail past `limit` is reachable
+            at all instead of being permanently cut off (def-D4)
 
     Returns:
         Formatted string of filtered tasks
@@ -7380,8 +7384,28 @@ def _get_project_tasks_by_filter(filter_func, filter_name: str) -> str:
             matched = [t for t in tasks if filter_func(t)]
             if not matched:
                 return f"No tasks found that are '{filter_name}'."
-            out = f"Tasks that are '{filter_name}' ({len(matched)}):\n"
-            return out + format_task_tree(matched)
+            total = len(matched)
+            offset = max(0, offset)
+            limit = max(1, limit)
+            page = matched[offset:offset + limit]
+            if not page:
+                # def-D4: пустая страница за концом списка — это НЕ «задач нет».
+                return (f"Tasks that are '{filter_name}': {total} total, but offset={offset} "
+                        f"is past the end (last page starts at offset="
+                        f"{max(0, (total - 1) // limit * limit)}).")
+            shown_to = offset + len(page)
+            if offset or shown_to < total:
+                out = (f"Tasks that are '{filter_name}' ({total} total; "
+                       f"showing {offset + 1}-{shown_to}):\n")
+            else:
+                out = f"Tasks that are '{filter_name}' ({total}):\n"
+            body = out + format_task_tree(page, limit)
+            if shown_to < total:
+                # Раньше здесь была голая пометка «... and N more.» из
+                # format_task_tree — она говорила, что список неполон, но не
+                # давала способа его дочитать: параметров у инструмента не было.
+                body += f"\n... and {total - shown_to} more — call again with offset={shown_to}."
+            return body
         except Exception as e:
             logger.warning(f"v2 task pool failed, falling back to official API: {e}")
 
@@ -7464,26 +7488,33 @@ async def get_all_tasks() -> str:
         return f"Error retrieving tasks: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
-async def get_tasks_by_priority(priority_id: int) -> str:
+async def get_tasks_by_priority(priority_id: int, limit: int = 200, offset: int = 0) -> str:
     """
     Get all tasks from TickTick by priority. Ignores closed projects.
 
+    The output is paged: the header always states the TOTAL number of matches,
+    and when it doesn't fit, the last line says how many are left and which
+    offset continues the list.
+
     Args:
         priority_id: Priority of tasks to retrieve {0: "None", 1: "Low", 3: "Medium", 5: "High"}
+        limit: Maximum tasks to show in one call (default 200)
+        offset: Skip this many matches — use it to read the tail past `limit`
     """
     err = _ensure_official()
     if err:
         return err
-    
+
     if priority_id not in PRIORITY_MAP:
         return f"Invalid priority_id. Valid values: {list(PRIORITY_MAP.keys())}"
-    
+
     try:
         def priority_filter(task: Dict[str, Any]) -> bool:
             return task.get('priority', 0) == priority_id
 
         priority_name = f"{PRIORITY_MAP[priority_id]} ({priority_id})"
-        return _get_project_tasks_by_filter(priority_filter, f"priority '{priority_name}'")
+        return _get_project_tasks_by_filter(priority_filter, f"priority '{priority_name}'",
+                                            limit=limit, offset=offset)
 
     except Exception as e:
         logger.error(f"Error in get_tasks_by_priority: {e}")
