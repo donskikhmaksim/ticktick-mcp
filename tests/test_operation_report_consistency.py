@@ -192,6 +192,139 @@ def test_report_refuses_to_confirm_anything_when_state_is_unavailable(
         "недоступное состояние выдано за подтверждённый успех")
 
 
+# ===========================================================================
+# def-110 (2026-08-07): «родитель применён» был ОДНИМ литералом на обе
+# противоположные операции (вложить / отцепить) — set_task_parent и
+# unset_task_parent над одной и той же задачей давали посимвольно
+# одинаковую строку успеха в блоке «Независимая перепроверка», и по отчёту
+# нельзя было восстановить, какая из двух операций реально произошла. Фикс
+# печатает НАБЛЮДАЕМОЕ состояние parentId (по образцу соседней ветки
+# `tags`, которая печатает `sorted(got)`, а не название операции), а не имя
+# действия — вложение и отцепление различаются сами собой.
+# ===========================================================================
+
+def test_parent_attach_and_detach_texts_are_different_and_match_the_fact(
+        monkeypatch, tmp_path):
+    """Прямое воспроизведение живого прогона: одна и та же ФОРМА журнальной
+    записи (`op == "parent"`), два противоположных `expect`. Тексты успеха
+    обязаны быть РАЗНЫМИ и каждый обязан отражать СВОЮ операцию — вложение
+    называет родителя по имени, отцепление явно говорит «нет»."""
+    live = {
+        "t1": {"id": "t1", "title": "Подзадача", "parentId": "p1"},
+        "p1": {"id": "p1", "title": "Родительская задача"},
+        "t2": {"id": "t2", "title": "Отцепленная"},  # parentId отсутствует
+    }
+    _wire(monkeypatch, live, tmp_path)
+
+    rid_attach = "parent-attach-01"
+    s._journal_write({"ts": "2026-08-07T10:00:00+00:00", "record": rid_attach,
+                      "op": "parent", "summary": "t",
+                      "items": [{"taskId": "t1", "title": "Подзадача",
+                                "expect": {"parentId": "p1"}}]})
+    rid_detach = "parent-detach-01"
+    s._journal_write({"ts": "2026-08-07T10:00:01+00:00", "record": rid_detach,
+                      "op": "parent", "summary": "t",
+                      "items": [{"taskId": "t2", "title": "Отцепленная",
+                                "expect": {"parentId": None}}]})
+
+    report_attach = s._build_operation_report(rid_attach)
+    report_detach = s._build_operation_report(rid_detach)
+
+    attach_line = [ln for ln in report_attach.splitlines()
+                   if ln.startswith("- ")][0]
+    detach_line = [ln for ln in report_detach.splitlines()
+                   if ln.startswith("- ")][0]
+
+    # Суть регрессии: раньше эти две строки были ПОСИМВОЛЬНО одинаковыми
+    # («родитель применён»), кроме заголовка с названием задачи.
+    assert attach_line != detach_line
+    assert "✅" in attach_line and "✅" in detach_line
+    # Вложение называет родителя по ИМЕНИ, не по id — id читателю бесполезен.
+    assert "Родительская задача" in attach_line
+    assert "p1" not in attach_line
+    # Отцепление явно говорит "нет", а не подделывает то же слово, что вложение.
+    assert "родитель: нет" in detach_line.lower()
+    assert "Родительская задача" not in detach_line
+
+
+def test_parent_text_falls_back_to_a_truncated_id_when_the_parent_has_no_title(
+        monkeypatch, tmp_path):
+    """Родитель среди живых задач есть (иначе был бы ❌ «не среди открытых»),
+    но по каким-то причинам без поля title — не выдумываем имя, показываем
+    усечённый id, как это уже делает соседняя ветка провала (`str(want)[:8]`)."""
+    live = {
+        "t1": {"id": "t1", "title": "Подзадача", "parentId": "p1"},
+        "p1": {"id": "p1"},  # без "title"
+    }
+    _wire(monkeypatch, live, tmp_path)
+
+    rid = "parent-no-title-01"
+    s._journal_write({"ts": "2026-08-07T10:00:02+00:00", "record": rid,
+                      "op": "parent", "summary": "t",
+                      "items": [{"taskId": "t1", "title": "Подзадача",
+                                "expect": {"parentId": "p1"}}]})
+
+    report = s._build_operation_report(rid)
+    line = [ln for ln in report.splitlines() if ln.startswith("- ")][0]
+    assert "✅" in line
+    assert "p1…" in line  # str("p1")[:8] + "…"
+
+
+def test_parent_detach_still_fails_when_parent_id_is_still_set(
+        monkeypatch, tmp_path):
+    """Регрессия на саму ЛОГИКУ вердикта (не текст): если ожидалось
+    detached (expect parentId=None), но живой parentId всё ещё стоит,
+    это обязано остаться ❌, а не превратиться в успех текстовой правкой."""
+    live = {"t1": {"id": "t1", "title": "Всё ещё подзадача", "parentId": "p1"},
+           "p1": {"id": "p1", "title": "Родитель"}}
+    _wire(monkeypatch, live, tmp_path)
+
+    rid = "parent-detach-fail-01"
+    s._journal_write({"ts": "2026-08-07T10:00:03+00:00", "record": rid,
+                      "op": "parent", "summary": "t",
+                      "items": [{"taskId": "t1", "title": "Всё ещё подзадача",
+                                "expect": {"parentId": None}}]})
+
+    report = s._build_operation_report(rid)
+    line = [ln for ln in report.splitlines() if ln.startswith("- ")][0]
+    assert line.startswith("- ❌")
+    assert "Статус операции: ❌" in report
+
+
+# ===========================================================================
+# Мелкая UX-правка (2026-08-07, попутно найдена при работе над def-110):
+# перепроверка тегов печатала сырой Python-репр списка («теги ['x', 'y']»,
+# «теги []») — владелец читает это в Telegram, квадратные скобки и кавычки
+# ему ни о чём не говорят. `_fmt_tag_set` даёт «tag1, tag2» / «нет».
+# ===========================================================================
+
+def test_tags_verify_text_is_human_readable_not_a_python_repr(
+        monkeypatch, tmp_path):
+    live = {
+        "t1": {"id": "t1", "title": "С тегами", "tags": ["b", "a"]},
+        "t2": {"id": "t2", "title": "Без тегов", "tags": []},
+    }
+    _wire(monkeypatch, live, tmp_path)
+
+    rid = "tags-fmt-01"
+    s._journal_write({"ts": "2026-08-07T10:00:04+00:00", "record": rid,
+                      "op": "tags", "summary": "t",
+                      "items": [{"taskId": "t1", "title": "С тегами",
+                                "expect": {"tags": ["a", "b"]}},
+                               {"taskId": "t2", "title": "Без тегов",
+                                "expect": {"tags": []}}]})
+
+    report = s._build_operation_report(rid)
+    lines = [ln for ln in report.splitlines() if ln.startswith("- ")]
+
+    assert "теги: a, b" in lines[0]
+    assert "теги: нет" in lines[1]
+    # старый сырой репр не должен просочиться нигде в теле отчёта
+    assert "[" not in "\n".join(lines)
+    assert "]" not in "\n".join(lines)
+    assert "'" not in "\n".join(lines)
+
+
 def test_post_verify_reads_a_fresh_state_not_the_cache(monkeypatch, tmp_path):
     """Перепроверка обязана читать состояние ЗАНОВО (`fresh=True`): иначе
     параллельный читатель успевает подсунуть снимок, снятый ДО мутации, и
