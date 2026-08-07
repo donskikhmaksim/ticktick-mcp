@@ -2855,9 +2855,11 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
                        manifest_id: str = "", user_reply: str = "",
                        automation_key: str = "") -> str:
     """
-    ⚠️ Delete one or more tasks permanently. Gated (🔴 — even a SINGLE
-    deletion): this is now a two-call plan → user says yes → execute flow,
-    same shape as plan_task_deletion/execute_task_deletion.
+    ⚠️ Delete one or more tasks (removed to TickTick's trash — recoverable
+    via restore_tasks, NOT permanent; def-114, 2026-08-07 — was wrongly
+    documented here as "permanently"). Gated (🔴 — even a SINGLE deletion):
+    this is now a two-call plan → user says yes → execute flow, same shape
+    as plan_task_deletion/execute_task_deletion.
 
     Call #1 (manifest_id omitted): resolves `tasks` against live state and
     returns a one-shot manifest — nothing is deleted yet. Show that manifest
@@ -2872,7 +2874,9 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
     summary (FIRST arg): one-line human sentence in the user's language,
     Destructive — START WITH ⚠️, e.g.
     «⚠️ Удаляю задачу „Купить молоко" из „Покупки"» or
-    «⚠️ Удаляю 5 задач из „Inbox"».
+    «⚠️ Удаляю 5 задач из „Inbox"». It is echoed VERBATIM as the plan card's
+    header (call #1's response) — this IS what the user reads, not
+    decoration, so make it accurate and specific.
 
     Put the human title and project name INSIDE each task object (call #1)
     so the manifest shows what's being deleted:
@@ -3005,8 +3009,22 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
             # превью не печатает, поэтому они едут прямо в ответ, иначе
             # автоматика молча не узнала бы, что часть списка не тронута.
             return "\n".join([done] + lines) if lines else done
-        preview = [f"### 📋 Готов удалить — {len(items)}",
-                  _plan_id_line(mid, "ничего ещё не удалено"), ""]
+        # def-114 (2026-08-07): заголовок раньше был обезличен («Готов
+        # удалить — N») и полностью отбрасывал `summary`, переданный
+        # вызывающим — а докстринг ТРЕБУЕТ от вызывающего начинать summary с
+        # ⚠️ и называть объект(ы) («⚠️ Удаляю задачу «Купить молоко» из
+        # «Покупки»»). У безопасных операций заголовок называет объект — у
+        # необратимой удаления был хуже, чем у безобидной. Теперь заголовок
+        # — сам `summary` (несёт и ⚠️, и названия — это ответственность
+        # вызывающего, как и раньше, только теперь она не выбрасывается), а
+        # следом честная строка про обратимость: удалённые задачи реально
+        # уходят в корзину TickTick (проверено живьём) и восстановимы через
+        # restore_tasks — молчание об этом раньше не давало Максиму понять,
+        # что удаление не окончательное.
+        preview = [f"### 📋 {summary} — {len(items)}",
+                  _plan_id_line(mid, "ничего ещё не удалено"),
+                  "- задачи уходят в корзину TickTick — можно вернуть через "
+                  "restore_tasks", ""]
         for i, it in enumerate(items, 1):
             preview.append(f"{i}. **«{it['title']}»** — {it['project']} (`{it['taskId']}`)")
         preview.extend(lines)

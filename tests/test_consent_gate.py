@@ -402,6 +402,54 @@ async def test_delete_tasks_bulk_over_cap_is_unaffected_by_the_gate(monkeypatch)
 
 
 # ===========================================================================
+# def-114 (2026-08-07): карточка плана delete_tasks была обезличена
+# («Готов удалить — N»), полностью отбрасывала вызывающего summary (⚠️ и
+# названия объектов терялись, хотя докстринг требует их от вызывающего), и
+# ни словом не упоминала, что удаление обратимо через корзину TickTick.
+# Образец правильного поведения (называть объект + сказать цену операции)
+# уже был у delete_habit — теперь и здесь.
+# ===========================================================================
+
+async def test_delete_tasks_plan_header_uses_the_caller_summary_verbatim(
+        monkeypatch, tmp_path):
+    """Раньше summary («⚠️ Удаляю задачу «Купить молоко» из «Покупки»»)
+    полностью терялся за жёстко закодированным «Готов удалить — N» — ⚠️,
+    названные объекты, весь смысл фразы исчезали из карточки.
+
+    Проверяется именно ПЕРВАЯ строка (заголовок «### ...»), а не «summary
+    где-то в тексте» — `agent_tail` тоже дословно повторяет summary внутри
+    инструкции для модели, поэтому простое `in preview` прошло бы даже без
+    исправления заголовка."""
+    live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
+    fake = _wire_delete_tasks(monkeypatch, live, tmp_path)
+
+    preview = await s.delete_tasks(
+        "⚠️ Удаляю задачу «Купить молоко» из «Покупки»",
+        [{"taskId": "t1", "title": "Купить молоко", "projectId": "p1"}])
+
+    assert fake.deleted_ids == []
+    header = preview.splitlines()[0]
+    assert header.startswith("### 📋 ⚠️ Удаляю задачу «Купить молоко» из «Покупки»")
+    assert "Готов удалить" not in header
+
+
+async def test_delete_tasks_plan_mentions_trash_reversibility(monkeypatch, tmp_path):
+    """Ни слова об обратимости не было — задачи реально уходят в корзину и
+    восстановимы через restore_tasks (проверено живьём), карточка обязана
+    это сказать."""
+    live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
+    fake = _wire_delete_tasks(monkeypatch, live, tmp_path)
+
+    preview = await s.delete_tasks(
+        "⚠️ Удаляю задачу «Купить молоко» из «Покупки»",
+        [{"taskId": "t1", "title": "Купить молоко", "projectId": "p1"}])
+
+    assert fake.deleted_ids == []
+    assert "restore_tasks" in preview
+    assert "корзин" in preview  # «корзину»/«корзины» — падеж не важен для теста
+
+
+# ===========================================================================
 # execute_task_deletion — the plan_task_deletion → execute pair
 # ===========================================================================
 
