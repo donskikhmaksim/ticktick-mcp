@@ -10670,6 +10670,12 @@ async def list_task_attachments(task_id: str, project_id: str = None) -> str:
     content (TickTick embeds them there as ![file](id/name) tokens), since
     not every account's attachment entries carry an id field directly.
 
+    Works for tasks that are no longer open too: a COMPLETED or TRASHED task's
+    files stay listable (that receipt/invoice is usually exactly what someone
+    comes back for). Those are looked up in the 100 most recently completed
+    tasks and the 500 newest trash entries — anything older than that has to be
+    reopened/restored first, and the error message says so.
+
     Args:
         task_id: ID of the task
         project_id: ID of the task's project (optional; auto-resolved)
@@ -10694,6 +10700,26 @@ async def list_task_attachments(task_id: str, project_id: str = None) -> str:
         return f"Error listing attachments: {str(e)}"
 
 
+def _attachment_project_id(task_id: str, given: str = None) -> Optional[str]:
+    """The projectId to build an attachment URL with, for a task in ANY state.
+
+    _resolve_project_id() only looks at OPEN tasks (deliberately — mutation
+    guards must not silently retarget a completed/trashed task), so on its own
+    it leaves every attachment of a completed task unreachable: the download
+    endpoint needs a projectId. This read-only path may look further, into the
+    completed feed and the trash (find_task_any_state, cached — no extra
+    request when the attachment list already resolved the same task)."""
+    pid = given or _resolve_project_id(task_id, given)
+    if pid:
+        return pid
+    try:
+        task, _state = ticktick_v2.find_task_any_state(task_id)
+        return (task or {}).get("projectId")
+    except Exception as e:
+        logger.warning(f"_attachment_project_id fallback failed for {task_id}: {e}")
+        return None
+
+
 async def _resolve_attachment_ref(task_id: str, project_id: str = None,
                                   attachment_id: str = None,
                                   filename: str = None, index: int = None
@@ -10706,7 +10732,7 @@ async def _resolve_attachment_ref(task_id: str, project_id: str = None,
     if not attachment_id and not filename and not index:
         return None, ("Provide one of attachment_id, filename, or index "
                       "(see list_task_attachments).")
-    pid = project_id or _resolve_project_id(task_id, project_id)
+    pid = await _run_blocking(lambda: _attachment_project_id(task_id, project_id))
     if not pid:
         return None, f"Could not resolve project_id for task {task_id}; pass it explicitly."
     atts = await _run_blocking(lambda: _merged_task_attachments(task_id))

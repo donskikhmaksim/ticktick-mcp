@@ -51,9 +51,36 @@ def test_get_task_attachments_returns_raw_dicts(client):
     assert atts == [{"fileName": "invoice.pdf"}]
 
 
-def test_get_task_attachments_missing_task_raises(client):
+def test_get_task_attachments_missing_everywhere_raises_honest_error(client, monkeypatch):
+    """Раньше этот тест назывался «missing task», а проверял «задача не среди
+    ОТКРЫТЫХ» — то есть закреплял дефект: у завершённой задачи вложения
+    объявлялись отсутствующими. Теперь «не найдена» означает «нет ни среди
+    открытых, ни среди завершённых, ни в корзине», и сообщение обязано это
+    честно называть."""
     _seed_open_task(client, {"id": "other", "projectId": PROJECT_ID})
-    with pytest.raises(ValueError, match=TASK_ID):
+    monkeypatch.setattr(client, "get_completed_tasks", lambda **kw: [])
+    monkeypatch.setattr(client, "get_trash", lambda **kw: [])
+
+    with pytest.raises(ValueError, match=TASK_ID) as e:
+        client.get_task_attachments(TASK_ID)
+
+    msg = str(e.value).lower()
+    assert "completed" in msg and "trash" in msg
+    assert f"open task {TASK_ID} not found" not in msg  # старая враньё-формулировка
+
+
+def test_lookup_failure_is_not_reported_as_no_such_task(client, monkeypatch):
+    """Протухший токен/сеть — это «не смог проверить», а не «задачи нет»:
+    ошибку надо поднять, иначе человек прочитает «файла нет»."""
+    _seed_open_task(client, {"id": "other", "projectId": PROJECT_ID})
+
+    def boom(**kw):
+        raise TickTickAuthError("token expired")
+
+    monkeypatch.setattr(client, "get_completed_tasks", boom)
+    monkeypatch.setattr(client, "get_trash", boom)
+
+    with pytest.raises(TickTickAuthError):
         client.get_task_attachments(TASK_ID)
 
 
