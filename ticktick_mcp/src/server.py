@@ -10214,7 +10214,13 @@ async def get_trash(limit: int = 50) -> str:
         if not tasks:
             return "Trash is empty."
         out = f"Trashed tasks ({len(tasks)}):\n\n"
-        return out + format_task_list(tasks)
+        # len(tasks), NOT format_task_list's default 100: the client already
+        # applied the caller's limit when asking TickTick, so a second, hidden
+        # cut here made everything past the 100th entry unreachable by ANY
+        # limit (live: limit=500 → 497 fetched, 100 shown, «...and 397 more»).
+        # The trash is what proves a deletion is reversible — it has to be
+        # readable in full.
+        return out + format_task_list(tasks, limit=len(tasks))
     except Exception as e:
         logger.error(f"Error in get_trash: {e}")
         return f"Error fetching trash: {str(e)}"
