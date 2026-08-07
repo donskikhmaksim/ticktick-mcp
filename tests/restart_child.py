@@ -42,7 +42,10 @@ os.environ.setdefault("TICKTICK_CLIENT_SECRET", "csecret")
 os.environ.setdefault("TICKTICK_ACCESS_TOKEN", "atoken")
 os.environ.setdefault("MIN_CONSENT_GAP", "0")
 # Журнал мутаций — во временную папку теста, чтобы ничего не писать в /data.
-os.environ.setdefault("TICKTICK_DATA_DIR", os.environ.get("TEST_DATA_DIR", "/tmp"))
+# Каталог обязателен и БЕЗ ЗАПАСНОГО «/tmp»: запасной вариант был общим на всю
+# машину, то есть журнал соседнего прогона (и соседнего агента) дописывался в
+# тот же файл, а `_journal_mentions_manifests` его читает.
+os.environ["TICKTICK_DATA_DIR"] = os.environ["TEST_DATA_DIR"]
 
 from ticktick_mcp.src import manifest_store, tg_approval  # noqa: E402
 import ticktick_mcp.src.server as s  # noqa: E402
