@@ -5,6 +5,8 @@ test_client_v2_activity.py). These tests lock in the fallback behaviour:
 when the real endpoint genuinely returns nothing for a task (empty list or
 a 404), fall back to the created/modified/completed stamps already on the
 task record."""
+from zoneinfo import ZoneInfo
+
 import pytest
 
 import ticktick_mcp.src.server as s
@@ -45,6 +47,12 @@ def _http_404():
 
 @pytest.mark.asyncio
 async def test_404_falls_back_to_task_stamps(monkeypatch):
+    # The stamps are now rendered in the OWNER's zone with the zone named
+    # (see tests/test_detail_views_local_date.py for why), so the assertion
+    # is on that rendering rather than on the raw stored string. _USER_TZ is
+    # pinned to UTC explicitly here so the expected text stays exact and does
+    # not silently depend on conftest's default.
+    monkeypatch.setattr(s, "_USER_TZ", ZoneInfo("UTC"))
     task = {"id": "task1", "createdTime": "2026-07-01T10:00:00+0000",
             "modifiedTime": "2026-07-02T11:00:00+0000", "creator": "me"}
     fake = FakeV2(activity_error=_http_404(), task=task, inbox_id="inbox_me")
@@ -54,8 +62,8 @@ async def test_404_falls_back_to_task_stamps(monkeypatch):
 
     assert "404" in out
     assert "falling back" in out
-    assert "2026-07-01T10:00:00+0000" in out
-    assert "2026-07-02T11:00:00+0000" in out
+    assert "2026-07-01 10:00 (UTC)" in out
+    assert "2026-07-02 11:00 (UTC)" in out
 
 
 @pytest.mark.asyncio
@@ -71,6 +79,7 @@ async def test_404_with_unknown_task_has_no_fallback_but_says_so(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_empty_events_also_offers_fallback(monkeypatch):
+    monkeypatch.setattr(s, "_USER_TZ", ZoneInfo("UTC"))
     task = {"id": "task1", "createdTime": "2026-07-01T10:00:00+0000",
             "creator": "me"}
     fake = FakeV2(activity_result=[], task=task, inbox_id="inbox_me")
@@ -80,7 +89,7 @@ async def test_empty_events_also_offers_fallback(monkeypatch):
 
     assert "No activity found" in out
     assert "What we do know from the task itself" in out
-    assert "2026-07-01T10:00:00+0000" in out
+    assert "2026-07-01 10:00 (UTC)" in out
 
 
 @pytest.mark.asyncio

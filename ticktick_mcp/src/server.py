@@ -12988,11 +12988,15 @@ def _task_activity_fallback(task_id: str) -> Optional[str]:
             return None
         creator = str(t.get("creator", ""))
         who = "you" if creator == owner else (f"user {creator}" if creator else "?")
-        lines = [f"  created: {t.get('createdTime', '?')}  by {who}"]
+        # Same three stamps get_task_info shows, so they are rendered by the
+        # same helper: this fallback is what the reader sees INSTEAD of the
+        # real log, and a substitute that dates events differently from the
+        # tool it substitutes for is worse than no substitute.
+        lines = [f"  created: {_local_stamp_str(t.get('createdTime'))}  by {who}"]
         if t.get("modifiedTime"):
-            lines.append(f"  last modified: {t['modifiedTime']}")
+            lines.append(f"  last modified: {_local_stamp_str(t['modifiedTime'])}")
         if t.get("completedTime"):
-            lines.append(f"  completed: {t['completedTime']}")
+            lines.append(f"  completed: {_local_stamp_str(t['completedTime'])}")
         return "\n".join(lines)
     except Exception:
         return None

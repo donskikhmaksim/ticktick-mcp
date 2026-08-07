@@ -229,3 +229,30 @@ async def test_task_info_stamps_of_all_day_task_are_still_instants(monkeypatch):
     ln = _line(await s.get_task_info("t1"), "created:")
     assert c_local.isoformat() in ln, ln
     assert c_utc.isoformat() not in ln, ln
+
+
+# ==========================================================================
+# Место 3 — _task_activity_fallback: те же три штампа
+# ==========================================================================
+
+async def test_activity_fallback_stamps_are_local(monkeypatch):
+    """Запасной «мини-лог» (когда у задачи нет настоящего лога) печатал те же
+    сырые UTC-штампы."""
+    monkeypatch.setattr(s, "_USER_TZ", ZoneInfo(LA))
+    created, c_local, c_utc = _at_local(LA, 23, 10, -30)
+    modified, m_local, m_utc = _at_local(LA, 23, 20, -3)
+    completed, k_local, k_utc = _at_local(LA, 23, 40, -1)
+    task = {"id": "t1", "projectId": "p1", "title": "x", "creator": "me",
+            "createdTime": created, "modifiedTime": modified,
+            "completedTime": completed}
+    monkeypatch.setattr(s, "ticktick_v2", FakeV2(task=task, activity=[]))
+
+    out = await s.get_task_activity(task_id="t1", project_id="p1")
+    assert "What we do know from the task itself" in out, out
+    for needle, local_d, utc_d in (("created:", c_local, c_utc),
+                                   ("last modified:", m_local, m_utc),
+                                   ("completed:", k_local, k_utc)):
+        ln = _line(out, needle)
+        assert local_d.isoformat() in ln, ln
+        assert utc_d.isoformat() not in ln, ln
+        assert LA in ln, ln
