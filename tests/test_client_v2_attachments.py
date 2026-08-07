@@ -58,8 +58,11 @@ def test_get_task_attachments_missing_everywhere_raises_honest_error(client, mon
     открытых, ни среди завершённых, ни в корзине», и сообщение обязано это
     честно называть."""
     _seed_open_task(client, {"id": "other", "projectId": PROJECT_ID})
-    monkeypatch.setattr(client, "get_completed_tasks", lambda **kw: [])
-    monkeypatch.setattr(client, "get_trash", lambda **kw: [])
+    # сигнатуры явные, как у настоящего клиента: заглушка не должна
+    # проглатывать произвольные аргументы (tests/test_doubles_do_not_cheat.py)
+    monkeypatch.setattr(client, "get_completed_tasks",
+                        lambda limit=50, from_str="", to_str=None: [])
+    monkeypatch.setattr(client, "get_trash", lambda limit=50: [])
 
     with pytest.raises(ValueError, match=TASK_ID) as e:
         client.get_task_attachments(TASK_ID)
@@ -74,7 +77,7 @@ def test_lookup_failure_is_not_reported_as_no_such_task(client, monkeypatch):
     ошибку надо поднять, иначе человек прочитает «файла нет»."""
     _seed_open_task(client, {"id": "other", "projectId": PROJECT_ID})
 
-    def boom(**kw):
+    def boom(limit=50, from_str="", to_str=None):
         raise TickTickAuthError("token expired")
 
     monkeypatch.setattr(client, "get_completed_tasks", boom)

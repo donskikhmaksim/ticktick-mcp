@@ -25,7 +25,10 @@ class FakeV2:
         self._cap = cap
         self.asked_limit = None
 
-    def get_completed_tasks(self, limit=50, **kw):
+    # параметры объявлены ЯВНО, как у настоящего клиента (без **kwargs —
+    # иначе двойник проглотит опечатку в имени параметра; см.
+    # tests/test_doubles_do_not_cheat.py)
+    def get_completed_tasks(self, limit=50, from_str="", to_str=None):
         self.asked_limit = limit
         end = min(limit, self._cap) if self._cap else limit
         return self._tasks[:end]
