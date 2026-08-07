@@ -11813,10 +11813,39 @@ async def archive_project(project_name: str, project_id: str, archived: bool = T
         manifest_id: from call #1's response — pass on call #2 to actually archive
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
+
+    project_id and project_name are cross-checked against the LIVE project
+    list TWICE (same pattern as delete_habit, def-116, 2026-08-07): once
+    while BUILDING the plan (call #1, before anything is shown to the owner)
+    and again, independently, right before the actual archive/unarchive
+    (call #2, unchanged). Same archived=True/False branching as
+    _archive_project_impl in both places (see below).
     """
     err = _ensure_ready()
     if err:
         return err
+    if not manifest_id:
+        # Перенос identity-guard (project_id↔project_name) на построение
+        # плана — ТЕ ЖЕ ветки archived=True/False, что уже стоят в
+        # _archive_project_impl НА ИСПОЛНЕНИИ (см. update_project для
+        # сиблинга без ветвления). archived=True (архивирование —
+        # деструктивно-смежно, вынимает проект из пула синхронизации):
+        # require_known=True, фейл-клоуз на неразрешимый id. archived=False
+        # (разархивирование): require_known=False — _guard_project молча
+        # пропускает id, который не резолвится в живое имя (архивированный
+        # проект МОГ не попасть в список активных имён — это легитимный
+        # сценарий, не баг), точно как уже делает _archive_project_impl на
+        # исполнении; перенос это не ужесточает и не смягчает. Бинарный
+        # исход — нет отдельной мягкой ветки на «временную недоступность»
+        # (см. move_project_to_group, 14907a9, тот же класс guard'а).
+        if archived:
+            refuse = _guard_project(project_id, project_name, fresh=True,
+                                    require_known=True)
+        else:
+            refuse = _guard_project(project_id, project_name, fresh=True)
+        if refuse:
+            return (refuse.replace("🛑 Отказ —", "🛑 План НЕ построен —", 1)
+                          .replace("Ничего не тронул.", "Ничего не изменено."))
     params = {"project_name": project_name, "project_id": project_id,
               "archived": archived}
     outcome = await _gate_single("archive_project", "archive_project",

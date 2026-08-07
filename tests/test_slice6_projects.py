@@ -339,6 +339,82 @@ async def test_archive_project_api_rejection_is_refused(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 2026-08-07: plan-phase identity-guard (def-116 follow-up, group B) —
+# project_id↔project_name is now cross-checked BEFORE the plan is built (call
+# #1), not only inside _archive_project_impl on execution (call #2,
+# unchanged) — same transfer as update_project just above. archived=True
+# reuses require_known=True (hard fail-closed, matches _archive_project_impl
+# exactly); archived=False reuses require_known=False (an archived project
+# may legitimately be missing from the live ACTIVE project-name list — that
+# is _archive_project_impl's existing leniency on execution, the transfer
+# must not turn it into a stricter block). These tests leave _guard_project
+# UN-mocked (only _v2_project_names is faked) to exercise the real function.
+# ---------------------------------------------------------------------------
+
+async def test_archive_project_refused_by_guard(monkeypatch):
+    """Mirrors test_update_project_refused_by_guard above: BEFORE this fix
+    _guard_project's refusal only surfaced from the EXECUTE phase — this
+    test used to (implicitly, via the shared pattern) only be catchable at
+    call #2. Now call #1 ALONE refuses — no plan card, no manifest."""
+    projects = [{"id": "p1", "name": "Работа", "closed": False}]
+    fake = FakeV2Archive(projects)
+    monkeypatch.setattr(s, "ticktick_v2", fake)
+    monkeypatch.setattr(s, "_guard_project", lambda *a, **k: "🛑 Отказ — не та личность.")
+
+    result = await s.archive_project("Совсем другое", "p1", archived=True)
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "manifest_id" not in result
+
+
+async def test_archive_project_plan_identity_guard_blocks_wrong_name(monkeypatch):
+    """project_id resolves to a REAL project ("Личное"), caller's
+    project_name claims a DIFFERENT one ("Работа") — before this fix, call
+    #1 would have built and shown a plan card regardless."""
+    projects = [{"id": "p1", "name": "Работа", "closed": False}]
+    fake = FakeV2Archive(projects)
+    monkeypatch.setattr(s, "ticktick_v2", fake)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Личное"})
+
+    result = await s.archive_project("Работа", "p1", archived=True)
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Личное»" in result
+    assert "manifest_id" not in result
+
+
+async def test_archive_project_plan_identity_guard_blocks_missing_project(monkeypatch):
+    """archived=True uses require_known=True — a project_id that resolves to
+    NO live name at all is refused just as hard as a genuine mismatch,
+    matching _archive_project_impl's own severity on execution."""
+    fake = FakeV2Archive([])
+    monkeypatch.setattr(s, "ticktick_v2", fake)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {})
+
+    result = await s.archive_project("Работа", "p-нет-такого", archived=True)
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "manifest_id" not in result
+
+
+async def test_archive_project_unarchive_missing_project_does_not_block_the_plan(
+        monkeypatch):
+    """archived=False (unarchive) uses _guard_project WITHOUT require_known
+    — _archive_project_impl already lets an unresolvable id through silently
+    on execution for this direction (an archived project may legitimately be
+    absent from the live ACTIVE project-name list). The plan-phase transfer
+    must reproduce that same leniency, not invent a stricter block."""
+    fake = FakeV2Archive([])
+    monkeypatch.setattr(s, "ticktick_v2", fake)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {})
+
+    result = await s.archive_project("Работа", "p1", archived=False)
+
+    assert "manifest_id" in result
+    assert "🛑" not in result
+
+
+# ---------------------------------------------------------------------------
 # create_project_column
 # ---------------------------------------------------------------------------
 

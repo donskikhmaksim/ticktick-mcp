@@ -462,3 +462,24 @@ async def test_update_project_automation_key_mismatch_is_refused_before_plan(mon
     assert "«Личное»" in result
     assert "manifest_id" not in result
     assert spy.calls == []
+
+
+# ===========================================================================
+# 2026-08-07: same headless-path check as above, for archive_project — see
+# tests/test_slice6_projects.py's own `test_archive_project_plan_identity_
+# guard_*` for the wrong-name/missing/unarchive-leniency cases (that file
+# already owns _guard_project/_v2_project_names-style testing for this tool).
+# ===========================================================================
+
+async def test_archive_project_automation_key_mismatch_is_refused_before_plan(monkeypatch):
+    spy = _wire(monkeypatch, "archive_project",
+               projects=[{"id": "p1", "name": "Личное"}])
+    monkeypatch.setattr(s, "SECRET", "test-secret")
+
+    result = await s.archive_project("Работа", "p1", archived=True,
+                                     automation_key="test-secret")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Личное»" in result
+    assert "manifest_id" not in result
+    assert spy.calls == []
