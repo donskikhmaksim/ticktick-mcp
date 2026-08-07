@@ -20,6 +20,42 @@ pre-existing logic (only moved into a `_x_impl` helper verbatim) and are not
 re-tested here; `_guard_task`/`_guard_project` are monkeypatched to a plain
 "ok" stand-in so these tests isolate the NEW gate wrapper behaviour.
 
+EXCEPTION (2026-08-07, group A of the def-116 follow-up): attach_file_to_task
+and update_task_comment are DIFFERENT from the other 8 tools above — for
+these two, identity-guard is NOT "unchanged pre-existing logic confined to
+_x_impl" anymore. Before this date, the claim above was literally true for
+them too, and it was a bug, not a feature: `_guard_task` ran ONLY inside
+`_attach_file_to_task_impl`/`_update_task_comment_impl` (call #2, execution),
+so the plan card shown on call #1 printed `task_title` straight from the
+caller with ZERO verification against the live task the id actually points
+at. The three tests that used to sit here
+(test_attach_file_to_task_full_gate_cycle,
+test_attach_file_to_task_missing_identity_downgrades_to_warn,
+test_update_task_comment_full_gate_cycle,
+test_update_task_comment_missing_identity_downgrades_to_warn) all passed
+`_guard_task` stand-ins that never distinguished call #1 from call #2 — every
+one of them would have happily built a plan carrying a WRONG title if the
+stand-in had been "mismatch" instead of "ok"/"missing", and nothing below
+this docstring proved otherwise. Live audit, not code review, is what
+actually found the real-world defect (see delete_habit/def-116,
+commit ea2a47c — same bug, different tool). Fixed the same way: `_guard_task`
+is now ALSO called while BUILDING the plan (call #1, before the card is
+shown) — a mismatched title refuses the plan outright (🛑, before anything is
+displayed); a live-read hiccup does NOT block the plan (fail-open — a network
+blip must not stop every attach/comment-edit), but the plan text says so
+honestly, and the UNCHANGED execution-side guard in `_x_impl` still catches a
+real mismatch independently. See the new
+`test_attach_file_to_task_plan_identity_guard_*` and
+`test_update_task_comment_plan_identity_guard_*` tests below the happy-path
+ones for each tool — THOSE are what actually exercises the plan-phase check;
+the older tests above them remain, unmodified in behaviour, to cover the
+gate-wrapper mechanics they were originally written for.
+
+The other 8 tools in this file (create_subtask, unset_task_parent,
+create_project_group, delete_project_group, move_project_to_group,
+add_task_comment, create_tag, duplicate_task) are UNCHANGED — the "not
+re-tested here" claim above is still accurate for them.
+
 No real network — the v2/official clients are faked."""
 import re
 
@@ -36,6 +72,19 @@ def _extract_manifest_id(preview: str) -> str:
 
 def _ok_guard(*_a, **_k):
     return s._Guard("ok", project_id="p1", title="Купить молоко")
+
+
+def _guard_sequence(*results):
+    """`_guard_task` stand-in that returns `results` in order, one per call —
+    used to simulate the plan-phase read (call #1) and the execution-phase
+    read (call #2, inside `_x_impl`, unchanged) disagreeing: e.g. the plan
+    read fails/times out (yields "unavailable") while the execution read a
+    moment later succeeds and finds either a match or a real mismatch."""
+    it = iter(results)
+
+    def _stub(*_a, **_k):
+        return next(it)
+    return _stub
 
 
 class FakeV2:
@@ -509,6 +558,126 @@ async def test_attach_file_to_task_missing_source_refused_before_gate(monkeypatc
     assert fake_v2.calls == []
 
 
+# ---------------------------------------------------------------------------
+# 2026-08-07: plan-phase identity-guard (def-116 follow-up, group A) —
+# task_id↔task_title now cross-checked BEFORE the plan is built, not only
+# inside _attach_file_to_task_impl on execution. See module docstring above
+# for why the tests above this point could NOT have caught the old bug.
+# ---------------------------------------------------------------------------
+
+async def test_attach_file_to_task_plan_identity_guard_blocks_wrong_title(
+        monkeypatch):
+    """The exact defect this follow-up closes: id points at a REAL task
+    ("Купить хлеб"), but the caller's task_title claims a DIFFERENT one
+    ("Купить молоко") — before this fix, call #1 would have built and shown
+    a plan card reading "Прикрепляю ... к задаче «Купить молоко»" even
+    though the id has nothing to do with that task. Now the plan is refused
+    outright, before any card is built."""
+    fake_v2 = FakeV2(live={"t1": {"id": "t1", "title": "Купить хлеб", "projectId": "p1"}})
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(
+        s, "_guard_task",
+        lambda *a, **k: s._Guard(
+            "mismatch", project_id="p1", title="Купить хлеб",
+            message='id указывает на «Купить хлеб», а НЕ «Купить молоко»'))
+
+    result = await s.attach_file_to_task("Купить молоко", "t1", "p1",
+                                         url="https://x/file.pdf")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Купить хлеб»" in result
+    assert "manifest_id" not in result, "план для несовпавшей пары строиться не должен"
+    assert fake_v2.calls == []
+
+
+async def test_attach_file_to_task_plan_read_failure_does_not_block_but_warns(
+        monkeypatch):
+    """A live-read hiccup while BUILDING the plan (call #1) must not block
+    every attach — fail-open here is cheaper than refusing everyone whose
+    network is briefly flaky. The plan is still built, honestly warns that
+    the title was not verified, and the real (unchanged) identity-guard on
+    execution (call #2) does its normal job right after."""
+    fake_v2 = FakeV2(live={"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}})
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(s, "_guard_task", _guard_sequence(
+        s._Guard("unavailable"),                                  # call #1 (plan)
+        s._Guard("ok", project_id="p1", title="Купить молоко"),   # call #2 (_impl)
+    ))
+
+    preview = await s.attach_file_to_task("Купить молоко", "t1", "p1",
+                                          url="https://x/file.pdf")
+    assert "🛑" not in preview, "временный сбой чтения не должен блокировать план"
+    assert "НЕ удалось сверить" in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.attach_file_to_task("Купить молоко", "t1", "p1",
+                                         url="https://x/file.pdf",
+                                         manifest_id=mid, user_reply="да")
+    assert ("attach", "t1") in fake_v2.calls
+    _assert_confirmed_success(result)
+
+
+async def test_attach_file_to_task_plan_read_failure_still_lets_execution_catch_a_real_mismatch(
+        monkeypatch):
+    """Same read failure on the plan as above, but this time the pair
+    actually DOESN'T match. The plan-phase check couldn't run (so it warns
+    instead of refusing), but the execution-phase guard inside
+    `_attach_file_to_task_impl` — untouched by this change — still catches
+    the real mismatch: a network blip on planning must not weaken the
+    protection at execution time."""
+    fake_v2 = FakeV2(live={"t1": {"id": "t1", "title": "Купить хлеб", "projectId": "p1"}})
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(s, "_guard_task", _guard_sequence(
+        s._Guard("unavailable"),                                    # call #1 (plan)
+        s._Guard("mismatch", project_id="p1", title="Купить хлеб",   # call #2 (_impl)
+                message='id указывает на «Купить хлеб», а НЕ «Купить молоко»'),
+    ))
+
+    preview = await s.attach_file_to_task("Купить молоко", "t1", "p1",
+                                          url="https://x/file.pdf")
+    assert "🛑" not in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.attach_file_to_task("Купить молоко", "t1", "p1",
+                                         url="https://x/file.pdf",
+                                         manifest_id=mid, user_reply="да")
+    assert result.startswith("🛑")
+    assert "«Купить хлеб»" in result
+    assert fake_v2.calls == []
+
+
+async def test_attach_file_to_task_automation_key_mismatch_is_refused_before_plan(
+        monkeypatch):
+    """Headless path (#118): a valid automation_key runs on the FIRST call,
+    with no plan card and no Telegram button ever shown — so if the identity
+    check only lived inside _gate_single/execution, a false name+id pair
+    would sail through silently on a single valid key. The check sits BEFORE
+    _gate_single, so it applies here too: plan is refused, upload never
+    attempted, and exactly one guard read happens (the plan-stage one) —
+    proving it is the PLAN stage refusing, not the execution stage (which
+    would print a different message, "НЕ прикрепил", and would only be
+    reached after a mutation attempt)."""
+    fake_v2 = FakeV2(live={"t1": {"id": "t1", "title": "Купить хлеб", "projectId": "p1"}})
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    calls = []
+
+    def _stub(*a, **k):
+        calls.append(1)
+        return s._Guard("mismatch", project_id="p1", title="Купить хлеб",
+                        message='id указывает на «Купить хлеб», а НЕ «Купить молоко»')
+    monkeypatch.setattr(s, "_guard_task", _stub)
+    monkeypatch.setattr(s, "SECRET", "test-secret")
+
+    result = await s.attach_file_to_task("Купить молоко", "t1", "p1",
+                                         url="https://x/file.pdf",
+                                         automation_key="test-secret")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Купить хлеб»" in result
+    assert fake_v2.calls == []
+    assert len(calls) == 1
+
+
 # ===========================================================================
 # create_tag
 # ===========================================================================
@@ -592,3 +761,122 @@ async def test_update_task_comment_missing_identity_downgrades_to_warn(monkeypat
     assert fake_v2.comments["t1"][0]["title"] == "новый текст"
     assert result.startswith("⚠️"), result
     assert not s._auto_execute_report_is_success(result), result
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-07: plan-phase identity-guard (def-116 follow-up, group A) — see
+# the equivalent block under attach_file_to_task above for the shared
+# rationale; same code shape, same _guard_task helper.
+# ---------------------------------------------------------------------------
+
+async def test_update_task_comment_plan_identity_guard_blocks_wrong_title(
+        monkeypatch):
+    """id points at a REAL task ("Купить хлеб"), caller's task_title claims a
+    DIFFERENT one ("Купить молоко") — before this fix, call #1 would have
+    built and shown a plan card reading "Правлю комментарий на «Купить
+    молоко»..." even though the id has nothing to do with that task. Now the
+    plan is refused outright."""
+    fake_v2 = FakeV2(live={"t1": {"id": "t1", "title": "Купить хлеб", "projectId": "p1"}},
+                     comments={"t1": [{"id": "c1", "title": "старый текст"}]})
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(
+        s, "_guard_task",
+        lambda *a, **k: s._Guard(
+            "mismatch", project_id="p1", title="Купить хлеб",
+            message='id указывает на «Купить хлеб», а НЕ «Купить молоко»'))
+
+    result = await s.update_task_comment("Купить молоко", "новый текст", "p1", "t1", "c1")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Купить хлеб»" in result
+    assert "manifest_id" not in result, "план для несовпавшей пары строиться не должен"
+    assert fake_v2.comments["t1"][0]["title"] == "старый текст"
+    assert fake_v2.calls == []
+
+
+async def test_update_task_comment_plan_read_failure_does_not_block_but_warns(
+        monkeypatch):
+    """A live-read hiccup while BUILDING the plan (call #1) must not block
+    every comment edit — fail-open here is cheaper than refusing everyone
+    whose network is briefly flaky. The plan is still built, honestly warns
+    that the title was not verified, and the real (unchanged) identity-guard
+    on execution (call #2) does its normal job right after."""
+    fake_v2 = FakeV2(live={"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}},
+                     comments={"t1": [{"id": "c1", "title": "старый текст"}]})
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(s, "_guard_task", _guard_sequence(
+        s._Guard("unavailable"),                                  # call #1 (plan)
+        s._Guard("ok", project_id="p1", title="Купить молоко"),   # call #2 (_impl)
+    ))
+
+    preview = await s.update_task_comment("Купить молоко", "новый текст", "p1", "t1", "c1")
+    assert "🛑" not in preview, "временный сбой чтения не должен блокировать план"
+    assert "НЕ удалось сверить" in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.update_task_comment("Купить молоко", "новый текст", "p1", "t1", "c1",
+                                         manifest_id=mid, user_reply="да")
+    assert ("update_comment", "c1", "новый текст") in fake_v2.calls
+    _assert_confirmed_success(result)
+
+
+async def test_update_task_comment_plan_read_failure_still_lets_execution_catch_a_real_mismatch(
+        monkeypatch):
+    """Same read failure on the plan as above, but this time the pair
+    actually DOESN'T match. The plan-phase check couldn't run (so it warns
+    instead of refusing), but the execution-phase guard inside
+    `_update_task_comment_impl` — untouched by this change — still catches
+    the real mismatch: a network blip on planning must not weaken the
+    protection at execution time."""
+    fake_v2 = FakeV2(live={"t1": {"id": "t1", "title": "Купить хлеб", "projectId": "p1"}},
+                     comments={"t1": [{"id": "c1", "title": "старый текст"}]})
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(s, "_guard_task", _guard_sequence(
+        s._Guard("unavailable"),                                    # call #1 (plan)
+        s._Guard("mismatch", project_id="p1", title="Купить хлеб",   # call #2 (_impl)
+                message='id указывает на «Купить хлеб», а НЕ «Купить молоко»'),
+    ))
+
+    preview = await s.update_task_comment("Купить молоко", "новый текст", "p1", "t1", "c1")
+    assert "🛑" not in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.update_task_comment("Купить молоко", "новый текст", "p1", "t1", "c1",
+                                         manifest_id=mid, user_reply="да")
+    assert result.startswith("🛑")
+    assert "«Купить хлеб»" in result
+    assert fake_v2.comments["t1"][0]["title"] == "старый текст"
+    assert fake_v2.calls == []
+
+
+async def test_update_task_comment_automation_key_mismatch_is_refused_before_plan(
+        monkeypatch):
+    """Headless path (#118): a valid automation_key runs on the FIRST call,
+    with no plan card and no Telegram button ever shown — so if the identity
+    check only lived inside _gate_single/execution, a false name+id pair
+    would sail through silently on a single valid key. The check sits BEFORE
+    _gate_single, so it applies here too: plan is refused, edit never
+    attempted, and exactly one guard read happens (the plan-stage one) —
+    proving it is the PLAN stage refusing, not the execution stage (which
+    would print a different message, "НЕ изменил комментарий", and would
+    only be reached after a mutation attempt)."""
+    fake_v2 = FakeV2(live={"t1": {"id": "t1", "title": "Купить хлеб", "projectId": "p1"}},
+                     comments={"t1": [{"id": "c1", "title": "старый текст"}]})
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    calls = []
+
+    def _stub(*a, **k):
+        calls.append(1)
+        return s._Guard("mismatch", project_id="p1", title="Купить хлеб",
+                        message='id указывает на «Купить хлеб», а НЕ «Купить молоко»')
+    monkeypatch.setattr(s, "_guard_task", _stub)
+    monkeypatch.setattr(s, "SECRET", "test-secret")
+
+    result = await s.update_task_comment("Купить молоко", "новый текст", "p1", "t1", "c1",
+                                         automation_key="test-secret")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Купить хлеб»" in result
+    assert fake_v2.comments["t1"][0]["title"] == "старый текст"
+    assert fake_v2.calls == []
+    assert len(calls) == 1

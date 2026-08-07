@@ -10177,17 +10177,55 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
     call #2 is refused whatever `user_reply` says — before the press (wait for
     it) and after it too (the server is already running the operation). Do not
     retry it; just tell the user to tap the button.
+
+    task_id and task_title are cross-checked against the LIVE task list
+    TWICE (same pattern as delete_habit, def-116, 2026-08-07): once while
+    BUILDING the plan (call #1, before anything is shown to the owner — a
+    mismatched title never reaches the plan card at all) and again,
+    independently, right before the actual upload (call #2, unchanged). If
+    the live read itself fails while building the plan, the plan still gets
+    built (a read hiccup must not block every attach), but its text says so
+    honestly — the call #2 check is unconditional and still guards the
+    mutation either way.
     """
     err = _ensure_ready()
     if err:
         return err
     if not url and not content_base64:
         return "Provide either a url or content_base64 for the file."
+    # Перенос identity-guard (task_id↔task_title) на построение плана — тот
+    # же _guard_task, что уже стоит в _attach_file_to_task_impl НА
+    # ИСПОЛНЕНИИ, но здесь — ДО показа карточки владельцу (тот же перенос,
+    # что в delete_habit, def-116: mismatch блокирует план целиком;
+    # временная недоступность живого чтения — fail-open с предупреждением в
+    # тексте плана, а исполнение — не тронуто этой правкой — перепроверит
+    # заново и остаётся последней линией защиты). Действует только на call #1
+    # (manifest_id пуст): call #2 обслуживает СОХРАНЁННЫЕ параметры плана, а
+    # не свежие аргументы вызова, и identity guard на исполнении там уже
+    # стоит. automation_key НЕ пропускает эту проверку — она стоит раньше
+    # самого гейта, поэтому headless-путь (карточки не видит вовсе) тоже
+    # защищён.
+    name_warning = ""
+    if not manifest_id:
+        g = _guard_task(task_id, task_title or "", project_id)
+        if g.status == "mismatch":
+            return (f"🛑 План НЕ построен — {g.message} (защита от «не той "
+                    "задачи»). Ничего не изменено.")
+        elif g.status == "unavailable":
+            name_warning = (" ⚠️ Название задачи НЕ удалось сверить с живым "
+                            "состоянием (чтение не удалось) — сверка "
+                            "повторится при подтверждении, и расхождение "
+                            "остановит исполнение.")
+        elif g.status == "missing":
+            name_warning = (" ⚠️ id не среди открытых задач (возможно, "
+                            "завершена) — название НЕ проверено.")
     params = {"task_title": task_title, "task_id": task_id, "project_id": project_id,
               "url": url, "content_base64": content_base64, "filename": filename}
+    describe_fn = ((lambda p: _describe_attach_file_to_task(p) + name_warning)
+                   if name_warning else _describe_attach_file_to_task)
     outcome = await _gate_single("attach_file_to_task", "attach_file_to_task",
                                  params if not manifest_id else None,
-                                 manifest_id, user_reply, _describe_attach_file_to_task,
+                                 manifest_id, user_reply, describe_fn,
                                  automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
@@ -11182,15 +11220,45 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
     call #2 is refused whatever `user_reply` says — before the press (wait for
     it) and after it too (the server is already running the operation). Do not
     retry it; just tell the user to tap the button.
+
+    task_id and task_title are cross-checked against the LIVE task list
+    TWICE (same pattern as delete_habit, def-116, 2026-08-07): once while
+    BUILDING the plan (call #1, before anything is shown to the owner — a
+    mismatched title never reaches the plan card at all) and again,
+    independently, right before the actual edit (call #2, unchanged). If the
+    live read itself fails while building the plan, the plan still gets
+    built (a read hiccup must not block every comment edit), but its text
+    says so honestly — the call #2 check is unconditional and still guards
+    the mutation either way.
     """
     err = _ensure_ready()
     if err:
         return err
+    # Перенос identity-guard (task_id↔task_title) на построение плана — тот
+    # же _guard_task, что уже стоит в _update_task_comment_impl НА
+    # ИСПОЛНЕНИИ, но здесь — ДО показа карточки владельцу. Комментарий с тем
+    # же обоснованием — см. attach_file_to_task выше (та же правка).
+    name_warning = ""
+    if not manifest_id:
+        g = _guard_task(task_id, task_title or "", project_id)
+        if g.status == "mismatch":
+            return (f"🛑 План НЕ построен — {g.message} (защита от «не той "
+                    "задачи»). Ничего не изменено.")
+        elif g.status == "unavailable":
+            name_warning = (" ⚠️ Название задачи НЕ удалось сверить с живым "
+                            "состоянием (чтение не удалось) — сверка "
+                            "повторится при подтверждении, и расхождение "
+                            "остановит исполнение.")
+        elif g.status == "missing":
+            name_warning = (" ⚠️ id не среди открытых задач (возможно, "
+                            "завершена) — название НЕ проверено.")
     params = {"task_title": task_title, "text": text, "project_id": project_id,
               "task_id": task_id, "comment_id": comment_id}
+    describe_fn = ((lambda p: _describe_update_task_comment(p) + name_warning)
+                   if name_warning else _describe_update_task_comment)
     outcome = await _gate_single("update_task_comment", "update_task_comment",
                                  params if not manifest_id else None,
-                                 manifest_id, user_reply, _describe_update_task_comment,
+                                 manifest_id, user_reply, describe_fn,
                                  automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
@@ -11270,15 +11338,46 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str,
         manifest_id: from call #1's response — pass on call #2 to actually delete
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
+
+    task_id and task_title are cross-checked against the LIVE task list
+    TWICE (same pattern as delete_habit, def-116, 2026-08-07): once while
+    BUILDING the plan (call #1, before anything is shown to the owner — a
+    mismatched title never reaches the plan card at all) and again,
+    independently, right before the actual delete (call #2, unchanged). If
+    the live read itself fails while building the plan, the plan still gets
+    built (a read hiccup must not block every comment deletion), but its
+    text says so honestly — the call #2 check is unconditional and still
+    guards the mutation either way.
     """
     err = _ensure_ready()
     if err:
         return err
+    # Перенос identity-guard (task_id↔task_title) на построение плана — тот
+    # же _guard_task, что уже стоит в _delete_task_comment_impl НА
+    # ИСПОЛНЕНИИ, но здесь — ДО показа карточки владельцу. Тот же перенос,
+    # что и у attach_file_to_task/update_task_comment (см. их коммиты) —
+    # здесь он особенно важен: удаление комментария необратимо.
+    name_warning = ""
+    if not manifest_id:
+        g = _guard_task(task_id, task_title or "", project_id)
+        if g.status == "mismatch":
+            return (f"🛑 План НЕ построен — {g.message} (защита от «не той "
+                    "задачи»). Ничего не изменено.")
+        elif g.status == "unavailable":
+            name_warning = (" ⚠️ Название задачи НЕ удалось сверить с живым "
+                            "состоянием (чтение не удалось) — сверка "
+                            "повторится при подтверждении, и расхождение "
+                            "остановит исполнение.")
+        elif g.status == "missing":
+            name_warning = (" ⚠️ id не среди открытых задач (возможно, "
+                            "завершена) — название НЕ проверено.")
     params = {"task_title": task_title, "project_id": project_id,
               "task_id": task_id, "comment_id": comment_id}
+    describe_fn = ((lambda p: _describe_delete_task_comment(p) + name_warning)
+                   if name_warning else _describe_delete_task_comment)
     outcome = await _gate_single("delete_task_comment", "delete_task_comment",
                                  params if not manifest_id else None,
-                                 manifest_id, user_reply, _describe_delete_task_comment,
+                                 manifest_id, user_reply, describe_fn,
                                  automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
