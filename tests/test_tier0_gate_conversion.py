@@ -54,6 +54,18 @@ moving a check that doesn't exist would be inventing new protection, outside
 this fix's mandate (see def-116 follow-up scope: move existing checks
 earlier, don't add new ones).
 
+delete_project_group and move_project_to_group get the same treatment for
+group_id↔group_name and project_id↔project_name respectively — see their own
+dedicated comment blocks right above their new
+`test_delete_project_group_plan_*`/`test_move_project_to_group_plan_*` tests
+for the per-tool nuance (delete_project_group has no monkeypatchable guard
+helper, reads `_live_groups()` directly; move_project_to_group reuses
+`_guard_project`, whose binary ok/refuse outcome has no separate "unavailable"
+branch to soften). create_project_group and create_tag are UNCHANGED and
+deliberately excluded from this whole follow-up: both create a BRAND-NEW
+object from a `name` only — there is no caller-supplied id for an identity
+guard to cross-check against anything.
+
 No real network — the v2/official clients are faked."""
 import re
 
@@ -850,6 +862,101 @@ async def test_move_project_to_group_full_gate_cycle(monkeypatch):
     _assert_confirmed_success(result)
     # Тот же класс бага, что и у create_project_group (дефект №3).
     assert s._auto_execute_report_is_success(result), result
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-07: plan-phase identity-guard (def-116 follow-up, group B) —
+# project_id↔project_name is now cross-checked BEFORE the plan is built, not
+# only inside _move_project_to_group_impl on execution. Unlike _guard_task,
+# _guard_project has a BINARY outcome (a refusal string, or None) — it does
+# not distinguish "couldn't verify" from "genuinely doesn't match/exist",
+# and that was ALREADY true at execution (require_known=True refuses both
+# the same way). So there is no separate "soft warning" branch to add here
+# on purpose: reproducing the exact same _guard_project call at plan time
+# reproduces the exact same strictness, unconditionally — see
+# test_move_project_to_group_plan_guard_refusal_blocks_even_when_reason_is_unavailable
+# below, which exists specifically to prove that decision (not invent a
+# softer path the original never had).
+# ---------------------------------------------------------------------------
+
+async def test_move_project_to_group_plan_identity_guard_blocks_wrong_name(
+        monkeypatch):
+    """project_id points at a REAL project ("Работа"), caller's
+    project_name claims a DIFFERENT one ("Личное") — before this fix, call
+    #1 would have built and shown a plan card even though the id has
+    nothing to do with that project. Now the plan is refused outright,
+    before any card is built, and move_project_to_group is never called."""
+    fake_v2 = FakeV2(groups=[{"id": "g1", "name": "Папка"}],
+                     projects=[{"id": "p1", "groupId": None}])
+    _wire(monkeypatch, fake_v2=fake_v2, guard_project=False)
+    monkeypatch.setattr(
+        s, "_guard_project",
+        lambda *a, **k: ('🛑 Отказ — project_id указывает на «Работа», а НЕ '
+                         '«Личное» (защита от «не того проекта»). Ничего не тронул.'))
+
+    result = await s.move_project_to_group("Личное", "p1", "g1")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Работа»" in result
+    assert "Ничего не изменено." in result
+    assert "manifest_id" not in result, "план для несовпавшей пары строиться не должен"
+    assert fake_v2.calls == []
+
+
+async def test_move_project_to_group_plan_guard_refusal_blocks_even_when_reason_is_unavailable(
+        monkeypatch):
+    """_guard_project(require_known=True) refuses BOTH an unreadable/unknown
+    id AND a genuine mismatch the exact same way (no distinct 'unavailable'
+    branch exists in the function being reused) — that is pre-existing,
+    unchanged behaviour, not something this transfer invents. Proves the
+    transfer does NOT add a softer "read hiccup" carve-out that the
+    original _move_project_to_group_impl never had: whatever _guard_project
+    refuses, the plan refuses too, same strictness, just earlier."""
+    fake_v2 = FakeV2(groups=[], projects=[])
+    _wire(monkeypatch, fake_v2=fake_v2, guard_project=False)
+    monkeypatch.setattr(
+        s, "_guard_project",
+        lambda *a, **k: ('🛑 Отказ — проект по id p1… не найден среди живых '
+                         'проектов (или имена недоступны) — сверить личность '
+                         'проекта нельзя. Ничего не тронул.'))
+
+    result = await s.move_project_to_group("Работа", "p1", "g1")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "manifest_id" not in result
+    assert fake_v2.calls == []
+
+
+async def test_move_project_to_group_automation_key_mismatch_is_refused_before_plan(
+        monkeypatch):
+    """Headless path (#118): a valid automation_key runs on the FIRST call,
+    with no plan card and no Telegram button ever shown — so if the identity
+    check only lived inside _gate_single/execution, a false name+id pair
+    would sail through silently on a single valid key. The check sits
+    BEFORE _gate_single, so it applies here too: plan is refused, move never
+    attempted, and exactly one guard call happens (the plan-stage one) —
+    proving it is the PLAN stage refusing, not the execution stage (which
+    would only be reached after _gate_single, and only after an approved
+    manifest)."""
+    fake_v2 = FakeV2(groups=[{"id": "g1", "name": "Папка"}],
+                     projects=[{"id": "p1", "groupId": None}])
+    _wire(monkeypatch, fake_v2=fake_v2, guard_project=False)
+    calls = []
+
+    def _stub(*a, **k):
+        calls.append(1)
+        return ('🛑 Отказ — project_id указывает на «Работа», а НЕ «Личное» '
+                '(защита от «не того проекта»). Ничего не тронул.')
+    monkeypatch.setattr(s, "_guard_project", _stub)
+    monkeypatch.setattr(s, "SECRET", "test-secret")
+
+    result = await s.move_project_to_group("Личное", "p1", "g1",
+                                           automation_key="test-secret")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Работа»" in result
+    assert fake_v2.calls == []
+    assert len(calls) == 1
 
 
 # ===========================================================================

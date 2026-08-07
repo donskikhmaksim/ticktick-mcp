@@ -9774,10 +9774,40 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
     call #2 is refused whatever `user_reply` says — before the press (wait for
     it) and after it too (the server is already running the operation). Do not
     retry it; just tell the user to tap the button.
+
+    project_id and project_name are cross-checked against the LIVE project
+    list TWICE (same pattern as delete_habit, def-116, 2026-08-07): once
+    while BUILDING the plan (call #1, before anything is shown to the owner)
+    and again, independently, right before the actual move (call #2,
+    unchanged).
     """
     err = _ensure_ready()
     if err:
         return err
+    # Перенос identity-guard (project_id↔project_name) на построение плана —
+    # тот же _guard_project(..., require_known=True), что уже стоит в
+    # _move_project_to_group_impl НА ИСПОЛНЕНИИ, вызванный ТЕМИ ЖЕ
+    # аргументами. _guard_project, в отличие от _guard_task, не различает
+    # «сверить не удалось» от «id не найден» — у неё бинарный исход (отказ
+    # либо ок), и это уже так на исполнении. Поэтому здесь НЕТ отдельной
+    # мягкой ветки на «временную недоступность»: воспроизвожу ТУ ЖЕ строгость
+    # (переносим момент проверки, не меняем её), а не изобретаю смягчение,
+    # которого в оригинале нет. Префикс/хвост сообщения приведены к тому же
+    # виду, что у остальных plan-отказов в этом файле («План НЕ построен» /
+    # «Ничего не изменено») — это текстовая правка отображения, сама
+    # сверка/строгость не меняется. Проверка группы-назначения (group_id
+    # существует) НЕ переносится: владелец не передаёт group_name для
+    # сверки (карточка печатает id как есть, см.
+    # _describe_move_project_to_group) — подменить нечего, это остаётся
+    # проверкой исполнения, как было. Действует только на call #1
+    # (manifest_id пуст); automation_key НЕ пропускает эту проверку — она
+    # стоит раньше самого гейта.
+    if not manifest_id:
+        refuse = _guard_project(project_id, project_name, fresh=True,
+                                require_known=True)
+        if refuse:
+            return (refuse.replace("🛑 Отказ —", "🛑 План НЕ построен —", 1)
+                          .replace("Ничего не тронул.", "Ничего не изменено."))
     params = {"project_name": project_name, "project_id": project_id, "group_id": group_id}
     outcome = await _gate_single("move_project_to_group", "move_project_to_group",
                                  params if not manifest_id else None,
