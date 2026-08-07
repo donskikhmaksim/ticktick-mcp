@@ -1379,6 +1379,83 @@ def format_task_tree(tasks: List[Dict], limit: int = 200) -> str:
     return out
 
 
+# Default page sizes for the two whole-account readers (def-E1). Calibrated on
+# the owner's live account, where BOTH tools returned an over-limit error
+# instead of data: get_all_tasks printed 164 871 chars for 1481 tasks (≈111
+# chars per compact line) and get_project_tasks 153 436 chars for a single
+# 310-task project (≈495 chars per full task card). At the measured ~1.9 chars
+# per token that is ~87k and ~81k tokens — far past any tool-output budget.
+# A default page costs ≈22 KB (~12k tokens) and ≈25 KB (~13k tokens): an order
+# of magnitude under the old dumps, with the tail reachable one call at a time.
+# 200 also matches the neighbouring get_tasks_by_priority page size.
+_ALL_TASKS_PAGE = 200
+_PROJECT_TASKS_PAGE = 50
+
+
+def _page_task_forest(tasks: List[Dict], limit: int, offset: int):
+    """One page of a task FOREST: whole subtrees only, never a torn-off child.
+
+    Slicing the flat list instead would tear a subtask off its parent exactly
+    at the page boundary — and format_task_tree() renders such an orphan at the
+    TOP level (its parent is "not in this list"), i.e. a subtask would silently
+    read as a standalone task. So a page is filled with top-level tasks TOGETHER
+    with their descendants, and stops once `limit` tasks are collected: the
+    boundary always falls between trees, never inside one.
+
+    `limit` counts TASKS (that's what the output size is made of, so the page
+    stays bounded even if one parent carries a hundred subtasks); it is a soft
+    ceiling — the tree that crosses it is finished, not cut. `offset` counts
+    TOP-LEVEL tasks, which is what the returned `shown_to` (and the caller's
+    footer) hands back for the next call.
+
+    Returns (page_tasks, total_roots, offset, shown_to) where page_tasks is a
+    flat list — roots each followed by their descendants — ready for the
+    existing grouping/formatting code.
+    """
+    ids = {t.get("id") for t in tasks if t.get("id")}
+    children: Dict[str, List] = {}
+    roots: List[Dict] = []
+    for t in tasks:
+        pid = t.get("parentId")
+        if pid and pid in ids:
+            children.setdefault(pid, []).append(t)
+        else:
+            # Same rule as format_task_tree: a subtask whose parent isn't in
+            # this list is a root here, so it can't fall out of the paging.
+            roots.append(t)
+
+    total_roots = len(roots)
+    offset = max(0, offset)
+    limit = max(1, limit)
+
+    page: List[Dict] = []
+    seen = set()  # guard against cyclic parentId references, as in the tree
+    roots_taken = 0
+
+    def walk(task: Dict) -> None:
+        tid = task.get("id")
+        if tid in seen:
+            return
+        seen.add(tid)
+        page.append(task)
+        for kid in children.get(tid or "", []):
+            walk(kid)
+
+    for root in roots[offset:]:
+        if page and len(page) >= limit:
+            break
+        walk(root)
+        roots_taken += 1
+
+    return page, total_roots, offset, offset + roots_taken
+
+
+def _last_page_offset(total: int, limit: int) -> int:
+    """Offset of the last non-empty page — what to tell a caller who overshot."""
+    limit = max(1, limit)
+    return max(0, (max(total, 1) - 1) // limit * limit)
+
+
 # --- Readiness helpers ------------------------------------------------------
 
 _INIT_FAIL_MSG = "Failed to initialize TickTick client. Please check your API credentials."
@@ -1474,12 +1551,20 @@ async def get_project(project_id: str) -> str:
         return f"Error retrieving project: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
-async def get_project_tasks(project_id: str) -> str:
+async def get_project_tasks(project_id: str, limit: int = _PROJECT_TASKS_PAGE,
+                            offset: int = 0) -> str:
     """
     Get all tasks in a specific project.
 
+    The output is paged: the header always states the TOTAL number of tasks in
+    the project and which range is shown, and when it doesn't fit, the last
+    line says how many are left and which offset continues the list.
+
     Args:
         project_id: ID of the project (the Inbox id from get_projects works too)
+        limit: Maximum tasks to show in one call (default 50 — a full task card
+            is ~0.5 KB, so a page is ~25 KB)
+        offset: Skip this many tasks — use it to read the tail past `limit`
     """
     err = _ensure_official()
     if err:
@@ -1490,7 +1575,13 @@ async def get_project_tasks(project_id: str) -> str:
     # instead of returning its "project not found" to the caller.
     inbox = await _run_blocking(_inbox_project)
     if inbox and project_id == inbox["id"]:
-        return await get_inbox_tasks()
+        out = await get_inbox_tasks()
+        # get_inbox_tasks pages on its own terms; silently dropping the
+        # caller's limit/offset would look like they were honoured.
+        if limit != _PROJECT_TASKS_PAGE or offset:
+            out += ("\n\n⚠️ limit/offset not applied: the Inbox is served by "
+                    "get_inbox_tasks, which pages on its own.")
+        return out
 
     try:
         project_data = await _run_blocking(lambda: ticktick.get_project_with_data(project_id))
@@ -1498,13 +1589,36 @@ async def get_project_tasks(project_id: str) -> str:
             return f"Error fetching project data: {project_data['error']}"
         
         tasks = project_data.get('tasks', [])
+        pname = project_data.get('project', {}).get('name', project_id)
         if not tasks:
-            return f"No tasks found in project '{project_data.get('project', {}).get('name', project_id)}'."
-        
-        result = f"Found {len(tasks)} tasks in project '{project_data.get('project', {}).get('name', project_id)}':\n\n"
-        for i, task in enumerate(tasks, 1):
+            return f"No tasks found in project '{pname}'."
+
+        # def-E1: раньше печатались ВСЕ задачи проекта — на боевом проекте из
+        # 310 задач это 153 436 символов, то есть ответ не влезал в лимит и
+        # инструмент возвращал ошибку вместо данных. Теперь страница
+        # ограничена, а хвост достижим через offset.
+        total = len(tasks)
+        offset = max(0, offset)
+        limit = max(1, limit)
+        page = tasks[offset:offset + limit]
+        if not page:
+            # Пустая страница за концом списка — это НЕ «задач нет».
+            return (f"Project '{pname}' has {total} tasks, but offset={offset} is past "
+                    f"the end (last page starts at offset={_last_page_offset(total, limit)}).")
+        shown_to = offset + len(page)
+
+        if offset or shown_to < total:
+            result = (f"Found {total} tasks in project '{pname}' "
+                      f"(showing {offset + 1}-{shown_to}):\n\n")
+        else:
+            result = f"Found {len(tasks)} tasks in project '{pname}':\n\n"
+        # Нумерация сквозная: иначе вторая страница выглядит как первая.
+        for i, task in enumerate(page, offset + 1):
             result += f"Task {i}:\n" + format_task(task) + "\n"
-        
+        if shown_to < total:
+            result += (f"... and {total - shown_to} more — call again with "
+                       f"offset={shown_to}.\n")
+
         return result
     except Exception as e:
         logger.error(f"Error in get_project_tasks: {e}")
@@ -7582,13 +7696,25 @@ def _get_project_tasks_by_filter(filter_func, filter_name: str,
 # New MCP Tools for Tasks
 
 @mcp.tool(annotations=READONLY)
-async def get_all_tasks() -> str:
+async def get_all_tasks(limit: int = _ALL_TASKS_PAGE, offset: int = 0) -> str:
     """
     Get ALL open tasks across every project and the Inbox in one fast call.
 
     Preferred over get_project_tasks when you need a full picture — this uses
     the v2 sync state (single request, includes Inbox) when available, falling
     back to the official API otherwise.
+
+    The output is paged: the header always states the TOTAL number of tasks,
+    and when they don't fit, the last line says how many top-level tasks are
+    left and which offset continues the list. Subtasks always travel with their
+    parent, so no page ever shows a subtask torn off the task it belongs to.
+
+    Args:
+        limit: Maximum tasks per call (default 200, same page size as
+            get_tasks_by_priority) — a soft ceiling: the subtree that crosses
+            it is finished rather than cut in half
+        offset: Skip this many TOP-LEVEL tasks — use it to read the tail; the
+            footer prints the exact offset that continues the list
     """
     err = _ensure_official()
     if err:
@@ -7599,12 +7725,31 @@ async def get_all_tasks() -> str:
             tasks = await _run_blocking(lambda: ticktick_v2.get_open_tasks())
             if not tasks:
                 return "No tasks found."
+            # def-E1: раньше печатались ВСЕ задачи — на боевом аккаунте
+            # владельца это 164 871 символ на 1481 задачу, то есть ответ не
+            # влезал в лимит и инструмент возвращал ошибку вместо данных.
+            # Срез считается по КОРНЯМ и уезжает вместе с поддеревьями, чтобы
+            # подзадача не осиротела на границе страницы (_page_task_forest).
+            page, total_roots, offset, shown_to = _page_task_forest(tasks, limit, offset)
+            if not page:
+                # Пустая страница за концом списка — это НЕ «задач нет».
+                # Страницы тут плавающие (поддерево дописывается целиком), так
+                # что называть «начало последней страницы» нельзя — врать про
+                # неё хуже, чем назвать диапазон допустимых offset.
+                return (f"All open tasks: {total_roots} top-level tasks total, but "
+                        f"offset={offset} is past the end (valid offsets are "
+                        f"0-{total_roots - 1}).")
             names = _v2_project_names()
             by_project: Dict[str, list] = {}
-            for t in tasks:
+            for t in page:
                 pid = t.get("projectId", "")
                 by_project.setdefault(pid, []).append(t)
-            out = f"All open tasks ({len(tasks)}):\n\n"
+            if offset or shown_to < total_roots:
+                out = (f"All open tasks ({len(tasks)} total, {total_roots} top-level; "
+                       f"showing top-level {offset + 1}-{shown_to} with their "
+                       f"subtasks):\n\n")
+            else:
+                out = f"All open tasks ({len(tasks)}):\n\n"
             for pid, ptasks in by_project.items():
                 pname = names.get(pid, pid or "Inbox")
                 # The WHOLE per-project list goes in, subtasks included:
@@ -7618,10 +7763,19 @@ async def get_all_tasks() -> str:
                 out += f"── {pname} ({len(ptasks)} tasks) ──\n"
                 out += format_task_tree(ptasks, 500)
                 out += "\n"
+            if shown_to < total_roots:
+                out += (f"... and {total_roots - shown_to} more top-level tasks — "
+                        f"call again with offset={shown_to}.\n")
             return out
 
         # Fallback: official API per project (projects fetched inside helper)
-        return _get_project_tasks_by_filter(lambda t: True, "included")
+        out = _get_project_tasks_by_filter(lambda t: True, "included")
+        # This path pages by its own rules inside the helper; pretending the
+        # caller's limit/offset were honoured here would be a silent lie.
+        if limit != _ALL_TASKS_PAGE or offset:
+            out += ("\n\n⚠️ limit/offset not applied: the v2 state is unavailable, so "
+                    "this listing came from the official API with its own paging.")
+        return out
 
     except Exception as e:
         logger.error(f"Error in get_all_tasks: {e}")
