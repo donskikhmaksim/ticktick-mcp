@@ -26,7 +26,8 @@ from starlette.responses import (JSONResponse, PlainTextResponse, Response,
                                  StreamingResponse)
 
 from .ticktick_client import TickTickClient, _normalize_date
-from .ticktick_v2_client import (ATTACHMENT_MAX_BYTES, TickTickAuthError,
+from .ticktick_v2_client import (ATTACHMENT_MAX_BYTES, COMPLETED_MAX_LIMIT,
+                                 TRASH_MAX_LIMIT, TickTickAuthError,
                                  TickTickV2Client, id2error_failures,
                                  new_attachment_id)
 from . import declutter_sheet
@@ -7938,6 +7939,10 @@ async def get_completed_tasks(limit: int = 100) -> str:
     """
     Get recently completed tasks across all lists (requires v2 API).
 
+    Asking for more than the feed can serve is answered honestly: the reply
+    says the feed's own per-call ceiling was hit, instead of passing off
+    "the newest 100" as "all of them".
+
     Args:
         limit: Maximum number of completed tasks to return (default 100 —
             the API's own hard cap, so there's no reason to default lower)
@@ -7950,7 +7955,20 @@ async def get_completed_tasks(limit: int = 100) -> str:
         if not tasks:
             return "No completed tasks found."
         out = f"Completed tasks ({len(tasks)}):\n\n"
-        return out + format_task_list(tasks)
+        # limit=len(tasks), NOT format_task_list's default 100: the client has
+        # already applied the caller's limit (and the feed's ceiling) when
+        # asking TickTick, and a second, hidden cut here is the get_trash
+        # defect of 2026-08-07. It happens to be harmless today only because
+        # COMPLETED_MAX_LIMIT is also 100 — correctness must not rest on two
+        # unrelated constants in two files staying equal.
+        out += format_task_list(tasks, limit=len(tasks))
+        if limit > COMPLETED_MAX_LIMIT and len(tasks) >= COMPLETED_MAX_LIMIT:
+            # The caller asked for more than TickTick serves per call. Silence
+            # here reads as "that's all there is"; say it's a ceiling.
+            out += (f"\n(Asked for {limit}, but TickTick's completed feed caps "
+                    f"at {COMPLETED_MAX_LIMIT} per call — these are the "
+                    f"{COMPLETED_MAX_LIMIT} most recent, not everything.)")
+        return out
     except Exception as e:
         logger.error(f"Error in get_completed_tasks: {e}")
         return f"Error fetching completed tasks: {str(e)}"
@@ -10221,18 +10239,47 @@ async def get_trash(limit: int = 50) -> str:
     before restoring), and to_project_id only if you want to override the
     original list it restored to.
 
+    A truncated answer ALWAYS says so and names the real total: the trash page
+    is fetched up to its 500-entry ceiling regardless of `limit`, so "showing
+    50 of 497" can be stated honestly. `limit` therefore controls how much is
+    PRINTED, not how much is known.
+
     Args:
-        limit: Maximum number of trashed tasks to return (default 50, max 500)
+        limit: How many trashed tasks to print (default 50, max 500 — the
+            page ceiling). Anything not printed is announced, never dropped
+            silently.
     """
     err = _ensure_ready()
     if err:
         return err
     try:
-        tasks = await _run_blocking(lambda: ticktick_v2.get_trash(limit))
+        # Always ask for the full page, not `limit`: asking for exactly what we
+        # print makes truncation INVISIBLE — a bare get_trash() used to answer
+        # «Trashed tasks (50):» with nothing else while the trash really held
+        # 497 (live, 2026-08-07). Fetching the ceiling costs the same single
+        # request (restore_tasks already does it) and is what lets the answer
+        # state the true total. «Showing 50» must never read as «there are 50».
+        tasks = await _run_blocking(lambda: ticktick_v2.get_trash(TRASH_MAX_LIMIT))
         if not tasks:
             return "Trash is empty."
-        out = f"Trashed tasks ({len(tasks)}):\n\n"
-        return out + format_task_list(tasks)
+        show = max(1, min(limit, len(tasks)))
+        # A full page means TickTick had at least that many — the true total is
+        # unknown, so say "500+" rather than inventing an exact number.
+        at_ceiling = len(tasks) >= TRASH_MAX_LIMIT
+        total = f"{TRASH_MAX_LIMIT}+" if at_ceiling else str(len(tasks))
+        if show < len(tasks) or at_ceiling:
+            out = f"Trashed tasks (showing {show} of {total}):\n\n"
+        else:
+            out = f"Trashed tasks ({len(tasks)}):\n\n"
+        # limit=show: the slice is already exact, so format_task_list must not
+        # apply its own hidden 100-entry cut on top (the 2026-08-07 defect).
+        out += format_task_list(tasks[:show], limit=show)
+        rest = len(tasks) - show
+        if rest > 0:
+            out += (f"\n... and {rest}{'+' if at_ceiling else ''} more — "
+                    f"call get_trash(limit={min(len(tasks), TRASH_MAX_LIMIT)}) "
+                    "to see them.")
+        return out
     except Exception as e:
         logger.error(f"Error in get_trash: {e}")
         return f"Error fetching trash: {str(e)}"
@@ -10688,6 +10735,12 @@ async def list_task_attachments(task_id: str, project_id: str = None) -> str:
     content (TickTick embeds them there as ![file](id/name) tokens), since
     not every account's attachment entries carry an id field directly.
 
+    Works for tasks that are no longer open too: a COMPLETED or TRASHED task's
+    files stay listable (that receipt/invoice is usually exactly what someone
+    comes back for). Those are looked up in the 100 most recently completed
+    tasks and the 500 newest trash entries — anything older than that has to be
+    reopened/restored first, and the error message says so.
+
     Args:
         task_id: ID of the task
         project_id: ID of the task's project (optional; auto-resolved)
@@ -10712,6 +10765,26 @@ async def list_task_attachments(task_id: str, project_id: str = None) -> str:
         return f"Error listing attachments: {str(e)}"
 
 
+def _attachment_project_id(task_id: str, given: str = None) -> Optional[str]:
+    """The projectId to build an attachment URL with, for a task in ANY state.
+
+    _resolve_project_id() only looks at OPEN tasks (deliberately — mutation
+    guards must not silently retarget a completed/trashed task), so on its own
+    it leaves every attachment of a completed task unreachable: the download
+    endpoint needs a projectId. This read-only path may look further, into the
+    completed feed and the trash (find_task_any_state, cached — no extra
+    request when the attachment list already resolved the same task)."""
+    pid = given or _resolve_project_id(task_id, given)
+    if pid:
+        return pid
+    try:
+        task, _state = ticktick_v2.find_task_any_state(task_id)
+        return (task or {}).get("projectId")
+    except Exception as e:
+        logger.warning(f"_attachment_project_id fallback failed for {task_id}: {e}")
+        return None
+
+
 async def _resolve_attachment_ref(task_id: str, project_id: str = None,
                                   attachment_id: str = None,
                                   filename: str = None, index: int = None
@@ -10724,7 +10797,7 @@ async def _resolve_attachment_ref(task_id: str, project_id: str = None,
     if not attachment_id and not filename and not index:
         return None, ("Provide one of attachment_id, filename, or index "
                       "(see list_task_attachments).")
-    pid = project_id or _resolve_project_id(task_id, project_id)
+    pid = await _run_blocking(lambda: _attachment_project_id(task_id, project_id))
     if not pid:
         return None, f"Could not resolve project_id for task {task_id}; pass it explicitly."
     atts = await _run_blocking(lambda: _merged_task_attachments(task_id))

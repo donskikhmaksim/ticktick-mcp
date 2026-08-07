@@ -29,7 +29,7 @@ import uuid
 import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,10 @@ REQUEST_TIMEOUT = 20
 
 # Completed-task endpoint hard-caps the page size.
 COMPLETED_MAX_LIMIT = 100
+
+# Trash endpoint page size used when LOOKING UP one task by id (not for
+# browsing) — same ceiling get_trash() itself clamps to.
+TRASH_MAX_LIMIT = 500
 
 # get_task_activity walks pages until one comes back empty/repeats, but stops
 # after this many pages regardless — a per-task edit log (title/due/move/etc.
@@ -125,6 +129,10 @@ class TickTickV2Client:
         self._state_cache: Optional[Dict] = None
         self._state_ts: float = 0.0
         self._state_ttl: float = 20.0
+        # find_task_any_state()'s fallback result (completed feed / trash),
+        # keyed by task id. Only populated when the open-task snapshot MISSED,
+        # so it never shadows the live open state; same TTL as the sync cache.
+        self._closed_lookup_cache: Dict[str, Tuple[float, Optional[Dict], Optional[str]]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -228,6 +236,7 @@ class TickTickV2Client:
     def invalidate_cache(self) -> None:
         """Drop the cached sync state (call after an external write)."""
         self._state_cache = None
+        self._closed_lookup_cache = {}
 
     def get_state(self, force: bool = False) -> Dict:
         """Full sync snapshot: projects, tags, open tasks, inboxId.
@@ -274,6 +283,73 @@ class TickTickV2Client:
         params = {"from": from_str, "to": to_str, "limit": limit}
         data = self._request("GET", "/project/all/completed", params=params)
         return data if isinstance(data, list) else data.get("tasks", [])
+
+    def find_task_any_state(self, task_id: str) -> Tuple[Optional[Dict], Optional[str]]:
+        """Locate a task by id across ALL THREE read paths this client has, and
+        say WHERE it was found: ("open" | "completed" | "trash"). Returns
+        (None, None) when it is in none of them.
+
+        Why this exists: the open-task sync snapshot (/batch/check/0) drops a
+        task the moment it is completed or deleted, so any read that resolved
+        tasks only there reported a live, perfectly readable task as missing —
+        the 2026-08-07 attachment incident, where a receipt attached to a
+        just-completed task answered "Open task <id> not found" and looked
+        lost for good.
+
+        COST — deliberately lazy, so the common case pays nothing:
+          * open      → 0 HTTP requests (served from the cached sync state);
+          * completed → 1 extra request, ONLY when the task isn't open;
+          * trash     → 1 more, ONLY when it isn't among the completed either.
+        A miss therefore costs 2 requests — exactly the case that used to just
+        raise. Fallback results (including "not found anywhere") are cached per
+        task id for `_state_ttl` seconds, so several reads of the same task
+        inside one turn resolve it once; invalidate_cache() clears them.
+
+        LIMITS — the fallback feeds are pages, not an index: the completed feed
+        returns at most COMPLETED_MAX_LIMIT (100) most-recent tasks and the
+        trash page at most TRASH_MAX_LIMIT (500). A task completed/deleted long
+        enough ago falls off both, and this returns (None, None) for it —
+        callers must phrase that as "not found among X" rather than
+        "does not exist".
+
+        FAILS LOUD, not silently absent: if a fallback fetch itself errors
+        (expired `t` cookie, network) and nothing was found, the error is
+        RAISED rather than reported as (None, None) — "couldn't check" must
+        never be rendered to a human as "your file isn't there".
+        """
+        task = next((t for t in self.get_open_tasks() if t.get("id") == task_id), None)
+        if task:
+            return task, "open"
+
+        hit = self._closed_lookup_cache.get(task_id)
+        if hit and (time.monotonic() - hit[0]) < self._state_ttl:
+            return hit[1], hit[2]
+
+        found: Optional[Dict] = None
+        state: Optional[str] = None
+        failure: Optional[Exception] = None
+        try:
+            found = next((t for t in self.get_completed_tasks(limit=COMPLETED_MAX_LIMIT)
+                          if t.get("id") == task_id), None)
+            if found:
+                state = "completed"
+        except Exception as e:
+            failure = e
+            logger.warning(f"find_task_any_state: completed lookup failed: {e}")
+        if not found:
+            try:
+                found = next((t for t in self.get_trash(limit=TRASH_MAX_LIMIT)
+                              if t.get("id") == task_id), None)
+                if found:
+                    state = "trash"
+            except Exception as e:
+                failure = failure or e
+                logger.warning(f"find_task_any_state: trash lookup failed: {e}")
+
+        if not found and failure is not None:
+            raise failure
+        self._closed_lookup_cache[task_id] = (time.monotonic(), found, state)
+        return found, state
 
     def move_task(self, task_id: str, to_project_id: str) -> Dict:
         """Move an open task to another project/list via batch/taskProject."""
@@ -734,15 +810,34 @@ class TickTickV2Client:
         return self._request("POST", "/trash/restore", json=body)
 
     # ---- attachments -----------------------------------------------------
-    def get_task_attachments(self, task_id: str) -> List[Dict]:
-        """Raw attachment metadata dicts for an OPEN task, straight from the
-        /batch/check/0 sync feed (whatever keys TickTick sends — not all
-        accounts/attachments carry the same fields, so callers should not
-        assume e.g. 'fileSize' or 'fileUrl' are always present)."""
-        task = next((t for t in self.get_open_tasks() if t.get("id") == task_id), None)
+    def _task_for_attachment_read(self, task_id: str) -> Dict:
+        """The task a caller wants attachment info from, WHEREVER it lives —
+        open, completed, or trashed (find_task_any_state). A completed task's
+        files must stay reachable: that receipt/invoice/contract is exactly
+        what someone comes back for after ticking the task off.
+
+        Raises ValueError naming the three places actually searched, so an
+        honest "not found among …" is never read as "the file is gone".
+        """
+        task, _state = self.find_task_any_state(task_id)
         if not task:
-            raise ValueError(f"Open task {task_id} not found.")
-        return task.get("attachments") or []
+            raise ValueError(
+                f"Task {task_id} not found among open tasks, the "
+                f"{COMPLETED_MAX_LIMIT} most recently completed ones, or the "
+                f"{TRASH_MAX_LIMIT} newest trash entries. If it was completed "
+                "or deleted longer ago than that, its attachments are not "
+                "reachable through this path — reopen/restore the task first.")
+        return task
+
+    def get_task_attachments(self, task_id: str) -> List[Dict]:
+        """Raw attachment metadata dicts for a task — open, completed OR
+        trashed — straight from TickTick's own task payload (whatever keys it
+        sends: not all accounts/attachments carry the same fields, so callers
+        should not assume e.g. 'fileSize' or 'fileUrl' are always present).
+
+        Resolving a completed/trashed task costs extra HTTP requests; see
+        find_task_any_state for the exact price and its page limits."""
+        return self._task_for_attachment_read(task_id).get("attachments") or []
 
     def get_content_attachment_refs(self, task_id: str) -> List[Dict]:
         """Fallback/cross-check source: TickTick embeds inline attachment
@@ -751,10 +846,11 @@ class TickTickV2Client:
         Parsed straight from the task text — useful when the structured
         `attachments` array is missing an id field for this account/attachment
         (observed in practice: the sync feed's attachments entries can carry
-        fileName without an id), or as a second opinion to cross-check it."""
-        task = next((t for t in self.get_open_tasks() if t.get("id") == task_id), None)
-        if not task:
-            raise ValueError(f"Open task {task_id} not found.")
+        fileName without an id), or as a second opinion to cross-check it.
+
+        Works for open, completed and trashed tasks alike — same resolution
+        (and same cost/limits) as get_task_attachments above."""
+        task = self._task_for_attachment_read(task_id)
         text = (task.get("content") or "") + "\n" + (task.get("desc") or "")
         refs = []
         for m in re.finditer(r"!\[file\]\(([0-9a-fA-F]{24})/([^)]+)\)", text):
