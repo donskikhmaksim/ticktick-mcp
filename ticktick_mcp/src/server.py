@@ -757,6 +757,88 @@ def _open_by_id(fresh: bool = False) -> Optional[Dict[str, Dict]]:
         return None
 
 
+# Сколько раз и с какой паузой повторно перечитывать живое состояние ПОСЛЕ
+# identity-changing мутации (меняет проект/родителя/группу задачи —
+# move_tasks, set_task_parent, unset_task_parent, move_project_to_group,
+# restore_tasks), прежде чем окончательно признать расхождение.
+#
+# ПОЧЕМУ ЭТО ЗДЕСЬ (дефект №4, живой прогон 2026-08-06, move_tasks, манифест
+# 58afe2beeea7): задача «__AUTOTEST__dup-src (copy)» РЕАЛЬНО переместилась —
+# независимое чтение через get_project_tasks (ОФИЦИАЛЬНЫЙ Open API,
+# ticktick.get_project_with_data) сразу после нажатия ✅ увидело её в новом
+# проекте, поле projectId на самой задаче обновилось. Но и собственный
+# post-verify _move_tasks_impl, и независимая перепроверка operation_report
+# читают состояние через СОВСЕМ ДРУГОЙ backend — неофициальный v2 web-API
+# (`ticktick_v2`, /batch/check/0), ТЕМ ЖЕ, которым сам move и был сделан —
+# и оба, прочитав его СРАЗУ после мутации, ещё видели задачу как «не среди
+# открытых вовсе» (ни в старом, ни в новом проекте — а не «нашлась, но не
+# там»). Сравнение против места назначения (`projectId == to_project_id` /
+# `parentId == parent_task_id` / `groupId == group_id`) уже было и остаётся
+# ПРАВИЛЬНЫМ — это подтверждено и чтением кода, и прогоном unit-тестов с
+# управляемым фейковым состоянием (see tests/test_move_tasks_postverify.py).
+# Расхождение — не в логике сравнения, а в том, что моментальное чтение
+# СРАЗУ после записи в /batch/check/0 может на секунду-две отставать от уже
+# состоявшейся мутации, сделанной через тот же API мгновением раньше.
+#
+# Ретрай НИКОГДА не ослабляет проверку: критерий успеха («там, куда
+# перемещали») остаётся тем же самым строгим сравнением на КАЖДОЙ попытке —
+# он просто даёт TickTick секунду-две «долиться», прежде чем звать
+# расхождение окончательным. Цена в общем случае — НОЛЬ: если состояние уже
+# свежее (как почти всегда), первое же чтение проходит проверку и цикл
+# завершается без единой лишней паузы. Настоящий провал (мутация правда не
+# применилась) по-прежнему остаётся ❌ — просто после исчерпания попыток, а
+# не после одной.
+_POSTVERIFY_RETRY_ATTEMPTS = 2
+_POSTVERIFY_RETRY_DELAY_S = 0.7
+
+
+def _reread_open_until(check, attempts: int = _POSTVERIFY_RETRY_ATTEMPTS,
+                       delay: float = _POSTVERIFY_RETRY_DELAY_S,
+                       ) -> Optional[Dict[str, Dict]]:
+    """_open_by_id(fresh=True), retried a bounded number of times while
+    `check(live_map) is False` — see the block comment above for why this
+    exists. `check` receives the freshly re-fetched {taskId: task} map and
+    returns True once it confirms whatever the caller is waiting to see
+    (e.g. every moved task's projectId now equals the destination).
+
+    Returns the LAST fetched map regardless of outcome — None only when a
+    fetch itself failed (v2 unavailable), exactly like a plain
+    `_open_by_id(fresh=True)` call; a caller's existing None-handling (fail
+    UNVERIFIED, never confused with "check still false") is untouched. The
+    caller re-runs its OWN strict comparison against whatever this returns —
+    this helper only decides how many times to look, never what counts as
+    success."""
+    fresh = _open_by_id(fresh=True)
+    tries = 0
+    while fresh is not None and not check(fresh) and tries < attempts:
+        time.sleep(delay)
+        fresh = _open_by_id(fresh=True)
+        tries += 1
+    return fresh
+
+
+def _reread_projects_until(check, attempts: int = _POSTVERIFY_RETRY_ATTEMPTS,
+                           delay: float = _POSTVERIFY_RETRY_DELAY_S,
+                           ) -> List[Dict]:
+    """Project-list analogue of _reread_open_until — used only by
+    move_project_to_group's post-verify, which checks a PROJECT's live
+    groupId rather than a task's projectId/parentId, so it can't share the
+    task-keyed map _open_by_id builds. Same contract: `check` gets the fresh
+    project list and returns True once it confirms the expected groupId;
+    retried on the same bounded schedule and for the same reason (a v2
+    /batch/check/0 re-read can lag a moment behind a write just made through
+    the same v2 API — see the block comment above _POSTVERIFY_RETRY_ATTEMPTS)."""
+    ticktick_v2.get_state(force=True)
+    projs = ticktick_v2.list_projects()
+    tries = 0
+    while not check(projs) and tries < attempts:
+        time.sleep(delay)
+        ticktick_v2.get_state(force=True)
+        projs = ticktick_v2.list_projects()
+        tries += 1
+    return projs
+
+
 # TickTick's own apps hard-cap nested subtasks at 5 total levels (root task =
 # level 1, subtask = level 2, sub-subtask = level 3, … down to level 5) —
 # confirmed 2026-08-06 against TickTick's official help center, "Multilevel
@@ -4815,6 +4897,25 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
             "проверяется автоматически)")
 
 
+def _compute_op_verdicts(records: List[Dict], live: Dict[str, Dict],
+                         names: Dict) -> List[Tuple[str, str]]:
+    """Runs _verify_item over every item of every journal record against ONE
+    given live snapshot. Factored out of _build_operation_report so the
+    identity-changing-op retry there (_POSTVERIFY_RETRY_ATTEMPTS) can re-run
+    the exact same computation against a freshly re-fetched snapshot without
+    duplicating the items-extraction logic."""
+    verdicts: List[Tuple[str, str]] = []
+    for rec in records:
+        op = rec.get("op") or "delete"
+        items = rec.get("items") or [
+            {"taskId": s.get("taskId"), "title": s.get("title"), "snapshot": s}
+            for s in rec.get("deleted", [])
+        ]
+        for item in items:
+            verdicts.append(_verify_item(op, item, live, names))
+    return verdicts
+
+
 @mcp.tool(annotations=READONLY)
 async def operation_report(record_id: str) -> str:
     """
@@ -4892,15 +4993,29 @@ def _build_operation_report(record_id: str) -> str:
         # с 4 явными пунктами ⚠️ — эти пункты начинались с ⚠️, а старый
         # счётчик по первым символам строки его не распознавал, поэтому
         # пункт печатался, но никогда не учитывался).
-        verdicts: List[Tuple[str, str]] = []
-        for rec in records:
-            op = rec.get("op") or "delete"
-            items = rec.get("items") or [
-                {"taskId": s.get("taskId"), "title": s.get("title"), "snapshot": s}
-                for s in rec.get("deleted", [])
-            ]
-            for item in items:
-                verdicts.append(_verify_item(op, item, live, names))
+        verdicts = _compute_op_verdicts(records, live, names)
+        # Ретрай ТОЛЬКО для identity-changing операций (move/parent/restore —
+        # см. _POSTVERIFY_RETRY_ATTEMPTS): та же гонка с v2-синком TickTick,
+        # найденная живьём 2026-08-06 на move_tasks, бьёт и по НЕЗАВИСИМОЙ
+        # перепроверке, не только по post-verify самого исполнителя — «not
+        # found among open at all» сразу после мутации был именно этот
+        # случай. Не трогает delete/create/tags/complete/abandon — там ❌
+        # уже сегодня означает то, что означает, и без подтверждённой гонки
+        # незачем добавлять им лишнюю задержку на настоящем провале.
+        retryable_ops = {"move", "parent", "restore"}
+        if (any(status == "bad" for status, _ in verdicts)
+                and any((rec.get("op") or "delete") in retryable_ops
+                        for rec in records)):
+            tries = 0
+            while (any(status == "bad" for status, _ in verdicts)
+                   and tries < _POSTVERIFY_RETRY_ATTEMPTS):
+                time.sleep(_POSTVERIFY_RETRY_DELAY_S)
+                live2 = _open_by_id(fresh=True)
+                if live2 is None:
+                    break
+                live = live2
+                verdicts = _compute_op_verdicts(records, live, names)
+                tries += 1
         lines.extend(line for _, line in verdicts)
         ok = sum(1 for status, _ in verdicts if status == "ok")
         warn = sum(1 for status, _ in verdicts if status == "warn")
@@ -7712,7 +7827,14 @@ async def _move_tasks_impl(summary: str, tasks: List[Dict[str, str]],
             resp = await _run_blocking(lambda: ticktick_v2.batch_move_tasks(
                 [f["taskId"] for f in found], to_project_id))
             api_fail = id2error_failures(resp, [f["taskId"] for f in found])
-            fresh = _open_by_id(fresh=True)  # verify the tasks actually landed
+            # verify the tasks actually landed — retried (see
+            # _reread_open_until) so an immediate re-read racing TickTick's
+            # own v2 sync doesn't misreport a real move as a failure; items
+            # TickTick itself already rejected (api_fail) are excluded from
+            # the wait condition, so a genuine failure isn't delayed.
+            fresh = await _run_blocking(_reread_open_until, lambda m: all(
+                (m.get(f["taskId"]) or {}).get("projectId") == to_project_id
+                for f in found if f["taskId"] not in api_fail))
             if fresh is None:
                 unverified = True
             else:
@@ -8455,7 +8577,13 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
         nested, failed = [], []
         unverified = False
         if ok_items:
-            fresh = _open_by_id(fresh=True)
+            # Retried re-read (see _reread_open_until / _POSTVERIFY_RETRY_*):
+            # an immediate single re-read can race TickTick's own v2 sync
+            # right after the SAME v2 API just wrote parentId — the exact
+            # class of false-❌ found live 2026-08-06 on move_tasks.
+            fresh = await _run_blocking(_reread_open_until, lambda m: all(
+                (m.get(f["taskId"]) or {}).get("parentId") == parent_task_id
+                for f in ok_items if f["taskId"] not in api_fail))
             if fresh is None:
                 unverified = True
             else:
@@ -8597,11 +8725,16 @@ async def _unset_task_parent_impl(task_title: str, parent_task_title: str,
         rid = _op_journal("parent", [{"taskId": task_id, "title": task_title,
                                       "expect": {"parentId": None}}],
                           f"Отцепить «{task_title}»")
-        # Post-verify: the live parentId must actually be gone.
-        fresh = _open_by_id(fresh=True)
         if api_err:
             return (f"❌ НЕ отцепил «{task_title}» — TickTick отклонил: {api_err}\n"
                     + _report_line(rid))
+        # Post-verify: the live parentId must actually be gone. Retried (see
+        # _reread_open_until) — same race class as move_tasks, found live
+        # 2026-08-06: an immediate re-read can still show the pre-mutation
+        # parentId for a moment right after the SAME v2 API cleared it.
+        fresh = await _run_blocking(
+            _reread_open_until,
+            lambda m: not (m.get(task_id) or {}).get("parentId"))
         if fresh is None:
             return (f"Отцепление «{task_title}» отправлено, но {_UNVERIFIED_MSG}\n"
                     + _report_line(rid))
@@ -9248,12 +9381,17 @@ async def _move_project_to_group_impl(project_name: str, project_id: str,
             dest_name = grp.get("name") or group_id
         live_pname = _v2_project_names().get(project_id, project_name)
         await _run_blocking(lambda: ticktick_v2.move_project_to_group(project_id, group_id))
+        want = None if group_id == "NONE" else group_id
         # Post-verify: the project's live groupId must equal the target.
-        await _run_blocking(lambda: ticktick_v2.get_state(force=True))
-        projs = await _run_blocking(lambda: ticktick_v2.list_projects())
+        # Retried (see _reread_projects_until / _POSTVERIFY_RETRY_*) — same
+        # race class as move_tasks, found live 2026-08-06: an immediate
+        # re-read can still show the pre-mutation groupId for a moment right
+        # after the SAME v2 API just changed it.
+        projs = await _run_blocking(_reread_projects_until, lambda ps: any(
+            p.get("id") == project_id and (p.get("groupId") or None) == want
+            for p in ps))
         proj = next((p for p in projs if p.get("id") == project_id), None)
         got = (proj or {}).get("groupId")
-        want = None if group_id == "NONE" else group_id
         dest = "без папки (ungrouped)" if group_id == "NONE" else f"папку «{dest_name}»"
         if proj is None:
             return (f"Проект «{live_pname}» отправлен в {dest}, но "
@@ -9573,7 +9711,16 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
         wrong_project = []  # [(title, want_pid, got_pid)] — так и не туда даже после фикса
         unverified = False
         if ok_items:
-            fresh = _open_by_id(fresh=True)
+            # Retried re-read (see _reread_open_until / _POSTVERIFY_RETRY_*):
+            # only waits for each item to become VISIBLE again (not for it to
+            # land in any particular project — "wrong project" below is a
+            # real, expected TickTick quirk, not the race this guards
+            # against) — the same v2-sync-lag class found live 2026-08-06 on
+            # move_tasks, which showed a just-restored task as fully absent
+            # for a moment right after the SAME v2 API restored it.
+            fresh = await _run_blocking(_reread_open_until, lambda m: all(
+                m.get(i["taskId"]) is not None
+                for i in ok_items if i["taskId"] not in api_fail))
             if fresh is None:
                 unverified = True
             else:
@@ -9607,7 +9754,13 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
                                         f"{pid} failed: {e}")
                             for tid2 in ids:
                                 fix_api_fail.setdefault(tid2, str(e))
-                    fresh2 = _open_by_id(fresh=True)
+                    # Same retried re-read, now checking the STRICT
+                    # identity-changing criterion (projectId == destination)
+                    # after the corrective move — mirrors move_tasks's own
+                    # post-verify exactly, same race class.
+                    fresh2 = await _run_blocking(_reread_open_until, lambda m: all(
+                        (m.get(i["taskId"]) or {}).get("projectId") == i["want_pid"]
+                        for i in to_fix if i["taskId"] not in fix_api_fail))
                     for i in to_fix:
                         live2 = (fresh2 or {}).get(i["taskId"])
                         if (fresh2 is not None and live2 is not None
