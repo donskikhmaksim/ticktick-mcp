@@ -13507,7 +13507,8 @@ async def create_project_column(project_id: str, name: str,
         name: Name of the new column/section
         project_name: Name of the project (recommended — arms the identity
             guard so a stale/wrong project_id is refused instead of silently
-            creating the column elsewhere)
+            creating the column elsewhere; the check runs BEFORE the plan
+            card is built, so a wrong pair never reaches your approval)
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
@@ -13520,10 +13521,40 @@ async def create_project_column(project_id: str, name: str,
     call #2 is refused whatever `user_reply` says — before the press (wait for
     it) and after it too (the server is already running the operation). Do not
     retry it; just tell the user to tap the button.
+
+    project_id and project_name are cross-checked against the LIVE project
+    list TWICE (same pattern as update_project / move_project_to_group): once
+    while BUILDING the plan (call #1, before the card is shown to the owner —
+    a wrong pair never reaches the approval) and again, independently, right
+    before the column is actually created (call #2, unchanged).
     """
     err = _ensure_ready()
     if err:
         return err
+    # Перенос identity-guard (project_id↔project_name) на построение плана —
+    # тот же _guard_project(..., require_known=True) с ТЕМИ ЖЕ аргументами,
+    # что уже стоит в _create_project_column_impl НА ИСПОЛНЕНИИ (образец:
+    # update_project / move_project_to_group).
+    #
+    # Живая приёмка 2026-08-07: докстринг `project_name` обещал «arms the
+    # identity guard so a stale/wrong project_id is refused instead of
+    # silently creating the column elsewhere», но на call #1 не проверялось
+    # НИЧЕГО — верный project_id и заведомо ложное имя «Совершенно другой
+    # проект» дали карточку «📋 План — Создаю раздел (колонку) «…» в проекте
+    # «Совершенно другой проект»». Человек подтверждал по имени, которое
+    # сервер даже не сверял; обещанной защиты не существовало до момента,
+    # когда подтверждение уже получено.
+    #
+    # Строгость НЕ меняется, меняется момент: `project_name or ""` +
+    # require_known=True — ровно то, чем зовёт impl, включая фейл-клоуз на
+    # id, который не резолвится ни в одно живое имя (там же, ниже).
+    # automation_key НЕ пропускает эту проверку — она стоит раньше гейта.
+    if not manifest_id:
+        refuse = _guard_project(project_id, project_name or "", fresh=True,
+                                require_known=True)
+        if refuse:
+            return (refuse.replace("🛑 Отказ —", "🛑 План НЕ построен —", 1)
+                          .replace("Ничего не тронул.", "Ничего не изменено."))
     params = {"project_id": project_id, "name": name, "project_name": project_name}
     outcome = await _gate_single("create_project_column", "create_project_column",
                                  params if not manifest_id else None,
