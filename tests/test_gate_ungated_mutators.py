@@ -24,9 +24,10 @@
 молча, поэтому проверяются не по хардкоду в тесте, а по реально переданному
 в `_gate_single` словарю.
 
-Сети нет: оба клиента TickTick подменены «растяжкой» (_TripWire), любое
-обращение к которой валит тест — так вызов #1 доказывает не только «impl не
-позвался», но и «в TickTick вообще не ходили»."""
+Сети нет: оба клиента TickTick подменены заглушкой (`_ReadOnlyStub`, см. её
+докстринг ниже про правку 2026-08-07) — вызов #1 доказывает «impl не
+позвался» и «в TickTick НИЧЕГО НЕ ЗАПИСАНО» (не «TickTick вообще не
+трогали» — с 2026-08-07 это уже не так, см. ниже)."""
 import inspect
 import re
 
@@ -41,17 +42,59 @@ def _extract_manifest_id(preview: str) -> str:
     return m.group(1)
 
 
-class _TripWire:
-    """Заглушка вместо клиента TickTick: ЛЮБОЕ обращение к атрибуту — это
-    попытка сходить в сеть, и на фазе плана её быть не должно."""
+_DEFAULT_PROJECTS = [{"id": "p1", "name": "Работа"}]
+_DEFAULT_TASKS = [{"id": "t1", "title": "Купить молоко", "projectId": "p1"}]
 
-    def __init__(self, label: str):
+
+class _ReadOnlyStub:
+    """2026-08-07 (def-116 follow-up, group B): ЗАМЕНА прежней `_TripWire`.
+
+    ДО этой правки `_TripWire` валила тест на ЛЮБОЕ обращение к атрибуту —
+    это было корректно, пока вызов #1 (план) для этих трёх тулов был
+    буквально read-free: identity-guard стоял только в `_<tool>_impl`
+    (исполнение), а он в этом файле ВСЕГДА подменён `_ImplSpy` и потому не
+    вызывается на call #1 вовсе. После группы B (см. коммит этого файла):
+    abandon_task/update_project/archive_project ТЕПЕРЬ сверяют
+    task_id/project_id с ЖИВЫМ состоянием (_guard_task/_guard_project) уже на
+    этапе ПЛАНА — той же логикой, что уже стояла на исполнении, перенесённой
+    раньше по времени (тот же перенос, что для create_subtask/
+    unset_task_parent/move_project_to_group и остальных 6 методов этой
+    ветки). `_TripWire` поэтому стала неверным тестовым допущением — «план
+    read-free» было СЛЕДСТВИЕМ отсутствия identity-guard на плане, а не
+    намеренным свойством дизайна (тот же вывод, что и в delete_habit/
+    ea2a47c: «план в TickTick не ходит вовсе» фиксировало баг, а не защищало
+    от него).
+
+    `_ReadOnlyStub` сохраняет ИСХОДНЫЙ смысл проверки — «вызов #1 не мутирует
+    TickTick» — но перестаёт путать «не мутирует» с «не читает»: отдаёт
+    ТОЛЬКО read-методы, которыми реально пользуются `_guard_task`/
+    `_guard_project` при построении плана (`get_state`/`get_open_tasks`/
+    `invalidate_cache`/`get_projects`), и по-прежнему валит тест на ЛЮБОЙ
+    другой атрибут (в т.ч. любой WRITE-метод) — та же страховка, что была у
+    `_TripWire`, просто больше не путает чтение ради сверки личности с
+    записью. `projects`/`tasks` по умолчанию совпадают с `_SPECS` ниже, так
+    что все ОБЫЧНЫЕ тесты файла (гейт/manifest/automation_key — не про
+    identity-guard) видят СОВПАДАЮЩУЮ пару и план строится штатно; тесты
+    identity-guard передают свои (несовпадающие/пустые) данные."""
+
+    def __init__(self, label: str, projects=None, tasks=None):
         self.label = label
+        self._projects = projects if projects is not None else list(_DEFAULT_PROJECTS)
+        self._tasks = tasks if tasks is not None else list(_DEFAULT_TASKS)
 
     def __getattr__(self, name):
+        if name == "get_state":
+            return lambda force=False: {"projectProfiles": list(self._projects)}
+        if name == "get_open_tasks":
+            return lambda: list(self._tasks)
+        if name == "invalidate_cache":
+            return lambda: None
+        if name == "get_projects":
+            return lambda: list(self._projects)
         raise AssertionError(
             f"фаза плана обратилась к {self.label}.{name} — вызов #1 обязан "
-            "быть полностью read-free/сетевo-free")
+            "быть МУТАЦИЯ-free (чтение ради identity-guard — ожидаемо и "
+            "разрешено этой заглушкой, запись — нет)")
 
 
 class _ImplSpy:
@@ -66,18 +109,20 @@ class _ImplSpy:
         return "### ✅ выполнено (spy)"
 
 
-def _wire_clients(monkeypatch):
-    monkeypatch.setattr(s, "ticktick", _TripWire("ticktick"))
-    monkeypatch.setattr(s, "ticktick_v2", _TripWire("ticktick_v2"))
+def _wire_clients(monkeypatch, projects=None, tasks=None):
+    monkeypatch.setattr(s, "ticktick",
+                        _ReadOnlyStub("ticktick", projects, tasks))
+    monkeypatch.setattr(s, "ticktick_v2",
+                        _ReadOnlyStub("ticktick_v2", projects, tasks))
     monkeypatch.setattr(s, "_ensure_ready", lambda: None)
     monkeypatch.setattr(s, "_ensure_official", lambda: None)
 
 
-def _wire(monkeypatch, tool_name: str) -> _ImplSpy:
-    """Клиенты — растяжка, исполнитель — шпион. monkeypatch.setattr здесь
-    заодно и проверка существования `_<tool_name>_impl`: если функцию
+def _wire(monkeypatch, tool_name: str, projects=None, tasks=None) -> _ImplSpy:
+    """Клиенты — read-only заглушка, исполнитель — шпион. monkeypatch.setattr
+    здесь заодно и проверка существования `_<tool_name>_impl`: если функцию
     переименовали, тест падает прямо тут."""
-    _wire_clients(monkeypatch)
+    _wire_clients(monkeypatch, projects, tasks)
     spy = _ImplSpy()
     monkeypatch.setattr(s, f"_{tool_name}_impl", spy)
     return spy
@@ -388,5 +433,174 @@ async def test_update_project_bad_view_mode_refused_before_gate(monkeypatch):
     spy = _wire(monkeypatch, "update_project")
     result = await s.update_project("Работа", "p1", view_mode="галерея")
     assert "Invalid view_mode" in result
+    assert "manifest_id" not in result
+    assert spy.calls == []
+
+
+# ===========================================================================
+# 2026-08-07: plan-phase identity-guard (def-116 follow-up, group B) —
+# update_project's project_id↔project_name is now cross-checked BEFORE the
+# plan is built too (see server.py and tests/test_slice6_projects.py's own
+# `test_update_project_plan_identity_guard_*` for the wrong-name/missing
+# cases). This one extra check belongs HERE because it needs THIS file's
+# automation_key/_SPECS plumbing: a valid automation_key runs on the FIRST
+# call with no plan card and no Telegram button ever shown, so if the
+# identity check only lived inside _gate_single/execution, a false
+# project_id/project_name pair would sail through silently on a single valid
+# key. The check sits BEFORE _gate_single, so it applies here too.
+# ===========================================================================
+
+async def test_update_project_automation_key_mismatch_is_refused_before_plan(monkeypatch):
+    spy = _wire(monkeypatch, "update_project",
+               projects=[{"id": "p1", "name": "Личное"}])
+    monkeypatch.setattr(s, "SECRET", "test-secret")
+
+    result = await s.update_project("Работа", "p1", name="X",
+                                    automation_key="test-secret")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Личное»" in result
+    assert "manifest_id" not in result
+    assert spy.calls == []
+
+
+# ===========================================================================
+# 2026-08-07: same headless-path check as above, for archive_project — see
+# tests/test_slice6_projects.py's own `test_archive_project_plan_identity_
+# guard_*` for the wrong-name/missing/unarchive-leniency cases (that file
+# already owns _guard_project/_v2_project_names-style testing for this tool).
+# ===========================================================================
+
+async def test_archive_project_automation_key_mismatch_is_refused_before_plan(monkeypatch):
+    spy = _wire(monkeypatch, "archive_project",
+               projects=[{"id": "p1", "name": "Личное"}])
+    monkeypatch.setattr(s, "SECRET", "test-secret")
+
+    result = await s.archive_project("Работа", "p1", archived=True,
+                                     automation_key="test-secret")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Личное»" in result
+    assert "manifest_id" not in result
+    assert spy.calls == []
+
+
+# ===========================================================================
+# 2026-08-07: plan-phase identity-guard (def-116 follow-up, group B) —
+# abandon_task's task_id↔task_title is now cross-checked BEFORE the plan is
+# built too, same _guard_task shape as duplicate_task (mismatch AND missing
+# both block — "не буду делать" can only be marked on an OPEN task;
+# _abandon_task_impl already treats a non-open id as a hard 🛑 on execution,
+# unlike e.g. add_task_comment where a missing task only warns). Unlike
+# _guard_project (used by update_project/archive_project above), _guard_task
+# DOES have a soft "unavailable" branch, so this block also covers the
+# read-failure-warns/still-catches pair — same shape as the analogous tests
+# in tests/test_slice1_real_gates.py for set_task_parent.
+# ===========================================================================
+
+async def test_abandon_task_plan_identity_guard_blocks_wrong_title(monkeypatch):
+    """task_id resolves to a REAL task ("Купить хлеб"), caller's task_title
+    claims a DIFFERENT one ("Купить молоко") — before this fix, call #1
+    would have built and shown a plan card describing the WRONG task."""
+    spy = _wire(monkeypatch, "abandon_task",
+               tasks=[{"id": "t1", "title": "Купить хлеб", "projectId": "p1"}])
+
+    result = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Купить хлеб»" in result
+    assert "manifest_id" not in result
+    assert spy.calls == []
+
+
+async def test_abandon_task_plan_identity_guard_blocks_missing_task(monkeypatch):
+    """_abandon_task_impl treats a task NOT among open tasks as a hard 🛑 too
+    (в отличие от add_task_comment, где комментировать завершённую задачу
+    разрешено) — «не буду делать» можно пометить только ОТКРЫТУЮ задачу, и
+    the plan-phase transfer must reproduce that same severity."""
+    spy = _wire(monkeypatch, "abandon_task", tasks=[])
+
+    result = await s.abandon_task("Отказываюсь", "t-нет-такой", task_title="Купить молоко")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "manifest_id" not in result
+    assert spy.calls == []
+
+
+async def test_abandon_task_plan_read_failure_does_not_block_but_warns(monkeypatch):
+    """A live-read hiccup while BUILDING the plan (call #1) must not block
+    every abandon — fail-open here is cheaper than refusing everyone whose
+    network is briefly flaky. The plan is still built, honestly warns that
+    the task was not verified, and call #2 still reaches the (stubbed)
+    execution normally."""
+    spy = _wire(monkeypatch, "abandon_task",
+               tasks=[{"id": "t1", "title": "Купить молоко", "projectId": "p1"}])
+    real_open_by_id = s._open_by_id
+    calls = {"n": 0}
+
+    def _flaky(fresh=False):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return real_open_by_id(fresh=fresh)
+    monkeypatch.setattr(s, "_open_by_id", _flaky)
+
+    preview = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко")
+    assert "🛑" not in preview, "временный сбой чтения не должен блокировать план"
+    assert "НЕ удалось сверить" in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко",
+                                  manifest_id=mid, user_reply="да")
+    assert "🛑" not in result
+    assert spy.calls == [{"summary": "Отказываюсь", "task_id": "t1",
+                          "task_title": "Купить молоко"}]
+
+
+async def test_abandon_task_plan_read_failure_still_lets_execution_catch_a_real_mismatch(
+        monkeypatch):
+    """Same read failure on the plan as above, but this time the pair
+    actually DOESN'T match. The plan-phase check couldn't run (so it warns
+    instead of refusing), but the execution-phase guard inside the REAL
+    `_abandon_task_impl` (NOT stubbed in this one test, unlike the rest of
+    this file — needed to prove the real guard, not a spy, catches it) still
+    catches the real mismatch: a network blip on planning must not weaken
+    the protection at execution time."""
+    _wire_clients(monkeypatch,
+                 tasks=[{"id": "t1", "title": "Купить хлеб", "projectId": "p1"}])
+    real_open_by_id = s._open_by_id
+    calls = {"n": 0}
+
+    def _flaky(fresh=False):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return real_open_by_id(fresh=fresh)
+    monkeypatch.setattr(s, "_open_by_id", _flaky)
+
+    preview = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко")
+    assert "🛑" not in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко",
+                                  manifest_id=mid, user_reply="да")
+    assert result.startswith("🛑")
+    assert "«Купить хлеб»" in result
+
+
+async def test_abandon_task_automation_key_mismatch_is_refused_before_plan(monkeypatch):
+    """Headless path (#118): a valid automation_key runs on the FIRST call,
+    with no plan card and no Telegram button ever shown — so if the identity
+    check only lived inside _gate_single/execution, a false name+id pair
+    would sail through silently on a single valid key."""
+    spy = _wire(monkeypatch, "abandon_task",
+               tasks=[{"id": "t1", "title": "Купить хлеб", "projectId": "p1"}])
+    monkeypatch.setattr(s, "SECRET", "test-secret")
+
+    result = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко",
+                                  automation_key="test-secret")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Купить хлеб»" in result
     assert "manifest_id" not in result
     assert spy.calls == []

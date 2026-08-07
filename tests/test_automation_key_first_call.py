@@ -248,10 +248,17 @@ _SIX = [
                  {"name": "тег", "color": None}, id="create_tag"),
     pytest.param("delete_tag", {"name": "тег"}, "_delete_tag_impl",
                  {"name": "тег"}, id="delete_tag"),
+    # def-116 follow-up (group B, 2026-08-07): move_project_to_group's plan
+    # phase now also cross-checks project_id↔project_name against
+    # `_v2_project_names()` — the `deletion` fixture below resolves p1 to
+    # "Покупки" (it was built for the delete_tasks scenarios in this same
+    # file), so project_name here must agree with THAT, not with an
+    # unrelated placeholder, or the plan-phase identity guard would refuse
+    # before the automation_key check under test even runs.
     pytest.param("move_project_to_group",
-                 {"project_name": "Проект", "project_id": "p1",
+                 {"project_name": "Покупки", "project_id": "p1",
                   "group_id": "g1"}, "_move_project_to_group_impl",
-                 {"project_name": "Проект", "project_id": "p1",
+                 {"project_name": "Покупки", "project_id": "p1",
                   "group_id": "g1"}, id="move_project_to_group"),
 ]
 

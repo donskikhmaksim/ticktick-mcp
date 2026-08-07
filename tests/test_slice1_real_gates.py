@@ -356,6 +356,152 @@ async def test_set_task_parent_full_gate_cycle(monkeypatch):
     assert "🛑" not in result
 
 
+# ---------------------------------------------------------------------------
+# 2026-08-07: plan-phase identity-guard (def-116 follow-up, group B) — the
+# PARENT's parent_task_id↔parent_task_title is now cross-checked BEFORE the
+# plan is built, not only inside _set_task_parent_impl on execution. Same
+# shape as create_subtask/unset_task_parent/duplicate_task: mismatch AND
+# missing both block the plan (the impl already treats both as a hard 🛑 for
+# the parent — "вложение под мёртвого родителя осиротит задачи"), unavailable
+# only warns. See set_task_parent's own docstring for why per-CHILD identity
+# (the `tasks` list) is explicitly OUT of scope for this transfer.
+# ---------------------------------------------------------------------------
+
+async def test_set_task_parent_plan_identity_guard_blocks_wrong_parent_title(monkeypatch):
+    """parent_task_id points at a REAL task ("Большой проект"), caller's
+    parent_task_title claims a DIFFERENT one ("Другой проект") — before this
+    fix, call #1 would have built and shown a plan card reading '... → под
+    «Другой проект»' even though the id has nothing to do with that task.
+    Now the plan is refused outright, before any card is built, and
+    set_task_parents is never called."""
+    live = {
+        "p": {"id": "p", "title": "Большой проект", "projectId": "p1"},
+        "c": {"id": "c", "title": "Шаг 1", "projectId": "p1"},
+    }
+    fake, official = _wire(monkeypatch, live)
+
+    result = await s.set_task_parent(
+        "Вкладываю", [{"taskId": "c", "title": "Шаг 1"}],
+        parent_task_id="p", project_id="p1", parent_task_title="Другой проект")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Большой проект»" in result
+    assert "manifest_id" not in result, "план для несовпавшей пары строиться не должен"
+    assert fake.calls == []
+    assert "parentId" not in live["c"]
+
+
+async def test_set_task_parent_plan_identity_guard_blocks_missing_parent(monkeypatch):
+    """_set_task_parent_impl treats a MISSING parent as a hard 🛑 too, not a
+    soft warning ("вложение под мёртвого родителя осиротит задачи") — the
+    plan-phase transfer must reproduce that same severity."""
+    live = {"c": {"id": "c", "title": "Шаг 1", "projectId": "p1"}}
+    fake, official = _wire(monkeypatch, live)
+
+    result = await s.set_task_parent(
+        "Вкладываю", [{"taskId": "c", "title": "Шаг 1"}],
+        parent_task_id="p-нет-такой", project_id="p1", parent_task_title="Большой проект")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "manifest_id" not in result
+    assert fake.calls == []
+
+
+async def test_set_task_parent_plan_read_failure_does_not_block_but_warns(monkeypatch):
+    """A live-read hiccup while BUILDING the plan (call #1) must not block
+    every nesting — fail-open here is cheaper than refusing everyone whose
+    network is briefly flaky. The plan is still built, honestly warns that
+    the parent's title was not verified, and the real (unchanged) identity-
+    guard on execution (call #2) does its normal job right after. Mirrors
+    _open_by_id's own real contract (returns None on failure, never raises)
+    rather than raising an exception."""
+    live = {
+        "p": {"id": "p", "title": "Большой проект", "projectId": "p1"},
+        "c": {"id": "c", "title": "Шаг 1", "projectId": "p1"},
+    }
+    fake, official = _wire(monkeypatch, live)
+    real_open_by_id = s._open_by_id
+    calls = {"n": 0}
+
+    def _flaky(fresh=False):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return real_open_by_id(fresh=fresh)
+    monkeypatch.setattr(s, "_open_by_id", _flaky)
+
+    preview = await s.set_task_parent(
+        "Вкладываю", [{"taskId": "c", "title": "Шаг 1"}],
+        parent_task_id="p", project_id="p1", parent_task_title="Большой проект")
+    assert "🛑" not in preview, "временный сбой чтения не должен блокировать план"
+    assert "НЕ удалось сверить" in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.set_task_parent("Вкладываю", manifest_id=mid, user_reply="да")
+    assert live["c"]["parentId"] == "p"
+    assert "🛑" not in result
+
+
+async def test_set_task_parent_plan_read_failure_still_lets_execution_catch_a_real_mismatch(
+        monkeypatch):
+    """Same read failure on the plan as above, but this time the pair
+    actually DOESN'T match. The plan-phase check couldn't run (so it warns
+    instead of refusing), but the execution-phase guard inside
+    `_set_task_parent_impl` — untouched by this change — still catches the
+    real mismatch: a network blip on planning must not weaken the protection
+    at execution time."""
+    live = {
+        "p": {"id": "p", "title": "Большой проект", "projectId": "p1"},
+        "c": {"id": "c", "title": "Шаг 1", "projectId": "p1"},
+    }
+    fake, official = _wire(monkeypatch, live)
+    real_open_by_id = s._open_by_id
+    calls = {"n": 0}
+
+    def _flaky(fresh=False):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return real_open_by_id(fresh=fresh)
+    monkeypatch.setattr(s, "_open_by_id", _flaky)
+
+    preview = await s.set_task_parent(
+        "Вкладываю", [{"taskId": "c", "title": "Шаг 1"}],
+        parent_task_id="p", project_id="p1", parent_task_title="Другой проект")
+    assert "🛑" not in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.set_task_parent("Вкладываю", manifest_id=mid, user_reply="да")
+    assert result.startswith("🛑")
+    assert "«Большой проект»" in result
+    assert fake.calls == []
+    assert "parentId" not in live["c"]
+
+
+async def test_set_task_parent_automation_key_mismatch_is_refused_before_plan(monkeypatch):
+    """Headless path (#118): a valid automation_key runs on the FIRST call,
+    with no plan card and no Telegram button ever shown — so if the identity
+    check only lived inside _gate_batch/execution, a false parent name+id
+    pair would sail through silently on a single valid key. The check sits
+    BEFORE _gate_batch, so it applies here too."""
+    live = {
+        "p": {"id": "p", "title": "Большой проект", "projectId": "p1"},
+        "c": {"id": "c", "title": "Шаг 1", "projectId": "p1"},
+    }
+    fake, official = _wire(monkeypatch, live)
+    monkeypatch.setattr(s, "SECRET", "test-secret")
+
+    result = await s.set_task_parent(
+        "Вкладываю", [{"taskId": "c", "title": "Шаг 1"}],
+        parent_task_id="p", project_id="p1", parent_task_title="Другой проект",
+        automation_key="test-secret")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Большой проект»" in result
+    assert fake.calls == []
+    assert "parentId" not in live["c"]
+
+
 # ===========================================================================
 # set_task_tags
 # ===========================================================================
