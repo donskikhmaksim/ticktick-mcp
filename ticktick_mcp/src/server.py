@@ -12449,8 +12449,22 @@ async def get_task_info(task_id: str) -> str:
         tasks = state.get("syncTaskBean", {}).get("update", []) or []
         t = next((x for x in tasks if x.get("id") == task_id), None)
         if not t:
-            return (f"Task {task_id} not found among open tasks "
-                    "(it may be completed or in the trash).")
+            # Three distinct causes hide behind "not in the open sync": the task
+            # is completed, it is in the trash, or it lives in an archived/closed
+            # project. The old one-liner named two of them and guessed. The trash
+            # one can be ANSWERED — one extra request, paid only on this branch
+            # (a miss), never on a successful read.
+            in_trash, _ = await _trash_state(task_id)
+            if in_trash:
+                return (f"Task {task_id} is IN THE TRASH (deleted). "
+                        "restore_tasks can bring it back.")
+            if in_trash is False:
+                return (f"Task {task_id} not found among open tasks and it is NOT in "
+                        "the trash — it is either completed, or in an archived/closed "
+                        "project.")
+            return (f"Task {task_id} not found among open tasks; the trash could NOT "
+                    "be checked. It may be completed, in the trash, or in an "
+                    "archived/closed project.")
 
         pr = PRIORITY_MAP.get(t.get("priority", 0))
         status = {0: "Active", 2: "Completed", -1: "Won't do"}.get(t.get("status", 0), t.get("status"))
