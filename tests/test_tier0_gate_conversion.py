@@ -761,3 +761,122 @@ async def test_update_task_comment_missing_identity_downgrades_to_warn(monkeypat
     assert fake_v2.comments["t1"][0]["title"] == "новый текст"
     assert result.startswith("⚠️"), result
     assert not s._auto_execute_report_is_success(result), result
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-07: plan-phase identity-guard (def-116 follow-up, group A) — see
+# the equivalent block under attach_file_to_task above for the shared
+# rationale; same code shape, same _guard_task helper.
+# ---------------------------------------------------------------------------
+
+async def test_update_task_comment_plan_identity_guard_blocks_wrong_title(
+        monkeypatch):
+    """id points at a REAL task ("Купить хлеб"), caller's task_title claims a
+    DIFFERENT one ("Купить молоко") — before this fix, call #1 would have
+    built and shown a plan card reading "Правлю комментарий на «Купить
+    молоко»..." even though the id has nothing to do with that task. Now the
+    plan is refused outright."""
+    fake_v2 = FakeV2(live={"t1": {"id": "t1", "title": "Купить хлеб", "projectId": "p1"}},
+                     comments={"t1": [{"id": "c1", "title": "старый текст"}]})
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(
+        s, "_guard_task",
+        lambda *a, **k: s._Guard(
+            "mismatch", project_id="p1", title="Купить хлеб",
+            message='id указывает на «Купить хлеб», а НЕ «Купить молоко»'))
+
+    result = await s.update_task_comment("Купить молоко", "новый текст", "p1", "t1", "c1")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Купить хлеб»" in result
+    assert "manifest_id" not in result, "план для несовпавшей пары строиться не должен"
+    assert fake_v2.comments["t1"][0]["title"] == "старый текст"
+    assert fake_v2.calls == []
+
+
+async def test_update_task_comment_plan_read_failure_does_not_block_but_warns(
+        monkeypatch):
+    """A live-read hiccup while BUILDING the plan (call #1) must not block
+    every comment edit — fail-open here is cheaper than refusing everyone
+    whose network is briefly flaky. The plan is still built, honestly warns
+    that the title was not verified, and the real (unchanged) identity-guard
+    on execution (call #2) does its normal job right after."""
+    fake_v2 = FakeV2(live={"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}},
+                     comments={"t1": [{"id": "c1", "title": "старый текст"}]})
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(s, "_guard_task", _guard_sequence(
+        s._Guard("unavailable"),                                  # call #1 (plan)
+        s._Guard("ok", project_id="p1", title="Купить молоко"),   # call #2 (_impl)
+    ))
+
+    preview = await s.update_task_comment("Купить молоко", "новый текст", "p1", "t1", "c1")
+    assert "🛑" not in preview, "временный сбой чтения не должен блокировать план"
+    assert "НЕ удалось сверить" in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.update_task_comment("Купить молоко", "новый текст", "p1", "t1", "c1",
+                                         manifest_id=mid, user_reply="да")
+    assert ("update_comment", "c1", "новый текст") in fake_v2.calls
+    _assert_confirmed_success(result)
+
+
+async def test_update_task_comment_plan_read_failure_still_lets_execution_catch_a_real_mismatch(
+        monkeypatch):
+    """Same read failure on the plan as above, but this time the pair
+    actually DOESN'T match. The plan-phase check couldn't run (so it warns
+    instead of refusing), but the execution-phase guard inside
+    `_update_task_comment_impl` — untouched by this change — still catches
+    the real mismatch: a network blip on planning must not weaken the
+    protection at execution time."""
+    fake_v2 = FakeV2(live={"t1": {"id": "t1", "title": "Купить хлеб", "projectId": "p1"}},
+                     comments={"t1": [{"id": "c1", "title": "старый текст"}]})
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(s, "_guard_task", _guard_sequence(
+        s._Guard("unavailable"),                                    # call #1 (plan)
+        s._Guard("mismatch", project_id="p1", title="Купить хлеб",   # call #2 (_impl)
+                message='id указывает на «Купить хлеб», а НЕ «Купить молоко»'),
+    ))
+
+    preview = await s.update_task_comment("Купить молоко", "новый текст", "p1", "t1", "c1")
+    assert "🛑" not in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.update_task_comment("Купить молоко", "новый текст", "p1", "t1", "c1",
+                                         manifest_id=mid, user_reply="да")
+    assert result.startswith("🛑")
+    assert "«Купить хлеб»" in result
+    assert fake_v2.comments["t1"][0]["title"] == "старый текст"
+    assert fake_v2.calls == []
+
+
+async def test_update_task_comment_automation_key_mismatch_is_refused_before_plan(
+        monkeypatch):
+    """Headless path (#118): a valid automation_key runs on the FIRST call,
+    with no plan card and no Telegram button ever shown — so if the identity
+    check only lived inside _gate_single/execution, a false name+id pair
+    would sail through silently on a single valid key. The check sits BEFORE
+    _gate_single, so it applies here too: plan is refused, edit never
+    attempted, and exactly one guard read happens (the plan-stage one) —
+    proving it is the PLAN stage refusing, not the execution stage (which
+    would print a different message, "НЕ изменил комментарий", and would
+    only be reached after a mutation attempt)."""
+    fake_v2 = FakeV2(live={"t1": {"id": "t1", "title": "Купить хлеб", "projectId": "p1"}},
+                     comments={"t1": [{"id": "c1", "title": "старый текст"}]})
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    calls = []
+
+    def _stub(*a, **k):
+        calls.append(1)
+        return s._Guard("mismatch", project_id="p1", title="Купить хлеб",
+                        message='id указывает на «Купить хлеб», а НЕ «Купить молоко»')
+    monkeypatch.setattr(s, "_guard_task", _stub)
+    monkeypatch.setattr(s, "SECRET", "test-secret")
+
+    result = await s.update_task_comment("Купить молоко", "новый текст", "p1", "t1", "c1",
+                                         automation_key="test-secret")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Купить хлеб»" in result
+    assert fake_v2.comments["t1"][0]["title"] == "старый текст"
+    assert fake_v2.calls == []
+    assert len(calls) == 1
