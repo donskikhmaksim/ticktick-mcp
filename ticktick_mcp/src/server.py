@@ -9549,9 +9549,20 @@ async def build_reminder(minutes_before: int = 0) -> str:
     Build a reminder TRIGGER string to pass in the reminders list of create_task/update_task.
 
     Args:
-        minutes_before: Minutes before the due time to remind. 0 = at the time of the event.
+        minutes_before: Minutes before the due time to remind. 0 = at the time
+            of the event. Must not be negative — a negative value is rejected
+            with an error instead of being silently treated as 0 (reminders
+            AFTER the due time are not supported here).
     """
-    if minutes_before <= 0:
+    if minutes_before < 0:
+        # def-D1: раньше любое отрицательное значение молча становилось
+        # "TRIGGER:PT0S" — ошибка в знаке превращалась в «напомнить ровно в
+        # момент события» и выглядела как успех. Ошибочный ввод должен быть
+        # отвергнут, а не подменён на ближайший возможный.
+        return (f"Invalid minutes_before={minutes_before}: must be 0 or positive. "
+                "0 = remind at the due time; a positive number = that many minutes "
+                "before it. Reminders after the due time are not supported.")
+    if minutes_before == 0:
         return "TRIGGER:PT0S"
     if minutes_before % (24 * 60) == 0:
         return f"TRIGGER:-P{minutes_before // (24 * 60)}D"
