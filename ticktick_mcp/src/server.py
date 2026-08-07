@@ -9516,17 +9516,32 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
 # Builder helpers (no API call — produce strings for create_task/update_task)
 # ---------------------------------------------------------------------------
 
+# def-D3: BYDAY-токен по RFC 5545 — необязательный порядковый номер
+# (±1..53, "2TU" = второй вторник периода, "-1FR" = последняя пятница) плюс
+# двухбуквенный день недели. Раньше by_day уходил в правило как есть, так что
+# опечатка ("MOND") давала синтаксически битое, но принятое правило.
+_BYDAY_TOKEN = re.compile(r"^([+-]?(?:[1-9]|[1-4]\d|5[0-3]))?(MO|TU|WE|TH|FR|SA|SU)$")
+
+
 @mcp.tool(annotations=READONLY)
 async def build_recurrence_rule(frequency: str, interval: int = 1,
                                 by_day: List[str] = None, count: int = None,
-                                until: str = None) -> str:
+                                until: str = None, by_month_day: List[int] = None,
+                                by_month: List[int] = None,
+                                by_set_pos: List[int] = None) -> str:
     """
     Build an RRULE recurrence string to pass as repeat_flag in create_task/update_task.
 
+    The FIRST line of the output is the rule itself — that is what goes into
+    repeat_flag. Anything after it is a warning about a rule that is valid but
+    probably not what was meant (read it, don't paste it).
+
     Args:
         frequency: DAILY, WEEKLY, MONTHLY, or YEARLY
-        interval: Repeat every N units (default 1)
-        by_day: For weekly rules, days like ["MO","WE","FR"] (optional)
+        interval: Repeat every N units (default 1; must be >= 1)
+        by_day: Days like ["MO","WE","FR"]. Works with ANY frequency, not just
+            WEEKLY. An optional ordinal prefix picks the Nth such day of the
+            period: "2TU" = 2nd Tuesday, "-1FR" = last Friday (MONTHLY/YEARLY).
         count: Stop after this many occurrences (optional). Mutually exclusive
             with `until` (RFC 5545 forbids both in one rule).
         until: Stop on this date YYYY-MM-DD (optional, INCLUSIVE). Relative
@@ -9534,6 +9549,14 @@ async def build_recurrence_rule(frequency: str, interval: int = 1,
             server's clock. The date is read as the END of that day in the
             OWNER's timezone (USER_TIMEZONE) and converted to UTC, so "until
             2026-08-31" really covers all of 31 August locally.
+        by_month_day: Days of the month, 1..31 or -1..-31 counting back from
+            its end (BYMONTHDAY). [-1] = last day of every month; [31] = the
+            31st, which simply does not occur in short months.
+        by_month: Months, 1..12 (BYMONTH). Needed for yearly rules like
+            "2nd Tuesday of March": by_month=[3], by_day=["2TU"].
+        by_set_pos: Pick the Nth match within each period (BYSETPOS), e.g.
+            by_day=["MO","TU","WE","TH","FR"] + by_set_pos=[-1] = last weekday
+            of the month. RFC 5545 requires another BY-rule alongside it.
     """
     freq = frequency.upper()
     if freq not in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY"):
@@ -9541,9 +9564,37 @@ async def build_recurrence_rule(frequency: str, interval: int = 1,
     if count and until:
         return ("Invalid rule: COUNT and UNTIL cannot both be set (RFC 5545). "
                 "Pass either count= (stop after N occurrences) or until= (stop on a date).")
-    parts = [f"FREQ={freq}", f"INTERVAL={max(1, interval)}"]
+    if interval < 1:
+        # Раньше здесь стоял max(1, interval): 0 и -3 молча становились 1.
+        return f"Invalid interval={interval}: must be 1 or greater."
+    bad_days = [d for d in (by_day or []) if not _BYDAY_TOKEN.match(str(d).strip().upper())]
+    if bad_days:
+        return (f"Invalid by_day entries: {bad_days}. Use MO/TU/WE/TH/FR/SA/SU, "
+                'optionally with an ordinal prefix ("2TU" = 2nd Tuesday, "-1FR" = last Friday).')
+    bad_mdays = [d for d in (by_month_day or []) if not (1 <= abs(int(d)) <= 31 and int(d) != 0)]
+    if bad_mdays:
+        return (f"Invalid by_month_day entries: {bad_mdays}. Use 1..31, or -1..-31 "
+                "to count back from the end of the month (-1 = last day).")
+    bad_months = [m for m in (by_month or []) if not 1 <= int(m) <= 12]
+    if bad_months:
+        return f"Invalid by_month entries: {bad_months}. Use 1..12."
+    bad_pos = [p for p in (by_set_pos or []) if int(p) == 0 or abs(int(p)) > 366]
+    if bad_pos:
+        return f"Invalid by_set_pos entries: {bad_pos}. Use -366..-1 or 1..366 (0 is not valid)."
+    if by_set_pos and not (by_day or by_month_day or by_month):
+        return ("Invalid rule: by_set_pos needs another BY-rule to pick from (RFC 5545). "
+                'Add by_day (e.g. ["MO","TU","WE","TH","FR"] + by_set_pos=[-1] = '
+                "last weekday of the month).")
+
+    parts = [f"FREQ={freq}", f"INTERVAL={interval}"]
+    if by_month:
+        parts.append("BYMONTH=" + ",".join(str(int(m)) for m in by_month))
+    if by_month_day:
+        parts.append("BYMONTHDAY=" + ",".join(str(int(d)) for d in by_month_day))
     if by_day:
-        parts.append("BYDAY=" + ",".join(d.upper() for d in by_day))
+        parts.append("BYDAY=" + ",".join(str(d).strip().upper() for d in by_day))
+    if by_set_pos:
+        parts.append("BYSETPOS=" + ",".join(str(int(p)) for p in by_set_pos))
     if count:
         parts.append(f"COUNT={count}")
     if until:
@@ -9562,7 +9613,27 @@ async def build_recurrence_rule(frequency: str, interval: int = 1,
                     "(or a relative word like 'tomorrow' / 'завтра' / a weekday name).")
         end_local = datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=_USER_TZ)
         parts.append("UNTIL=" + end_local.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
-    return "RRULE:" + ";".join(parts)
+
+    rule = "RRULE:" + ";".join(parts)
+
+    # def-D3: правило может быть синтаксически безупречным и при этом значить
+    # не то, что просили. Такие случаи не переписываются молча — они
+    # называются вслух ПОД правилом (первая строка остаётся чистым RRULE).
+    warnings = []
+    if freq == "YEARLY" and not by_month and any(
+            _BYDAY_TOKEN.match(str(d).strip().upper()).group(1) for d in (by_day or [])):
+        warnings.append(
+            '⚠️ YEARLY + ordinal by_day without by_month: "2TU" here means the 2nd Tuesday '
+            "of the YEAR, not of a month. Add by_month=[3] for \"2nd Tuesday of March\".")
+    short_days = sorted({int(d) for d in (by_month_day or []) if int(d) in (29, 30, 31)})
+    if short_days:
+        warnings.append(
+            f"⚠️ by_month_day={short_days}: months that are shorter simply have no such day, "
+            "so the repeat is SKIPPED there (RFC 5545) — February never fires on 30/31. "
+            "Use by_month_day=[-1] if you meant \"the last day of every month\".")
+    if not warnings:
+        return rule
+    return rule + "\n\n" + "\n".join(warnings)
 
 
 @mcp.tool(annotations=READONLY)
