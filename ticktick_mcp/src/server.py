@@ -174,6 +174,59 @@ async def health_check(request: Request) -> Response:
     return JSONResponse({"status": "ok", "ticktick_connected": ticktick is not None})
 
 
+# --- own_bot: собственный Telegram-вебхук (TG_BOT_TOKEN_OVERRIDE) ------------
+# По умолчанию (own_bot=False) ticktick-mcp НЕ владеет вебхуком: решение по
+# кнопке доходит через общий вебхук gmail-mcp и таблицу tg_approvals (см.
+# tg_approval.py's докстринг). Этот роут существует ТОЛЬКО ради
+# TG_BOT_TOKEN_OVERRIDE — сервер с собственным ботом получает апдейты
+# исключительно СВОЕГО токена, поэтому здесь нет коллизии с общим ботом,
+# которую решает TG_WEBHOOK_OWNER на TS-стороне.
+#
+# Роут смонтирован БЕЗУСЛОВНО (та же дисциплина, что у /health, /dl, /ul выше
+# и ниже — все они всегда в маршрутной таблице, а поведение решает состояние
+# модуля на момент запроса, не факт регистрации): переключение
+# TG_BOT_TOKEN_OVERRIDE никогда не требует передеплоя ради изменения роутинга,
+# и снаружи выключенный own_bot неотличим от отсутствия роута вовсе — тот же
+# 404, что и для любого несуществующего пути. `_TG_CFG`/`TRANSPORT`
+# читаются здесь как атрибуты МОДУЛЯ (а не замороженные на момент декорации
+# значения), поэтому monkeypatch в тестах (`monkeypatch.setattr(s, "_TG_CFG",
+# ...)`) реально меняет поведение уже смонтированного роута — тот же паттерн,
+# которым `health_check` выше читает `ticktick`.
+@mcp.custom_route("/tg/webhook", methods=["POST"])
+async def tg_own_bot_webhook(request: Request) -> Response:
+    """Принимает апдейты Telegram для СВОЕГО бота (own_bot). Порт http.ts's
+    `app.post("/tg/webhook", ...)` — тот же порядок проверок:
+
+    1. own_bot выключен (или транспорт не streamable-http, где этот роут
+       физически не мог бы получать трафик) → 404, ничего не раскрываем;
+    2. секрет из заголовка не совпал с `TG_APPROVAL_WEBHOOK_SECRET` → 401;
+    3. тело разбирается и уходит в `tg_approval.handle_webhook` (в поток —
+       та же причина, что у `_run_blocking` везде в этом файле: внутри
+       синхронный `requests` к Telegram API и к Postgres, держать event loop
+       на время этого — то же самое зависание /health, что уже чинили для
+       notify_plan/reap);
+    4. ВСЕГДА отвечает 200, что бы ни случилось внутри — Telegram ретраит
+       не-2xx, а каждый «отказ» внутри `handle_webhook` (чужой отправитель,
+       повтор, неизвестный callback_data) — намеренный no-op, не ошибка,
+       которую стоит повторять."""
+    if not (_TG_CFG.enabled and _TG_CFG.own_bot and TRANSPORT == "streamable-http"):
+        return PlainTextResponse("Not Found", status_code=404)
+    provided = request.headers.get("x-telegram-bot-api-secret-token", "")
+    if not tg_approval.secret_token_matches(provided, _TG_CFG.webhook_secret):
+        return PlainTextResponse("Unauthorized", status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        await _run_blocking(tg_approval.handle_webhook, _TG_CFG, body)
+    except Exception as e:  # noqa: BLE001 — вебхук обязан ответить Telegram'у,
+        # что бы ни случилось внутри обработки; Telegram ретраит не-2xx, а
+        # повторная доставка того же апдейта на сломанном коде ничего не чинит
+        logger.error(f"TG own_bot webhook: handle_webhook упал: {e!r}")
+    return PlainTextResponse("", status_code=200)
+
+
 # --- Attachment transfer links (/dl, /ul) -----------------------------------
 # Big files must not travel through the MCP response body (download_task_
 # attachment base64-encodes into the answer and caps at 15 MB). Instead a tool
@@ -14150,9 +14203,32 @@ def main():
         # кнопки (см. шапку manifest_store.py). Миграция применяется здесь же,
         # кодом при старте, как и схема tg_approvals.
         manifest_store.init_store(db_url)
-        logger.info("TG approval: Postgres подключен, слой активен "
-                    "(server=ticktick, webhook НЕ регистрируется — владелец gmail-mcp)")
+        if _TG_CFG.own_bot:
+            logger.info("TG approval: Postgres подключен, слой активен "
+                        "(server=ticktick, TG_BOT_TOKEN_OVERRIDE задан — свой бот, "
+                        "свой /tg/webhook)")
+        else:
+            logger.info("TG approval: Postgres подключен, слой активен "
+                        "(server=ticktick, webhook НЕ регистрируется — владелец gmail-mcp)")
         logger.info("Долговечные планы подтверждения: таблица mcp_manifests готова")
+        # own_bot: регистрация /tg/webhook у Telegram (setWebhook) — ТОЛЬКО
+        # при streamable-http, потому что при stdio нет никакого HTTP-сервера
+        # (mcp.run_stdio_async() ниже), которому Telegram мог бы что-то
+        # прислать: setWebhook на несуществующий адрес не упал бы сразу, но и
+        # смысла в нём не было бы — кнопки own_bot молча не работали бы, и
+        # это ДОЛЖНО быть видно в логе явно, а не тонуть в тишине (тот же дух,
+        # что у остального fail-loud в этом файле).
+        if _TG_CFG.own_bot:
+            if TRANSPORT == "streamable-http":
+                tg_approval.register_webhook(_TG_CFG, _public_base_url())
+            else:
+                logger.warning(
+                    f"TG own_bot: MCP_TRANSPORT={TRANSPORT!r}, а не "
+                    "'streamable-http' — вебхук физически невозможен (нет HTTP-"
+                    "сервера, которому Telegram мог бы слать апдейты). Кнопки "
+                    "own_bot работать НЕ будут, пока транспорт не переключат на "
+                    "streamable-http. Обычный (не-TG) чат-путь подтверждения "
+                    "по-прежнему работает без изменений.")
 
     if not initialize_client():
         # Don't stop the server: on streamable-http this leaves /health

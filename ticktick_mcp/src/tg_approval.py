@@ -5,13 +5,49 @@ tg_approval.py — опциональный внеполосный (out-of-band)
 
 Портировано с TypeScript-модуля gmail-mcp/src/tg_approval.ts — тот же бот
 (@maksim_mcp_approval_bot), та же таблица `tg_approvals` в ОБЩЕМ Postgres,
-который уже используют gmail/sheets/calendar/docs/drive-mcp. gmail-mcp
-остаётся ЕДИНСТВЕННЫМ владельцем вебхука (`TG_WEBHOOK_OWNER=true` только
-там) — ticktick-mcp никогда не регистрирует `setWebhook` и не поднимает
-`/tg/webhook`. Решение по кнопке доходит сюда через ту же таблицу: gmail-mcp's
-`consumeTgDecisionAnyServer` уже server-agnostic (manifest_id — глобальный
-PRIMARY KEY), так что строка с `server='ticktick'` обрабатывается ИМ без
-единой правки на его стороне.
+который уже используют gmail/sheets/calendar/docs/drive-mcp. По умолчанию
+(`TG_BOT_TOKEN_OVERRIDE` не задан) gmail-mcp остаётся ЕДИНСТВЕННЫМ владельцем
+вебхука (`TG_WEBHOOK_OWNER=true` только там) — ticktick-mcp не регистрирует
+`setWebhook` и не поднимает `/tg/webhook`. Решение по кнопке доходит сюда
+через ту же таблицу: gmail-mcp's `consumeTgDecisionAnyServer` уже
+server-agnostic (manifest_id — глобальный PRIMARY KEY), так что строка с
+`server='ticktick'` обрабатывается ИМ без единой правки на его стороне.
+
+СВОЙ БОТ (2026-08-06, `TG_BOT_TOKEN_OVERRIDE`, портировано byte-for-byte по
+духу с той же правки на TS-стороне — см. `ownBot` в gmail/drive-mcp's
+`config.ts`/`tg_approval.ts`). Единственный флаг — переменная окружения
+`TG_BOT_TOKEN_OVERRIDE`; её присутствие И ЕСТЬ включатель `own_bot`, отдельной
+булевой переменной нет. Когда она задана:
+  * `bot_token` резолвится в НЕЁ, а не в общий `TG_BOT_TOKEN` — сервер говорит
+    со СВОИМ ботом, а не с общим `@maksim_mcp_approval_bot`;
+  * `main()` (server.py) регистрирует `/tg/webhook` через `register_webhook()`
+    и `setWebhook` — этот сервер сам становится вебхук-владельцем СВОЕГО
+    токена (никакого конфликта с `TG_WEBHOOK_OWNER` общего бота: токены
+    разные, Telegram не может перепутать, кому какой апдейт маршрутизировать);
+  * `handle_webhook()` консьюмит решение SERVER-SCOPED
+    (`WHERE server = 'ticktick'`), а не через общую `consumeTgDecisionAnyServer`-
+    логику gmail-mcp: раз вебхук получает апдейты ТОЛЬКО своего бота, чужих
+    манифестов здесь физически быть не может, и server-scoped фильтр —
+    дополнительный (не единственный) пояс безопасности поверх глобально
+    уникального `manifest_id`.
+Без `TG_BOT_TOKEN_OVERRIDE` (по умолчанию) всё поведение выше отсутствует
+БИТ В БИТ, как и до появления этого флага — обратная совместимость по
+построению, а не по соглашению. Откат — снять переменную, без нового деплоя.
+
+ИСПОЛНЕНИЕ ОСТАЁТСЯ ЗА ПОЛЛЕРОМ, А НЕ ЗА ВЕБХУКОМ (важно для защиты от
+двойного исполнения — см. server.py's `_tg_auto_execute_poller_loop`/
+`_consume_manifest_for_auto_execute`). `handle_webhook()` здесь только
+переводит строку `tg_approvals` PENDING → APPROVED/REJECTED — ТОЧНО ТУ ЖЕ
+роль, которую раньше (и сейчас, без own_bot) играл общий вебхук gmail-mcp.
+Саму мутацию в TickTick по-прежнему исполняет фоновый поллер, который читает
+статус APPROVED из той же таблицы и атомарно захватывает план через
+`manifest_store.claim()` (`UPDATE … WHERE consumed_at IS NULL … RETURNING`) —
+ЭТОТ захват один и тот же, кем бы ни был проставлен APPROVED (общим ботом
+через gmail-mcp или своим ботом через этот вебхук), и он уже был единственной
+защитой от двойного исполнения ДО этой правки. own_bot не добавляет и не
+меняет ни одной строчки в поллере — см. `try_auto_execute` и
+`_consume_manifest_for_auto_execute` в server.py, которые не знают о
+существовании own_bot вовсе.
 
 ВАЖНО про историю (docs/DESIGN_approval_gate.md §7): v1-дизайн с Telegram-
 кнопками для ticktick-mcp был explicitly ОТВЕРГНУТ Максимом 2026-07-27
@@ -39,10 +75,13 @@ OFF BY DEFAULT: без `TG_APPROVAL_ENABLED=true` ни одна функция �
 
 Env этого слоя: TG_APPROVAL_ENABLED, TG_BOT_TOKEN, TG_OWNER_CHAT_ID,
 TG_APPROVAL_TOOLS, TG_APPROVAL_TTL_S, TG_REPORTS_CHAT_ID, TG_REAP_ENABLED.
+Свой бот (см. блок выше): TG_BOT_TOKEN_OVERRIDE, TG_APPROVAL_WEBHOOK_SECRET.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import os
 import re
@@ -100,12 +139,32 @@ class TgApprovalConfig:
     # сломало бы существующие вызовы. Пустой reports_chat_id = «отчёты в личку».
     reports_chat_id: str = ""
     reap_enabled: bool = True
+    # own_bot / webhook_secret (2026-08-06, TG_BOT_TOKEN_OVERRIDE) — та же
+    # дисциплина дефолтов: оба поля добавлены ПОСЛЕДНИМИ и оба со значением,
+    # воспроизводящим поведение ДО их появления (own_bot=False — общий бот и
+    # поллер, ни байта нового HTTP-роута; webhook_secret="" — secret_token_
+    # matches() всегда отказывает пустому секрету, так что случайно оставшийся
+    # own_bot=True без секрета не открывает вебхук неаутентифицированным
+    # запросам сам по себе — хотя load_tg_approval_config ниже такую
+    # комбинацию и не пропускает, конструирование конфига вручную в тестах
+    # остаётся безопасным по умолчанию).
+    own_bot: bool = False
+    webhook_secret: str = ""
 
 
 def load_tg_approval_config() -> TgApprovalConfig:
     enabled = os.environ.get("TG_APPROVAL_ENABLED", "").strip().lower() == "true"
-    bot_token = os.environ.get("TG_BOT_TOKEN", "").strip()
+    # TG_BOT_TOKEN_OVERRIDE — единственный переключатель own_bot: сама его
+    # непустота и есть флаг (отдельной булевой TG_OWN_BOT переменной нет,
+    # см. блок в шапке файла и TS-референс gmail/drive-mcp's config.ts). Когда
+    # он задан, ЭТОТ токен используется для ВСЕХ вызовов Telegram API — план,
+    # отчёты, вебхук — сервер целиком переезжает на свой бот, а не только
+    # вебхук.
+    own_bot_token = os.environ.get("TG_BOT_TOKEN_OVERRIDE", "").strip()
+    own_bot = bool(own_bot_token)
+    bot_token = own_bot_token or os.environ.get("TG_BOT_TOKEN", "").strip()
     owner_chat_id = os.environ.get("TG_OWNER_CHAT_ID", "").strip()
+    webhook_secret = os.environ.get("TG_APPROVAL_WEBHOOK_SECRET", "").strip()
     tools_raw = os.environ.get("TG_APPROVAL_TOOLS", "").strip()
     tools_allowlist = (
         {t.strip() for t in tools_raw.split(",") if t.strip()} if tools_raw else None
@@ -120,16 +179,30 @@ def load_tg_approval_config() -> TgApprovalConfig:
     reap_enabled = os.environ.get("TG_REAP_ENABLED", "").strip().lower() != "false"
     if enabled and (not bot_token or not owner_chat_id):
         missing = ", ".join(
-            n for n, v in (("TG_BOT_TOKEN", bot_token), ("TG_OWNER_CHAT_ID", owner_chat_id)) if not v
+            n for n, v in (("TG_BOT_TOKEN (или TG_BOT_TOKEN_OVERRIDE)", bot_token),
+                           ("TG_OWNER_CHAT_ID", owner_chat_id)) if not v
         )
         raise RuntimeError(
             f"TG_APPROVAL_ENABLED=true, но не задано: {missing}. Либо задай оба, либо "
             "убери TG_APPROVAL_ENABLED, чтобы работать без этого слоя."
         )
+    # own_bot тянет за собой РЕАЛЬНЫЙ HTTP-эндпоинт (/tg/webhook) — без секрета
+    # для проверки X-Telegram-Bot-Api-Secret-Token кто угодно, узнавший URL,
+    # мог бы слать поддельные callback_query и решать подтверждения за
+    # владельца. Тот же fail-fast принцип, что у bot_token/owner_chat_id
+    # выше — не деградировать молча до незащищённого вебхука.
+    if enabled and own_bot and not webhook_secret:
+        raise RuntimeError(
+            "TG_BOT_TOKEN_OVERRIDE задан (own_bot), но TG_APPROVAL_WEBHOOK_SECRET — нет. "
+            "Без него /tg/webhook не сможет отличить настоящий запрос от Telegram от "
+            "подделки. Задай TG_APPROVAL_WEBHOOK_SECRET (любая случайная строка, "
+            "например `openssl rand -hex 24`) либо убери TG_BOT_TOKEN_OVERRIDE."
+        )
     return TgApprovalConfig(
         enabled=enabled, bot_token=bot_token, owner_chat_id=owner_chat_id,
         server="ticktick", tools_allowlist=tools_allowlist, ttl_s=ttl_s,
         reports_chat_id=reports_chat_id, reap_enabled=reap_enabled,
+        own_bot=own_bot, webhook_secret=webhook_secret,
     )
 
 
@@ -1011,6 +1084,182 @@ def claim_lost_manifests(manifest_ids: Iterable[str]) -> List[str]:
     finally:
         _pg_pool.putconn(conn)
     return [r[0] for r in rows]
+
+
+# ───────────────────── own_bot: собственный вебхук (2026-08-06) ─────────────
+#
+# Всё в этом блоке существует ТОЛЬКО ради `TG_BOT_TOKEN_OVERRIDE` (own_bot);
+# см. блок в шапке файла. server.py вызывает эти функции из своего роута
+# `/tg/webhook` и из `main()` — сам HTTP-роут (проверка секрета из заголовка,
+# 404/401-гейт) живёт в server.py, потому что ему нужен сырой `Request`
+# (заголовки), которого у этого модуля нет и не должно быть (та же
+# дисциплина, что у TS-референса: секрет из заголовка читает http.ts,
+# остальное — tg_approval.ts).
+
+def secret_token_matches(provided: str, expected: str) -> bool:
+    """Постоянное по времени сравнение `X-Telegram-Bot-Api-Secret-Token` с
+    `TG_APPROVAL_WEBHOOK_SECRET`. Порт `secretTokenMatches` из TS-референса
+    (gmail/drive-mcp's tg_approval.ts), но через SHA-256-дайджесты, а не
+    `hmac.compare_digest` на сырых строках напрямую — та же причина, что у
+    `server.py`'s `_automation_key_matches`: `compare_digest` на ДВУХ `str`
+    требует ASCII с обеих сторон, иначе CPython бросает `TypeError` вместо
+    честного «не совпало». Заголовок — вход снаружи (Telegram его не
+    гарантирует, а тем более не гарантирует подделка), и не-ASCII байт в нём
+    не должен ронять вебхук исключением вместо ответа 401."""
+    if not (expected and provided):
+        return False
+    return hmac.compare_digest(
+        hashlib.sha256(provided.encode("utf-8")).digest(),
+        hashlib.sha256(expected.encode("utf-8")).digest(),
+    )
+
+
+def consume_tg_decision(manifest_id: str, status: str) -> Optional[Dict[str, Any]]:
+    """Атомарный одноразовый захват РЕШЕНИЯ по кнопке — SERVER-SCOPED аналог
+    того, что для общего бота делает `consumeTgDecisionAnyServer` на стороне
+    gmail-mcp. Вызывается ТОЛЬКО из own_bot-вебхука (`handle_webhook` ниже):
+    раз этот вебхук физически получает апдейты ИСКЛЮЧИТЕЛЬНО своего бота
+    (Telegram не пришлёт сюда чужой callback_query — токены разные), строка
+    ЗАВЕДОМО принадлежит `server='ticktick'`, и фильтр по нему — не единственная
+    защита (ею остаётся глобально уникальный `manifest_id`, PRIMARY KEY), а
+    дополнительный пояс, снимающий даже теоретическую путаницу.
+
+    `WHERE status = 'PENDING'` в ТОМ ЖЕ операторе — то же самое anti-replay,
+    что у `consumeTgDecisionAnyServer`: повторная доставка одного и того же
+    Telegram-апдейта (Telegram ретраит недоставленные вебхуки) — не более чем
+    no-op на второй раз, а не двойная запись решения.
+
+    Возвращает {"chat_id", "message_id"} строки при успехе (нужно вызывающему,
+    чтобы снять кнопки), None — если строки не было / она не 'ticktick' / уже
+    не 'PENDING' (кто-то успел раньше — гонка с двойным тапом или ретраем)."""
+    if not store_ready():
+        return None
+    conn = _pg_pool.getconn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE tg_approvals SET status = %s, decided_at = %s "
+                "WHERE manifest_id = %s AND server = 'ticktick' AND status = 'PENDING' "
+                "RETURNING chat_id, message_id",
+                (status, _now_ms(), manifest_id),
+            )
+            row = cur.fetchone()
+    except Exception as e:  # noqa: BLE001 — сбой БД не должен ронять вебхук
+        logger.warning(f"TG own_bot: consume_tg_decision({manifest_id}) упал: {e}")
+        return None
+    finally:
+        _pg_pool.putconn(conn)
+    if not row:
+        return None
+    return {"chat_id": row[0], "message_id": row[1]}
+
+
+_CALLBACK_DATA_RE = re.compile(r"^([ar]):(.+)$")
+
+
+def handle_webhook(cfg: TgApprovalConfig, update: Dict[str, Any]) -> None:
+    """Обрабатывает ОДИН апдейт Telegram, уже прошедший проверку секрета в
+    server.py's роуте (тому нужен сырой заголовок запроса, которого здесь
+    нет — та же граница ответственности, что в TS-референсе между http.ts и
+    tg_approval.ts). Порт `handleWebhook`, ветка `cfg.ownBot=true`:
+
+    1. игнорирует любой апдейт без `callback_query` (не наш тип апдейта —
+       `register_webhook` подписывается только на `["callback_query"]`, но
+       чужой/будущий тип апдейта не должен ронять вебхук);
+    2. owner-only — `callback_query.from.id` обязан совпадать с
+       `cfg.owner_chat_id`; иначе тихо игнорируется (Telegram всё равно
+       получит 200 от вызывающего роута — это не тот случай, чтобы
+       предупреждать нажавшего, кем бы он ни был);
+    3. `callback_data` — это АДРЕС, не факт доверия: решение читается назад
+       из БД по `manifest_id`, сама метка кнопки не считается истиной сама по
+       себе (та же дисциплина, что и у TS-версии);
+    4. anti-replay — атомарный `consume_tg_decision` (`WHERE status =
+       'PENDING'`); повторный тап/ретрай — no-op;
+    5. кнопки снимаются с сообщения ПОСЛЕ любого зафиксированного решения —
+       best-effort, никогда не блокирует само решение;
+    6. `answerCallbackQuery` зовётся ВСЕГДА, когда есть `callback_query.id` —
+       иначе «часики» на кнопке в клиенте Telegram крутятся до таймаута.
+
+    НЕ исполняет мутацию сама — см. блок-комментарий в шапке файла про то,
+    что исполнение остаётся за поллером и его атомарным `manifest_store.
+    claim()`; эта функция только переводит статус."""
+    cq = (update or {}).get("callback_query")
+    if not cq:
+        return
+    from_id = str((cq.get("from") or {}).get("id") or "")
+    if not from_id or from_id != str(cfg.owner_chat_id):
+        return
+    data = cq.get("data") or ""
+    m = _CALLBACK_DATA_RE.match(data)
+    if not m:
+        return
+    decision = "APPROVED" if m.group(1) == "a" else "REJECTED"
+    manifest_id = m.group(2)
+
+    consumed = consume_tg_decision(manifest_id, decision)
+
+    if consumed:
+        # Снятие кнопок — по данным из САМОГО callback_query в приоритете
+        # (совпадает с TS-версией): это те chat_id/message_id, где кнопка
+        # реально была нажата, а данные из БД — запасной вариант на случай,
+        # если Telegram их почему-то не прислал.
+        chat_id = ((cq.get("message") or {}).get("chat") or {}).get("id") \
+            or consumed.get("chat_id") or cfg.owner_chat_id
+        message_id = (cq.get("message") or {}).get("message_id")
+        if message_id is None:
+            message_id = consumed.get("message_id")
+        if message_id is not None:
+            clear_inline_keyboard(cfg, str(chat_id), message_id)
+
+    cq_id = cq.get("id")
+    if cq_id:
+        answer_text = "Уже обработано" if not consumed else (
+            "Подтверждено" if decision == "APPROVED" else "Отклонено")
+        _tg_call(cfg, "answerCallbackQuery",
+                {"callback_query_id": cq_id, "text": answer_text})
+
+
+def register_webhook(cfg: TgApprovalConfig, public_base_url: Optional[str]) -> None:
+    """Регистрирует `/tg/webhook` в Telegram (`setWebhook`) — own_bot-аналог
+    того, что для общего бота делает `TG_WEBHOOK_OWNER` на стороне gmail-mcp.
+    Вызывается из server.py's `main()`, ТОЛЬКО когда `cfg.enabled and
+    cfg.own_bot` (сам гейт — на вызывающей стороне; здесь дублируем его же
+    первой строкой ради того же defense-in-depth, что у TS-референса
+    `registerWebhook`: функция не должна полагаться на то, что единственный
+    вызывающий её код когда-нибудь не забудет свою же проверку).
+
+    Транспорт `stdio` сюда вообще не должен доходить (в нём нет HTTP-сервера,
+    регистрировать вебхук физически некуда) — это ответственность
+    вызывающего (server.py's `main()` логирует предупреждение и не зовёт эту
+    функцию в таком случае); здесь на этот случай отдельной проверки нет,
+    чтобы не дублировать то же решение в двух местах.
+
+    Никогда не бросает — падение регистрации не должно ронять запуск
+    сервера: сервер поднимется, просто кнопки own_bot не будут доходить, и
+    это видно в логе как ERROR (тот же принцип, что у TS-версии — «громкий
+    лог, а не тихий сбой»)."""
+    if not (cfg.enabled and cfg.own_bot):
+        return
+    if not public_base_url:
+        logger.error("TG own_bot: не знаю свой публичный адрес (PUBLIC_BASE_URL / "
+                     "RAILWAY_PUBLIC_DOMAIN не заданы) — не могу зарегистрировать "
+                     "/tg/webhook, кнопки own_bot работать не будут")
+        return
+    url = f"{public_base_url.rstrip('/')}/tg/webhook"
+    try:
+        res = _tg_call(cfg, "setWebhook", {
+            "url": url,
+            "secret_token": cfg.webhook_secret,
+            "allowed_updates": ["callback_query"],
+        })
+    except Exception as e:  # noqa: BLE001 — регистрация best-effort на старте
+        logger.error(f"TG own_bot: setWebhook упал: {e} — url={url}")
+        return
+    if not res.get("ok"):
+        logger.error(f"TG own_bot: setWebhook не удался "
+                     f"({res.get('description') or 'unknown error'}) — url={url}")
+        return
+    logger.info(f"TG own_bot: вебхук зарегистрирован на {url} (server=ticktick)")
 
 
 # ───────────────────────── Публичное API для server.py ─────────────────────

@@ -95,11 +95,12 @@ How it works, end to end:
    private Telegram DM with **✅ Confirm** / **🛑 Reject** buttons. A long
    plan is split across several Telegram messages automatically — the
    buttons live on the last one.
-2. Tapping a button doesn't hit this server directly. The **webhook**
-   (the HTTP endpoint Telegram calls when you tap something) lives in the
-   neighboring **gmail-mcp** service, which writes your decision into the
-   shared `tg_approvals` table. ticktick-mcp itself never registers a
-   webhook for this.
+2. Tapping a button doesn't hit this server directly by default. The
+   **webhook** (the HTTP endpoint Telegram calls when you tap something)
+   lives in the neighboring **gmail-mcp** service, which writes your decision
+   into the shared `tg_approvals` table. ticktick-mcp itself never registers
+   a webhook for this — unless you opt into **own_bot** (see below), which
+   flips this one step to a webhook this server owns itself.
 3. A background **poller** (a job that periodically checks for new state
    instead of being pushed to) in ticktick-mcp, running every
    `TG_AUTO_EXECUTE_INTERVAL_S` seconds, sees the approval and executes the
@@ -124,6 +125,41 @@ access, and chat confirmation alone remains the only gate.
 > schema is treated as frozen: don't change its columns or status semantics
 > unilaterally from this repo — every other server reading/writing that
 > table depends on the current shape.
+
+#### Own bot instead of the shared one (`TG_BOT_TOKEN_OVERRIDE`)
+
+Set `TG_BOT_TOKEN_OVERRIDE` to give this server its own Telegram bot instead
+of sharing `@maksim_mcp_approval_bot` with the other five MCP servers. This is
+purely additive and fully backward compatible — leave it unset and everything
+above behaves byte-for-byte the same (shared bot, gmail-mcp owns the webhook,
+this server's poller executes). When it IS set:
+
+- `TG_BOT_TOKEN_OVERRIDE`'s value is used for every Telegram API call this
+  server makes (plans, reports, the webhook) instead of `TG_BOT_TOKEN`.
+- This server registers its **own** `/tg/webhook` with Telegram at startup
+  (`setWebhook`) — no conflict with the shared bot's webhook, since the two
+  bot tokens are different and Telegram routes updates per-token.
+- `TG_APPROVAL_WEBHOOK_SECRET` becomes required — the webhook checks it
+  (constant-time) against Telegram's `X-Telegram-Bot-Api-Secret-Token` header
+  on every request, so the URL alone isn't enough to forge a button press.
+- Requires `MCP_TRANSPORT=streamable-http` (there's no HTTP server to receive
+  a webhook on `stdio`) and a resolvable `PUBLIC_BASE_URL` (or Railway's
+  `RAILWAY_PUBLIC_DOMAIN`) to register the webhook against. If you set
+  `TG_BOT_TOKEN_OVERRIDE` while running `stdio` locally, the server logs a
+  loud warning at startup instead of silently doing nothing — own_bot buttons
+  won't work until you switch transport, but the server still starts and the
+  plain chat-confirmation path is unaffected.
+- The webhook only records your decision (PENDING → APPROVED/REJECTED) — the
+  same background poller described above still does the actual execution,
+  reading that same table. This means own_bot introduces no new way for an
+  action to run twice: the poller's existing atomic claim
+  (`manifest_store.claim`, one `UPDATE … WHERE consumed_at IS NULL …
+  RETURNING`) is still the single place a plan gets consumed, regardless of
+  which webhook (shared or own) flipped the row to APPROVED.
+
+Rollback is just unsetting `TG_BOT_TOKEN_OVERRIDE` — no redeploy of routing
+required; the `/tg/webhook` route stays mounted either way and simply 404s
+when own_bot is off (same as if the route didn't exist).
 
 ## Two TickTick APIs, and what breaks if the unofficial one goes down
 
@@ -208,7 +244,9 @@ maintaining a second codebase that covers a fraction of the functionality.
 | `CLAUDE_CLI_URL` / `CLAUDE_CLI_TOKEN` / `CLAUDE_CLI_MODEL` | optional | LLM judge for declutter dedup/SMART-rewrite + destination suggestions — see above |
 | `DECLUTTER_SHEET_ID` / `GSHEETS_SA_JSON` | optional | sheet-backed declutter manifest (`plan_declutter(persist="sheet")`) — see below |
 | `TG_APPROVAL_ENABLED` | optional | enables the Telegram approval layer (2nd factor on top of chat confirmation) — see above; `false` (default) = no network calls, behaves exactly as before |
-| `TG_BOT_TOKEN` | if `TG_APPROVAL_ENABLED=true` | Telegram bot token for the approval bot |
+| `TG_BOT_TOKEN` | if `TG_APPROVAL_ENABLED=true` and `TG_BOT_TOKEN_OVERRIDE` unset | Telegram bot token for the shared approval bot |
+| `TG_BOT_TOKEN_OVERRIDE` | optional | own bot token instead of the shared one — see "Own bot instead of the shared one" above; also the single switch that turns on `own_bot` mode |
+| `TG_APPROVAL_WEBHOOK_SECRET` | if `TG_BOT_TOKEN_OVERRIDE` is set | random string checked against Telegram's `X-Telegram-Bot-Api-Secret-Token` on `/tg/webhook` — generate with `openssl rand -hex 24` |
 | `TG_OWNER_CHAT_ID` | if `TG_APPROVAL_ENABLED=true` | your personal Telegram chat id — where the plan with buttons is sent |
 | `TG_REPORTS_CHAT_ID` | optional (default: `TG_OWNER_CHAT_ID`) | group chat id for the auto-execution report archive (e.g. the real "MCP Отчёты" group: `-1004357150083`); unset sends reports to your DM instead |
 | `TG_APPROVAL_TOOLS` | optional | comma-separated tool names to gate with TG approval; empty (default) = all gated tools |
