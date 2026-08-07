@@ -1048,6 +1048,31 @@ async def test_add_task_comment_plan_identity_guard_blocks_wrong_title(
     assert fake_v2.calls == []
 
 
+async def test_add_task_comment_plan_missing_identity_does_not_block_but_warns(
+        monkeypatch):
+    """The id is genuinely not among open tasks (most likely: the task was
+    already completed) — _add_task_comment_impl treats this as LEGITIMATE on
+    execution (commenting a completed task is a normal thing to do), only
+    downgrading the confirmation to a warning because the title could not be
+    cross-checked. The plan-phase transfer MUST reproduce that same
+    softness, not silently upgrade "missing" into a hard block: the plan is
+    still built (manifest_id present, no 🛑 anywhere), and its text honestly
+    says the title wasn't verified."""
+    fake_v2 = FakeV2(live={})
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(
+        s, "_guard_task",
+        lambda *a, **k: s._Guard("missing", project_id="p1",
+                                 message="id … не среди открытых задач"))
+
+    preview = await s.add_task_comment("Купить молоко", "не забыть", "p1", "t1")
+
+    assert "🛑" not in preview, "missing на плане должен предупреждать, не блокировать"
+    assert "manifest_id" in preview, "план обязан построиться — missing здесь мягкий"
+    assert "не среди открытых задач" in preview
+    assert fake_v2.calls == []
+
+
 async def test_add_task_comment_plan_read_failure_does_not_block_but_warns(
         monkeypatch):
     """A live-read hiccup while BUILDING the plan (call #1) must not block
