@@ -4902,6 +4902,15 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
         return f"Error executing deletion manifest: {str(e)}"
 
 
+def _fmt_tag_set(tags) -> str:
+    """Человекочитаемое представление набора тегов для отчёта перепроверки:
+    «tag1, tag2» вместо сырого Python-репра `['tag1', 'tag2']` — владелец
+    читает это в Telegram, квадратные скобки и кавычки ему ни о чём не
+    говорят. Пустой набор — «нет», не «[]»."""
+    joined = ", ".join(sorted(tags))
+    return joined if joined else "нет"
+
+
 def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
                  names: Dict) -> Tuple[str, str]:
     """Один вердикт по одной записи из журнала, по ТЕКУЩЕМУ живому состоянию.
@@ -4990,9 +4999,9 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
     if op == "tags":
         want = set(exp.get("tags") or [])
         got = set(live.get("tags") or [])
-        return (("ok", f"- ✅ **«{title}»** — теги {sorted(got)}") if want == got
-                else ("bad", f"- ❌ **«{title}»** — теги {sorted(got)}, "
-                      f"ожидались {sorted(want)}"))
+        return (("ok", f"- ✅ **«{title}»** — теги: {_fmt_tag_set(got)}") if want == got
+                else ("bad", f"- ❌ **«{title}»** — теги: {_fmt_tag_set(got)}, "
+                      f"ожидались: {_fmt_tag_set(want)}"))
     if op == "parent":
         want = exp.get("parentId")  # None = detached
         got = live.get("parentId")
@@ -5003,8 +5012,25 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
                     "среди открытых задач (вложение под несуществующего/"
                     "закрытого родителя)")
         ok = (got == want) if want else not got
-        return (("ok", f"- ✅ **«{title}»** — родитель применён") if ok else
-                ("bad", f"- ❌ **«{title}»** — parentId={got!r}, ожидался {want!r}"))
+        if not ok:
+            return ("bad", f"- ❌ **«{title}»** — parentId={got!r}, ожидался {want!r}")
+        # def-110: «родитель применён» раньше был ОДНИМ литералом на обе
+        # противоположные операции (вложить / отцепить) — set_task_parent и
+        # unset_task_parent над одной и той же задачей давали посимвольно
+        # одинаковую строку успеха, и по отчёту нельзя было понять, что
+        # реально произошло. По образцу соседней ветки `tags` чуть выше
+        # (которая печатает НАБЛЮДАЕМОЕ состояние поля — `sorted(got)` — а не
+        # название операции) строка теперь называет ФАКТ: что сейчас стоит в
+        # `parentId`, прочитанное живьём (`got`), а не какая операция
+        # предположительно к этому привела. Так строка не может
+        # рассинхронизироваться с операцией — она вообще не знает, какая она
+        # была, — и сама собой различает любую будущую операцию над
+        # `parentId`, не только эти две.
+        if got:
+            parent_title = (live_map.get(got) or {}).get("title") \
+                or f"{str(got)[:8]}…"
+            return ("ok", f"- ✅ **«{title}»** — родитель: «{parent_title}»")
+        return ("ok", f"- ✅ **«{title}»** — родитель: нет")
     if op == "update":
         changes = exp.get("changes") or {}
         diffs = []
@@ -13753,9 +13779,21 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
 
 
 def _manifest_affected_count(m: Optional[Dict]) -> Optional[int]:
-    """Сколько объектов затрагивал манифест — только для КОРОТКОЙ сводки в
-    личку («затронуто 5 задач»). Что не знаем — просто None, и в сводке этой
-    строки не будет; врать числом здесь нельзя.
+    """Сколько объектов ПЛАНИРОВАЛ манифест — только для короткой сводки в
+    личку. Что не знаем — просто None, и в сводке этой строки не будет; врать
+    числом здесь нельзя.
+
+    def-111 (2026-08-07): это число из ПЛАНА (намерение ДО исполнения,
+    `consumed` захватывается в try_auto_execute до вызова исполнителя), а НЕ
+    факт того, сколько объектов реально изменилось — гейт мог законно
+    отказаться менять что-либо (например unset_task_parent на задаче, у
+    которой родителя уже нет: «Ничего не тронул», журнал не пишется вообще).
+    Раньше это число подписывалось в сводке словом «Затронуто» — прямая ложь
+    рядом с «Ничего не тронул». Сама эта функция ПРАВА в своём подсчёте (она
+    и не претендует на факт исполнения, только на размер плана) — вызывающий
+    код (`_short_auto_execute_summary`) теперь называет её результат «Объектов
+    в плане» и рядом, когда доступно, печатает РЕАЛЬНОЕ число подтверждённых
+    из `_parse_verify_totals` над уже готовым независимым отчётом.
 
     Форм манифеста несколько, и после 2026-08-06 (кнопка у 22 тулов) их надо
     знать все, иначе строка молча пропадала бы у всех новых исполнителей:
@@ -13764,8 +13802,10 @@ def _manifest_affected_count(m: Optional[Dict]) -> Optional[int]:
         move_tasks, set_task_tags, restore_tasks…);
       * `raw`   — план создания (plan_task_creation / create_tasks);
       * `_gate == "single"` — одиночный гейт (`_gate_single`): по определению
-        РОВНО один объект (create_tag, delete_project, rename_tag…), поэтому
-        1 — это факт из конструкции гейта, а не догадка."""
+        РОВНО один объект В ПЛАНЕ (create_tag, delete_project, rename_tag…),
+        поэтому 1 — это факт из конструкции гейта, а не догадка. Он не
+        гарантирует, что этот один объект реально изменился — это отдельная
+        проверка (см. выше)."""
     if not isinstance(m, dict):
         return None
     for key in ("items", "tasks", "raw"):
@@ -13781,7 +13821,8 @@ def _short_auto_execute_summary(tool: str, verdict: str,
                                 affected: Optional[int],
                                 group_delivered: bool,
                                 fallback_to_dm: bool = False,
-                                partial: Optional[Tuple[int, int]] = None) -> str:
+                                partial: Optional[Tuple[int, int]] = None,
+                                totals: Optional[Tuple[int, int, int]] = None) -> str:
     """2-4 строки в ЛИЧКУ владельца. Максим просил не захламлять личный чат
     1:1 простынями — подробности живут в группе «MCP Отчёты», сюда идёт
     только вердикт. Если в группу отчёт НЕ доставился, сводка обязана сказать
@@ -13792,11 +13833,25 @@ def _short_auto_execute_summary(tool: str, verdict: str,
     «не дошло»: на затяжном флуд-лимите Telegram в группу ложатся, например,
     2 части из 6. Раньше такой случай не отличался от полного успеха (список
     id ведь непустой), и владельцу писали «Подробный отчёт — в группе», хотя
-    там лежала треть. Теперь это называется своими словами."""
+    там лежала треть. Теперь это называется своими словами.
+
+    def-111 (2026-08-07): `affected` (см. `_manifest_affected_count`) — размер
+    ПЛАНА, захваченного ДО исполнения, а не факт того, что реально изменилось
+    — гейт мог законно ничего не менять («Ничего не тронул»). Раньше это число
+    подписывалось словом «Затронуто», и рядом с «Ничего не тронул» получалась
+    прямая ложь. Теперь оно подписано «Объектов в плане», а когда доступен
+    `totals=(ok, warn, bad)` — РЕАЛЬНЫЙ исход независимой перепроверки,
+    распарсенный `_parse_verify_totals` из уже готового `full_md` в
+    `_publish_auto_execute_outcome` — рядом печатается факт «Подтверждено
+    перепроверкой: N», чтобы план и факт не расходились молча."""
     lines = [f"{_VERDICT_EMOJI.get(verdict, '❓')} Автоисполнение «{tool}» — "
              f"{_VERDICT_WORD.get(verdict, verdict)}."]
     if affected is not None:
-        lines.append(f"Затронуто объектов: {affected}.")
+        if totals is not None:
+            lines.append(f"Объектов в плане: {affected}. Подтверждено "
+                         f"перепроверкой: {totals[0]}.")
+        else:
+            lines.append(f"Объектов в плане: {affected}.")
     if partial is not None:
         got, total = partial
         lines.append(f"⚠️ отчёт доставлен в группу частично ({got} из {total} "
@@ -13931,9 +13986,19 @@ def _publish_auto_execute_outcome(candidate: Dict, tool: str, full_md: str,
     partial = None
     if not delivery.ok and delivery.delivered > 0:
         partial = (delivery.delivered, delivery.total_chunks)
+    # def-111: `full_md` уже содержит (внутри `independent_block`, дословно
+    # вставленным `_verified_auto_execute_report`) ровно ОДНУ итоговую строку
+    # «Итог: ✅ N подтверждено, ⚠️ M не проверено, ❌ K расхождений» — ту же,
+    # что `_parse_verify_totals` уже умеет читать и что использовалась для
+    # вычисления самого `verdict`. Переиспользуем её здесь, а не тащим
+    # отдельный параметр через сигнатуру `_verified_auto_execute_report` (у
+    # неё единственный вызывающий, и раздувать её возврат ради одной строки
+    # короткой сводки — лишнее): `_parse_verify_totals` уже по конструкции
+    # безопасна (None на любую неоднозначность), так что риска путаницы нет.
+    totals = _parse_verify_totals(full_md)
     short_md = _short_auto_execute_summary(tool, verdict, affected,
                                            bool(delivery.ok), fallback_ok,
-                                           partial)
+                                           partial, totals)
     summary_ok = False
     try:
         summary_ok = bool(tg_approval.summarize_in_owner_chat(

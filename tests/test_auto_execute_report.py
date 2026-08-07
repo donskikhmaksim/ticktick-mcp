@@ -463,7 +463,7 @@ def test_failure_markdown_explains_basis(monkeypatch):
 def test_short_summary_points_to_group_when_delivered():
     short = s._short_auto_execute_summary("delete_tasks", "ok", 3, True)
     assert "MCP Отчёты" in short
-    assert "Затронуто объектов: 3" in short
+    assert "Объектов в плане: 3" in short
     assert short.count("\n") <= 3  # 2-4 строки, личный чат не захламляется
 
 
@@ -475,8 +475,74 @@ def test_short_summary_admits_group_delivery_failure():
 
 def test_short_summary_without_known_object_count():
     short = s._short_auto_execute_summary("delete_tasks", "unverified", None, True)
-    assert "Затронуто объектов" not in short
+    assert "Объектов в плане" not in short
     assert "НЕ подтверждено" in short
+
+
+# ===========================================================================
+# def-111 (2026-08-07): «Затронуто объектов: N» рядом с «Ничего не тронул» —
+# сводка утверждала факт исполнения по РАЗМЕРУ ПЛАНА (см.
+# _manifest_affected_count), а не по тому, что реально подтвердила
+# независимая перепроверка. Живой пример: unset_task_parent на задаче без
+# родителя — гейт честно отказался что-либо менять («Ничего не тронул»),
+# журнал не пишется, а сводка всё равно объявляла «Затронуто объектов: 1».
+# ===========================================================================
+
+def test_short_summary_never_claims_something_was_touched_when_nothing_was():
+    """Воспроизводит живой пример дословно: план на 1 объект (single-gate),
+    но НИКАКОГО реального исхода (totals=None — журнала для этой мутации нет,
+    ровно как у unset_task_parent, отказавшегося что-либо менять). Сводка не
+    имеет права утверждать, что объект «затронут» — только что он БЫЛ В
+    ПЛАНЕ, без claim'а о факте."""
+    short = s._short_auto_execute_summary("unset_task_parent", "unverified", 1,
+                                          True, totals=None)
+    assert "Затронуто" not in short
+    assert "Объектов в плане: 1" in short
+    assert "Подтверждено" not in short  # нечем подтвердить — не выдумываем число
+
+
+def test_short_summary_shows_real_confirmed_count_when_totals_available():
+    """Когда независимая перепроверка ЕСТЬ (totals распознаны), сводка обязана
+    показать РЕАЛЬНОЕ число подтверждённых рядом с размером плана — не только
+    он один, как раньше."""
+    short = s._short_auto_execute_summary("delete_tasks", "partial", 3, True,
+                                          totals=(2, 0, 1))
+    assert "Объектов в плане: 3" in short
+    assert "Подтверждено перепроверкой: 2" in short
+
+
+def test_short_summary_confirmed_count_can_be_zero_and_says_so():
+    """Прямое воспроизведение симптома: план был на 1, перепроверка нашла 0
+    подтверждённых (например операция журналировалась, но пост-верификация не
+    подтвердила ни одного изменения) — сводка обязана честно показать 0, а не
+    молчать/подгонять под affected."""
+    short = s._short_auto_execute_summary("unset_task_parent", "unverified", 1,
+                                          True, totals=(0, 1, 0))
+    assert "Объектов в плане: 1" in short
+    assert "Подтверждено перепроверкой: 0" in short
+
+
+def test_publish_outcome_derives_totals_from_the_full_report_it_already_has(
+        monkeypatch):
+    """Интеграционная проверка на уровне `_publish_auto_execute_outcome`:
+    `full_md` уже несёт итоговую строку независимой перепроверки (как в
+    проде — это дословный `_build_operation_report()`), и короткая сводка
+    обязана вытащить из неё РЕАЛЬНОЕ число подтверждённых через
+    `_parse_verify_totals`, без изменения сигнатуры `_verified_auto_execute_
+    report`."""
+    _sent, _chunked, edits = _publish_harness(monkeypatch, group_ids=[1, 2, 3],
+                                              total_chunks=3)
+    full_md = ("### 🧾 Независимый отчёт — `m1`\n\n"
+               "- ✅ **«A»** — удалена\n\n"
+               "**Итог: ✅ 1 подтверждено, ⚠️ 0 не проверено, "
+               "❌ 0 расхождений.**")
+    s._publish_auto_execute_outcome(
+        {"manifest_id": "m1", "chat_id": "111", "message_id": 9},
+        "delete_tasks", full_md, "ok", 1)
+
+    short = edits[0][2]
+    assert "Объектов в плане: 1" in short
+    assert "Подтверждено перепроверкой: 1" in short
 
 
 # ===========================================================================
@@ -707,7 +773,7 @@ def test_manifest_affected_count():
 def test_manifest_affected_count_knows_every_gate_shape():
     """С 2026-08-06 кнопка есть у 22 тулов, и их манифесты имеют РАЗНУЮ
     форму. Если счётчик знает только `items` (форму удаления), строка
-    «Затронуто объектов» молча исчезает у всех новых исполнителей —
+    «Объектов в плане» молча исчезает у всех новых исполнителей —
     незаметная потеря, которую этот тест и ловит."""
     # _gate_batch: complete_tasks / move_tasks / set_task_tags / restore_tasks…
     assert s._manifest_affected_count(
