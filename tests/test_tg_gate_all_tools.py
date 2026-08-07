@@ -315,6 +315,48 @@ async def test_plan_is_sent_to_telegram_with_its_own_tool_name(tool, monkeypatch
     assert "Telegram" in preview            # модель предупреждена про кнопку
 
 
+# Служебные фразы ДЛЯ МОДЕЛИ, которые НИКОГДА не должны попадать в текст,
+# уходящий в Telegram-карточку плана (2026-08-06, дефект №2, живой прогон на
+# update_project) — проверка «по смыслу», а не по одной точной строке: любая
+# из этих фраз в тексте карточки означает утечку служебной инструкции.
+_AGENT_ONLY_MARKERS = (
+    "Покажи это пользователю дословно",
+    "Покажи этот план пользователю дословно",
+    "СНОВА",
+    "manifest_id=",
+    "user_reply=",
+)
+
+
+@pytest.mark.parametrize("tool", sorted(ALL_TOOLS))
+async def test_telegram_card_never_carries_the_agents_own_instructions(tool, monkeypatch):
+    """Дефект №1 живого прогона (2026-08-06, манифест eb77e4e758c7 на
+    update_project): владелец читал в Telegram дословно «вызови
+    update_project СНОВА... manifest_id="...", user_reply="..."» — текст,
+    адресованный МОДЕЛИ, а не ему. Причина — `_maybe_tg_notify_plan` слала в
+    `notify_plan()` тот же `preview_text`, что возвращался модели целиком
+    (инструкция была его последней строкой). Теперь `agent_tail` приклеивается
+    ТОЛЬКО к ответу модели; здесь проверяется, что в текст, реально ушедший в
+    `notify_plan()`, ни одна из служебных фраз не попала — для ВСЕХ 24
+    гейтованных тулов сразу (та же таблица, что и выше)."""
+    _no_client_checks(monkeypatch)
+    _tg_on(monkeypatch)
+    seen = []
+    _notify_ok(monkeypatch, seen)
+
+    preview, mid = await _plan(tool, monkeypatch)
+
+    telegram_text = seen[0]["preview"]
+    for marker in _AGENT_ONLY_MARKERS:
+        assert marker not in telegram_text, (
+            f"{tool}: служебная фраза «{marker}» уехала в Telegram:\n{telegram_text}")
+    # Идентификатор манифеста остаётся человеку — это НЕ инструкция для
+    # модели, Максим прямо просил оставить его как есть.
+    assert f"`{mid}`" in telegram_text
+    # А модель по-прежнему видит полную инструкцию — этот канал не пострадал.
+    assert "manifest_id=" in preview and "user_reply=" in preview
+
+
 # ═══════ 3. Кнопка не нажата → честное «да» ничего не исполняет ═══════
 
 @pytest.mark.parametrize("tool", sorted(ALL_TOOLS))

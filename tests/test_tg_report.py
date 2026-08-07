@@ -710,8 +710,12 @@ def test_notify_plan_fails_closed_when_the_row_cannot_be_created(monkeypatch):
 @pytest.mark.parametrize("verdict,marker", [
     ("ok", "✅ Исполнено и подтверждено"),
     ("partial", "⚠️ Исполнено частично"),
+    ("mismatch", "❌ Исполнено, но результат расходится с ожиданием"),
     ("failed", "🛑 Ошибка исполнения"),
-    ("unverified", "⚠️ Исполнено, НО независимой перепроверкой не подтверждено"),
+    # ❓, не ⚠️ (2026-08-06, дефект №1 части 1+2): раньше этот словарь и
+    # server.py's _VERDICT_EMOJI расходились для "unverified" (⚠️ здесь, ❓
+    # там) — теперь оба честного «не знаю» согласны.
+    ("unverified", "❓ Исполнено, НО независимой перепроверкой не подтверждено"),
 ])
 def test_report_header_matches_verdict(monkeypatch, verdict, marker):
     seen = {}
@@ -732,6 +736,60 @@ def test_report_header_matches_verdict(monkeypatch, verdict, marker):
     assert marker in seen["text"]
     assert "delete_tasks" in seen["text"] and "m1" in seen["text"]
     assert "тело отчёта" in seen["text"]
+
+
+def test_report_with_its_own_header_is_not_wrapped_in_a_second_one(monkeypatch):
+    """2026-08-06, дефект №1 часть 2 (живой прогон на update_project): когда
+    `report_md` УЖЕ несёт свой самодостаточный `###`-заголовок (ровно то, что
+    строит `_verified_auto_execute_report` в server.py — output-format.md
+    §7.1, правило 1), `post_report_to_group` не должен приклеивать ВТОРОЙ,
+    независимо сформулированный заголовок про тот же исход поверх него. До
+    этой правки оба заголовка печатались подряд одним сообщением, притом
+    разными словами (а для "unverified" — и разным эмодзи)."""
+    seen = {}
+
+    def fake_send(cfg, chat, text, **kw):
+        seen["text"] = text
+        return tg.SendResult(True, [1], "", 1)
+
+    monkeypatch.setattr(tg, "send_message_chunked", fake_send)
+    monkeypatch.setattr(tg, "record_report_messages", lambda *a: None)
+
+    own_header_report = ("### ✅ Автоисполнение «update_project» — "
+                         "подтверждено живым чтением\n_manifest: `eb77e4e758c7`_\n\n"
+                         "тело отчёта")
+    tg.post_report_to_group(_cfg(), "eb77e4e758c7", own_header_report,
+                            tool="update_project", verdict="ok")
+
+    # РОВНО один "###"-заголовок в сообщении — это и есть заголовок самого
+    # report_md, обёрточный из _VERDICT_HEADERS отсутствует.
+    assert seen["text"].count("###") == 1
+    assert "Автоисполнение «update_project»" in seen["text"]
+    # Обёрточная формулировка ("✅ Исполнено и подтверждено" и т.п.) не
+    # продублирована — её просто нет в тексте.
+    for wrapper_marker in tg._VERDICT_HEADERS.values():
+        assert wrapper_marker not in seen["text"], wrapper_marker
+    assert "тело отчёта" in seen["text"]
+
+
+def test_report_without_its_own_header_still_gets_the_wrapper(monkeypatch):
+    """Обратная сторона: отчёты БЕЗ своего заголовка (например verdict="lost"
+    — план не пережил перезапуск) по-прежнему получают заголовок от
+    `_VERDICT_HEADERS` — им больше неоткуда."""
+    seen = {}
+
+    def fake_send(cfg, chat, text, **kw):
+        seen["text"] = text
+        return tg.SendResult(True, [1], "", 1)
+
+    monkeypatch.setattr(tg, "send_message_chunked", fake_send)
+    monkeypatch.setattr(tg, "record_report_messages", lambda *a: None)
+
+    tg.post_report_to_group(_cfg(), "m2", "_manifest: `m2`_\n\nплан пропал",
+                            tool="операция неизвестна", verdict="lost")
+
+    assert seen["text"].count("###") == 1
+    assert "Подтверждено, но исполнять было нечего" in seen["text"]
 
 
 def test_report_timestamp_is_owner_timezone_not_utc(monkeypatch):

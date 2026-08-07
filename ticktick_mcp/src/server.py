@@ -1982,7 +1982,11 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
                      "(«2 — в Fix&Roll»), тогда план пересоберётся с явными "
                      "адресами._")
     lines.append("")
-    lines.append("После явного «да» вызови "
+    # Инструкция для модели («вызови execute_task_creation…») — ОТДЕЛЬНО от
+    # человеческой части `lines` (2026-08-06, дефект №2): `_maybe_tg_notify_plan`
+    # приклеивает её только к ответу модели, в Telegram-карточку плана она не
+    # уходит.
+    agent_tail = ("После явного «да» вызови "
                  f"`execute_task_creation(manifest_id=\"{mid}\", "
                  "user_reply=\"<дословная реплика пользователя>\")` · "
                  f"действует {_manifest_ttl_phrase()}, одноразово.")
@@ -1991,7 +1995,8 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     # помечает манифест `tg_notified`, из-за чего execute-фаза начинает
     # требовать нажатие. Fail-closed: не смогли отправить — манифест гаснет,
     # наружу уходит текст ошибки вместо плана.
-    return await _maybe_tg_notify_plan("create_tasks", mid, "\n".join(lines))
+    return await _maybe_tg_notify_plan("create_tasks", mid, "\n".join(lines),
+                                       agent_tail)
 
 
 @mcp.tool()
@@ -2776,20 +2781,22 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
             preview.append(f"{i}. **«{it['title']}»** — {it['project']} (`{it['taskId']}`)")
         preview.extend(lines)
         preview.append("")
-        preview.append("Покажи это пользователю дословно и ДОЖДИСЬ его "
-                       "отдельного ответа (не отвечай за него). Когда он явно "
-                       "согласится, вызови "
-                       f"`delete_tasks(summary=\"{summary}\", manifest_id=\"{mid}\", "
-                       "user_reply=\"<дословная реплика пользователя>\")` — "
-                       "НЕ в этом же ходе. Манифест одноразовый, "
-                       f"действует {_manifest_ttl_phrase()}.")
+        # Инструкция для модели — ОТДЕЛЬНО от `preview` (2026-08-06, дефект
+        # №2): раньше уходила дословно в Telegram-карточку плана.
+        agent_tail = ("Покажи это пользователю дословно и ДОЖДИСЬ его "
+                     "отдельного ответа (не отвечай за него). Когда он явно "
+                     "согласится, вызови "
+                     f"`delete_tasks(summary=\"{summary}\", manifest_id=\"{mid}\", "
+                     "user_reply=\"<дословная реплика пользователя>\")` — "
+                     "НЕ в этом же ходе. Манифест одноразовый, "
+                     f"действует {_manifest_ttl_phrase()}.")
         # Хук — корутина: сетевую часть (синхронный requests, паузы между
         # кусками, сон на 429 до _MAX_SEND_WAIT_S на КАЖДЫЙ кусок) он уводит в
         # поток сам, одинаково для всех 22 гейтованных тулов. Раньше поток
         # заказывал каждый вызывающий вручную, и сделали это ровно три места
         # из двадцати двух — см. `_maybe_tg_notify_plan`.
         return await _maybe_tg_notify_plan("delete_tasks", mid,
-                                           "\n".join(preview))
+                                           "\n".join(preview), agent_tail)
     except Exception as e:
         logger.error(f"Error in delete_tasks: {e}")
         return f"Error deleting tasks: {str(e)}"
@@ -3497,7 +3504,7 @@ class ConsentResult:
 
 
 async def _maybe_tg_notify_plan(tool: str, manifest_id: str,
-                                preview_text: str) -> str:
+                                preview_text: str, agent_tail: str = "") -> str:
     """Зовётся ПОСЛЕ создания манифеста (`_MANIFESTS[mid] = {...}`), ПЕРЕД
     возвратом превью-текста моделью — портирует поведение gmail-mcp's
     requireConsent's "фаза плана" ветки на архитектуру ticktick-mcp, где
@@ -3505,6 +3512,20 @@ async def _maybe_tg_notify_plan(tool: str, manifest_id: str,
     dual-mode вызов, как в TS). Fail-closed (та же дисциплина, что в TS): если
     отправка в Telegram упала, манифест ИНВАЛИДИРУЕТСЯ, а не остаётся
     доступным через голое user_reply без второго фактора.
+
+    `agent_tail` (2026-08-06, дефект №2, живой прогон на update_project) —
+    служебная инструкция ДЛЯ МОДЕЛИ («покажи это пользователю дословно,
+    дождись ответа, затем вызови tool СНОВА с manifest_id=…, user_reply=…»).
+    Раньше она была последней строкой того же `preview_text`, который ЦЕЛИКОМ
+    уходил и в notify_plan(), и в возврат модели — то есть эта инструкция
+    печаталась в Telegram-карточке плана ДОСЛОВНО, хотя адресована модели, а
+    не Максиму, и активно вводила его в заблуждение («вызови update_project
+    снова», хотя от человека требуется только нажать кнопку). Теперь
+    `preview_text` — ЧИСТО человеческая часть (то, что видит владелец что в
+    notify_plan(), что в Telegram), а `agent_tail` приклеивается ТОЛЬКО к
+    тому, что возвращается модели, и НИКОГДА не передаётся в notify_plan().
+    Опционален (default "") ради обратной совместимости старых 3-аргументных
+    вызовов — они по-прежнему возвращают текст побайтово как раньше.
 
     КОРУТИНА, А НЕ ОБЫЧНАЯ ФУНКЦИЯ (2026-08-06, задача #115). Внутри
     `tg_approval.notify_plan` — синхронные `requests`, профилактические паузы
@@ -3526,8 +3547,9 @@ async def _maybe_tg_notify_plan(tool: str, manifest_id: str,
       • внутренний порядок notify_plan (INSERT строки → sendMessage →
         UPDATE message_id) вынос не меняет: функция уезжает в поток целиком.
     """
+    full_text = preview_text + (f"\n{agent_tail}" if agent_tail else "")
     if not (tool and tg_approval.enabled_for(_TG_CFG, tool)):
-        return preview_text
+        return full_text
     # ПОМЕТКА ДО ОТПРАВКИ, А НЕ ПОСЛЕ (2026-08-06, гонка, которую создаёт
     # сам вынос в поток). `tg_notified` — это то, по чему `_tg_button_only`
     # решает, что текстовое «да» для плана больше не принимается. Пока
@@ -3617,13 +3639,13 @@ async def _maybe_tg_notify_plan(tool: str, manifest_id: str,
     # авто-исполнителя (delete_project / rename_tag-слияние) повторный вызов
     # ПО-ПРЕЖНЕМУ нужен — им нельзя обещать «выполнится само».
     if _resolve_auto_executor(_auto_execute_tool_of(m or {}), m or {}) is not None:
-        return (preview_text + "\n\n_⏳ Запрос на подтверждение отправлен в "
+        return (full_text + "\n\n_⏳ Запрос на подтверждение отправлен в "
                 "Telegram. Подтвердите кнопкой ✅ в боте — операция выполнится "
                 "автоматически: короткая сводка придёт в то же сообщение, "
                 "полный отчёт — в группу-архив «MCP Отчёты». Повторно "
                 "вызывать этот инструмент НЕ нужно, текстовое «да» для этого "
                 "плана не принимается._")
-    return (preview_text + "\n\n_⏳ Запрос на подтверждение отправлен в "
+    return (full_text + "\n\n_⏳ Запрос на подтверждение отправлен в "
             "Telegram. Подтвердите кнопкой ✅ в боте — этот план сервер сам не "
             "исполняет, после нажатия повторите вызов инструмента._")
 
@@ -4063,25 +4085,29 @@ class _GateOutcome:
 def _gate_batch_preview_lines(tool_name: str, mid: str, summary: str,
                               tasks: List[Dict], describe_item,
                               items_arg: str = "tasks",
-                              notes: Optional[List[str]] = None) -> List[str]:
-    """Строки предпросмотра call #1 — РОВНО то, что уходит и в чат, и (через
-    `_maybe_tg_notify_plan`) в Telegram. Вынесено из `_gate_batch` отдельной
-    функцией, чтобы вызывающий мог ОЦЕНИТЬ будущий текст (например, влезет ли
-    он в лимит Telegram-сообщения) той же самой сборкой, а не своей копией,
-    которая со временем разойдётся с настоящей."""
+                              notes: Optional[List[str]] = None
+                              ) -> Tuple[List[str], str]:
+    """(человеческие строки превью, инструкция для модели) — РАЗДЕЛЬНО
+    (2026-08-06, дефект №2). Первый элемент — РОВНО то, что уходит и в чат, и
+    (через `_maybe_tg_notify_plan`) в Telegram; второй — служебная реплика
+    «покажи это пользователю дословно и вызови тул снова», которая раньше
+    была последней строкой ТОГО ЖЕ списка и потому дословно печаталась в
+    Telegram-карточке плана владельцу, хотя адресована модели. Вынесено из
+    `_gate_batch` отдельной функцией, чтобы вызывающий мог ОЦЕНИТЬ будущий
+    текст (например, влезет ли он в лимит Telegram-сообщения) той же самой
+    сборкой, а не своей копией, которая со временем разойдётся с настоящей."""
     lines = [f"### 📋 План — {summary}",
              _plan_id_line(mid), ""]
     for i, t in enumerate(tasks, 1):
         lines.append(f"{i}. {describe_item(t)}")
     # `notes` — предупреждения ПРО ВЕСЬ план (а не про отдельную строку),
-    # которые обязаны быть видны человеку в обоих каналах. Печатаются между
-    # списком и инструкцией: после операций, к которым относятся, и до текста
-    # «когда он согласится — позови снова», чтобы не разрывать инструкцию.
+    # которые обязаны быть видны человеку в обоих каналах. Печатаются после
+    # списка операций, к которым относятся, и до инструкции для модели.
     for note in (notes or []):
         lines.append("")
         lines.append(note)
     lines.append("")
-    lines.append(
+    agent_tail = (
         "Покажи это пользователю дословно и ДОЖДИСЬ его отдельного ответа "
         "(не отвечай за него). Когда он явно согласится, вызови этот же "
         f'инструмент снова: {tool_name}(summary="{summary}", {items_arg}=[...], '
@@ -4089,7 +4115,7 @@ def _gate_batch_preview_lines(tool_name: str, mid: str, summary: str,
         f"— НЕ в этом же ходе (сам список {items_arg} можно повторить как "
         "есть, на 2-м вызове он игнорируется — используются данные из "
         f"манифеста). Манифест одноразовый, действует {_manifest_ttl_phrase()}.")
-    return lines
+    return lines, agent_tail
 
 
 async def _claim_plan_for_automation(kind: str, manifest_id: str) -> Optional[Dict]:
@@ -4229,10 +4255,10 @@ async def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
     # строку с id внутри неё печатает общий `_plan_id_line` (ветка plan-id),
     # срок жизни — общий `_manifest_ttl_phrase()` (ветка tg-report-group).
     # Все три правки живут вместе: здесь остаётся один вызов.
-    lines = _gate_batch_preview_lines(tool_name, mid, summary, tasks,
-                                      describe_item, items_arg, notes)
+    lines, agent_tail = _gate_batch_preview_lines(tool_name, mid, summary, tasks,
+                                                  describe_item, items_arg, notes)
     return _GateOutcome(False, message=await _maybe_tg_notify_plan(
-        tool_name, mid, "\n".join(lines)))
+        tool_name, mid, "\n".join(lines), agent_tail))
 
 
 # ---------------------------------------------------------------------------
@@ -4327,18 +4353,27 @@ async def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
                        "params": params, "created": now,
                        "plan_shown_at": now, "consumed": False,
                        "object_hash": _manifest_params_hash(kind, params)}
+    # `lines` — ТОЛЬКО человеческая часть (заголовок, id манифеста): это
+    # РОВНО то, что уходит в Telegram-карточку плана. `agent_tail` — служебная
+    # инструкция ДЛЯ МОДЕЛИ (что и с какими аргументами вызвать вторым ходом)
+    # — приклеивается only к ответу модели самим `_maybe_tg_notify_plan`
+    # (2026-08-06, дефект №2: раньше эта инструкция была последней строкой
+    # `lines` и потому дословно печаталась владельцу в Telegram — «вызови
+    # update_project СНОВА…», хотя от человека требовалось только нажать
+    # кнопку).
     lines = [f"### 📋 План — {describe_fn(params)}",
-             _plan_id_line(mid), "",
-             "Покажи это пользователю дословно и ДОЖДИСЬ его отдельного "
-             "ответа (не отвечай за него). Когда он явно согласится, вызови "
-             f"{tool_name} СНОВА с теми же аргументами и добавь "
-             f'manifest_id="{mid}", user_reply="<дословная реплика '
-             'пользователя>" — НЕ в этом же ходе (сами аргументы можно '
-             "повторить как есть, на 2-м вызове они игнорируются — "
-             "используются данные из манифеста). Манифест одноразовый, "
-             f"действует {_manifest_ttl_phrase()}."]
+             _plan_id_line(mid), ""]
+    agent_tail = (
+        "Покажи это пользователю дословно и ДОЖДИСЬ его отдельного "
+        "ответа (не отвечай за него). Когда он явно согласится, вызови "
+        f"{tool_name} СНОВА с теми же аргументами и добавь "
+        f'manifest_id="{mid}", user_reply="<дословная реплика '
+        'пользователя>" — НЕ в этом же ходе (сами аргументы можно '
+        "повторить как есть, на 2-м вызове они игнорируются — "
+        "используются данные из манифеста). Манифест одноразовый, "
+        f"действует {_manifest_ttl_phrase()}.")
     return _GateOutcome(False, message=await _maybe_tg_notify_plan(
-        tool_name, mid, "\n".join(lines)))
+        tool_name, mid, "\n".join(lines), agent_tail))
 
 
 @mcp.tool(annotations=READONLY)
@@ -4464,7 +4499,9 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
         lines.append(f"↷ Исключены (не среди открытых) {len(missing)}: "
                      + ", ".join(f"«{m['title']}»" for m in missing))
     lines.append("")
-    lines.append("Покажи этот план пользователю дословно и ДОЖДИСЬ его "
+    # Инструкция для модели — ОТДЕЛЬНО от `lines` (2026-08-06, дефект №2):
+    # раньше уходила дословно в Telegram-карточку плана.
+    agent_tail = ("Покажи этот план пользователю дословно и ДОЖДИСЬ его "
                  "отдельного ответа (не отвечай за него). Когда он явно "
                  "согласится, вызови "
                  f"`execute_task_deletion(manifest_id=\"{mid}\", "
@@ -4473,7 +4510,8 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
                  f"действует {_manifest_ttl_phrase()}.")
     # Сетевую часть отправки уводит в поток сам хук (см. delete_tasks выше и
     # докстринг `_maybe_tg_notify_plan`) — здесь просто await.
-    return await _maybe_tg_notify_plan("delete_tasks", mid, "\n".join(lines))
+    return await _maybe_tg_notify_plan("delete_tasks", mid, "\n".join(lines),
+                                       agent_tail)
 
 
 @mcp.tool()
@@ -6110,7 +6148,9 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
                  f"🔗 {sum(len(g['children']) for g in actions['group'])}). "
                  "Протухшие и спорные НЕ входят.")
     lines.append("")
-    lines.append("Покажи этот план пользователю дословно и ДОЖДИСЬ его "
+    # Инструкция для модели — ОТДЕЛЬНО от `lines`/`sheet_note` (2026-08-06,
+    # дефект №2): раньше уходила дословно в Telegram-карточку плана.
+    agent_tail = ("Покажи этот план пользователю дословно и ДОЖДИСЬ его "
                  "отдельного ответа. Когда он явно согласится, вызови "
                  f"`execute_declutter(manifest_id=\"{mid}\", "
                  "user_reply=\"<дословная реплика пользователя>\")` — НЕ в "
@@ -6118,7 +6158,7 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
                  "пройдёт через штатные удаление/обновление/вложение "
                  "(guard + журнал + сверка).")
     return await _maybe_tg_notify_plan("execute_declutter", mid,
-                                       "\n".join(lines) + sheet_note)
+                                       "\n".join(lines) + sheet_note, agent_tail)
 
 
 # DISABLED 2026-08-04 — см. пометку у plan_declutter выше.
@@ -6655,8 +6695,14 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
                 lines.insert(1, _plan_id_line(mid, "ничего ещё не удалено"))
             lines.append(cr.reason)
             return "\n".join(lines)
-        lines.append(
-            "Ничего не удалено. Покажи это пользователю дословно и "
+        # "Ничего не удалено." — человеку; остальное (2026-08-06, дефект №2)
+        # — служебная инструкция ДЛЯ МОДЕЛИ («вызови delete_project снова с
+        # user_reply=…»), раньше склеенная В ТУ ЖЕ строку и потому уходившая
+        # дословно в Telegram-карточку плана. `_maybe_tg_notify_plan`
+        # приклеивает её только к ответу модели.
+        lines.append("Ничего не удалено.")
+        agent_tail = (
+            "Покажи это пользователю дословно и "
             "ДОЖДИСЬ его отдельного ответа (не отвечай за него). Когда "
             "он явно согласится, вызови "
             f'delete_project(project_name="{live_name}", '
@@ -6682,7 +6728,7 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
         # что и делал агент уборки, получив 19 «планов без идентификатора».
         lines.insert(1, _plan_id_line(new_mid, "ничего ещё не удалено"))
         return await _maybe_tg_notify_plan("delete_project", new_mid,
-                                           "\n".join(lines))
+                                           "\n".join(lines), agent_tail)
 
     if m is not None:
         # one-shot: план сгорел вместе с исполнением (и в памяти, и в базе)
@@ -10256,14 +10302,29 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
                 # плана, а не отказываем навсегда.
                 cr = ConsentResult(False, "")
             if not (allow_merge and cr.ok):
-                msg = (f"🛑 Тег «{new_name}» уже существует — это будет СЛИЯНИЕ "
-                       f"тегов «{old_name}» и «{new_name}» (необратимо: какие "
-                       "задачи носили какой тег — потеряется). Покажи это "
-                       "пользователю дословно и, ТОЛЬКО после его явного "
-                       "согласия, повтори с allow_merge=true и "
-                       "user_reply=<дословная реплика пользователя>. Ничего "
-                       "не тронул." + (f" ({cr.reason})"
-                                       if (not cr.ok and cr.reason) else ""))
+                # Человеческая часть и инструкция ДЛЯ МОДЕЛИ — РАЗДЕЛЬНО
+                # (2026-08-06, дефект №2): раньше это была одна строка `msg`,
+                # и «Покажи это пользователю дословно и... повтори с
+                # allow_merge=true и user_reply=...» уходило дословно в
+                # Telegram-карточку плана вместе с остальным. Ранний возврат
+                # ниже (план уже есть/отказ) НЕ ходит в Telegram — там `msg`
+                # как раньше несёт обе части одной строкой для модели.
+                human_msg = (f"🛑 Тег «{new_name}» уже существует — это будет "
+                            f"СЛИЯНИЕ тегов «{old_name}» и «{new_name}» "
+                            "(необратимо: какие задачи носили какой тег — "
+                            "потеряется). Ничего не тронул.")
+                # `cr.reason` здесь (когда непусто) — тоже реплика ДЛЯ МОДЕЛИ
+                # от `_require_consent` («вызывай его ТОЛЬКО после того, как
+                # человек ответил... Передай user_reply=...»), а не для
+                # человека — та же утечка, найденная тестом на этой ветке
+                # (2026-08-06). Кладём её к agent_tail, а не к human_msg.
+                agent_tail = ("Покажи это пользователю дословно и, ТОЛЬКО "
+                             "после его явного согласия, повтори с "
+                             "allow_merge=true и user_reply=<дословная "
+                             "реплика пользователя>." +
+                             (f" ({cr.reason})"
+                              if (not cr.ok and cr.reason) else ""))
+                msg = human_msg + " " + agent_tail
                 if m is not None or _is_negative_reply(user_reply):
                     # План уже есть (возможно, уже висит кнопкой в Telegram)
                     # либо человек отказался — второй раз не шлём.
@@ -10289,8 +10350,9 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
                 # тегов был снаружи безымянным, и нажать по нему кнопку мог
                 # только код, живущий В ЭТОМ ЖЕ процессе (он читал `_MANIFESTS`
                 # напрямую) — ни один сетевой клиент так не может.
-                msg += "\n" + _plan_id_line(new_mid, "ничего ещё не тронуто")
-                return await _maybe_tg_notify_plan("rename_tag", new_mid, msg)
+                human_msg += "\n" + _plan_id_line(new_mid, "ничего ещё не тронуто")
+                return await _maybe_tg_notify_plan("rename_tag", new_mid,
+                                                   human_msg, agent_tail)
             if m is not None:
                 _mark_manifest_consumed(m, mid)  # one-shot
         return await _rename_tag_impl(old_name, new_name,
@@ -12951,6 +13013,24 @@ def _auto_execute_report_is_failure(report_text: str) -> bool:
     return head.startswith(_AUTO_EXECUTE_FAILURE_MARKS)
 
 
+def _auto_execute_report_is_success(report_text: str) -> bool:
+    """Симметрично `_auto_execute_report_is_failure` выше: начинается ли
+    голова СОБСТВЕННОГО отчёта исполнителя с ✅ — единственного статус-
+    маркера успеха в замороженной эмодзи-легенде (output-format.md §7.2).
+
+    Нужна для `_verified_auto_execute_report` (дефект 2026-08-06 №1):
+    single-gate исполнители (update_project, create_tag, create_habit и
+    ~40 таких же) не пишут в журнал мутаций (журналируются только операции
+    над задачами, см. `_op_journal`), поэтому независимая перепроверка ниже
+    для них СТРУКТУРНО никогда не найдёт запись. Но по стандарту КАЖДЫЙ из
+    них уже обязан делать свой собственный post-verify — отдельным свежим
+    чтением TickTick — и печатает ✅ ТОЛЬКО когда этот post-verify реально
+    подтвердил результат. Голова его отчёта — уже готовое доказательство,
+    просто не через журнал."""
+    head = (report_text or "").lstrip().lstrip("#").lstrip()
+    return head.startswith("✅")
+
+
 
 # ---------------------------------------------------------------------------
 # Честная пост-верификация автоисполнения (2026-08-06)
@@ -12965,10 +13045,28 @@ def _auto_execute_report_is_failure(report_text: str) -> bool:
 # самоотчёту исполнителя.
 #
 # Ключевой принцип (Максим, пункт 3 ТЗ): «не удалось доказать» ≠ «получилось».
-# Поэтому вердиктов ЧЕТЫРЕ, а не два: помимо ok/failed есть "partial" (часть
-# подтвердилась, часть нет) и "unverified" (мутация, возможно, прошла, но мы
-# этого НЕ ДОКАЗАЛИ — журнал пуст, живое чтение недоступно, формат итога не
-# распознан, исключение). "unverified" НИКОГДА не выдаётся за "ok".
+# Поэтому вердиктов ПЯТЬ, а не два: помимо ok/failed есть "partial" (часть
+# подтвердилась, часть нет), "mismatch" (см. ниже) и "unverified" (мутация,
+# возможно, прошла, но мы этого НЕ ДОКАЗАЛИ — журнал пуст, живое чтение
+# недоступно, формат итога не распознан, исключение). "unverified" НИКОГДА не
+# выдаётся за "ok".
+#
+# ВТОРОЙ ДЕФЕКТ (2026-08-06, найден живым прогоном на update_project): у
+# БОЛЬШИНСТВА гейтованных методов (проект/тег/группа/привычка — всё, что
+# гейтуется через `_gate_single`, а не через списочный `_gate_batch`) НЕТ
+# записи в журнал мутаций вообще — журналируются только операции над задачами
+# (`_op_journal`). Для них независимая перепроверка ниже СТРУКТУРНО никогда
+# не найдёт запись, и старое правило («нет журнала → unverified») давало
+# «❓ не подтверждено» на КАЖДОЙ успешной операции этого класса, хотя сам
+# исполнитель уже доказал результат собственным (обязательным по стандарту)
+# post-verify. Раз журнала нет, а голова самоотчёта исполнителя — ✅ (реальное
+# доказательство, не хвастовство — см. `_auto_execute_report_is_success`),
+# верим ЕЙ, а не молчанию журнала: verdict="ok" с честной оговоркой в
+# основании («журнал недоступен, но эффект подтверждён отдельным чтением»).
+# Если же голова самоотчёта — ❌ (тот же обязательный post-verify нашёл
+# расхождение), это НАСТОЯЩИЙ провал — verdict="mismatch", а не "unverified":
+# путать «не доказано» и «доказано, что не сработало» — та же нечестность в
+# другую сторону.
 #
 # ЧЕСТНОЕ ОГРАНИЧЕНИЕ: `_build_operation_report` умеет выносить вердикт не для
 # всех типов операций. Для незнакомого `op` его построчный `_verify_item()`
@@ -13065,9 +13163,19 @@ def _strip_trailing_independent_report(text: str) -> str:
     return stripped if stripped.strip() else text
 
 
-_VERDICT_EMOJI = {"ok": "✅", "partial": "⚠️", "failed": "🛑", "unverified": "❓"}
+# "mismatch" — НОВЫЙ пятый вердикт (2026-08-06, дефект №1, пункт 2 ТЗ
+# Максима): собственный post-verify исполнителя (не журнал — журнала для
+# этого тула нет) нашёл расхождение. Эмодзи ❌, а не 🛑 — по замороженной
+# легенде (output-format.md §7.2) 🛑 значит «ничего не изменено», а ❌ значит
+# «не получилось, либо пруф показал несоответствие»: мутация здесь РЕАЛЬНО
+# происходила, просто не сошлась с ожиданием — это не то же самое, что отказ
+# ДО мутации ("failed", когда исполнитель сам написал «🛑 Автоисполнение
+# отменено…» и ничего не менял).
+_VERDICT_EMOJI = {"ok": "✅", "partial": "⚠️", "mismatch": "❌",
+                  "failed": "🛑", "unverified": "❓"}
 _VERDICT_WORD = {"ok": "подтверждено живым чтением",
                  "partial": "подтверждено частично",
+                 "mismatch": "расхождение с ожидаемым результатом",
                  "failed": "не выполнено",
                  "unverified": "НЕ подтверждено (проверить не удалось)"}
 
@@ -13126,9 +13234,10 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
                                   exec_output: str) -> Tuple[str, str]:
     """Возвращает (полный_markdown_отчёта, verdict).
 
-    verdict ∈ {"ok", "partial", "failed", "unverified"} — см. блок-комментарий
-    выше. Ничего не обрезает: длину теперь держит чанкинг в tg_approval
-    (`send_message_chunked`), а не молчаливое обрезание отчёта по 4096."""
+    verdict ∈ {"ok", "partial", "mismatch", "failed", "unverified"} — см.
+    блок-комментарий выше. Ничего не обрезает: длину теперь держит чанкинг в
+    tg_approval (`send_message_chunked`), а не молчаливое обрезание отчёта по
+    4096."""
     exec_output = exec_output or ""
 
     # 1. Независимая перепроверка. Сама `_build_operation_report` ловит свои
@@ -13172,8 +13281,26 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
     report_doubt = report_usable and any(
         mark in independent for mark in _REPORT_DOUBT_MARKERS)
 
+    # НОВОЕ (2026-08-06, дефект №1, пункт 1-2 ТЗ Максима). Голова
+    # САМОотчёта исполнителя — ✅/❌ — используется как источник истины
+    # ТОЛЬКО когда журналу нечем ни подтвердить, ни опровергнуть операцию
+    # (totals is None: записи нет / журнал недоступен / формат не
+    # распознан / перепроверка упала). Когда totals ЕСТЬ, журнал остаётся
+    # старшим источником — эта ветка его не трогает вообще.
+    self_head = exec_self.lstrip().lstrip("#").lstrip()
+    self_proves_ok = self_head.startswith("✅") and not exec_warn
+    self_proves_mismatch = self_head.startswith("❌")
+    self_verified_no_journal = False  # для basis ниже: "ok" пришёл САМ, без журнала
+
     if exec_failed:
         verdict = "failed"
+    elif totals is None and self_proves_mismatch:
+        # Исполнитель НЕ отказался (иначе сработала бы ветка exec_failed
+        # выше) — он реально что-то поменял и его собственный обязательный
+        # post-verify нашёл расхождение. Это провал ПОСЛЕ мутации, а не «мы
+        # не смогли доказать» — честная разница между "unverified" и
+        # "mismatch" (см. блок-комментарий выше).
+        verdict = "mismatch"
     else:
         verdict = _verdict_from_totals(totals)
         # Даунгрейд, но НИКОГДА не апгрейд: сомнение исполнителя (⚠️/⏭/«не
@@ -13183,6 +13310,14 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
         # ничего).
         if verdict == "ok" and (exec_warn or report_doubt):
             verdict = "partial"
+        if verdict == "unverified" and totals is None and self_proves_ok:
+            # Журналу нечем подтвердить (нет записи для этого класса
+            # тулов/недоступен/формат не распознан), но сам исполнитель уже
+            # доказал результат ОТДЕЛЬНЫМ обязательным по стандарту
+            # живым чтением — молчание журнала здесь не повод звать это
+            # "не знаю". См. `_auto_execute_report_is_success`.
+            verdict = "ok"
+            self_verified_no_journal = True
 
     # 3. Полный markdown: оба раздела целиком + честное основание вердикта.
     if independent is None:
@@ -13191,7 +13326,23 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
     else:
         independent_block = independent
 
-    if totals is not None:
+    if self_verified_no_journal:
+        basis = ("Основание вердикта: собственное живое чтение исполнителя "
+                 "(обязательный post-verify после КАЖДОЙ мутации, "
+                 "output-format.md §7.2) подтвердило результат — "
+                 "расхождений в его отчёте нет. Журнал мутаций для этой "
+                 "операции недоступен как источник независимого "
+                 "постфактум-аудита, но это НЕ равно «не сработало»: "
+                 "эффект уже подтверждён отдельным прямым чтением, просто "
+                 "не журналом.")
+    elif verdict == "mismatch":
+        basis = ("Основание вердикта: собственное живое чтение исполнителя "
+                 "нашло расхождение с ожидаемым результатом (детали — в "
+                 "разделе «Что сделал исполнитель» выше). Журнал мутаций для "
+                 "этой операции недоступен, но самоотчёт исполнителя уже "
+                 "доказывает исход напрямую — это настоящий провал, а не "
+                 "«не удалось проверить».")
+    elif totals is not None:
         basis = (f"Основание вердикта: независимая перепроверка живым чтением — "
                  f"✅ {totals[0]} подтверждено, ⚠️ {totals[1]} не проверено, "
                  f"❌ {totals[2]} расхождений.")
@@ -13204,11 +13355,15 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
                       "понижен.")
     elif not report_usable:
         basis = ("Основание вердикта: независимую перепроверку выполнить НЕ "
-                 "удалось (журнал/живое состояние недоступны) — исход операции "
-                 "НЕ ПОДТВЕРЖДЁН. Это не то же самое, что «успешно».")
+                 "удалось (журнал/живое состояние недоступны), и собственный "
+                 "отчёт исполнителя тоже не доказывает результат — исход "
+                 "операции НЕ ПОДТВЕРЖДЁН. Это не то же самое, что «успешно»."
+                 )
     else:
         basis = ("Основание вердикта: формат итоговой строки независимого "
-                 "отчёта не распознан — считаем исход НЕ ПОДТВЕРЖДЁННЫМ.")
+                 "отчёта не распознан, и собственный отчёт исполнителя тоже "
+                 "не доказывает результат — считаем исход НЕ "
+                 "ПОДТВЕРЖДЁННЫМ.")
     if exec_failed:
         basis = ("Основание вердикта: исполнитель сам отрапортовал провал "
                  "(в его отчёте есть маркер ошибки и ни одного ✅). " + basis)

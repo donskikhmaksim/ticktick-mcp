@@ -9,8 +9,13 @@
 покрыт отдельно).
 
 Главный инвариант, ради которого всё это писалось: "ok" выдаётся ТОЛЬКО когда
-независимое живое чтение реально подтвердило всё (расхождений 0 И
-подтверждённых > 0). Любая неопределённость — "unverified", никогда не "ok".
+ЕСТЬ реальное живое доказательство — журнальное (расхождений 0 И
+подтверждённых > 0) ИЛИ, когда журнала для этого класса тулов нет вообще
+(single-gate методы вроде update_project — см. 2026-08-06, дефект №1),
+собственный обязательный post-verify исполнителя. Любая неопределённость,
+не подкреплённая НИ ОДНИМ из двух, — "unverified", никогда не "ok". Провал,
+доказанный ЛЮБЫМ из двух источников (журнал ИЛИ собственный post-verify
+исполнителя), — "failed"/"mismatch", никогда не смягчается до "unverified".
 """
 import pytest
 
@@ -233,40 +238,121 @@ def test_forged_total_in_a_title_cannot_upgrade_a_failure(monkeypatch):
 
 
 def test_unverified_when_independent_check_raises(monkeypatch):
+    """exec_output НЕ претендует на собственное доказательство (нет ✅ в
+    голове) — значит ни журнал (упал), ни самоотчёт исполнителя ничего не
+    подтверждают. Честное "unverified" (пункт 3 ТЗ Максима — третий исход)."""
     _patch_report(monkeypatch, RuntimeError("live read down"))
     md, verdict = s._verified_auto_execute_report(
-        "m1", "delete_tasks", "✅ Удалено 2 задачи")
+        "m1", "delete_tasks", "Удалено 2 задачи")
     assert verdict == "unverified"
     assert "live read down" in md
 
 
-def test_unverified_when_journal_has_no_records(monkeypatch):
+def test_ok_when_own_report_proves_success_and_journal_has_no_records(monkeypatch):
+    """ГЛАВНЫЙ регресс-тест дефекта №1 (живой прогон 2026-08-06 на
+    update_project, манифест eb77e4e758c7): у single-gate методов
+    (update_project/create_project/create_tag/… — всё, что идёт через
+    `_gate_single`, а не `_gate_batch`) журнала мутаций НЕТ вообще — только
+    задачи журналируются через `_op_journal`. До этой правки «В журнале нет
+    записей» ВСЕГДА давало verdict="unverified", даже когда исполнитель уже
+    доказал результат собственным (обязательным по стандарту) post-verify —
+    ровно эта голова ("### ✅ ... (проверено)") и есть то доказательство.
+    Теперь такой self-report при отсутствующем журнале даёт "ok", а не
+    молчаливое «не знаю»."""
+    _patch_report(monkeypatch,
+                  "🧾 В журнале нет записей по m1 — операция не исполнялась.")
+    exec_self = ("### ✅ Проект «X» → «Y» обновлён (проверено)\n\n"
+                 "id: p1\nname: Y\n\n"
+                 "🧾 Проверено: все изменённые поля подтверждены отдельным "
+                 "живым чтением TickTick.")
+    md, verdict = s._verified_auto_execute_report("m1", "update_project", exec_self)
+    assert verdict == "ok"
+    # Шапка обязана звучать как успех, а не как провал (Максим: «это НЕ
+    # должно выглядеть как провал»).
+    assert md.startswith("### ✅")
+    assert "не выполнено" not in md.split("\n", 1)[0]
+    # Честная оговорка про журнал — ОТДЕЛЬНОЙ строкой, не в заголовке.
+    assert "журнал" in md.lower() and "недоступ" in md.lower()
+    assert "не сработало" not in md or "НЕ равно" in md
+
+
+def test_unverified_when_journal_has_no_records_and_own_report_does_not_prove_it(
+        monkeypatch):
+    """Обратная сторона предыдущего теста: журнала нет, но и сам исполнитель
+    ничего не доказывает (никакого ✅ в голове его отчёта) — тогда честный
+    исход по-прежнему "unverified", а не "ok" на пустом месте."""
     _patch_report(monkeypatch,
                   "🧾 В журнале нет записей по m1 — операция не исполнялась.")
     _, verdict = s._verified_auto_execute_report(
-        "m1", "delete_tasks", "✅ Удалено 2 задачи")
+        "m1", "delete_tasks", "Удалено 2 задачи")
     assert verdict == "unverified"
 
 
+def test_unverified_when_own_report_hedges_and_journal_has_no_records(monkeypatch):
+    """Голова самоотчёта — ⚠️ (исполнитель САМ не смог перепроверить, см.
+    `_UNVERIFIED_MSG`), а не ✅. Это тоже «ни живое чтение, ни журнал» —
+    честное "unverified", апгрейд до "ok" здесь запрещён."""
+    _patch_report(monkeypatch,
+                  "🧾 В журнале нет записей по m1 — операция не исполнялась.")
+    exec_self = ("### ⚠️ Проект «X» обновлён, но НЕ подтверждён\n\n"
+                 "⚠️ Исход НЕ ПОДТВЕРЖДЁН — состояние TickTick недоступно, "
+                 "проверь вручную.")
+    _, verdict = s._verified_auto_execute_report("m1", "update_project", exec_self)
+    assert verdict == "unverified"
+
+
+def test_mismatch_when_own_report_finds_a_discrepancy_and_journal_has_no_records(
+        monkeypatch):
+    """Пункт 2 ТЗ Максима, третья ветка 3-way split: собственный post-verify
+    исполнителя (журнала для этого тула нет) нашёл РАСХОЖДЕНИЕ (голова его
+    отчёта — ❌). Это настоящий провал — "mismatch" (❌), а НЕ "unverified"
+    (❓): путать «не доказано» и «доказано, что не сработало» — нечестность
+    в другую сторону от исходного дефекта."""
+    _patch_report(monkeypatch,
+                  "🧾 В журнале нет записей по m1 — операция не исполнялась.")
+    exec_self = ("### ❌ Проект «X» обновлён частично — расхождение\n\n"
+                 "id: p1\nname: X (не изменилось)\n\n"
+                 "🧾 Проверка: name: ожидалось «Y», сейчас «X».")
+    md, verdict = s._verified_auto_execute_report("m1", "update_project", exec_self)
+    assert verdict == "mismatch"
+    assert md.startswith("### ❌")
+    assert "расхожд" in md.split("\n", 1)[0].lower()
+
+
 def test_unverified_when_live_state_unavailable(monkeypatch):
+    """Независимая перепроверка недоступна (не «нет записи», а «живое
+    состояние не читается»), и сам исполнитель тоже ничего не доказывает —
+    честное "unverified" по-прежнему."""
     _patch_report(monkeypatch,
                   "### 🧾 Отчёт по `m1` невозможен\n⚠️ Живое состояние "
                   "TickTick недоступно — исход НЕ ПОДТВЕРЖДЁН.")
     _, verdict = s._verified_auto_execute_report(
-        "m1", "delete_tasks", "✅ Удалено 2 задачи")
+        "m1", "delete_tasks", "Удалено 2 задачи")
     assert verdict == "unverified"
+
+
+def test_ok_when_own_report_proves_success_even_if_independent_check_raises(
+        monkeypatch):
+    """Правило работает НЕЗАВИСИМО от ПРИЧИНЫ, по которой у журнала нет
+    ответа (нет записи / формат не распознан / перепроверка упала
+    исключением) — во всех случаях totals=None одинаково, и самодоказанный
+    ✅ исполнителя одинаково перевешивает молчание журнала."""
+    _patch_report(monkeypatch, RuntimeError("live read down"))
+    exec_self = "### ✅ Тег «домашние» создан (проверено)\n\n🧾 Подтверждено."
+    _, verdict = s._verified_auto_execute_report("m1", "create_tag", exec_self)
+    assert verdict == "ok"
 
 
 def test_unverified_when_report_format_unrecognised(monkeypatch):
     _patch_report(monkeypatch, "какой-то новый формат отчёта без итоговой строки")
     _, verdict = s._verified_auto_execute_report(
-        "m1", "delete_tasks", "✅ Удалено 2 задачи")
+        "m1", "delete_tasks", "Удалено 2 задачи")
     assert verdict == "unverified"
 
 
 def test_unverified_when_report_is_empty(monkeypatch):
     _patch_report(monkeypatch, "")
-    _, verdict = s._verified_auto_execute_report("m1", "delete_tasks", "✅ ок")
+    _, verdict = s._verified_auto_execute_report("m1", "delete_tasks", "ок")
     assert verdict == "unverified"
 
 
