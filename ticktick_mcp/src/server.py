@@ -451,10 +451,23 @@ async def attachment_upload_link(request: Request) -> Response:
 # Single source of truth for TickTick's priority levels (0/1/3/5).
 PRIORITY_MAP = {0: "None", 1: "Low", 3: "Medium", 5: "High"}
 
+# ...and for its task statuses. -1 ("won't do" / abandoned) is absent from the
+# official API docs but very much present in the data — get_task_info's v2
+# branch already mapped it. format_task used to test `status == 2` and call
+# EVERYTHING else "Active", so an abandoned task was reported as active. Any
+# status this map doesn't know must stay visible as unknown rather than fall
+# into the same silent "Active" bucket.
+STATUS_MAP = {0: "Active", 2: "Completed", -1: "Won't do (abandoned)"}
+
 
 # Format a task object from TickTick for better display
-def format_task(task: Dict) -> str:
-    """Format a task into a human-readable string (title first, ids at the end)."""
+def format_task(task: Dict, trash_state: Optional[bool] = None) -> str:
+    """Format a task into a human-readable string (title first, ids at the end).
+
+    trash_state: True = caller VERIFIED the task sits in the trash, False =
+    verified it does not, None = not checked (the default — the official v1
+    API carries no deletion flag at all, so most callers simply cannot know).
+    """
     formatted = f"Title: {task.get('title', 'No title')}\n"
 
     # Dates are printed in the OWNER's zone (_local_datetime_str), never as the
@@ -471,21 +484,27 @@ def format_task(task: Dict) -> str:
     priority = task.get('priority', 0)
     formatted += f"Priority: {PRIORITY_MAP.get(priority, str(priority))}\n"
     
-    # Add status if available
-    status = "Completed" if task.get('status') == 2 else "Active"
-    formatted += f"Status: {status}\n"
-    
+    # Status. A trashed task keeps whatever status it had before deletion, so
+    # printing that field alone ("Active") is a lie about a task in the bin —
+    # the deletion has to lead, with the raw field kept for reference.
+    raw_status = task.get('status', 0)
+    status = STATUS_MAP.get(raw_status, f"Unknown (raw: {raw_status})")
+    if trash_state is True:
+        formatted += f"Status: IN TRASH (deleted) — status field says «{status}»\n"
+    else:
+        formatted += f"Status: {status}\n"
+
     # Add content if available
     if task.get('content'):
         formatted += f"\nContent:\n{task.get('content')}\n"
-    
+
     # Add subtasks if available
     items = task.get('items', [])
     if items:
         formatted += f"\nSubtasks ({len(items)}):\n"
         for i, item in enumerate(items, 1):
-            status = "✓" if item.get('status') == 1 else "□"
-            formatted += f"{i}. [{status}] {item.get('title', 'No title')}\n"
+            mark = "✓" if item.get('status') == 1 else "□"
+            formatted += f"{i}. [{mark}] {item.get('title', 'No title')}\n"
 
     # Ids last — needed for follow-up calls, but not the headline.
     formatted += f"(id: {task.get('id', '?')} | project: {task.get('projectId', '?')})\n"
@@ -1481,11 +1500,55 @@ async def get_project_tasks(project_id: str) -> str:
         logger.error(f"Error in get_project_tasks: {e}")
         return f"Error retrieving project tasks: {str(e)}"
 
+# v2's trash endpoint caps a page at 500; ask for the whole page so "not in the
+# trash" is as close to a full answer as one request can be.
+_TRASH_SCAN_LIMIT = 500
+
+
+async def _trash_state(task_id: str) -> tuple:
+    """Is this task in the trash — and could that even be checked?
+
+    The official v1 API does not know. GET /project/{pid}/task/{tid} happily
+    returns a DELETED task's object with no deletion flag anywhere in it, which
+    is exactly how get_task came to print "Status: Active" about two tasks
+    sitting in the bin. The only source of truth is the v2 trash listing, and it
+    costs ONE extra GET /project/all/trash/pagination per get_task call.
+
+    That price is paid on purpose: get_task is the point-lookup tool people use
+    as PROOF about a single task (not a loop over a list — format_task's other
+    callers get trash_state=None and pay nothing), and staying silent here reads
+    as "definitely not deleted", a claim the source never made.
+
+    Returns (in_trash, note):
+      (True,  "")     found in the trash;
+      (False, "")     trash read in full, not there;
+      (False, note)   only the most recent page was read — older trash unchecked;
+      (None,  note)   could not check at all (v2 unavailable / read failed).
+    """
+    unknown = ("Trash: NOT CHECKED — the official API carries no deletion flag, "
+               "so this task could be in the trash and still read as above.\n")
+    if not ticktick_v2:
+        return None, unknown
+    try:
+        trashed = await _run_blocking(lambda: ticktick_v2.get_trash(_TRASH_SCAN_LIMIT))
+    except Exception as e:
+        logger.warning(f"get_task: trash check failed: {e}")
+        return None, unknown
+    if any(t.get("id") == task_id for t in (trashed or [])):
+        return True, ""
+    if len(trashed or []) >= _TRASH_SCAN_LIMIT:
+        return False, (f"Trash: not among the {_TRASH_SCAN_LIMIT} most recently "
+                       "deleted tasks; older trash was not checked.\n")
+    return False, ""
+
+
 @mcp.tool(annotations=READONLY)
 async def get_task(project_id: str, task_id: str) -> str:
     """
-    Get details about a specific task.
-    
+    Get details about a specific task. The Status line is cross-checked against
+    the trash (v2), because the official API reports a deleted task as if it
+    were still live; when that check is impossible the output says so.
+
     Args:
         project_id: ID of the project
         task_id: ID of the task
@@ -1493,13 +1556,14 @@ async def get_task(project_id: str, task_id: str) -> str:
     err = _ensure_official()
     if err:
         return err
-    
+
     try:
         task = await _run_blocking(lambda: ticktick.get_task(project_id, task_id))
         if 'error' in task:
             return f"Error fetching task: {task['error']}"
-        
-        return format_task(task)
+
+        in_trash, note = await _trash_state(task_id)
+        return format_task(task, trash_state=in_trash) + note
     except Exception as e:
         logger.error(f"Error in get_task: {e}")
         return f"Error retrieving task: {str(e)}"
