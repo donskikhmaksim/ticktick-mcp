@@ -26,7 +26,8 @@ from starlette.responses import (JSONResponse, PlainTextResponse, Response,
                                  StreamingResponse)
 
 from .ticktick_client import TickTickClient, _normalize_date
-from .ticktick_v2_client import (ATTACHMENT_MAX_BYTES, TickTickAuthError,
+from .ticktick_v2_client import (ATTACHMENT_MAX_BYTES,
+                                 TRASH_MAX_LIMIT, TickTickAuthError,
                                  TickTickV2Client, id2error_failures,
                                  new_attachment_id)
 from . import declutter_sheet
@@ -10203,24 +10204,47 @@ async def get_trash(limit: int = 50) -> str:
     before restoring), and to_project_id only if you want to override the
     original list it restored to.
 
+    A truncated answer ALWAYS says so and names the real total: the trash page
+    is fetched up to its 500-entry ceiling regardless of `limit`, so "showing
+    50 of 497" can be stated honestly. `limit` therefore controls how much is
+    PRINTED, not how much is known.
+
     Args:
-        limit: Maximum number of trashed tasks to return (default 50, max 500)
+        limit: How many trashed tasks to print (default 50, max 500 — the
+            page ceiling). Anything not printed is announced, never dropped
+            silently.
     """
     err = _ensure_ready()
     if err:
         return err
     try:
-        tasks = await _run_blocking(lambda: ticktick_v2.get_trash(limit))
+        # Always ask for the full page, not `limit`: asking for exactly what we
+        # print makes truncation INVISIBLE — a bare get_trash() used to answer
+        # «Trashed tasks (50):» with nothing else while the trash really held
+        # 497 (live, 2026-08-07). Fetching the ceiling costs the same single
+        # request (restore_tasks already does it) and is what lets the answer
+        # state the true total. «Showing 50» must never read as «there are 50».
+        tasks = await _run_blocking(lambda: ticktick_v2.get_trash(TRASH_MAX_LIMIT))
         if not tasks:
             return "Trash is empty."
-        out = f"Trashed tasks ({len(tasks)}):\n\n"
-        # len(tasks), NOT format_task_list's default 100: the client already
-        # applied the caller's limit when asking TickTick, so a second, hidden
-        # cut here made everything past the 100th entry unreachable by ANY
-        # limit (live: limit=500 → 497 fetched, 100 shown, «...and 397 more»).
-        # The trash is what proves a deletion is reversible — it has to be
-        # readable in full.
-        return out + format_task_list(tasks, limit=len(tasks))
+        show = max(1, min(limit, len(tasks)))
+        # A full page means TickTick had at least that many — the true total is
+        # unknown, so say "500+" rather than inventing an exact number.
+        at_ceiling = len(tasks) >= TRASH_MAX_LIMIT
+        total = f"{TRASH_MAX_LIMIT}+" if at_ceiling else str(len(tasks))
+        if show < len(tasks) or at_ceiling:
+            out = f"Trashed tasks (showing {show} of {total}):\n\n"
+        else:
+            out = f"Trashed tasks ({len(tasks)}):\n\n"
+        # limit=show: the slice is already exact, so format_task_list must not
+        # apply its own hidden 100-entry cut on top (the 2026-08-07 defect).
+        out += format_task_list(tasks[:show], limit=show)
+        rest = len(tasks) - show
+        if rest > 0:
+            out += (f"\n... and {rest}{'+' if at_ceiling else ''} more — "
+                    f"call get_trash(limit={min(len(tasks), TRASH_MAX_LIMIT)}) "
+                    "to see them.")
+        return out
     except Exception as e:
         logger.error(f"Error in get_trash: {e}")
         return f"Error fetching trash: {str(e)}"
