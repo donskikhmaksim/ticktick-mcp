@@ -17,10 +17,21 @@ single call.
 
 2026-08-06: update_project and archive_project joined them (they were the
 last two project-level mutators with no gate at all) — same treatment here,
-their calls go through _gated_call. Note their identity guard
-(_guard_project) now runs inside _update_project_impl/_archive_project_impl,
-i.e. on call #2 against state that is fresh at execute time — so a
-guard-refusal now surfaces from the execute phase, not the plan phase."""
+their calls go through _gated_call.
+
+2026-08-07 (def-116 follow-up, group B): the paragraph that used to be here
+claimed identity guard (_guard_project) "runs inside
+_update_project_impl/_archive_project_impl, i.e. on call #2 ... so a
+guard-refusal now surfaces from the execute phase, not the plan phase" — that
+was true THEN and it was a bug: the plan card on call #1 printed
+project_name straight from the caller with ZERO verification against the id,
+so the owner could read (and approve) a card describing the WRONG project.
+Both tools now call the SAME _guard_project ALSO while building the plan
+(call #1), mirroring move_project_to_group (14907a9) — see the new
+`test_*_plan_identity_guard_*` tests below. `test_update_project_refused_by_
+guard` used to run the FULL plan→execute cycle via `_gated_call` and assert
+the refusal came back from call #2; it has been rewritten to assert the
+refusal on call #1 alone, since that is now where it actually happens."""
 import re
 
 import ticktick_mcp.src.server as s
@@ -171,11 +182,67 @@ async def test_update_project_success_is_post_verified(monkeypatch):
 
 
 async def test_update_project_refused_by_guard(monkeypatch):
+    """2026-08-07 (def-116 follow-up, group B): BEFORE this fix (see this
+    file's module docstring, now updated) — _guard_project's refusal only
+    surfaced from the EXECUTE phase (call #2), so this test used to run the
+    FULL `_gated_call` plan→execute cycle and assert the refusal came back
+    at the end. That was wrong: it meant call #1 built and returned a plan
+    card ("### 📋 План — ...") for a project_id/project_name pair
+    _guard_project itself says doesn't match, and the owner could approve it
+    before the mismatch was ever caught. Now the SAME _guard_project call
+    also runs while BUILDING the plan — so call #1 ALONE refuses, no plan
+    card, no manifest."""
     fake = FakeOfficialUpdate({"id": "p1", "name": "Работа"})
     monkeypatch.setattr(s, "ticktick", fake)
     monkeypatch.setattr(s, "_guard_project", lambda *a, **k: "🛑 Отказ — не та личность.")
-    result = await _gated_call(s.update_project, "Совсем другое", "p1", name="X")
-    assert result.startswith("🛑")
+
+    result = await s.update_project("Совсем другое", "p1", name="X")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "manifest_id" not in result, "план для отказа guard'а строиться не должен"
+    assert fake.get_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-07: plan-phase identity-guard (def-116 follow-up, group B) —
+# project_id↔project_name is now cross-checked BEFORE the plan is built (call
+# #1), not only inside _update_project_impl on execution (call #2,
+# unchanged). Unlike _guard_task, _guard_project has a BINARY outcome
+# (refusal string or None) — no separate "unavailable" soft branch exists
+# (matches move_project_to_group, 14907a9, exactly). These tests leave
+# _guard_project UN-mocked (only _v2_project_names is faked) to exercise the
+# real function end to end, not just the new call site around it.
+# ---------------------------------------------------------------------------
+
+async def test_update_project_plan_identity_guard_blocks_wrong_name(monkeypatch):
+    """project_id resolves to a REAL project ("Личное"), caller's
+    project_name claims a DIFFERENT one ("Работа") — before this fix, call
+    #1 would have built and shown a plan card regardless. Now the plan is
+    refused outright, before any card is built."""
+    fake = FakeOfficialUpdate({"id": "p1", "name": "Работа"})
+    monkeypatch.setattr(s, "ticktick", fake)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Личное"})
+
+    result = await s.update_project("Работа", "p1", name="X")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Личное»" in result
+    assert "manifest_id" not in result
+    assert fake.get_calls == 0
+
+
+async def test_update_project_plan_identity_guard_blocks_missing_project(monkeypatch):
+    """_guard_project(require_known=True) refuses when the id resolves to NO
+    live project name at all — _update_project_impl already refuses this on
+    execution; the plan-phase transfer must refuse just as hard."""
+    fake = FakeOfficialUpdate({"id": "p1", "name": "Работа"})
+    monkeypatch.setattr(s, "ticktick", fake)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {})
+
+    result = await s.update_project("Работа", "p-нет-такого", name="X")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "manifest_id" not in result
     assert fake.get_calls == 0
 
 

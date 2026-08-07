@@ -11668,6 +11668,12 @@ async def update_project(project_name: str, project_id: str, name: str = None,
         manifest_id: from call #1's response — pass on call #2 to actually update
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
+
+    project_id and project_name are cross-checked against the LIVE project
+    list TWICE (same pattern as delete_habit, def-116, 2026-08-07): once
+    while BUILDING the plan (call #1, before anything is shown to the owner)
+    and again, independently, right before the actual update (call #2,
+    unchanged).
     """
     err = _ensure_official()
     if err:
@@ -11686,6 +11692,21 @@ async def update_project(project_name: str, project_id: str, name: str = None,
                         "убери поле. Ничего не тронул.")
         if view_mode is not None and view_mode not in ("list", "kanban", "timeline"):
             return "Invalid view_mode. Must be one of: list, kanban, timeline."
+        # Перенос identity-guard (project_id↔project_name) на построение
+        # плана — тот же _guard_project(..., require_known=True), что уже
+        # стоит в _update_project_impl НА ИСПОЛНЕНИИ, вызванный ТЕМИ ЖЕ
+        # аргументами (см. move_project_to_group, 14907a9). Бинарный исход
+        # (отказ либо ок) — здесь нет отдельной мягкой ветки на «временную
+        # недоступность»: воспроизвожу ТУ ЖЕ строгость, что уже на
+        # исполнении, а не изобретаю смягчение, которого в оригинале нет.
+        # Префикс/хвост сообщения приведены к тому же виду, что у остальных
+        # plan-отказов («План НЕ построен» / «Ничего не изменено») —
+        # текстовая правка отображения, сама сверка не меняется.
+        refuse = _guard_project(project_id, project_name, fresh=True,
+                                require_known=True)
+        if refuse:
+            return (refuse.replace("🛑 Отказ —", "🛑 План НЕ построен —", 1)
+                          .replace("Ничего не тронул.", "Ничего не изменено."))
     params = {"project_name": project_name, "project_id": project_id,
               "name": name, "color": color, "view_mode": view_mode}
     outcome = await _gate_single("update_project", "update_project",

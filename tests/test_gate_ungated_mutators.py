@@ -24,9 +24,10 @@
 молча, поэтому проверяются не по хардкоду в тесте, а по реально переданному
 в `_gate_single` словарю.
 
-Сети нет: оба клиента TickTick подменены «растяжкой» (_TripWire), любое
-обращение к которой валит тест — так вызов #1 доказывает не только «impl не
-позвался», но и «в TickTick вообще не ходили»."""
+Сети нет: оба клиента TickTick подменены заглушкой (`_ReadOnlyStub`, см. её
+докстринг ниже про правку 2026-08-07) — вызов #1 доказывает «impl не
+позвался» и «в TickTick НИЧЕГО НЕ ЗАПИСАНО» (не «TickTick вообще не
+трогали» — с 2026-08-07 это уже не так, см. ниже)."""
 import inspect
 import re
 
@@ -41,17 +42,59 @@ def _extract_manifest_id(preview: str) -> str:
     return m.group(1)
 
 
-class _TripWire:
-    """Заглушка вместо клиента TickTick: ЛЮБОЕ обращение к атрибуту — это
-    попытка сходить в сеть, и на фазе плана её быть не должно."""
+_DEFAULT_PROJECTS = [{"id": "p1", "name": "Работа"}]
+_DEFAULT_TASKS = [{"id": "t1", "title": "Купить молоко", "projectId": "p1"}]
 
-    def __init__(self, label: str):
+
+class _ReadOnlyStub:
+    """2026-08-07 (def-116 follow-up, group B): ЗАМЕНА прежней `_TripWire`.
+
+    ДО этой правки `_TripWire` валила тест на ЛЮБОЕ обращение к атрибуту —
+    это было корректно, пока вызов #1 (план) для этих трёх тулов был
+    буквально read-free: identity-guard стоял только в `_<tool>_impl`
+    (исполнение), а он в этом файле ВСЕГДА подменён `_ImplSpy` и потому не
+    вызывается на call #1 вовсе. После группы B (см. коммит этого файла):
+    abandon_task/update_project/archive_project ТЕПЕРЬ сверяют
+    task_id/project_id с ЖИВЫМ состоянием (_guard_task/_guard_project) уже на
+    этапе ПЛАНА — той же логикой, что уже стояла на исполнении, перенесённой
+    раньше по времени (тот же перенос, что для create_subtask/
+    unset_task_parent/move_project_to_group и остальных 6 методов этой
+    ветки). `_TripWire` поэтому стала неверным тестовым допущением — «план
+    read-free» было СЛЕДСТВИЕМ отсутствия identity-guard на плане, а не
+    намеренным свойством дизайна (тот же вывод, что и в delete_habit/
+    ea2a47c: «план в TickTick не ходит вовсе» фиксировало баг, а не защищало
+    от него).
+
+    `_ReadOnlyStub` сохраняет ИСХОДНЫЙ смысл проверки — «вызов #1 не мутирует
+    TickTick» — но перестаёт путать «не мутирует» с «не читает»: отдаёт
+    ТОЛЬКО read-методы, которыми реально пользуются `_guard_task`/
+    `_guard_project` при построении плана (`get_state`/`get_open_tasks`/
+    `invalidate_cache`/`get_projects`), и по-прежнему валит тест на ЛЮБОЙ
+    другой атрибут (в т.ч. любой WRITE-метод) — та же страховка, что была у
+    `_TripWire`, просто больше не путает чтение ради сверки личности с
+    записью. `projects`/`tasks` по умолчанию совпадают с `_SPECS` ниже, так
+    что все ОБЫЧНЫЕ тесты файла (гейт/manifest/automation_key — не про
+    identity-guard) видят СОВПАДАЮЩУЮ пару и план строится штатно; тесты
+    identity-guard передают свои (несовпадающие/пустые) данные."""
+
+    def __init__(self, label: str, projects=None, tasks=None):
         self.label = label
+        self._projects = projects if projects is not None else list(_DEFAULT_PROJECTS)
+        self._tasks = tasks if tasks is not None else list(_DEFAULT_TASKS)
 
     def __getattr__(self, name):
+        if name == "get_state":
+            return lambda force=False: {"projectProfiles": list(self._projects)}
+        if name == "get_open_tasks":
+            return lambda: list(self._tasks)
+        if name == "invalidate_cache":
+            return lambda: None
+        if name == "get_projects":
+            return lambda: list(self._projects)
         raise AssertionError(
             f"фаза плана обратилась к {self.label}.{name} — вызов #1 обязан "
-            "быть полностью read-free/сетевo-free")
+            "быть МУТАЦИЯ-free (чтение ради identity-guard — ожидаемо и "
+            "разрешено этой заглушкой, запись — нет)")
 
 
 class _ImplSpy:
@@ -66,18 +109,20 @@ class _ImplSpy:
         return "### ✅ выполнено (spy)"
 
 
-def _wire_clients(monkeypatch):
-    monkeypatch.setattr(s, "ticktick", _TripWire("ticktick"))
-    monkeypatch.setattr(s, "ticktick_v2", _TripWire("ticktick_v2"))
+def _wire_clients(monkeypatch, projects=None, tasks=None):
+    monkeypatch.setattr(s, "ticktick",
+                        _ReadOnlyStub("ticktick", projects, tasks))
+    monkeypatch.setattr(s, "ticktick_v2",
+                        _ReadOnlyStub("ticktick_v2", projects, tasks))
     monkeypatch.setattr(s, "_ensure_ready", lambda: None)
     monkeypatch.setattr(s, "_ensure_official", lambda: None)
 
 
-def _wire(monkeypatch, tool_name: str) -> _ImplSpy:
-    """Клиенты — растяжка, исполнитель — шпион. monkeypatch.setattr здесь
-    заодно и проверка существования `_<tool_name>_impl`: если функцию
+def _wire(monkeypatch, tool_name: str, projects=None, tasks=None) -> _ImplSpy:
+    """Клиенты — read-only заглушка, исполнитель — шпион. monkeypatch.setattr
+    здесь заодно и проверка существования `_<tool_name>_impl`: если функцию
     переименовали, тест падает прямо тут."""
-    _wire_clients(monkeypatch)
+    _wire_clients(monkeypatch, projects, tasks)
     spy = _ImplSpy()
     monkeypatch.setattr(s, f"_{tool_name}_impl", spy)
     return spy
@@ -388,5 +433,32 @@ async def test_update_project_bad_view_mode_refused_before_gate(monkeypatch):
     spy = _wire(monkeypatch, "update_project")
     result = await s.update_project("Работа", "p1", view_mode="галерея")
     assert "Invalid view_mode" in result
+    assert "manifest_id" not in result
+    assert spy.calls == []
+
+
+# ===========================================================================
+# 2026-08-07: plan-phase identity-guard (def-116 follow-up, group B) —
+# update_project's project_id↔project_name is now cross-checked BEFORE the
+# plan is built too (see server.py and tests/test_slice6_projects.py's own
+# `test_update_project_plan_identity_guard_*` for the wrong-name/missing
+# cases). This one extra check belongs HERE because it needs THIS file's
+# automation_key/_SPECS plumbing: a valid automation_key runs on the FIRST
+# call with no plan card and no Telegram button ever shown, so if the
+# identity check only lived inside _gate_single/execution, a false
+# project_id/project_name pair would sail through silently on a single valid
+# key. The check sits BEFORE _gate_single, so it applies here too.
+# ===========================================================================
+
+async def test_update_project_automation_key_mismatch_is_refused_before_plan(monkeypatch):
+    spy = _wire(monkeypatch, "update_project",
+               projects=[{"id": "p1", "name": "Личное"}])
+    monkeypatch.setattr(s, "SECRET", "test-secret")
+
+    result = await s.update_project("Работа", "p1", name="X",
+                                    automation_key="test-secret")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Личное»" in result
     assert "manifest_id" not in result
     assert spy.calls == []
