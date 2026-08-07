@@ -511,6 +511,38 @@ def format_task(task: Dict, trash_state: Optional[bool] = None) -> str:
     formatted += f"(id: {task.get('id', '?')} | project: {task.get('projectId', '?')})\n"
     return formatted
 
+def _identity_or_refusal(obj: Optional[Dict], wanted_id: str, kind: str,
+                         missing: str = "не найдена", hint: str = "") -> Optional[str]:
+    """None if `obj` really is the object with id `wanted_id`; otherwise the
+    refusal text to return to the caller INSTEAD of a formatted card.
+
+    Why this exists: the official v1 API answers an unknown id with an EMPTY
+    body, and `_make_request` turns an empty body into `{}` (its normal
+    convention for 204/empty). `{}` carries no `error` key, so a plain
+    "if 'error' in resp" check let it through into format_task()/
+    format_project(), where every field fell back to a placeholder — «No
+    title», «No name», «(id: ?)» — and format_task's default status 0 printed
+    a cheerful «Status: Active». The result was a plausible card for an object
+    that does not exist, i.e. an answer from which «exists» and «does not
+    exist» are indistinguishable.
+
+    The id check (not just emptiness) is the same invariant
+    `_official_task_snapshot()` already enforces: an object whose id isn't the
+    requested one cannot be printed as an answer ABOUT the requested one.
+    """
+    if not isinstance(obj, dict) or not obj:
+        return (f"🛑 {kind} с id «{wanted_id}» {missing}: TickTick вернул "
+                f"пустой ответ. Такого объекта нет, либо id неверный.\n"
+                f"Карточку не печатаю — выдумывать поля не буду." +
+                (f"\n{hint}" if hint else ""))
+    got = obj.get("id")
+    if got != wanted_id:
+        return (f"🛑 Не подтверждаю: по id «{wanted_id}» TickTick вернул объект "
+                f"с ДРУГИМ id «{got}». Печатать его как запрошенный объект "
+                f"нельзя." + (f"\n{hint}" if hint else ""))
+    return None
+
+
 def _format_folder_line(project: Dict, group_names: Optional[Dict] = None) -> str:
     """The "Folder:" line of format_project().
 
@@ -1549,8 +1581,16 @@ async def get_project(project_id: str) -> str:
 
     try:
         project = await _run_blocking(lambda: ticktick.get_project(project_id))
-        if 'error' in project:
+        if isinstance(project, dict) and 'error' in project:
             return f"Error fetching project: {project['error']}"
+
+        # Тот же отказ, что и в get_task: пустой ответ печатался как проект
+        # «No name / (id: ?)», то есть как существующий.
+        refusal = _identity_or_refusal(
+            project, project_id, "Проект", "не найден",
+            hint="Список живых проектов и их id — get_projects().")
+        if refusal:
+            return refusal
 
         # Folder name comes from the v2 state — resolve it off the event loop
         # instead of letting format_project() do it inline.
@@ -1697,8 +1737,17 @@ async def get_task(project_id: str, task_id: str) -> str:
 
     try:
         task = await _run_blocking(lambda: ticktick.get_task(project_id, task_id))
-        if 'error' in task:
+        if isinstance(task, dict) and 'error' in task:
             return f"Error fetching task: {task['error']}"
+
+        # Пустой/чужой ответ — это ОТКАЗ, а не карточка «No title / Active».
+        refusal = _identity_or_refusal(
+            task, task_id, "Задача", "не найдена",
+            hint=(f"Проверял в проекте «{project_id}» — задача может лежать в "
+                  "другом списке. Попробуй get_task_info(task_id) (ищет по "
+                  "всем спискам, включая завершённые и корзину)."))
+        if refusal:
+            return refusal
 
         in_trash, note = await _trash_state(task_id)
         return format_task(task, trash_state=in_trash) + note
