@@ -7450,9 +7450,16 @@ async def get_all_tasks() -> str:
             out = f"All open tasks ({len(tasks)}):\n\n"
             for pid, ptasks in by_project.items():
                 pname = names.get(pid, pid or "Inbox")
-                top = [t for t in ptasks if not t.get("parentId")]
-                out += f"── {pname} ({len(top)} tasks) ──\n"
-                out += format_task_tree(top, 500)
+                # The WHOLE per-project list goes in, subtasks included:
+                # format_task_tree builds the hierarchy itself (children nested
+                # under their parent, orphans promoted to top level). Handing it
+                # only parent-less tasks — as this did until 2026-08-07 — dropped
+                # every subtask from the output while the header kept counting
+                # them, so the tool under-reported by hundreds of tasks (1477
+                # promised vs 1234 printed) with no marker that anything was
+                # missing. Never pre-filter on parentId here.
+                out += f"── {pname} ({len(ptasks)} tasks) ──\n"
+                out += format_task_tree(ptasks, 500)
                 out += "\n"
             return out
 
@@ -9576,10 +9583,21 @@ async def run_filter(filter: str) -> str:
     if err:
         return err
     try:
-        tasks = await _run_blocking(lambda: ticktick_v2.run_filter(filter))
+        tasks, unsupported = await _run_blocking(
+            lambda: ticktick_v2.run_filter_detailed(filter))
+        # A condition this server cannot evaluate narrows NOTHING, so without
+        # this warning an unfiltered pool reads as a filtered result — exactly
+        # what happened live on 2026-08-07, when «For me» (an `assignee` rule)
+        # returned all 1477 open tasks and looked like a legitimate answer.
+        warning = ""
+        if unsupported:
+            names = ", ".join(f"«{c}»" for c in unsupported)
+            warning = (f"⚠️ Условие {names} этот сервер вычислять не умеет — "
+                       f"фильтрация по нему НЕ применялась, поэтому в списке "
+                       f"могут быть лишние задачи.\n\n")
         if not tasks:
-            return f"Filter '{filter}' matched no open tasks."
-        out = f"Filter '{filter}' — {len(tasks)} task(s):\n\n"
+            return warning + f"Filter '{filter}' matched no open tasks."
+        out = warning + f"Filter '{filter}' — {len(tasks)} task(s):\n\n"
         return out + format_task_tree(tasks)
     except Exception as e:
         logger.error(f"Error in run_filter: {e}")

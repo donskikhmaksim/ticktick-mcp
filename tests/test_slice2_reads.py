@@ -32,9 +32,13 @@ def _fake_official_client(monkeypatch):
 
 
 async def test_get_all_tasks_v2_branch_is_english_not_russian(monkeypatch):
+    # The fixture deliberately includes a SUBTASK (parentId set): the original
+    # version had none, which made it blind to the 2026-08-07 defect where
+    # get_all_tasks dropped every subtask (see test_get_all_tasks_subtasks.py).
     tasks = [
         {"id": "t1", "title": "Позвонить в банк", "projectId": "p1"},
         {"id": "t2", "title": "Купить билеты", "projectId": "p1"},
+        {"id": "t3", "title": "Уточнить реквизиты", "projectId": "p1", "parentId": "t1"},
     ]
     monkeypatch.setattr(
         s, "ticktick_v2",
@@ -43,8 +47,9 @@ async def test_get_all_tasks_v2_branch_is_english_not_russian(monkeypatch):
 
     out = await s.get_all_tasks()
 
-    assert "All open tasks (2):" in out
-    assert "Работа (2 tasks)" in out
+    assert "All open tasks (3):" in out
+    assert "Работа (3 tasks)" in out
+    assert "Уточнить реквизиты" in out
     # regression guard: the old hardcoded Russian strings must be gone
     assert "Задач не найдено" not in out
     assert "Все открытые задачи" not in out
