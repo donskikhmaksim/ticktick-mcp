@@ -27,7 +27,10 @@ _CHILD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "restart_child
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _run(phase, dsn, calls_file, tag="тег-из-плана", data_dir="/tmp", mid=""):
+def _run(phase, dsn, calls_file, *, data_dir, tag="тег-из-плана", mid=""):
+    # `data_dir` — обязательный и именованный: пока у него был запасной «/tmp»,
+    # забытый аргумент уводил журнал мутаций в общий на всю машину файл, где
+    # его дописывали и соседние прогоны.
     env = dict(os.environ)
     env["TEST_CALLS_FILE"] = calls_file
     env["TEST_DATA_DIR"] = data_dir
