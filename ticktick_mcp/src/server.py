@@ -9527,19 +9527,41 @@ async def build_recurrence_rule(frequency: str, interval: int = 1,
         frequency: DAILY, WEEKLY, MONTHLY, or YEARLY
         interval: Repeat every N units (default 1)
         by_day: For weekly rules, days like ["MO","WE","FR"] (optional)
-        count: Stop after this many occurrences (optional)
-        until: Stop on this date YYYY-MM-DD (optional)
+        count: Stop after this many occurrences (optional). Mutually exclusive
+            with `until` (RFC 5545 forbids both in one rule).
+        until: Stop on this date YYYY-MM-DD (optional, INCLUSIVE). Relative
+            words ("tomorrow"/"завтра", a weekday name) are resolved on this
+            server's clock. The date is read as the END of that day in the
+            OWNER's timezone (USER_TIMEZONE) and converted to UTC, so "until
+            2026-08-31" really covers all of 31 August locally.
     """
     freq = frequency.upper()
     if freq not in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY"):
         return "Invalid frequency. Use DAILY, WEEKLY, MONTHLY, or YEARLY."
+    if count and until:
+        return ("Invalid rule: COUNT and UNTIL cannot both be set (RFC 5545). "
+                "Pass either count= (stop after N occurrences) or until= (stop on a date).")
     parts = [f"FREQ={freq}", f"INTERVAL={max(1, interval)}"]
     if by_day:
         parts.append("BYDAY=" + ",".join(d.upper() for d in by_day))
     if count:
         parts.append(f"COUNT={count}")
     if until:
-        parts.append("UNTIL=" + until.replace("-", "") + "T000000Z")
+        # def-D2: раньше здесь было `until.replace("-", "") + "T000000Z"` —
+        # календарная дата владельца объявлялась ПОЛНОЧЬЮ UTC. В
+        # America/Los_Angeles «до 31 августа» становилось 17:00 30 августа по
+        # местному: правило обрывалось на ~7 часов раньше ожидаемого, молча.
+        # Теперь дата читается как КОНЕЦ этого дня в таймзоне владельца и
+        # честно переводится в UTC (RFC 5545 требует UNTIL в UTC при
+        # Z-форме), а неразобранная дата отвергается вместо мусора в правиле.
+        until_resolved = _resolve_relative_date(until.strip())
+        try:
+            d = datetime.strptime(until_resolved, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return (f"Invalid until={until!r}: expected a date as YYYY-MM-DD "
+                    "(or a relative word like 'tomorrow' / 'завтра' / a weekday name).")
+        end_local = datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=_USER_TZ)
+        parts.append("UNTIL=" + end_local.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
     return "RRULE:" + ";".join(parts)
 
 
