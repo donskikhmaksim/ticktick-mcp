@@ -9583,10 +9583,21 @@ async def run_filter(filter: str) -> str:
     if err:
         return err
     try:
-        tasks = await _run_blocking(lambda: ticktick_v2.run_filter(filter))
+        tasks, unsupported = await _run_blocking(
+            lambda: ticktick_v2.run_filter_detailed(filter))
+        # A condition this server cannot evaluate narrows NOTHING, so without
+        # this warning an unfiltered pool reads as a filtered result — exactly
+        # what happened live on 2026-08-07, when «For me» (an `assignee` rule)
+        # returned all 1477 open tasks and looked like a legitimate answer.
+        warning = ""
+        if unsupported:
+            names = ", ".join(f"«{c}»" for c in unsupported)
+            warning = (f"⚠️ Условие {names} этот сервер вычислять не умеет — "
+                       f"фильтрация по нему НЕ применялась, поэтому в списке "
+                       f"могут быть лишние задачи.\n\n")
         if not tasks:
-            return f"Filter '{filter}' matched no open tasks."
-        out = f"Filter '{filter}' — {len(tasks)} task(s):\n\n"
+            return warning + f"Filter '{filter}' matched no open tasks."
+        out = warning + f"Filter '{filter}' — {len(tasks)} task(s):\n\n"
         return out + format_task_tree(tasks)
     except Exception as e:
         logger.error(f"Error in run_filter: {e}")

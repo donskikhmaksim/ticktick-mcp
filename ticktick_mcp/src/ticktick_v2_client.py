@@ -889,8 +889,18 @@ class TickTickV2Client:
 
     # ---- smart-list (filter) execution -----------------------------------
     def run_filter(self, filter_id_or_name: str) -> List[Dict]:
+        """Matching open tasks only. Prefer run_filter_detailed() where the
+        caller can tell the user that part of the rule was not applied."""
+        return self.run_filter_detailed(filter_id_or_name)[0]
+
+    def run_filter_detailed(self, filter_id_or_name: str) -> tuple:
         """Fetch all open tasks and return those matching a saved filter's rule,
-        which TickTick evaluates client-side (no server endpoint exists)."""
+        which TickTick evaluates client-side (no server endpoint exists).
+
+        Returns (tasks, unsupported_conditions). The second element names the
+        rule conditions this client could not evaluate; those conditions
+        narrowed nothing, so the caller MUST say so rather than present the
+        result as fully filtered."""
         filters = self.get_filters()
         flt = next((f for f in filters
                     if f.get("id") == filter_id_or_name
@@ -906,8 +916,11 @@ class TickTickV2Client:
         # map projectId -> groupId for listOrGroup conditions
         proj_group = {p["id"]: p.get("groupId") for p in
                       (state.get("projectProfiles", []) or [])}
+        owner_id = self._owner_user_id()  # resolves the `assignee: me` token
         tasks = state.get("syncTaskBean", {}).get("update", []) or []
-        return [t for t in tasks if _rule_matches(t, rule, inbox, proj_group)]
+        matched = [t for t in tasks
+                   if _rule_matches(t, rule, inbox, proj_group, owner_id)]
+        return matched, rule_unsupported_conditions(rule)
 
     # ---- tag write ops ---------------------------------------------------
     def create_tag(self, name: str, color: str = None) -> Dict:
@@ -1065,28 +1078,93 @@ class TickTickV2Client:
 
 # ---- filter rule evaluation (client-side, mirrors the TickTick web app) ----
 
-def _rule_matches(task: Dict, rule: Dict, inbox: str, proj_group: Dict) -> bool:
+# Conditions this client can actually evaluate. Anything outside this set is
+# NOT quietly treated as "matches everything" — see rule_unsupported_conditions
+# and the warning run_filter's caller prints.
+SUPPORTED_FILTER_CONDITIONS = frozenset({
+    "list", "listOrGroup", "tag", "priority", "dueDate", "assignee",
+})
+
+
+def _node_children(node: Dict):
+    """(items, combine) for one rule node — the single place that knows how a
+    node exposes its children, shared by the matcher and by the static
+    unsupported-condition scan so the two cannot drift apart."""
+    items = node.get("or")
+    if items is None:
+        return (node.get("and") or []), all
+    return items, any
+
+
+def rule_unsupported_conditions(rule: Dict) -> List[str]:
+    """Condition names present in a saved filter's rule that this client
+    cannot evaluate (in rule order, de-duplicated).
+
+    Read STATICALLY off the rule, not collected while matching: `all`/`any`
+    short-circuit, and an empty task list would evaluate no leaf at all, so a
+    match-time collection would report an unsupported condition only
+    sometimes. The caller uses this to tell the user their result is NOT
+    filtered by that condition instead of passing a full pool off as a
+    filtered one."""
+    found: List[str] = []
+
+    def walk(node: Dict) -> None:
+        items, _ = _node_children(node)
+        if not items:
+            return
+        if isinstance(items[0], dict):
+            for it in items:
+                walk(it)
+            return
+        name = node.get("conditionName")
+        if name not in SUPPORTED_FILTER_CONDITIONS and name not in found:
+            found.append(name)
+
+    for group in (rule.get("and") or []):
+        walk(group)
+    return found
+
+
+def _rule_matches(task: Dict, rule: Dict, inbox: str, proj_group: Dict,
+                  owner_id=None) -> bool:
     groups = rule.get("and") or []
     if not groups:
         return True  # empty rule = everything
-    return all(_node_matches(task, g, inbox, proj_group) for g in groups)
+    return all(_node_matches(task, g, inbox, proj_group, owner_id) for g in groups)
 
 
-def _node_matches(task: Dict, node: Dict, inbox: str, proj_group: Dict) -> bool:
-    items = node.get("or")
-    combine = any
-    if items is None:
-        items = node.get("and") or []
-        combine = all
+def _node_matches(task: Dict, node: Dict, inbox: str, proj_group: Dict,
+                  owner_id=None) -> bool:
+    items, combine = _node_children(node)
     if not items:
         return True
     # Nested condition objects → recurse.
     if items and isinstance(items[0], dict):
-        return combine(_node_matches(task, it, inbox, proj_group) for it in items)
-    return _leaf_matches(task, node.get("conditionName"), items, inbox, proj_group)
+        return combine(_node_matches(task, it, inbox, proj_group, owner_id) for it in items)
+    return _leaf_matches(task, node.get("conditionName"), items, inbox, proj_group,
+                         owner_id)
 
 
-def _leaf_matches(task, name, values, inbox, proj_group) -> bool:
+def _assignee_matches(task, values, owner_id) -> bool:
+    """TickTick's `assignee` condition. Values are the web app's own tokens:
+    'noassignee' (nobody assigned), 'me' (the account owner), or a member's
+    numeric userId. Ids are compared as strings — the sync payload is not
+    consistent about int vs str."""
+    assignee = task.get("assignee")
+    unassigned = assignee in (None, "", 0)
+    for v in values:
+        if v == "noassignee":
+            if unassigned:
+                return True
+        elif v == "me":
+            if not unassigned and owner_id is not None and str(assignee) == str(owner_id):
+                return True
+        elif not unassigned and str(assignee) == str(v):
+            return True
+    return False
+
+
+def _leaf_matches(task, name, values, inbox, proj_group, owner_id=None) -> bool:
     if name in ("list", "listOrGroup"):
         if "all" in values:
             return True
@@ -1104,7 +1182,13 @@ def _leaf_matches(task, name, values, inbox, proj_group) -> bool:
         return task.get("priority", 0) in set(values)
     if name == "dueDate":
         return any(_due_token_matches(task, v) for v in values)
-    return True  # unknown condition → don't exclude
+    if name == "assignee":
+        return _assignee_matches(task, values, owner_id)
+    # Unknown condition: don't exclude — but this is NOT silent. The condition
+    # name is reported separately by rule_unsupported_conditions() and surfaced
+    # in the tool output, because "matches everything" used to make an
+    # unfiltered pool (all 1477 tasks, live 2026-08-07) look like a result.
+    return True
 
 
 def _task_due_date(task):
