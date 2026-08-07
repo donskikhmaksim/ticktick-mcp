@@ -11338,15 +11338,46 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str,
         manifest_id: from call #1's response — pass on call #2 to actually delete
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
+
+    task_id and task_title are cross-checked against the LIVE task list
+    TWICE (same pattern as delete_habit, def-116, 2026-08-07): once while
+    BUILDING the plan (call #1, before anything is shown to the owner — a
+    mismatched title never reaches the plan card at all) and again,
+    independently, right before the actual delete (call #2, unchanged). If
+    the live read itself fails while building the plan, the plan still gets
+    built (a read hiccup must not block every comment deletion), but its
+    text says so honestly — the call #2 check is unconditional and still
+    guards the mutation either way.
     """
     err = _ensure_ready()
     if err:
         return err
+    # Перенос identity-guard (task_id↔task_title) на построение плана — тот
+    # же _guard_task, что уже стоит в _delete_task_comment_impl НА
+    # ИСПОЛНЕНИИ, но здесь — ДО показа карточки владельцу. Тот же перенос,
+    # что и у attach_file_to_task/update_task_comment (см. их коммиты) —
+    # здесь он особенно важен: удаление комментария необратимо.
+    name_warning = ""
+    if not manifest_id:
+        g = _guard_task(task_id, task_title or "", project_id)
+        if g.status == "mismatch":
+            return (f"🛑 План НЕ построен — {g.message} (защита от «не той "
+                    "задачи»). Ничего не изменено.")
+        elif g.status == "unavailable":
+            name_warning = (" ⚠️ Название задачи НЕ удалось сверить с живым "
+                            "состоянием (чтение не удалось) — сверка "
+                            "повторится при подтверждении, и расхождение "
+                            "остановит исполнение.")
+        elif g.status == "missing":
+            name_warning = (" ⚠️ id не среди открытых задач (возможно, "
+                            "завершена) — название НЕ проверено.")
     params = {"task_title": task_title, "project_id": project_id,
               "task_id": task_id, "comment_id": comment_id}
+    describe_fn = ((lambda p: _describe_delete_task_comment(p) + name_warning)
+                   if name_warning else _describe_delete_task_comment)
     outcome = await _gate_single("delete_task_comment", "delete_task_comment",
                                  params if not manifest_id else None,
-                                 manifest_id, user_reply, _describe_delete_task_comment,
+                                 manifest_id, user_reply, describe_fn,
                                  automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
