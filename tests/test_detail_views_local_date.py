@@ -185,3 +185,47 @@ async def test_task_info_all_day_is_verbatim(zone, monkeypatch):
     assert day.isoformat() in _line(out, "due:"), out
     assert day.isoformat() in _line(out, "start:"), out
     assert "all-day" in _line(out, "due:").lower(), out
+
+
+# ==========================================================================
+# Место 2 — get_task_info: created / last modified / completed
+# ==========================================================================
+
+async def test_task_info_stamps_are_local_and_name_the_zone(monkeypatch):
+    """Штампы печатались сырым UTC и БЕЗ указания зоны — читатель не мог
+    даже понять, что перед ним не его время."""
+    monkeypatch.setattr(s, "_USER_TZ", ZoneInfo(LA))
+    created, c_local, c_utc = _at_local(LA, 23, 10, -30)
+    modified, m_local, m_utc = _at_local(LA, 23, 20, -3)
+    completed, k_local, k_utc = _at_local(LA, 23, 40, -1)
+    task = {"id": "t1", "projectId": "p1", "title": "x", "creator": "me",
+            "createdTime": created, "modifiedTime": modified,
+            "completedTime": completed, "status": 2}
+    monkeypatch.setattr(s, "ticktick_v2", FakeV2(task=task))
+
+    out = await s.get_task_info("t1")
+    for needle, local_d, utc_d in (("created:", c_local, c_utc),
+                                   ("last modified:", m_local, m_utc),
+                                   ("completed:", k_local, k_utc)):
+        ln = _line(out, needle)
+        assert local_d.isoformat() in ln, ln
+        assert utc_d.isoformat() not in ln, ln
+        assert LA in ln, ln
+
+
+async def test_task_info_stamps_of_all_day_task_are_still_instants(monkeypatch):
+    """Ловушка на реализацию: у all-day задачи стоит isAllDay=True, но
+    createdTime/modifiedTime — ВСЕГДА моменты времени, а не календарные даты.
+    Переиспользование all-day-ветки для штампов напечатало бы UTC-день
+    создания как «зононезависимый» и вернуло бы ровно тот же дефект."""
+    monkeypatch.setattr(s, "_USER_TZ", ZoneInfo(LA))
+    created, c_local, c_utc = _at_local(LA, 23, 10, -30)
+    day = (datetime.now(ZoneInfo(LA)) + timedelta(days=2)).date()
+    task = {"id": "t1", "projectId": "p1", "title": "x", "isAllDay": True,
+            "dueDate": day.isoformat(), "createdTime": created,
+            "creator": "me"}
+    monkeypatch.setattr(s, "ticktick_v2", FakeV2(task=task))
+
+    ln = _line(await s.get_task_info("t1"), "created:")
+    assert c_local.isoformat() in ln, ln
+    assert c_utc.isoformat() not in ln, ln

@@ -7489,6 +7489,32 @@ def _local_datetime_str(task: Dict[str, Any], field: str = "dueDate") -> str:
     return f"{dt.astimezone(_USER_TZ).strftime('%Y-%m-%d %H:%M')} ({_USER_TZ.key})"
 
 
+def _local_stamp_str(value: Any, with_zone: bool = True,
+                     seconds: bool = False) -> str:
+    """Render an EVENT INSTANT — createdTime / modifiedTime / completedTime,
+    an activity-log `when` — in the owner's zone.
+
+    Deliberately NOT _local_datetime_str: that one asks _is_all_day_value()
+    first, and an all-day TASK carries isAllDay=True for the whole record, so
+    reusing it here would declare the task's CREATION TIME a zone-independent
+    calendar date and re-introduce the very off-by-one this fixes. These
+    stamps are always real moments; there is no all-day case for them.
+
+    with_zone=False drops the trailing "(America/Los_Angeles)" for callers
+    that state the zone once in a header instead of on every one of N lines
+    (the activity log). `seconds` keeps an event log's second-level precision,
+    which the old `[:19]` slice did carry.
+    """
+    if not value:
+        return "?"
+    dt = _parse_ticktick_datetime(str(value))
+    if dt is None:
+        return f"{value} (unparsed)"
+    fmt = "%Y-%m-%d %H:%M:%S" if seconds else "%Y-%m-%d %H:%M"
+    out = dt.astimezone(_USER_TZ).strftime(fmt)
+    return f"{out} ({_USER_TZ.key})" if with_zone else out
+
+
 def _today_local():
     return datetime.now(_USER_TZ).date()
 
@@ -12896,11 +12922,14 @@ async def get_task_info(task_id: str) -> str:
         if content:
             out += f"  content: {content[:300]}\n"
         # Activity (no full edit-log endpoint exists; these are the task's stamps)
+        # Same treatment as the due/start lines above: these three were raw UTC
+        # stamps with no zone stated at all, so a task created 23:10 local read
+        # as the NEXT day and nothing in the output hinted why.
         out += "\nActivity:\n"
-        out += f"  created: {t.get('createdTime', '?')} by {who}\n"
-        out += f"  last modified: {t.get('modifiedTime', '?')}\n"
+        out += f"  created: {_local_stamp_str(t.get('createdTime'))} by {who}\n"
+        out += f"  last modified: {_local_stamp_str(t.get('modifiedTime'))}\n"
         if t.get("completedTime"):
-            out += f"  completed: {t['completedTime']}\n"
+            out += f"  completed: {_local_stamp_str(t['completedTime'])}\n"
         # Checklist items
         items = t.get("items") or []
         if items:
