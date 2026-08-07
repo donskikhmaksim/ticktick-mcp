@@ -9639,14 +9639,61 @@ async def delete_project_group(group_name: str, group_id: str,
     call #2 is refused whatever `user_reply` says — before the press (wait for
     it) and after it too (the server is already running the operation). Do not
     retry it; just tell the user to tap the button.
+
+    group_id and group_name are cross-checked against the LIVE group list
+    TWICE (same pattern as delete_habit, def-116, 2026-08-07): once while
+    BUILDING the plan (call #1, before anything is shown to the owner — a
+    mismatched or gone group never reaches the plan card at all) and again,
+    independently, right before the actual delete (call #2, unchanged). If
+    the live read itself fails while building the plan, the plan still gets
+    built (a read hiccup must not block every deletion), but its text says
+    so honestly — the call #2 check is unconditional and still guards the
+    mutation either way.
     """
     err = _ensure_ready()
     if err:
         return err
+    # Перенос identity-guard (group_id↔group_name) на построение плана — та
+    # же сверка (_live_groups + _names_agree), что уже стоит в
+    # _delete_project_group_impl НА ИСПОЛНЕНИИ, но здесь — ДО показа карточки
+    # владельцу, до необратимого удаления. missing И mismatch блокируют план
+    # целиком — _delete_project_group_impl уже трактует ОБА как 🛑 на
+    # исполнении, перенос это не ужесточает. Временная недоступность живого
+    # чтения (исключение при _live_groups()) — fail-open с предупреждением, а
+    # исполнение (не тронуто) перепроверит заново. automation_key НЕ
+    # пропускает эту проверку — она стоит раньше самого гейта.
+    name_warning = ""
+    if not manifest_id:
+        try:
+            groups = await _live_groups()
+        except Exception as e:
+            groups = None
+            logger.warning("delete_project_group: не удалось прочитать "
+                           f"список групп на этапе плана ({e}) — план всё "
+                           "равно строится, сверка имени повторится на "
+                           "исполнении.")
+        if groups is not None:
+            grp = next((g for g in groups if g.get("id") == group_id), None)
+            if grp is None:
+                return (f"🛑 План НЕ построен — группы с id "
+                        f"{str(group_id)[:12]}… нет в живом списке групп "
+                        "(уже удалена/неверный id). Ничего не изменено.")
+            real = grp.get("name") or ""
+            if not _names_agree(group_name, real):
+                return (f"🛑 План НЕ построен — group_id указывает на "
+                        f"«{real}», а НЕ «{group_name}» (защита от «не той "
+                        "папки»). Ничего не изменено.")
+        else:
+            name_warning = (" ⚠️ Имя папки НЕ удалось сверить с живым списком "
+                            "групп (чтение не удалось) — сверка повторится "
+                            "при подтверждении, и расхождение остановит "
+                            "удаление.")
     params = {"group_name": group_name, "group_id": group_id}
+    describe_fn = ((lambda p: _describe_delete_project_group(p) + name_warning)
+                   if name_warning else _describe_delete_project_group)
     outcome = await _gate_single("delete_project_group", "delete_project_group",
                                  params if not manifest_id else None,
-                                 manifest_id, user_reply, _describe_delete_project_group,
+                                 manifest_id, user_reply, describe_fn,
                                  automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message

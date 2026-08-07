@@ -707,6 +707,128 @@ async def test_delete_project_group_unknown_manifest_refused(monkeypatch):
     assert fake_v2.calls == []
 
 
+# ---------------------------------------------------------------------------
+# 2026-08-07: plan-phase identity-guard (def-116 follow-up, group B) —
+# group_id↔group_name is now cross-checked BEFORE the plan is built, not
+# only inside _delete_project_group_impl on execution. Unlike attach_file_
+# to_task/update_task_comment (_guard_task), this method has no monkeypatch-
+# able guard helper — it reads _live_groups() directly — so these tests
+# shape the FAKE's live group list itself instead of stubbing a guard
+# function.
+# ---------------------------------------------------------------------------
+
+async def test_delete_project_group_plan_identity_guard_blocks_wrong_name(
+        monkeypatch):
+    """id points at a REAL group ("Работа"), caller's group_name claims a
+    DIFFERENT one ("Личное") — before this fix, call #1 would have built and
+    shown a plan card reading "Удаляю папку проектов «Личное» ..." even
+    though the id has nothing to do with that group. Now the plan is refused
+    outright, before any card is built, and delete_group is never called."""
+    fake_v2 = FakeV2(groups=[{"id": "g1", "name": "Работа"}])
+    _wire(monkeypatch, fake_v2=fake_v2)
+
+    result = await s.delete_project_group("Личное", "g1")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Работа»" in result
+    assert "manifest_id" not in result, "план для несовпавшей пары строиться не должен"
+    assert fake_v2.calls == []
+    assert any(g["id"] == "g1" for g in fake_v2.groups), "группа не должна быть тронута"
+
+
+async def test_delete_project_group_plan_identity_guard_blocks_missing_group(
+        monkeypatch):
+    """The group_id isn't in the live list at all (already deleted/wrong id)
+    — _delete_project_group_impl already refuses this with 🛑 on execution;
+    the plan-phase transfer must refuse it just as hard, before the card."""
+    fake_v2 = FakeV2(groups=[])
+    _wire(monkeypatch, fake_v2=fake_v2)
+
+    result = await s.delete_project_group("Личное", "g-нет-такой")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "manifest_id" not in result
+    assert fake_v2.calls == []
+
+
+async def test_delete_project_group_plan_read_failure_does_not_block_but_warns(
+        monkeypatch):
+    """A live-read hiccup while BUILDING the plan (call #1) must not block
+    every deletion — fail-open here is cheaper than refusing everyone whose
+    network is briefly flaky. The plan is still built, honestly warns that
+    the name was not verified, and the real (unchanged) identity-guard on
+    execution (call #2) does its normal job right after."""
+    fake_v2 = FakeV2(groups=[{"id": "g1", "name": "Личное"}])
+    _wire(monkeypatch, fake_v2=fake_v2)
+    calls = {"n": 0}
+    real_live_groups = s._live_groups
+
+    async def _flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("v2 read timed out")
+        return await real_live_groups(*a, **k)
+    monkeypatch.setattr(s, "_live_groups", _flaky)
+
+    preview = await s.delete_project_group("Личное", "g1")
+    assert "🛑" not in preview, "временный сбой чтения не должен блокировать план"
+    assert "НЕ удалось сверить" in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.delete_project_group("Личное", "g1", manifest_id=mid, user_reply="да")
+    assert ("delete_group", "g1") in fake_v2.calls
+    _assert_confirmed_success(result)
+
+
+async def test_delete_project_group_plan_read_failure_still_lets_execution_catch_a_real_mismatch(
+        monkeypatch):
+    """Same read failure on the plan as above, but this time the pair
+    actually DOESN'T match. The plan-phase check couldn't run (so it warns
+    instead of refusing), but the execution-phase guard inside
+    `_delete_project_group_impl` — untouched by this change — still catches
+    the real mismatch: a network blip on planning must not weaken the
+    protection at execution time, especially on an irreversible delete."""
+    fake_v2 = FakeV2(groups=[{"id": "g1", "name": "Работа"}])
+    _wire(monkeypatch, fake_v2=fake_v2)
+    calls = {"n": 0}
+    real_live_groups = s._live_groups
+
+    async def _flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("v2 read timed out")
+        return await real_live_groups(*a, **k)
+    monkeypatch.setattr(s, "_live_groups", _flaky)
+
+    preview = await s.delete_project_group("Личное", "g1")
+    assert "🛑" not in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.delete_project_group("Личное", "g1", manifest_id=mid, user_reply="да")
+    assert result.startswith("🛑")
+    assert "«Работа»" in result
+    assert fake_v2.calls == []
+    assert any(g["id"] == "g1" for g in fake_v2.groups)
+
+
+async def test_delete_project_group_automation_key_mismatch_is_refused_before_plan(
+        monkeypatch):
+    """Headless path (#118): a valid automation_key runs on the FIRST call,
+    with no plan card and no Telegram button ever shown — so if the identity
+    check only lived inside _gate_single/execution, a false name+id pair
+    would sail through silently on a single valid key, deleting the WRONG
+    group. The check sits BEFORE _gate_single, so it applies here too."""
+    fake_v2 = FakeV2(groups=[{"id": "g1", "name": "Работа"}])
+    _wire(monkeypatch, fake_v2=fake_v2)
+    monkeypatch.setattr(s, "SECRET", "test-secret")
+
+    result = await s.delete_project_group("Личное", "g1", automation_key="test-secret")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Работа»" in result
+    assert fake_v2.calls == []
+
+
 # ===========================================================================
 # move_project_to_group
 # ===========================================================================
