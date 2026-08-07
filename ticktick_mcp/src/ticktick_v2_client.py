@@ -28,6 +28,7 @@ import urllib.parse
 import uuid
 import requests
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,11 @@ TASK_ACTIVITY_MAX_PAGES = 20
 # TickTick spaces kanban columns with this default gap so new ones can be
 # slotted between existing columns without renumbering (mirrors the web app).
 COLUMN_SORT_STEP = 1099511627776
+
+# The user's own timezone — the SAME env var server.py's _USER_TZ reads, so a
+# smart-list filter and a due-date tool can never disagree about what day it
+# is. Date comparisons here must never fall back to the process zone.
+_USER_TZ = ZoneInfo(os.getenv("USER_TIMEZONE", "UTC"))
 
 
 class TickTickAuthError(RuntimeError):
@@ -1202,9 +1208,16 @@ def _task_due_date(task):
 
 
 def _due_token_matches(task, token) -> bool:
-    from datetime import date, timedelta
+    from datetime import timedelta
     d = _task_due_date(task)
-    today = date.today()
+    # "Today" is the user's today (USER_TIMEZONE), never the process's.
+    # date.today() reads the zone the server happens to run in — UTC on
+    # Railway — while every due-date tool on the server side resolves the day
+    # through _USER_TZ. For an America/Los_Angeles owner the two disagree for
+    # 7-8 hours of every single day, so a filter with a dueDate condition
+    # would quietly answer for the wrong calendar day (and disagree with
+    # get_tasks_due_today about the very same task).
+    today = datetime.now(_USER_TZ).date()
     if token == "nodate":
         return d is None
     if token == "recurring":
