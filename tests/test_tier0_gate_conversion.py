@@ -340,6 +340,12 @@ async def test_create_project_group_full_gate_cycle(monkeypatch):
     result = await s.create_project_group("Личное", manifest_id=mid, user_reply="да")
     assert ("create_group", "Личное") in fake_v2.calls
     _assert_confirmed_success(result)
+    # Регресс-тест дефекта №3 (2026-08-06, живой прогон, манифест
+    # ea79556baf0f): группа создалась реально, но кнопочный вердикт был
+    # ложным «❓ НЕ подтверждено», потому что self-report не начинался с ✅
+    # (single-gate тул, журнала мутаций для групп нет — верится только
+    # ведущему ✅ собственного отчёта, см. _auto_execute_report_is_success).
+    assert s._auto_execute_report_is_success(result), result
 
     again = await s.create_project_group("Личное", manifest_id=mid, user_reply="да")
     assert "🛑" in again
@@ -361,6 +367,9 @@ async def test_delete_project_group_full_gate_cycle(monkeypatch):
     assert ("delete_group", "g1") in fake_v2.calls
     assert not any(g["id"] == "g1" for g in fake_v2.groups)
     _assert_confirmed_success(result)
+    # Тот же класс бага, что и у create_project_group (дефект №3) — не
+    # журналируется, self-report был без ведущего ✅.
+    assert s._auto_execute_report_is_success(result), result
 
 
 async def test_delete_project_group_unknown_manifest_refused(monkeypatch):
@@ -391,6 +400,8 @@ async def test_move_project_to_group_full_gate_cycle(monkeypatch):
     assert ("move_group", "p1", "g1") in fake_v2.calls
     assert fake_v2.projects[0]["groupId"] == "g1"
     _assert_confirmed_success(result)
+    # Тот же класс бага, что и у create_project_group (дефект №3).
+    assert s._auto_execute_report_is_success(result), result
 
 
 # ===========================================================================
@@ -461,6 +472,33 @@ async def test_attach_file_to_task_full_gate_cycle(monkeypatch):
                                          manifest_id=mid, user_reply="да")
     assert ("attach", "t1") in fake_v2.calls
     _assert_confirmed_success(result)
+    # Тот же класс бага, что и у create_project_group (дефект №3): вложение
+    # реально прикреплено и post-verify его видит, но старый текст не начинался
+    # с ✅ ("Attached '...' to '...'"), поэтому кнопочный вердикт был ложным.
+    assert s._auto_execute_report_is_success(result), result
+
+
+async def test_attach_file_to_task_missing_identity_downgrades_to_warn(monkeypatch):
+    """Симметрично update_task_comment/delete_task_comment: identity-guard не
+    смог сверить название → ⚠️, даже если вложение реально прикрепилось и
+    post-verify его видит. ✅ значит «подтверждено ПОЛНОСТЬЮ» (output-
+    format.md §7.2) — название здесь не проверено, значит не полностью."""
+    fake_v2 = FakeV2(live={"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}})
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(
+        s, "_guard_task",
+        lambda *a, **k: s._Guard("missing", project_id="p1"))
+
+    preview = await s.attach_file_to_task("Купить молоко", "t1", "p1",
+                                          url="https://x/file.pdf")
+    mid = _extract_manifest_id(preview)
+    result = await s.attach_file_to_task("Купить молоко", "t1", "p1",
+                                         url="https://x/file.pdf",
+                                         manifest_id=mid, user_reply="да")
+
+    assert ("attach", "t1") in fake_v2.calls
+    assert result.startswith("⚠️"), result
+    assert not s._auto_execute_report_is_success(result), result
 
 
 async def test_attach_file_to_task_missing_source_refused_before_gate(monkeypatch):
@@ -528,3 +566,29 @@ async def test_update_task_comment_full_gate_cycle(monkeypatch):
     assert ("update_comment", "c1", "новый текст") in fake_v2.calls
     assert fake_v2.comments["t1"][0]["title"] == "новый текст"
     _assert_confirmed_success(result)
+    # Тот же класс бага, что и у create_project_group (дефект №3): правка
+    # подтверждена post-verify (комментарий перечитан, текст совпал), но
+    # старый текст не начинался с ✅ ("Comment on '...' updated").
+    assert s._auto_execute_report_is_success(result), result
+
+
+async def test_update_task_comment_missing_identity_downgrades_to_warn(monkeypatch):
+    """Когда identity-guard НЕ смог сверить название (id не среди открытых
+    задач — например, задача завершена), маркер обязан быть ⚠️, а не ✅: сама
+    правка комментария подтверждена, но НЕ ВСЁ подтверждено (название — нет).
+    ✅ по замороженной легенде (output-format.md §7.2) значит «подтверждено
+    ПОЛНОСТЬЮ» — раздача его здесь была бы новой дырой того же типа."""
+    fake_v2 = FakeV2(live={}, comments={"t1": [{"id": "c1", "title": "старый текст"}]})
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(
+        s, "_guard_task",
+        lambda *a, **k: s._Guard("missing", project_id="p1"))
+
+    preview = await s.update_task_comment("Купить молоко", "новый текст", "p1", "t1", "c1")
+    mid = _extract_manifest_id(preview)
+    result = await s.update_task_comment("Купить молоко", "новый текст", "p1", "t1", "c1",
+                                         manifest_id=mid, user_reply="да")
+
+    assert fake_v2.comments["t1"][0]["title"] == "новый текст"
+    assert result.startswith("⚠️"), result
+    assert not s._auto_execute_report_is_success(result), result

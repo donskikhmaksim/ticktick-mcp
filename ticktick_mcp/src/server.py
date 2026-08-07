@@ -8608,7 +8608,7 @@ async def _unset_task_parent_impl(task_title: str, parent_task_title: str,
         if (fresh.get(task_id) or {}).get("parentId"):
             return (f"❌ НЕ отцепил «{task_title}» — parentId всё ещё стоит.\n"
                     + _report_line(rid))
-        return (f"✓ «{task_title}» отцеплена от «{parent_task_title}» (проверено).\n"
+        return (f"✅ «{task_title}» отцеплена от «{parent_task_title}» (проверено).\n"
                 + _report_line(rid))
     except Exception as e:
         logger.error(f"Error in unset_task_parent: {e}")
@@ -9076,7 +9076,7 @@ async def _create_project_group_impl(name: str) -> str:
                     "групп после создания, проверь вручную.")
     except Exception as e:
         return f"Группа «{name}» отправлена (id: {gid}), но {_UNVERIFIED_MSG} ({e})"
-    return f"Группа проектов «{name}» создана (проверено). (id: {gid})"
+    return f"✅ Группа проектов «{name}» создана (проверено). (id: {gid})"
 
 
 def _describe_delete_project_group(p: Dict) -> str:
@@ -9159,7 +9159,8 @@ async def _delete_project_group_impl(group_name: str, group_id: str) -> str:
         groups = await _live_groups()
         if any(g.get("id") == group_id for g in groups):
             return f"❌ Группа «{real}» ВСЁ ЕЩЁ в списке — удаление не сработало."
-        return f"Project group '{real}' deleted (проверено; проекты остались, просто без папки)."
+        return (f"✅ Группа проектов «{real}» удалена (проверено; проекты "
+                "остались, просто без папки).")
     except Exception as e:
         logger.error(f"Error in delete_project_group: {e}")
         return f"Error deleting project group: {str(e)}"
@@ -9260,7 +9261,7 @@ async def _move_project_to_group_impl(project_name: str, project_id: str,
         if (got or None) != want:
             return (f"❌ Проект «{live_pname}» НЕ переместился — живой groupId "
                     f"{got!r}, ожидался {want!r}.")
-        return f"Проект «{live_pname}» перемещён в {dest} (проверено)."
+        return f"✅ Проект «{live_pname}» перемещён в {dest} (проверено)."
     except Exception as e:
         logger.error(f"Error in move_project_to_group: {e}")
         return f"Error moving project: {str(e)}"
@@ -9754,18 +9755,26 @@ async def _attach_file_to_task_impl(task_title: str, task_id: str, project_id: s
         shown_name = att.get("fileName") or filename or \
             ((url or "").split("?")[0].rstrip("/").split("/")[-1] or "attachment")
         size = att.get("size")
-        size_str = f"{size} bytes" if size is not None else "размер неизвестен"
+        size_str = f"{size} байт" if size is not None else "размер неизвестен"
         post = _open_by_id(fresh=True)
         if post is None:
-            verify = f" {_UNVERIFIED_MSG}"
+            marker, verify = "⚠️", f" {_UNVERIFIED_MSG}"
         elif task_id in post:
             post_count = len((post.get(task_id) or {}).get("attachments") or [])
-            verify = (" (проверено: вложение видно на задаче)"
-                      if post_count > pre_count else
-                      " ⚠️ вложение НЕ видно на задаче — проверь вручную")
+            if post_count > pre_count:
+                marker, verify = "✅", " (проверено: вложение видно на задаче)"
+            else:
+                marker, verify = ("⚠️",
+                    " вложение НЕ видно на задаче — проверь вручную")
         else:
-            verify = " (задача не среди открытых — вложение не проверить)"
-        return f"Attached '{shown_name}' ({size_str}) to '{title}'{verify}{warn}"
+            marker, verify = "⚠️", " (задача не среди открытых — вложение не проверить)"
+        if warn:
+            # Identity-guard не смог сверить название (задача не среди
+            # открытых) — даже подтверждённое вложением ✅ здесь понижается:
+            # ✅ по легенде (output-format.md §7.2) значит «подтверждено
+            # ПОЛНОСТЬЮ», а название задачи в этой ветке не проверено.
+            marker = "⚠️"
+        return f"{marker} Прикреплён файл «{shown_name}» ({size_str}) к «{title}»{verify}{warn}"
     except Exception as e:
         logger.error(f"Error in attach_file_to_task: {e}")
         return f"Error attaching file: {str(e)}"
@@ -10381,7 +10390,7 @@ async def _rename_tag_impl(old_name: str, new_name: str,
         return (f"❌ Тега «{new_name}» нет после переименования — исход "
                 "не подтверждён, проверь вручную.")
     note = " (слито с существующим)" if merged else ""
-    return f"Tag '{old_name}' renamed to '{new_name}' (проверено){note}."
+    return f"✅ Тег «{old_name}» переименован в «{new_name}» (проверено){note}."
 
 
 # Конфликт слияния 2026-08-06, разрешён сохранением ОБЕИХ сторон: эта ветка
@@ -10746,9 +10755,14 @@ async def _update_task_comment_impl(task_title: str, text: str, project_id: str,
         if (cm.get("title") or "") != text:
             return (f"❌ Правка комментария к '{task_title}' НЕ применилась "
                     "(текст прежний).")
+        # Маркер — ⚠️, а не ✅, когда identity-guard не смог сверить название
+        # (задача не среди открытых): сама правка комментария подтверждена
+        # post-verify выше, но НЕ ВСЁ подтверждено — а ✅ по замороженной
+        # легенде (output-format.md §7.2) означает «подтверждено ПОЛНОСТЬЮ».
+        marker = "⚠️" if g.status == "missing" else "✅"
         warn = ("\n⚠️ id не среди открытых задач — название НЕ проверено."
                 if g.status == "missing" else "")
-        return f"Comment on '{task_title}' updated (проверено).{warn}"
+        return f"{marker} Комментарий на «{task_title}» обновлён (проверено).{warn}"
     except Exception as e:
         logger.error(f"Error in update_task_comment: {e}")
         return f"Error updating comment: {str(e)}"
@@ -10828,9 +10842,11 @@ async def _delete_task_comment_impl(task_title: str, project_id: str,
         if any(c.get("id") == comment_id for c in cms):
             return (f"❌ Комментарий на '{task_title}' ВСЁ ЕЩЁ существует — "
                     "удаление не сработало.")
+        # См. тот же комментарий про маркер в _update_task_comment_impl выше.
+        marker = "⚠️" if g.status == "missing" else "✅"
         warn = ("\n⚠️ id не среди открытых задач — название НЕ проверено."
                 if g.status == "missing" else "")
-        return f"Comment on '{task_title}' deleted (проверено).{warn}"
+        return f"{marker} Комментарий на «{task_title}» удалён (проверено).{warn}"
     except Exception as e:
         logger.error(f"Error in delete_task_comment: {e}")
         return f"Error deleting comment: {str(e)}"
@@ -13026,7 +13042,36 @@ def _auto_execute_report_is_success(report_text: str) -> bool:
     них уже обязан делать свой собственный post-verify — отдельным свежим
     чтением TickTick — и печатает ✅ ТОЛЬКО когда этот post-verify реально
     подтвердил результат. Голова его отчёта — уже готовое доказательство,
-    просто не через журнал."""
+    просто не через журнал.
+
+    ДЕФЕКТ 2026-08-06 №3 (найден живым прогоном на create_project_group,
+    манифест ea79556baf0f — группа реально создалась, но пришло «❓ НЕ
+    подтверждено»): проверка «starts with ✅» сама по себе честная, но
+    ~7 из ~21 single-gate исполнителей возвращали успешный self-report БЕЗ
+    ведущего ✅ (кто-то без эмодзи вовсе, кто-то с забытым ASCII «✓», который
+    легенда прямо запрещает — output-format.md §7.2), поэтому эта функция
+    ЧЕСТНО говорила "не доказано" — по факту, а не по ошибке распознавания.
+    Полный список найденных и исправленных: create_project_group,
+    delete_project_group, move_project_to_group, rename_tag (обе ветки),
+    update_task_comment, delete_task_comment, attach_file_to_task (плюс
+    ASCII «✓» → ✅ у unset_task_parent, не влиявший на вердикт — та операция
+    журналируется). Все приведены к единому ведущему ✅ у своих impl-функций
+    (server.py, см. `_*_impl` соответствующих тулов) — это и есть исправление,
+    НЕ правка этой функции.
+
+    Сознательно НЕ исправлено расширением этой функции (например, поиском
+    подстроки «(проверено)» где угодно в тексте): такой поиск был бы менее
+    строгим, чем ведущий маркер, И ЛОВУШКА — строка отказа «название НЕ
+    проверено» САМА содержит подстроку «проверено» (без «НЕ» уже входит в
+    «НЕ проверено»), так что подстрочный поиск дал бы ЛОЖНЫЙ ✅ ровно на
+    предупреждении, для которого честный ответ — «не доказано». Явный
+    положительный признак (ведущий ✅) без исключений — единственная
+    проверка, которая не наступает на эти грабли; единообразие достигается
+    на стороне текстов-источников, а не ослаблением детектора. См. также
+    tests/test_tier0_gate_conversion.py, tests/test_gate_delete_tag_comment.py,
+    tests/test_button_only_execution.py — happy-path каждого из
+    перечисленных методов теперь проверяет именно
+    `_auto_execute_report_is_success()`, а не только отсутствие ❌/🛑."""
     head = (report_text or "").lstrip().lstrip("#").lstrip()
     return head.startswith("✅")
 

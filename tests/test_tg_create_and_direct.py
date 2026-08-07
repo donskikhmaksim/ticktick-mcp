@@ -566,7 +566,7 @@ async def test_rename_tag_plain_rename_untouched_by_tg_layer(monkeypatch):
 
     out = await s.rename_tag("старый", "новый")
 
-    assert "renamed" in out
+    assert "переименован" in out
     assert seen == []
     assert fake._names == ["новый"]
 
@@ -583,7 +583,7 @@ async def test_rename_tag_merge_unchanged_when_tg_off(monkeypatch):
     assert seen == []
 
     out = await s.rename_tag("a", "b", allow_merge=True, user_reply="да, сливай")
-    assert "renamed" in out
+    assert "переименован" in out
     assert fake._names == ["b"]
     assert calls["n"] == 0
 

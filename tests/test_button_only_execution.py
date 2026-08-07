@@ -603,7 +603,12 @@ async def test_rename_tag_merge_is_button_only_and_the_poller_executes_it(
     report = await entry.execute(mid, consumed)
 
     assert fake._names == ["b"], "кнопка не слила теги"
-    assert "renamed" in report and "слито" in report
+    assert "переименован" in report and "слито" in report
+    # Регресс-тест дефекта №3 (2026-08-06, живой прогон create_project_group):
+    # rename_tag не журналируется, поэтому кнопочный вердикт для него держится
+    # ИСКЛЮЧИТЕЛЬНО на ведущем ✅ собственного отчёта — см.
+    # _auto_execute_report_is_success.
+    assert s._auto_execute_report_is_success(report)
 
 
 # ═════════ 8b. Инвентаризация: у КАЖДОЙ кнопки есть чем исполнить ═════════

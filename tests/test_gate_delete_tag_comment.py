@@ -169,6 +169,33 @@ async def test_delete_task_comment_call2_empty_reply_refused_and_retryable(monke
     assert ("delete_comment", "t1", "c1") in fake.calls
     assert fake.comments["t1"] == []
     assert "🛑" not in result
+    # Регресс-тест дефекта №3 (2026-08-06, тот же класс бага, что нашёл живой
+    # прогон create_project_group, манифест ea79556baf0f): удаление
+    # комментария подтверждено post-verify (список перечитан, комментария
+    # больше нет), но старый текст не начинался с ✅ ("Comment on '...'
+    # deleted") — кнопочный вердикт был бы ложным "❓ НЕ подтверждено".
+    assert s._auto_execute_report_is_success(result), result
+
+
+async def test_delete_task_comment_missing_identity_downgrades_to_warn(monkeypatch):
+    """Симметрично update_task_comment: когда identity-guard не смог сверить
+    название (id не среди открытых задач), маркер — ⚠️, а не ✅, даже если
+    само удаление комментария подтвердилось. ✅ значит «подтверждено
+    ПОЛНОСТЬЮ» — раздавать его на неполной проверке нельзя."""
+    fake = FakeV2(comments={"t1": [{"id": "c1", "title": "не забыть"}]})
+    _wire(monkeypatch, fake, guard_task=False)
+    monkeypatch.setattr(
+        s, "_guard_task",
+        lambda *a, **k: s._Guard("missing", project_id="p1"))
+
+    preview = await s.delete_task_comment("Купить молоко", "p1", "t1", "c1")
+    mid = _extract_manifest_id(preview)
+    result = await s.delete_task_comment("Купить молоко", "p1", "t1", "c1",
+                                         manifest_id=mid, user_reply="да")
+
+    assert fake.comments["t1"] == []
+    assert result.startswith("⚠️"), result
+    assert not s._auto_execute_report_is_success(result), result
 
 
 async def test_delete_task_comment_explicit_no_refuses_and_burns_manifest(monkeypatch):

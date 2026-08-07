@@ -460,7 +460,7 @@ async def test_rename_tag_plain_rename_needs_no_consent(monkeypatch):
     fake = _FakeV2Tags(["старый"])
     monkeypatch.setattr(s, "ticktick_v2", fake)
     result = await s.rename_tag("старый", "новый")
-    assert "renamed" in result
+    assert "переименован" in result
     assert "новый" in fake._names
 
 
@@ -481,7 +481,7 @@ async def test_rename_tag_merge_with_genuine_consent_succeeds(monkeypatch):
     monkeypatch.setattr(s, "ticktick_v2", fake)
 
     result = await s.rename_tag("a", "b", allow_merge=True, user_reply="да, сливай")
-    assert "renamed" in result
+    assert "переименован" in result
     assert fake._names == ["b"]
 
 
