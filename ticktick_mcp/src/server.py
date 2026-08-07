@@ -12667,7 +12667,8 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
 
 @mcp.tool(annotations=READONLY)
 async def get_changes(since: str, until: str = None,
-                      project_id: str = None) -> str:
+                      project_id: str = None, limit: int = 100,
+                      offset: int = 0) -> str:
     """
     Audit feed: everything that changed across the account in a date range —
     what was CREATED, COMPLETED, DELETED, and MODIFIED (requires v2 API).
@@ -12680,10 +12681,17 @@ async def get_changes(since: str, until: str = None,
     Dates are matched at day granularity in UTC; a task completed late at night
     local time may land on the next UTC day.
 
+    Newest events come first. The header always states the TOTAL number of
+    events in the range; when they don't fit in one page, the footer says how
+    many are left and which offset continues the feed.
+
     Args:
         since: Start date YYYY-MM-DD (inclusive)
         until: End date YYYY-MM-DD (inclusive; defaults to today)
         project_id: Optional — limit the feed to one list/project
+        limit: Maximum events per call (default 100, same shape as
+            get_completed_tasks / get_trash)
+        offset: Skip this many events — use it to read the tail
     """
     err = _ensure_ready()
     if err:
@@ -12707,10 +12715,11 @@ async def get_changes(since: str, until: str = None,
         def pname(pid):
             return names.get(pid, pid or "?")
 
+        _COMPLETED_SRC_CAP, _TRASH_SRC_CAP = 100, 300
         open_tasks = await _run_blocking(lambda: ticktick_v2.get_open_tasks())
         completed = await _run_blocking(lambda: ticktick_v2.get_completed_tasks(
-            limit=100, from_str=since + " 00:00:00", to_str=until + " 23:59:59"))
-        trash = await _run_blocking(lambda: ticktick_v2.get_trash(limit=300))
+            limit=_COMPLETED_SRC_CAP, from_str=since + " 00:00:00", to_str=until + " 23:59:59"))
+        trash = await _run_blocking(lambda: ticktick_v2.get_trash(limit=_TRASH_SRC_CAP))
 
         if project_id:
             open_tasks = [t for t in open_tasks if t.get("projectId") == project_id]
@@ -12745,10 +12754,41 @@ async def get_changes(since: str, until: str = None,
             return f"С {since} по {until} изменений не найдено."
 
         events.sort(key=lambda e: e[0] or "", reverse=True)
-        header = f"Изменения с {since} по {until} ({len(events)}):\n\n"
-        body = "\n".join(f"{icon} {line}" for _, icon, line in events)
-        note = ("\n\nℹ️ Для точной истории конкретной задачи (кто/куда перенёс, "
-                "что переименовал) используй get_task_activity.")
+
+        # def-D6: раньше здесь печаталась ВСЯ лента — реальный вызов на три дня
+        # выдал 461 событие (~56 КБ) и упёрся в лимит токенов при чтении, то
+        # есть аудит-фид было физически не прочитать. Теперь страница
+        # ограничена (как у get_completed_tasks / get_trash), общее число
+        # названо, а хвост достижим через offset.
+        total = len(events)
+        offset = max(0, offset)
+        limit = max(1, limit)
+        page = events[offset:offset + limit]
+        if not page:
+            return (f"Изменений с {since} по {until}: всего {total}, но offset={offset} "
+                    f"уже за концом ленты (последняя страница начинается с offset="
+                    f"{max(0, (total - 1) // limit * limit)}).")
+        shown_to = offset + len(page)
+        if offset or shown_to < total:
+            header = (f"Изменения с {since} по {until} (всего {total}, "
+                      f"показаны {offset + 1}-{shown_to}):\n\n")
+        else:
+            header = f"Изменения с {since} по {until} ({total}):\n\n"
+        body = "\n".join(f"{icon} {line}" for _, icon, line in page)
+        note = ""
+        if shown_to < total:
+            note += (f"\n\n… ещё {total - shown_to} событий — повтори вызов "
+                     f"с offset={shown_to}.")
+        # Источники тоже имеют свои потолки: когда пачка пришла ровно по
+        # лимиту, лента заведомо неполна — молчать об этом нельзя.
+        if len(completed) >= _COMPLETED_SRC_CAP:
+            note += (f"\n⚠️ Завершённых пришло ровно {_COMPLETED_SRC_CAP} (потолок API) — "
+                     "в диапазоне их может быть больше, сузь период.")
+        if len(trash) >= _TRASH_SRC_CAP:
+            note += (f"\n⚠️ Корзина отдала ровно {_TRASH_SRC_CAP} записей (потолок запроса) — "
+                     "более старые удаления в ленту не попали.")
+        note += ("\n\nℹ️ Для точной истории конкретной задачи (кто/куда перенёс, "
+                 "что переименовал) используй get_task_activity.")
         return header + body + note
     except Exception as e:
         logger.error(f"Error in get_changes: {e}")
