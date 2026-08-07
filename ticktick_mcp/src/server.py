@@ -9077,6 +9077,23 @@ async def _unset_task_parent_impl(task_title: str, parent_task_title: str,
             real_pname = (by_id.get(live_parent) or {}).get("title") or live_parent
             return (f"🛑 НЕ отцепил — «{task_title}» является подзадачей "
                     f"«{real_pname}», а НЕ «{parent_task_title}». Ничего не тронул.")
+        # def-126, вторая линия защиты: связь id↔id выше (live_parent ==
+        # parent_task_id) подтверждает, что это ДЕЙСТВИТЕЛЬНО текущий
+        # родитель — но само ИМЯ parent_task_title до сих пор не сверялось ни
+        # с чем (проверка выше — это сверка id с id, не имени с id). Между
+        # планом (call #1) и подтверждением (call #2) проходит до часа —
+        # состояние могло смениться, поэтому перепроверяем заново тем же
+        # _guard_task, что и на плане. Строгость СИММЕТРИЧНА плану: mismatch
+        # (родитель жив, но назван иначе) — 🛑, ничего не мутируем; missing
+        # (родитель завершён/удалён — обычный повод отцеплять именно от
+        # него, см. docstring unset_task_parent) молча пропускаем, связь уже
+        # подтверждена по id.
+        pg = _guard_task(parent_task_id, parent_task_title or "", project_id,
+                         by_id=by_id)
+        if pg.status == "mismatch":
+            return (f"🛑 НЕ отцепил — родитель по id это «{pg.title}», а НЕ "
+                    f"«{parent_task_title}» (защита от «не той задачи»). "
+                    "Ничего не тронул.")
         resp = await _run_blocking(lambda: ticktick_v2.unset_task_parent(
             task_id, live_parent, g.project_id or project_id))
         api_err = id2error_failures(resp, [task_id]).get(task_id)

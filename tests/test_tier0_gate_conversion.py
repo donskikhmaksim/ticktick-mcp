@@ -469,6 +469,48 @@ async def test_unset_task_parent_automation_key_parent_mismatch_is_refused_befor
     assert len(calls) == 1
 
 
+# ---------------------------------------------------------------------------
+# 2026-08-07 (def-126), continued: the SAME parent_task_id↔parent_task_title
+# check, now as the SECOND, independent line of defense right before the
+# actual detach in _unset_task_parent_impl — up to an hour can pass between
+# the plan (call #1) and the confirmation (call #2), so state can change in
+# between. Exercised specifically via a plan-phase read failure (the ONLY
+# way to reach execution with the parent's name still unverified — a plan-
+# phase mismatch above refuses outright and never reaches this code at all).
+# ---------------------------------------------------------------------------
+
+async def test_unset_task_parent_plan_read_failure_still_lets_execution_catch_a_real_parent_mismatch(
+        monkeypatch):
+    """Same read failure on the plan as
+    test_unset_task_parent_plan_read_failure_does_not_block_but_warns above,
+    but this time the parent's real name actually DOESN'T match the claim.
+    The plan-phase check couldn't run (so it warns instead of refusing), but
+    the execution-phase guard inside `_unset_task_parent_impl` — the second,
+    independent line of defense added by this commit — still catches the
+    real mismatch: a network blip on planning must not weaken the protection
+    at execution time."""
+    live = {"c": {"id": "c", "title": "Шаг 1", "projectId": "p1", "parentId": "p"}}
+    fake_v2 = FakeV2(live=live)
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(s, "_guard_task", _guard_sequence(
+        s._Guard("unavailable"),                                       # call #1 (plan, parent)
+        s._Guard("ok", project_id="p1", title="Шаг 1"),                # call #2 (impl, subtask)
+        s._Guard("mismatch", project_id="p1", title="Другой родитель",  # call #2 (impl, parent)
+                message='id указывает на «Другой родитель», а НЕ «Большой проект»'),
+    ))
+
+    preview = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1")
+    assert "🛑" not in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1",
+                                       manifest_id=mid, user_reply="да")
+    assert result.startswith("🛑")
+    assert "«Другой родитель»" in result
+    assert live["c"]["parentId"] == "p"
+    assert fake_v2.calls == []
+
+
 # ===========================================================================
 # create_project_group
 # ===========================================================================
