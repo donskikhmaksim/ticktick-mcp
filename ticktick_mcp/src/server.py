@@ -8517,10 +8517,16 @@ async def delete_habit(habit_name: str, habit_id: str, manifest_id: str = "",
     know it and guessing is a protocol violation.
 
     Both habit_name AND habit_id are required and must describe the SAME
-    habit: before deleting, the server re-reads the live habit list and
-    refuses when the id resolves to a different name (protection against
-    deleting the wrong habit). A snapshot of the habit is written to the
-    mutation journal first, since nothing else can bring it back.
+    habit: the server re-reads the live habit list and refuses when the id
+    resolves to a different name — TWICE (def-116, 2026-08-07): once while
+    BUILDING the plan (call #1, before anything is shown to the owner — a
+    mismatched name never reaches the plan card at all) and again,
+    independently, right before the actual delete (call #2). If the live
+    read itself fails while building the plan, the plan still gets built
+    (a read hiccup must not block every deletion), but its text says so
+    honestly — the call #2 check is unconditional and still guards the
+    mutation either way. A snapshot of the habit is written to the mutation
+    journal first, since nothing else can bring it back.
 
     Args:
         habit_name: Name of the habit (shown first in the summary you show the user, see get_habits) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
@@ -8544,10 +8550,59 @@ async def delete_habit(habit_name: str, habit_id: str, manifest_id: str = "",
     if not (habit_name or "").strip() or not (habit_id or "").strip():
         return ("🛑 Нужны И имя, И id привычки — удаление вслепую по одному id "
                 "не делаю (см. get_habits). Ничего не изменено.")
+    # def-116 (2026-08-07): та же сверка habit_id↔habit_name, что уже стоит
+    # в _delete_habit_impl НА ИСПОЛНЕНИИ (identity guard), но здесь — ДО
+    # построения плана. Живой пример: подали habit_name реальной привычки
+    # («Растяжка», 18 отметок) вместе с habit_id ДРУГОЙ (тестовой) —
+    # владельцу ушла карточка «Удаляю привычку «Растяжка»…», хотя id вёл не
+    # туда. Гейт на исполнении это ловит, но к тому моменту человек уже
+    # читал (и мог одобрить) непроверенное имя — по образцу
+    # `_resolve_triage_ops` в manual_triage ("название не совпало — по
+    # этому id сейчас «X», а в плане «Y»"), сверка сдвинута на ПОСТРОЕНИЕ.
+    #
+    # Действует только на call #1 (не manifest_id): call #2 обслуживает
+    # СОХРАНЁННЫЕ параметры плана, а не свежие аргументы вызова (тот же
+    # анти-подмен контракт, что у всех гейтов), и identity guard на
+    # исполнении там уже стоит, не тронут. automation_key НЕ пропускает эту
+    # проверку — она стоит раньше самого гейта, поэтому и headless-путь
+    # (карточки вообще не видит) защищён, а не только интерактивный.
+    name_warning = ""
+    if not manifest_id:
+        try:
+            habits = await _run_blocking(lambda: ticktick_v2.get_habits())
+        except Exception as e:
+            # Живое чтение недоступно ВРЕМЕННО — не блокируем удаление
+            # наглухо (fail-closed здесь стоил бы дороже, чем однократный
+            # непроверенный план: исполнение всё равно перепроверит), но и
+            # не выдаём непроверенное имя за факт — карточка честно скажет
+            # об этом сама (см. name_warning ниже).
+            habits = None
+            logger.warning(f"delete_habit: не удалось прочитать список "
+                           f"привычек на этапе плана ({e}) — план всё равно "
+                           "строится, сверка имени повторится на исполнении.")
+        if habits is not None:
+            habit = next((h for h in habits if h.get("id") == habit_id), None)
+            if habit is None:
+                return (f"🛑 План НЕ построен — привычки с id "
+                        f"{str(habit_id)[:12]}… нет в живом списке (уже "
+                        "удалена или неверный id, см. get_habits). Ничего не "
+                        "изменено.")
+            real_name = habit.get("name") or ""
+            if not _names_agree(habit_name, real_name):
+                return (f"🛑 План НЕ построен — habit_id указывает на "
+                        f"«{real_name}», а НЕ «{habit_name}» (защита от «не "
+                        "той привычки»). Ничего не изменено.")
+        else:
+            name_warning = (" ⚠️ Имя НЕ удалось сверить с живым списком "
+                            "привычек (чтение не удалось) — сверка "
+                            "повторится при подтверждении, и расхождение "
+                            "остановит удаление.")
     params = {"habit_name": habit_name, "habit_id": habit_id}
+    describe_fn = ((lambda p: _describe_delete_habit(p) + name_warning)
+                   if name_warning else _describe_delete_habit)
     outcome = await _gate_single("delete_habit", "delete_habit",
                                  params if not manifest_id else None,
-                                 manifest_id, user_reply, _describe_delete_habit,
+                                 manifest_id, user_reply, describe_fn,
                                  automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
