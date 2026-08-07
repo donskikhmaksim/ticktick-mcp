@@ -13822,7 +13822,8 @@ def _short_auto_execute_summary(tool: str, verdict: str,
                                 group_delivered: bool,
                                 fallback_to_dm: bool = False,
                                 partial: Optional[Tuple[int, int]] = None,
-                                totals: Optional[Tuple[int, int, int]] = None) -> str:
+                                totals: Optional[Tuple[int, int, int]] = None,
+                                group_configured: bool = True) -> str:
     """2-4 строки в ЛИЧКУ владельца. Максим просил не захламлять личный чат
     1:1 простынями — подробности живут в группе «MCP Отчёты», сюда идёт
     только вердикт. Если в группу отчёт НЕ доставился, сводка обязана сказать
@@ -13834,6 +13835,21 @@ def _short_auto_execute_summary(tool: str, verdict: str,
     2 части из 6. Раньше такой случай не отличался от полного успеха (список
     id ведь непустой), и владельцу писали «Подробный отчёт — в группе», хотя
     там лежала треть. Теперь это называется своими словами.
+
+    def-118 (2026-08-07): `group_delivered` = `bool(delivery.ok)` — «ушло
+    туда, куда сейчас указывает reports_chat_id» — а НЕ «ушло в РЕАЛЬНУЮ
+    группу». Когда `TG_REPORTS_CHAT_ID` не задана, `load_tg_approval_config`
+    (tg_approval.py) подставляет `reports_chat_id = owner_chat_id` — то есть
+    «группа» технически ЭТО ЖЕ личка. Telegram успешно отправляет туда
+    сообщение (`delivery.ok=True`), но группы «MCP Отчёты», о которой
+    говорит следующая строка, не существует — владелец шёл искать отчёт не
+    там. `group_configured` — честный флаг «группа реально отличается от
+    лички» (то же сравнение `reports_chat != owner_chat`, что уже стоит в
+    `_publish_auto_execute_outcome` для fallback_ok чуть ниже), передаётся
+    вызывающей стороной. Дефолт `True` — для существующих прямых вызовов
+    этой функции (тесты и любой будущий вызывающий, который явно не думал
+    про этот кейс) ничего не меняет; единственный боевой вызывающий
+    (`_publish_auto_execute_outcome`) передаёт настоящее значение явно.
 
     def-111 (2026-08-07): `affected` (см. `_manifest_affected_count`) — размер
     ПЛАНА, захваченного ДО исполнения, а не факт того, что реально изменилось
@@ -13857,8 +13873,15 @@ def _short_auto_execute_summary(tool: str, verdict: str,
         lines.append(f"⚠️ отчёт доставлен в группу частично ({got} из {total} "
                      f"частей) — остальное не дошло, подробности в логах "
                      f"сервера.")
-    elif group_delivered:
+    elif group_delivered and group_configured:
         lines.append("Подробный отчёт — в группе «MCP Отчёты».")
+    elif group_delivered:
+        # def-118: доставлено, но НЕ в группу (её нет — reports_chat_id ==
+        # owner_chat_id) — ушло отдельным сообщением в этот же личный чат,
+        # позже отредактированной сводки по времени отправки (см. порядок
+        # вызовов в _publish_auto_execute_outcome: post_report_to_group идёт
+        # ДО summarize_in_owner_chat) — «ниже» здесь честно, а не «в группе».
+        lines.append("Подробный отчёт — ниже.")
     elif fallback_to_dm:
         lines.append("⚠️ В группу отчёт не ушёл (проверь TG_REPORTS_CHAT_ID и "
                      "что бот в группе) — полный текст прислан сюда отдельным "
@@ -13968,6 +13991,12 @@ def _publish_auto_execute_outcome(candidate: Dict, tool: str, full_md: str,
     fallback_ok = False
     reports_chat = str(getattr(_TG_CFG, "reports_chat_id", "") or "")
     owner_chat = str(candidate.get("chat_id") or "")
+    # def-118: «группа реально настроена ОТДЕЛЬНО от лички» — то же сравнение,
+    # что чуть ниже решает нужен ли фолбэк на личку, но здесь оно нужно И для
+    # случая, когда TG_REPORTS_CHAT_ID пуст, а post_report_to_group всё равно
+    # технически «доставил» (Telegram просто отправил в тот же личный чат, а
+    # не провалился) — тогда fallback_ok ниже даже не вычисляется.
+    group_configured = bool(reports_chat) and reports_chat != owner_chat
     if not delivery.message_ids and owner_chat and reports_chat != owner_chat:
         try:
             fb = tg_approval.send_message_chunked(_TG_CFG, owner_chat, full_md)
@@ -13998,7 +14027,8 @@ def _publish_auto_execute_outcome(candidate: Dict, tool: str, full_md: str,
     totals = _parse_verify_totals(full_md)
     short_md = _short_auto_execute_summary(tool, verdict, affected,
                                            bool(delivery.ok), fallback_ok,
-                                           partial, totals)
+                                           partial, totals,
+                                           group_configured=group_configured)
     summary_ok = False
     try:
         summary_ok = bool(tg_approval.summarize_in_owner_chat(
