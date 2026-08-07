@@ -35,6 +35,25 @@ covers only gate-wrapper mechanics). See the new
 `test_create_subtask_plan_identity_guard_*` tests below the existing
 create_subtask block — THOSE are what exercises the plan-phase check.
 
+unset_task_parent is the SAME fix, same rationale, for the SUBTASK being
+detached (task_id/task_title) — see the new
+`test_unset_task_parent_plan_identity_guard_*` tests below its existing
+block. task_id and the two existing tests above them
+(test_unset_task_parent_full_gate_cycle,
+test_unset_task_parent_confirmed_detaches) already monkeypatch `_guard_task`
+to an unconditional "ok" stand-in (same result on every call), so they
+remain valid and unmodified — they could not have distinguished "checked on
+plan" from "checked only on execution" either way. IMPORTANT SCOPE NOTE (see
+def-126, filed separately by the owner): parent_task_id/parent_task_title
+(the claimed PARENT) is NOT covered by this fix and never was — even
+`_unset_task_parent_impl` on execution never verifies parent_task_title
+against anything; it only checks that the subtask's live parentId equals
+parent_task_id (a relationship check, not a name/id identity check). That is
+a distinct, pre-existing gap, not something this transfer moves earlier —
+moving a check that doesn't exist would be inventing new protection, outside
+this fix's mandate (see def-116 follow-up scope: move existing checks
+earlier, don't add new ones).
+
 No real network — the v2/official clients are faked."""
 import re
 
@@ -489,6 +508,143 @@ async def test_unset_task_parent_confirmed_detaches(monkeypatch):
                                        manifest_id=mid, user_reply="да")
     assert ("unset_parent", "c") in fake_v2.calls
     _assert_confirmed_success(result)
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-07: plan-phase identity-guard (def-116 follow-up, group B) — the
+# task_id↔task_title of the SUBTASK being detached is now cross-checked
+# BEFORE the plan is built, not only inside _unset_task_parent_impl on
+# execution. See module docstring above for why the tests above this point
+# could NOT have caught the old bug, and for why parent_task_title stays
+# untouched (def-126, separate gap).
+# ---------------------------------------------------------------------------
+
+async def test_unset_task_parent_plan_identity_guard_blocks_wrong_title(
+        monkeypatch):
+    """id points at a REAL task ("Шаг 2"), caller's task_title claims a
+    DIFFERENT one ("Шаг 1") — before this fix, call #1 would have built and
+    shown a plan card reading "Отцепляю «Шаг 1» от родителя ..." even though
+    the id has nothing to do with that task. Now the plan is refused
+    outright."""
+    live = {"c": {"id": "c", "title": "Шаг 2", "projectId": "p1", "parentId": "p"}}
+    fake_v2 = FakeV2(live=live)
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(
+        s, "_guard_task",
+        lambda *a, **k: s._Guard(
+            "mismatch", project_id="p1", title="Шаг 2",
+            message='id указывает на «Шаг 2», а НЕ «Шаг 1»'))
+
+    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Шаг 2»" in result
+    assert "manifest_id" not in result, "план для несовпавшей пары строиться не должен"
+    assert live["c"]["parentId"] == "p"
+    assert fake_v2.calls == []
+
+
+async def test_unset_task_parent_plan_identity_guard_blocks_missing_task(
+        monkeypatch):
+    """_unset_task_parent_impl treats a MISSING task as a hard 🛑 too, not a
+    soft warning — the plan-phase transfer must reproduce that same
+    severity."""
+    fake_v2 = FakeV2(live={})
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(
+        s, "_guard_task",
+        lambda *a, **k: s._Guard("missing", project_id="p1",
+                                 message="id … не среди открытых задач"))
+
+    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c-нет-такой", "p", "p1")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "manifest_id" not in result
+    assert fake_v2.calls == []
+
+
+async def test_unset_task_parent_plan_read_failure_does_not_block_but_warns(
+        monkeypatch):
+    """A live-read hiccup while BUILDING the plan (call #1) must not block
+    every detach — fail-open here is cheaper than refusing everyone whose
+    network is briefly flaky. The plan is still built, honestly warns that
+    the title was not verified, and the real (unchanged) identity-guard on
+    execution (call #2) does its normal job right after."""
+    live = {"c": {"id": "c", "title": "Шаг 1", "projectId": "p1", "parentId": "p"}}
+    fake_v2 = FakeV2(live=live)
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(s, "_guard_task", _guard_sequence(
+        s._Guard("unavailable"),                                # call #1 (plan)
+        s._Guard("ok", project_id="p1", title="Шаг 1"),         # call #2 (_impl)
+    ))
+
+    preview = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1")
+    assert "🛑" not in preview, "временный сбой чтения не должен блокировать план"
+    assert "НЕ удалось сверить" in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1",
+                                       manifest_id=mid, user_reply="да")
+    assert ("unset_parent", "c") in fake_v2.calls
+    _assert_confirmed_success(result)
+
+
+async def test_unset_task_parent_plan_read_failure_still_lets_execution_catch_a_real_mismatch(
+        monkeypatch):
+    """Same read failure on the plan as above, but this time the pair
+    actually DOESN'T match. The plan-phase check couldn't run (so it warns
+    instead of refusing), but the execution-phase guard inside
+    `_unset_task_parent_impl` — untouched by this change — still catches the
+    real mismatch: a network blip on planning must not weaken the
+    protection at execution time."""
+    live = {"c": {"id": "c", "title": "Шаг 2", "projectId": "p1", "parentId": "p"}}
+    fake_v2 = FakeV2(live=live)
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(s, "_guard_task", _guard_sequence(
+        s._Guard("unavailable"),                                   # call #1 (plan)
+        s._Guard("mismatch", project_id="p1", title="Шаг 2",        # call #2 (_impl)
+                message='id указывает на «Шаг 2», а НЕ «Шаг 1»'),
+    ))
+
+    preview = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1")
+    assert "🛑" not in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1",
+                                       manifest_id=mid, user_reply="да")
+    assert result.startswith("🛑")
+    assert "«Шаг 2»" in result
+    assert live["c"]["parentId"] == "p"
+    assert fake_v2.calls == []
+
+
+async def test_unset_task_parent_automation_key_mismatch_is_refused_before_plan(
+        monkeypatch):
+    """Headless path (#118): a valid automation_key runs on the FIRST call,
+    with no plan card and no Telegram button ever shown — so if the identity
+    check only lived inside _gate_single/execution, a false name+id pair
+    would sail through silently on a single valid key. The check sits BEFORE
+    _gate_single, so it applies here too."""
+    live = {"c": {"id": "c", "title": "Шаг 2", "projectId": "p1", "parentId": "p"}}
+    fake_v2 = FakeV2(live=live)
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    calls = []
+
+    def _stub(*a, **k):
+        calls.append(1)
+        return s._Guard("mismatch", project_id="p1", title="Шаг 2",
+                        message='id указывает на «Шаг 2», а НЕ «Шаг 1»')
+    monkeypatch.setattr(s, "_guard_task", _stub)
+    monkeypatch.setattr(s, "SECRET", "test-secret")
+
+    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1",
+                                       automation_key="test-secret")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Шаг 2»" in result
+    assert live["c"]["parentId"] == "p"
+    assert fake_v2.calls == []
+    assert len(calls) == 1
 
 
 # ===========================================================================

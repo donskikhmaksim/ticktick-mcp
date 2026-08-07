@@ -9025,16 +9025,53 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
     call #2 is refused whatever `user_reply` says — before the press (wait for
     it) and after it too (the server is already running the operation). Do not
     retry it; just tell the user to tap the button.
+
+    task_id and task_title (the SUBTASK being detached) are cross-checked
+    against the LIVE task list TWICE (same pattern as delete_habit, def-116,
+    2026-08-07): once while BUILDING the plan (call #1, before anything is
+    shown to the owner — a mismatched title never reaches the plan card at
+    all) and again, independently, right before the actual detach (call #2,
+    unchanged). If the live read itself fails while building the plan, the
+    plan still gets built (a read hiccup must not block every detach), but
+    its text says so honestly — the call #2 check is unconditional and still
+    guards the mutation either way. NOTE: parent_task_title (the PARENT's
+    claimed name) is NOT verified by this guard, on either call — see
+    def-126 for that separate, pre-existing gap.
     """
     err = _ensure_ready()
     if err:
         return err
+    # Перенос identity-guard (task_id↔task_title, ТОЛЬКО субтаска, который
+    # отцепляем — не родителя, см. def-126) на построение плана — тот же
+    # _guard_task, что уже стоит в _unset_task_parent_impl НА ИСПОЛНЕНИИ.
+    # mismatch И missing здесь блокируют план целиком — _unset_task_parent_impl
+    # уже трактует ОБА как 🛑 на исполнении, перенос это не ужесточает.
+    # Временная недоступность живого чтения — fail-open с предупреждением, а
+    # исполнение (не тронуто) перепроверит заново. automation_key НЕ
+    # пропускает эту проверку — она стоит раньше самого гейта.
+    name_warning = ""
+    if not manifest_id:
+        g = _guard_task(task_id, task_title or "", project_id)
+        if g.status == "mismatch":
+            return (f"🛑 План НЕ построен — id это «{g.title}», а НЕ "
+                    f"«{task_title}» (защита от «не той задачи»). Ничего не "
+                    "изменено.")
+        elif g.status == "missing":
+            return (f"🛑 План НЕ построен — «{task_title}» не среди открытых "
+                    "задач (завершена/удалена/неверный id). Ничего не изменено.")
+        elif g.status == "unavailable":
+            name_warning = (" ⚠️ Название задачи НЕ удалось сверить с живым "
+                            "состоянием (чтение не удалось) — сверка "
+                            "повторится при подтверждении, и расхождение "
+                            "остановит исполнение.")
     params = {"task_title": task_title, "parent_task_title": parent_task_title,
               "task_id": task_id, "parent_task_id": parent_task_id,
               "project_id": project_id}
+    describe_fn = ((lambda p: _describe_unset_task_parent(p) + name_warning)
+                   if name_warning else _describe_unset_task_parent)
     outcome = await _gate_single("unset_task_parent", "unset_task_parent",
                                  params if not manifest_id else None,
-                                 manifest_id, user_reply, _describe_unset_task_parent,
+                                 manifest_id, user_reply, describe_fn,
                                  automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
