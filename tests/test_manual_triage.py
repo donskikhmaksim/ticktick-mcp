@@ -73,11 +73,14 @@ class _FakeV2:
             self.live.pop(tid, None)
         return {}
 
-    def batch_move_tasks(self, ids, to_project_id):
-        self.calls.append(("move", list(ids), to_project_id))
-        for tid in ids:
+    def batch_move_tasks_raw(self, rows):
+        ids = [r["taskId"] for r in rows]
+        to_project_id = rows[0]["toProjectId"] if rows else None
+        self.calls.append(("move", ids, to_project_id))
+        for r in rows:
+            tid = r["taskId"]
             if tid in self.live:
-                self.live[tid]["projectId"] = to_project_id
+                self.live[tid]["projectId"] = r["toProjectId"]
         return {}
 
     def batch_delete_tasks(self, rows):

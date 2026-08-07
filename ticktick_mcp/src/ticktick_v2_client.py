@@ -285,7 +285,19 @@ class TickTickV2Client:
         return self._request("POST", "/batch/taskProject", json=body)
 
     def batch_move_tasks(self, task_ids: List[str], to_project_id: str) -> Dict:
-        """Move several open tasks to to_project_id in one batch/taskProject call."""
+        """Move several open tasks to to_project_id in one batch/taskProject call.
+
+        DERIVES each task's fromProjectId from get_open_tasks() — the v2
+        open-task sync snapshot. If a task isn't in THAT snapshot (it can be
+        missing for a task that is otherwise live and confirmed by other
+        means — see server.py's identity-guard fallback and its docstring),
+        this method silently DROPS it from the request body (`continue`
+        below) — no error, no id2error entry, nothing sent to TickTick for
+        it at all. A caller that already confirmed the task exists via a
+        more reliable path (e.g. the official Open API) should use
+        batch_move_tasks_raw() instead, passing the fromProjectId it already
+        knows, rather than letting this method re-derive it from the same
+        snapshot that may not have the task."""
         by_id = {t.get("id"): t for t in self.get_open_tasks()}
         body = []
         for tid in task_ids:
@@ -299,6 +311,28 @@ class TickTickV2Client:
                          "toProjectId": to_project_id, "taskId": tid})
         if not body:
             return {"message": "No tasks to move (already in target or not found)."}
+        return self._request("POST", "/batch/taskProject", json=body)
+
+    def batch_move_tasks_raw(self, rows: List[Dict]) -> Dict:
+        """Raw batch/taskProject move: rows of {"taskId", "fromProjectId",
+        "toProjectId"} — lets the caller send each task's OWN already-
+        confirmed live fromProjectId, instead of batch_move_tasks() above
+        re-deriving it from get_open_tasks(). That re-derivation is exactly
+        the bug behind a live incident (2026-08-07): identity-guard's
+        official-API fallback correctly found and allowed a move for a task
+        missing from the v2 open-task snapshot, batch_move_tasks() was then
+        called with just its id, looked the id up in THAT SAME missing-it
+        snapshot again, found nothing, and silently dropped the task from
+        the request body — the guard's success never translated into an
+        actual TickTick write, and no error was raised anywhere (id2error
+        stayed empty, since TickTick was never even asked). Same "trust the
+        caller's own already-verified projectId" pattern as
+        set_task_parents() above."""
+        body = [{"fromProjectId": r["fromProjectId"], "toProjectId": r["toProjectId"],
+                 "taskId": r["taskId"]}
+                for r in rows if r.get("fromProjectId") != r.get("toProjectId")]
+        if not body:
+            return {"message": "No tasks to move (already in target)."}
         return self._request("POST", "/batch/taskProject", json=body)
 
     # ---- smart lists / filters -------------------------------------------

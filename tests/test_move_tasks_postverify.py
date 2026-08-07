@@ -250,8 +250,9 @@ class _FakeV2MoveOnly:
         self.calls = []
         self.actually_moves = actually_moves
 
-    def batch_move_tasks(self, ids, to_project_id):
-        self.calls.append(("move", list(ids), to_project_id))
+    def batch_move_tasks_raw(self, rows):
+        self.calls.append(("move", [r["taskId"] for r in rows],
+                           rows[0]["toProjectId"] if rows else None))
         return {}
 
 
@@ -531,7 +532,7 @@ def _wire_restore(monkeypatch, reads, trash):
         def batch_restore_tasks(self, ids, to_project_id=None):
             return {}
 
-        def batch_move_tasks(self, ids, to_project_id):
+        def batch_move_tasks_raw(self, rows):
             return {}
     monkeypatch.setattr(s, "ticktick_v2", _FakeV2Restore())
 

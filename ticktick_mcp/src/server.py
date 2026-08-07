@@ -7957,8 +7957,21 @@ async def _move_tasks_impl(summary: str, tasks: List[Dict[str, str]],
         unverified = False
         api_fail = {}
         if found:
-            resp = await _run_blocking(lambda: ticktick_v2.batch_move_tasks(
-                [f["taskId"] for f in found], to_project_id))
+            # batch_move_tasks_raw (not batch_move_tasks): each item's
+            # fromProjectId is already CONFIRMED by the identity guard above
+            # (including its official-API fallback for a task missing from
+            # the v2 open-task snapshot — see _official_task_snapshot's
+            # docstring). batch_move_tasks() would re-derive fromProjectId
+            # by looking the task up in THAT SAME v2 snapshot again and
+            # silently drop it if not found there — which is exactly how a
+            # guard-approved move turned into a live no-op with no error at
+            # all (2026-08-07 incident): found the task via the fallback,
+            # called the OLD batch_move_tasks with just the id, which
+            # couldn't find it in get_open_tasks() either and dropped it
+            # from the request body before TickTick was ever asked.
+            resp = await _run_blocking(lambda: ticktick_v2.batch_move_tasks_raw([
+                {"taskId": f["taskId"], "fromProjectId": f["projectId"],
+                 "toProjectId": to_project_id} for f in found]))
             api_fail = id2error_failures(resp, [f["taskId"] for f in found])
             # verify the tasks actually landed — retried (see
             # _reread_open_until) so an immediate re-read racing TickTick's
@@ -9868,19 +9881,30 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
                         # засчитать как успех, который на деле не проверен.
                         unknown_dest.append(i["title"])
                     elif live.get("projectId") != i["want_pid"]:
-                        to_fix.append(i)
+                        # Carry the CURRENT live projectId along (usually
+                        # Inbox, where /trash/restore dropped it) — needed
+                        # below as the raw move's fromProjectId, since
+                        # batch_move_tasks() would otherwise have to
+                        # re-derive it from get_open_tasks() (see that
+                        # method's docstring for why that can silently drop
+                        # the task from the request entirely).
+                        to_fix.append({**i, "cur_pid": live.get("projectId")})
                     else:
                         restored.append(i["title"])
                 if to_fix:
-                    fix_by_pid: Dict[str, List[str]] = {}
+                    fix_by_pid: Dict[str, List[Dict]] = {}
                     for i in to_fix:
-                        fix_by_pid.setdefault(i["want_pid"], []).append(i["taskId"])
+                        fix_by_pid.setdefault(i["want_pid"], []).append(i)
                     fix_api_fail: Dict[str, str] = {}
-                    for pid, ids in fix_by_pid.items():
+                    for pid, items in fix_by_pid.items():
+                        ids = [i["taskId"] for i in items]
                         try:
                             mresp = await _run_blocking(
-                                lambda pid=pid, ids=ids:
-                                    ticktick_v2.batch_move_tasks(ids, pid))
+                                lambda pid=pid, items=items:
+                                    ticktick_v2.batch_move_tasks_raw([
+                                        {"taskId": i["taskId"],
+                                         "fromProjectId": i["cur_pid"],
+                                         "toProjectId": pid} for i in items]))
                             fix_api_fail.update(id2error_failures(mresp, ids))
                         except Exception as e:
                             logger.error("restore_tasks: corrective move to "

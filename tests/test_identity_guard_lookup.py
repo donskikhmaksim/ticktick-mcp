@@ -234,8 +234,8 @@ class _FakeV2MoveOnly:
     def __init__(self):
         self.calls = []
 
-    def batch_move_tasks(self, ids, to_project_id):
-        self.calls.append(("move", list(ids), to_project_id))
+    def batch_move_tasks_raw(self, rows):
+        self.calls.append(("move_raw", list(rows)))
         return {}
 
 
@@ -296,7 +296,12 @@ async def test_move_tasks_second_move_succeeds_when_v2_snapshot_lost_the_task(
     assert "↷ Не найдены" not in result
     assert "Перемещено 1" in result
     assert "❌" not in result
-    assert fake_v2.calls == [("move", ["t1"], "p_old")]
+    # Raw move (not batch_move_tasks): fromProjectId came from the identity
+    # guard's OWN confirmed live projectId (p_new — found via the fallback),
+    # not re-derived by v2 from a snapshot that doesn't have the task.
+    assert fake_v2.calls == [
+        ("move_raw", [{"taskId": "t1", "fromProjectId": "p_new",
+                       "toProjectId": "p_old"}])]
     # Полный скан официальных проектов реально нашёл задачу — доказательство,
     # что fallback без project_id тоже долетает до конца инструмента.
     assert ("p_new", "t1") in fake_official.calls
