@@ -389,3 +389,45 @@ async def test_declutter_obsolete_flag_uses_owner_day(monkeypatch):
     got = out["flag_obsolete"][0]["due"]
     assert got == local_d.isoformat(), got
     assert got != utc_d.isoformat(), got
+
+
+# ==========================================================================
+# ГЛАВНОЕ: три источника про ОДНУ задачу обязаны назвать ОДИН день
+# ==========================================================================
+
+def _due_day_from(text: str, needle: str) -> str:
+    days = _days(_line(text, needle))
+    assert len(days) == 1, (needle, days, text)
+    return days.pop()
+
+
+@pytest.mark.parametrize("zone,hour,minute", [(LA, 23, 59), (MSK, 0, 30)])
+async def test_get_task_and_task_info_and_list_agree(zone, hour, minute, monkeypatch):
+    """САМА СУТЬ ЗАДАНИЯ.
+
+    Половинчатый фикс f85fc76 сделал состояние ХУЖЕ исходного: до него все
+    инструменты врали одинаково, после — `get_task` и список говорили одно, а
+    `get_task_info` другое, и определить правого без ЧЕТВЁРТОГО источника было
+    нельзя. Здесь три вида одной и той же задачи обязаны сойтись на одном
+    календарном дне — на нём же, что и внутренняя классификация
+    (`_task_due_local_date`, по которой строятся «просрочено» / «на сегодня»).
+    """
+    monkeypatch.setattr(s, "_USER_TZ", ZoneInfo(zone))
+    due, local_d, utc_d = _at_local(zone, hour, minute)
+    task = {"id": "t1", "projectId": "p1", "title": "Deliver the door",
+            "dueDate": due, "status": 0}
+
+    monkeypatch.setattr(s, "ticktick", FakeV1(task))
+    monkeypatch.setattr(s, "ticktick_v2", FakeV2(task=task))
+
+    from_get_task = _due_day_from(await s.get_task("p1", "t1"), "Due Date:")
+    from_info = _due_day_from(await s.get_task_info("t1"), "due:")
+    from_line = _due_day_from(s.format_task_line(task), "due ")
+
+    assert from_get_task == from_info == from_line, {
+        "get_task": from_get_task, "get_task_info": from_info,
+        "list": from_line, "ожидался локальный день": local_d.isoformat(),
+        "день по UTC": utc_d.isoformat()}
+    assert from_info == local_d.isoformat()
+    # И тот же день, по которому задача КЛАССИФИЦИРУЕТСЯ в фильтрах.
+    assert s._task_due_local_date(task).isoformat() == from_info
