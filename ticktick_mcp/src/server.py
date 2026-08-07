@@ -757,6 +757,91 @@ def _open_by_id(fresh: bool = False) -> Optional[Dict[str, Dict]]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Identity-guard fallback: point-read via the OFFICIAL Open API.
+#
+# ПОЧЕМУ ЭТО ЗДЕСЬ (живой прогон 2026-08-07 00:03 PT, move_tasks, задача
+# «__AUTOTEST__dup-src», id 6a7571238f0854e347f51407 — обычная задача, НЕ
+# дубликат): в 23:38 PT она была штатно перемещена в проект X (перемещение
+# реально состоялось). В 00:03 PT — через 25 МИНУТ — попытка переместить её
+# обратно была отвергнута identity-guard'ом («не найдена среди открытых»),
+# хотя та же задача читалась МГНОВЕННО и напрямую через get_project_tasks и
+# get_task (оба — официальный Open API) сразу после отказа. Это НЕ та же
+# гонка, что чинит _POSTVERIFY_RETRY_DELAYS_S/_reread_open_until (пара
+# секунд лага сразу после мутации, до ~9с ретраев) — 25 минут не влезают ни
+# в какое разумное окно ретраев одного и того же источника. Причина глубже:
+# _open_by_id/_guard_task читают ТОЛЬКО через неофициальный v2 web-API
+# (`ticktick_v2`, /batch/check/0) — та же задача может надолго выпасть из
+# ЭТОЙ выборки «открытых задач» и никаким количеством повторных чтений ЕЁ ЖЕ
+# это не исправить (см. также test_identity_guard_lookup.py). Официальный
+# Open API — СОВСЕМ ДРУГОЙ backend (OAuth, /project/{id}/task/{id}) — этой
+# проблеме не подвержен: он и увидел задачу мгновенно в живом прогоне.
+#
+# Поэтому guard, прежде чем объявить задачу отсутствующей СРЕДИ ОТКРЫТЫХ,
+# пробует один точечный запрос к официальному API — но ТОЛЬКО когда v2-
+# выборка уже не нашла задачу (нулевая цена на счастливом пути, который
+# остаётся таким же, как был) и только как ДОПОЛНИТЕЛЬНЫЙ источник данных:
+# сама сверка id/названия/контейнера (_guard_task ниже) не меняется — меняется
+# только СПОСОБ добыть объект для этой сверки.
+def _official_task_snapshot(project_id: str, task_id: str) -> Optional[Dict]:
+    """Single-task fallback read via the OFFICIAL Open API (`GET
+    /project/{projectId}/task/{taskId}`) — used by the identity guard ONLY
+    when the v2 open-task snapshot didn't have the task. Requires the
+    CURRENT project_id (the official endpoint 404s on a stale one, which is
+    fine: that's the same "can't confirm" outcome the caller already handles
+    as missing/mismatch).
+
+    Returns a dict shaped like a v2 task ({id, title, projectId, status, …})
+    on success. Returns None on ANY failure: no official client configured,
+    no project_id given, a network/HTTP error, a 404 (wrong container or
+    truly gone), an id that doesn't match, or a task that exists but is no
+    longer OPEN (completed/won't-do) — the OPEN restriction mirrors what
+    _open_by_id already enforces via get_open_tasks(), so this fallback
+    can't accidentally make the guard MORE permissive than the primary path,
+    only more resilient to the primary path's staleness."""
+    if not ticktick or not project_id or not task_id:
+        return None
+    try:
+        t = ticktick.get_task(project_id, task_id)
+    except Exception:
+        return None
+    if not isinstance(t, dict) or "error" in t:
+        return None
+    if t.get("id") != task_id:
+        return None
+    if t.get("status", 0) != 0:
+        return None  # completed / won't-do — not part of the OPEN pool
+    return t
+
+
+def _official_task_scan(task_id: str) -> Optional[Dict]:
+    """Last-resort identity-guard fallback for callers that don't have a
+    project_id at all (e.g. abandon_task/duplicate_task take no project_id
+    argument) — scans every official project for the task, same rationale
+    as _official_task_snapshot above just without a container to target
+    directly. Reuses the same "iterate official projects" pattern already
+    used by search_tasks'/get_recurring_tasks' no-v2 fallback. Only ever
+    reached after the v2 snapshot already came up empty, so the extra HTTP
+    calls are paid exclusively on that already-degraded path, never on the
+    common happy path. Returns None (never raises) on any failure."""
+    if not ticktick:
+        return None
+    try:
+        projects = ticktick.get_projects()
+    except Exception:
+        return None
+    if not isinstance(projects, list):
+        return None
+    for p in projects:
+        pid = p.get("id") if isinstance(p, dict) else None
+        if not pid:
+            continue
+        t = _official_task_snapshot(pid, task_id)
+        if t:
+            return t
+    return None
+
+
 # Сколько раз и с какой паузой повторно перечитывать живое состояние ПОСЛЕ
 # identity-changing мутации (меняет проект/родителя/группу задачи —
 # move_tasks, set_task_parent, unset_task_parent, move_project_to_group,
@@ -1003,13 +1088,28 @@ def _guard_task(
     - id in a different project than asked  → status 'mismatch'
     - otherwise                            → status 'ok', project_id corrected
 
-    Title check is armed only when `expected_title` is given (back-compatible)."""
+    Title check is armed only when `expected_title` is given (back-compatible).
+
+    When the v2 open-task snapshot (`by_id`) doesn't have the task, this
+    does NOT immediately conclude 'missing': that snapshot can lag a
+    mutation made through the same v2 API by far longer than any bounded
+    retry covers (minutes, not seconds — see _official_task_snapshot's
+    docstring for the live incident this fixes). Before refusing, it takes
+    one point-read against the OFFICIAL Open API — a different backend not
+    subject to the same staleness — using `project_id` when given, or a
+    full-project scan when it isn't (see _official_task_scan). Only THEN,
+    if that also fails to confirm the task, is it reported missing. The
+    identity check itself (id/title/container below) is unchanged either
+    way — only how the live object is obtained changes."""
     if by_id is None:
         by_id = _open_by_id(fresh=fresh)
     if by_id is None:
         return _Guard("unavailable", project_id, expected_title,
                       _STATE_UNAVAILABLE_MSG)
     live = by_id.get(task_id)
+    if not live:
+        live = (_official_task_snapshot(project_id, task_id) if project_id
+                else _official_task_scan(task_id))
     if not live:
         return _Guard("missing", project_id, expected_title,
                       f"id {str(task_id)[:8]}… не среди открытых задач "
