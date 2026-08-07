@@ -8831,15 +8831,73 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
     call #2 is refused whatever `user_reply` says — before the press (wait for
     it) and after it too (the server is already running the operation). Do not
     retry it; just tell the user to tap the button.
+
+    parent_task_id and parent_task_title are cross-checked against the LIVE
+    task list TWICE (same pattern as delete_habit, def-116, 2026-08-07): once
+    while BUILDING the plan (call #1, before anything is shown to the owner —
+    a mismatched or gone parent never reaches the plan card at all) and again,
+    independently, right before the actual nesting (call #2, unchanged). If
+    the live read itself fails while building the plan, the plan still gets
+    built (a read hiccup must not block every nesting), but its text says so
+    honestly — the call #2 check is unconditional and still guards the
+    mutation either way. NOTE: this only covers the PARENT's identity — each
+    task in `tasks` is still resolved found/mismatch/missing only on
+    execution (see _set_task_parent_impl / _split_tasks_by_state), same as
+    before.
     """
     err = _ensure_ready()
     if err:
         return err
+    # Перенос identity-guard (parent_task_id↔parent_task_title) на построение
+    # плана — тот же _guard_task, что уже стоит в _set_task_parent_impl НА
+    # ИСПОЛНЕНИИ для РОДИТЕЛЯ, но здесь — ДО показа карточки владельцу (тот
+    # же перенос, что в create_subtask/unset_task_parent/duplicate_task).
+    # mismatch И missing здесь блокируют план целиком — _set_task_parent_impl
+    # уже трактует ОБА как 🛑 («НЕ вложил») на исполнении для родителя (в
+    # отличие от add_task_comment, где missing мягче), перенос это не
+    # ужесточает. Временная недоступность живого чтения — fail-open с
+    # предупреждением (через notes батч-карточки), исполнение (не тронуто)
+    # перепроверит заново. Действует только на call #1 (manifest_id пуст);
+    # automation_key НЕ пропускает эту проверку — она стоит раньше самого
+    # гейта.
+    #
+    # СКОУП: переносится сверка ТОЛЬКО parent_task_id↔parent_task_title (сам
+    # родитель) — это единственный именованный объект, который карточка
+    # плана печатает БЕЗ сверки («… → под «{parent_task_title}»»). Личность
+    # КАЖДОЙ задачи из списка `tasks` уже разбирается в _set_task_parent_impl
+    # через _split_tasks_by_state — но это не блокирующий identity-guard
+    # ОДНОГО именованного объекта, а частичная батч-логика: found/mismatch/
+    # missing по каждому элементу обрабатываются НЕЗАВИСИМО, ни один reject
+    # не валит весь батч (mismatch-элементы просто исключаются из вложения,
+    # см. _mismatch_report в _set_task_parent_impl). Перенести её на план
+    # значило бы не «сдвинуть момент существующей проверки раньше», а
+    # переписать сам формат батч-карточки заново (нужен live-статус на
+    # КАЖДЫЙ элемент до его показа, с иным типом отчёта) — это вне мандата
+    # этой правки: «переносишь момент, не меняешь строгость», а не
+    # «придумываешь новую защиту».
+    notes = None
+    if not manifest_id:
+        pg = _guard_task(parent_task_id, parent_task_title or "", project_id)
+        if pg.status == "mismatch":
+            return (f"🛑 План НЕ построен — родитель по id это «{pg.title}», а "
+                    f"НЕ «{parent_task_title}» (защита от «не той задачи»). "
+                    "Ничего не изменено.")
+        if pg.status == "missing":
+            return (f"🛑 План НЕ построен — родитель «{parent_task_title or parent_task_id}» "
+                    "не среди открытых задач (завершён/удалён/неверный id) — "
+                    "вложение под мёртвого родителя осиротит задачи. Ничего "
+                    "не изменено.")
+        if pg.status == "unavailable":
+            notes = ["⚠️ Название родительской задачи НЕ удалось сверить с "
+                     "живым состоянием (чтение не удалось) — сверка "
+                     "повторится при подтверждении, и расхождение остановит "
+                     "исполнение."]
     outcome = await _gate_batch(
         "parent", "set_task_parent", tasks, summary, manifest_id, user_reply,
         lambda t: f"**«{t.get('title') or t.get('taskId')}»** → под «{parent_task_title or parent_task_id}»",
         extra={"parent_task_id": parent_task_id, "project_id": project_id,
                "parent_task_title": parent_task_title},
+        notes=notes,
         automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
