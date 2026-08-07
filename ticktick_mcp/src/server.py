@@ -5229,7 +5229,12 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         if live.get("columnId"):
             facts.append("раздел применён")
         if live.get("dueDate"):
-            facts.append(f"срок {str(live['dueDate'])[:10]}")
+            # Это текст РЕШЕНИЯ: по нему владелец принимает результат
+            # создания, а не просматривает список. Сырой срез [:10] от
+            # UTC-строки называл здесь чужой календарный день — тот же
+            # дефект, что чинили в списках (f85fc76), но с более дорогой
+            # ценой ошибки. _local_date_str() держит и all-day буквально.
+            facts.append(f"срок {_local_date_str(live, 'dueDate')}")
         if live.get("priority"):
             facts.append(f"приоритет {PRIORITY_MAP.get(live['priority'], live['priority'])}")
         return ("ok", f"- ✅ **«{title}»** — создана {', '.join(facts)}")
@@ -5879,7 +5884,12 @@ async def _dc_analyze(tasks: List[Dict], names: Dict, judge_fn=None, smart_fn=No
             out["flag_obsolete"].append({
                 "taskId": t.get("id"), "title": t.get("title") or "",
                 "project": names.get(t.get("projectId"), ""),
-                "due": str(t.get("dueDate"))[:10] if t.get("dueDate") else "",
+                # Печатает это plan_declutter: «срок X (просрочено N дней)».
+                # Счётчик N уже считался в зоне владельца
+                # (_dc_is_obsolete → _task_due_local_date), а срок рядом
+                # брался сырым срезом — строка противоречила сама себе на
+                # день, и по ней человек решает, добивать задачу или нет.
+                "due": _local_date_str(t, "dueDate") if t.get("dueDate") else "",
                 "overdue_days": info["overdue_days"], "age_days": info["age_days"],
             })
 
@@ -7487,6 +7497,32 @@ def _local_datetime_str(task: Dict[str, Any], field: str = "dueDate") -> str:
     if dt is None:
         return f"{raw} (unparsed)"
     return f"{dt.astimezone(_USER_TZ).strftime('%Y-%m-%d %H:%M')} ({_USER_TZ.key})"
+
+
+def _local_stamp_str(value: Any, with_zone: bool = True,
+                     seconds: bool = False) -> str:
+    """Render an EVENT INSTANT — createdTime / modifiedTime / completedTime,
+    an activity-log `when` — in the owner's zone.
+
+    Deliberately NOT _local_datetime_str: that one asks _is_all_day_value()
+    first, and an all-day TASK carries isAllDay=True for the whole record, so
+    reusing it here would declare the task's CREATION TIME a zone-independent
+    calendar date and re-introduce the very off-by-one this fixes. These
+    stamps are always real moments; there is no all-day case for them.
+
+    with_zone=False drops the trailing "(America/Los_Angeles)" for callers
+    that state the zone once in a header instead of on every one of N lines
+    (the activity log). `seconds` keeps an event log's second-level precision,
+    which the old `[:19]` slice did carry.
+    """
+    if not value:
+        return "?"
+    dt = _parse_ticktick_datetime(str(value))
+    if dt is None:
+        return f"{value} (unparsed)"
+    fmt = "%Y-%m-%d %H:%M:%S" if seconds else "%Y-%m-%d %H:%M"
+    out = dt.astimezone(_USER_TZ).strftime(fmt)
+    return f"{out} ({_USER_TZ.key})" if with_zone else out
 
 
 def _today_local():
@@ -12868,12 +12904,18 @@ async def get_task_info(task_id: str) -> str:
             parent = next((x for x in all_tasks if x.get("id") == t["parentId"]), None)
             pname = parent.get("title") if parent else t["parentId"]
             out += f"  parent: «{pname}»  (id:{t['parentId']})\n"
+        # Same renderer as format_task()/format_task_line() — deliberately not
+        # a second, local implementation. This branch printed the raw stored
+        # instant for any TIMED deadline ("2026-08-08T21:00:00.000+0000"),
+        # while get_task and the listings had already moved to the owner's
+        # zone: one live task then answered 2026-08-06 in one tool and
+        # 2026-08-07 in this one, with no third source to break the tie.
+        # _local_datetime_str keeps all-day values verbatim (#36) and appends
+        # its own "(all-day)" marker, so no extra suffix here.
         if t.get("startDate"):
-            sd = t["startDate"][:10] if t.get("isAllDay") else t["startDate"]
-            out += f"  start: {sd}\n"
+            out += f"  start: {_local_datetime_str(t, 'startDate')}\n"
         if t.get("dueDate"):
-            d = t["dueDate"][:10] if t.get("isAllDay") else t["dueDate"]
-            out += f"  due: {d}{'  (all-day)' if t.get('isAllDay') else ''}\n"
+            out += f"  due: {_local_datetime_str(t, 'dueDate')}\n"
         repeat = t.get("repeatFlag") or t.get("repeatRule")
         if repeat:
             out += f"  repeat: {repeat}\n"
@@ -12890,11 +12932,14 @@ async def get_task_info(task_id: str) -> str:
         if content:
             out += f"  content: {content[:300]}\n"
         # Activity (no full edit-log endpoint exists; these are the task's stamps)
+        # Same treatment as the due/start lines above: these three were raw UTC
+        # stamps with no zone stated at all, so a task created 23:10 local read
+        # as the NEXT day and nothing in the output hinted why.
         out += "\nActivity:\n"
-        out += f"  created: {t.get('createdTime', '?')} by {who}\n"
-        out += f"  last modified: {t.get('modifiedTime', '?')}\n"
+        out += f"  created: {_local_stamp_str(t.get('createdTime'))} by {who}\n"
+        out += f"  last modified: {_local_stamp_str(t.get('modifiedTime'))}\n"
         if t.get("completedTime"):
-            out += f"  completed: {t['completedTime']}\n"
+            out += f"  completed: {_local_stamp_str(t['completedTime'])}\n"
         # Checklist items
         items = t.get("items") or []
         if items:
@@ -12953,11 +12998,15 @@ def _task_activity_fallback(task_id: str) -> Optional[str]:
             return None
         creator = str(t.get("creator", ""))
         who = "you" if creator == owner else (f"user {creator}" if creator else "?")
-        lines = [f"  created: {t.get('createdTime', '?')}  by {who}"]
+        # Same three stamps get_task_info shows, so they are rendered by the
+        # same helper: this fallback is what the reader sees INSTEAD of the
+        # real log, and a substitute that dates events differently from the
+        # tool it substitutes for is worse than no substitute.
+        lines = [f"  created: {_local_stamp_str(t.get('createdTime'))}  by {who}"]
         if t.get("modifiedTime"):
-            lines.append(f"  last modified: {t['modifiedTime']}")
+            lines.append(f"  last modified: {_local_stamp_str(t['modifiedTime'])}")
         if t.get("completedTime"):
-            lines.append(f"  completed: {t['completedTime']}")
+            lines.append(f"  completed: {_local_stamp_str(t['completedTime'])}")
         return "\n".join(lines)
     except Exception:
         return None
@@ -13009,10 +13058,18 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
             "T_TAG":     "changed tags",
         }
 
-        out = f"Activity log ({len(events)} events):\n\n"
+        # Times are the OWNER's, and the zone is named ONCE in the header
+        # rather than on each of N lines (with_zone=False below) — a log of 40
+        # events would otherwise repeat "(America/Los_Angeles)" 40 times. The
+        # old `[:19]` slice just chopped the offset off the raw UTC string, so
+        # an event at 23:30 local was logged under the NEXT calendar day.
+        # Seconds are kept: `[:19]` carried them and an edit log is exactly
+        # where two changes a minute apart need distinguishing.
+        out = (f"Activity log ({len(events)} events; times in "
+               f"{_USER_TZ.key}):\n\n")
         for e in events:
             action = e.get("action", "?")
-            when = (e.get("when") or "?")[:19].replace("T", " ")
+            when = _local_stamp_str(e.get("when"), with_zone=False, seconds=True)
             who = e.get("whoProfile", {})
             actor = "you" if who.get("isMyself") else who.get("displayName") or "someone"
             channel = e.get("deviceChannel", "")
@@ -13022,8 +13079,19 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
             if action == "T_TITLE" and e.get("title"):
                 line += f' → "{e["title"]}"'
             elif action == "T_DUE":
-                before = (e.get("dueDateBefore") or "")[:10] or "none"
-                after = (e.get("dueDate") or "")[:10] or "none"
+                # Both ends of the move are CALENDAR DAYS in the owner's zone,
+                # so they go through the same _local_date_str() the listings
+                # use. The old [:10] slice off the raw UTC string made the
+                # history of "when did we push this deadline" show days the
+                # owner never saw — worse here than in a list, because this is
+                # the record people reconstruct decisions from. The event dict
+                # carries its own isAllDay, which _local_date_str honours, so
+                # an all-day move stays verbatim (#36). "none" stays the word
+                # "none" — str(None)[:10] would have printed "None".
+                before = (_local_date_str(e, "dueDateBefore")
+                          if e.get("dueDateBefore") else "none")
+                after = (_local_date_str(e, "dueDate")
+                         if e.get("dueDate") else "none")
                 line += f"  {before} → {after}"
                 if e.get("isAllDay"):
                     line += " (all-day)"
