@@ -38,6 +38,20 @@ def _ok_guard(*_a, **_k):
     return s._Guard("ok", project_id="p1", title="Купить молоко")
 
 
+def _guard_sequence(*results):
+    """`_guard_task` stand-in that returns `results` in order, one per call —
+    used below (def-126) to simulate the plan-phase parent read (call #1)
+    disagreeing with what the execution-phase reads (call #2, inside
+    _unset_task_parent_impl, unchanged) find a moment later: e.g. the plan
+    read fails/times out (yields "unavailable") while the execution read
+    either confirms the claimed name or catches a real mismatch."""
+    it = iter(results)
+
+    def _stub(*_a, **_k):
+        return next(it)
+    return _stub
+
+
 class FakeV2:
     """One fake covering every v2 call touched by the 10 tools below,
     mutating a shared `live`/`groups`/`tags`/`comments` state so post-verify
@@ -319,6 +333,140 @@ async def test_unset_task_parent_confirmed_detaches(monkeypatch):
                                        manifest_id=mid, user_reply="да")
     assert ("unset_parent", "c") in fake_v2.calls
     _assert_confirmed_success(result)
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-07 (def-126): parent_task_id↔parent_task_title (the claimed PARENT,
+# NOT the subtask being detached) is now cross-checked BEFORE the plan is
+# built. Before this fix, NOTHING verified it at all — only the RELATIONSHIP
+# (live parentId of the subtask == parent_task_id) was checked, never the
+# parent's NAME against that id. The two tests above this point monkeypatch
+# `_guard_task` to an unconditional "ok" (same result on every call, for
+# every argument) so they could not have caught either the old bug or a
+# regression here — they remain unmodified.
+#
+# Strictness note (see server.py docstring/comments for the full rationale):
+# mismatch (a LIVE parent with a DIFFERENT name than claimed) blocks the plan
+# (🛑) — same severity as set_task_parent's parent guard. But missing/
+# unavailable (parent not resolvable live) does NOT block here, unlike
+# set_task_parent: unset_task_parent SEVERS a link rather than creating one,
+# and a parent that is completed/deleted (hence unresolvable live) is the
+# ordinary, expected reason to want to detach from it — the subtask's own
+# live parentId is still independently checked against parent_task_id in
+# _unset_task_parent_impl either way, so the id-level relationship is never
+# taken on faith. The execution-side (second-line) guard for the SAME check
+# is exercised separately, in its own commit/tests below this one.
+# ---------------------------------------------------------------------------
+
+async def test_unset_task_parent_plan_identity_guard_blocks_wrong_parent_title(
+        monkeypatch):
+    """parent_task_id points at a REAL task ("Большой проект"), caller's
+    parent_task_title claims a DIFFERENT one ("Другой родитель") — before
+    this fix, call #1 would have built and shown a plan card reading
+    'Отцепляю «Шаг 1» от родителя «Другой родитель»' even though the id has
+    nothing to do with that task. Now the plan is refused outright, before
+    any card is built, and unset_task_parent (the v2 mutation) is never
+    called."""
+    live = {"c": {"id": "c", "title": "Шаг 1", "projectId": "p1", "parentId": "p"}}
+    fake_v2 = FakeV2(live=live)
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(
+        s, "_guard_task",
+        lambda *a, **k: s._Guard(
+            "mismatch", project_id="p1", title="Большой проект",
+            message='id указывает на «Большой проект», а НЕ «Другой родитель»'))
+
+    result = await s.unset_task_parent("Шаг 1", "Другой родитель", "c", "p", "p1")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Большой проект»" in result
+    assert "manifest_id" not in result, "план для несовпавшей пары строиться не должен"
+    assert live["c"]["parentId"] == "p"
+    assert fake_v2.calls == []
+
+
+async def test_unset_task_parent_plan_missing_parent_does_not_block_but_warns(
+        monkeypatch):
+    """Deliberately DIFFERENT severity from set_task_parent's own missing-
+    parent case (which refuses the plan outright): a parent that doesn't
+    resolve live (completed/deleted) is the NORMAL reason to detach from it,
+    so the plan is still built — it just honestly warns that the parent's
+    name could not be verified — and the detach (id-based, verified via the
+    relationship check further down) still goes through on confirmation."""
+    live = {"c": {"id": "c", "title": "Шаг 1", "projectId": "p1", "parentId": "p"}}
+    fake_v2 = FakeV2(live=live)
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(s, "_guard_task", _guard_sequence(
+        s._Guard("missing", project_id="p1"),               # call #1 (plan, parent)
+        s._Guard("ok", project_id="p1", title="Шаг 1"),      # call #2 (impl, subtask)
+        s._Guard("ok", project_id="p1", title="Большой проект"),  # call #2 (impl, parent)
+    ))
+
+    preview = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1")
+    assert "🛑" not in preview, "родитель, не найденный среди открытых, не должен блокировать план"
+    assert "возможно завершён/удалён" in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1",
+                                       manifest_id=mid, user_reply="да")
+    assert ("unset_parent", "c") in fake_v2.calls
+    _assert_confirmed_success(result)
+
+
+async def test_unset_task_parent_plan_read_failure_does_not_block_but_warns(
+        monkeypatch):
+    """A live-read hiccup while BUILDING the plan (call #1) must not block
+    every detach — fail-open here is cheaper than refusing everyone whose
+    network is briefly flaky. The plan is still built, honestly warns that
+    the parent's name was not verified, and the real (unchanged) identity-
+    guard on execution (call #2) does its normal job right after."""
+    live = {"c": {"id": "c", "title": "Шаг 1", "projectId": "p1", "parentId": "p"}}
+    fake_v2 = FakeV2(live=live)
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    monkeypatch.setattr(s, "_guard_task", _guard_sequence(
+        s._Guard("unavailable"),                                  # call #1 (plan, parent)
+        s._Guard("ok", project_id="p1", title="Шаг 1"),            # call #2 (impl, subtask)
+        s._Guard("ok", project_id="p1", title="Большой проект"),   # call #2 (impl, parent)
+    ))
+
+    preview = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1")
+    assert "🛑" not in preview, "временный сбой чтения не должен блокировать план"
+    assert "НЕ удалось сверить" in preview
+    mid = _extract_manifest_id(preview)
+
+    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1",
+                                       manifest_id=mid, user_reply="да")
+    assert ("unset_parent", "c") in fake_v2.calls
+    _assert_confirmed_success(result)
+
+
+async def test_unset_task_parent_automation_key_parent_mismatch_is_refused_before_plan(
+        monkeypatch):
+    """Headless path (#118): a valid automation_key runs on the FIRST call,
+    with no plan card and no Telegram button ever shown — so if the parent
+    identity check only lived inside _gate_single/execution, a false parent
+    name+id pair would sail through silently on a single valid key. The
+    check sits BEFORE _gate_single, so it applies here too."""
+    live = {"c": {"id": "c", "title": "Шаг 1", "projectId": "p1", "parentId": "p"}}
+    fake_v2 = FakeV2(live=live)
+    _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
+    calls = []
+
+    def _stub(*a, **k):
+        calls.append(1)
+        return s._Guard("mismatch", project_id="p1", title="Большой проект",
+                        message='id указывает на «Большой проект», а НЕ «Другой родитель»')
+    monkeypatch.setattr(s, "_guard_task", _stub)
+    monkeypatch.setattr(s, "SECRET", "test-secret")
+
+    result = await s.unset_task_parent("Шаг 1", "Другой родитель", "c", "p", "p1",
+                                       automation_key="test-secret")
+
+    assert result.startswith("🛑 План НЕ построен")
+    assert "«Большой проект»" in result
+    assert live["c"]["parentId"] == "p"
+    assert fake_v2.calls == []
+    assert len(calls) == 1
 
 
 # ===========================================================================
