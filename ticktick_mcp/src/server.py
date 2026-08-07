@@ -782,24 +782,58 @@ def _open_by_id(fresh: bool = False) -> Optional[Dict[str, Dict]]:
 #
 # Ретрай НИКОГДА не ослабляет проверку: критерий успеха («там, куда
 # перемещали») остаётся тем же самым строгим сравнением на КАЖДОЙ попытке —
-# он просто даёт TickTick секунду-две «долиться», прежде чем звать
-# расхождение окончательным. Цена в общем случае — НОЛЬ: если состояние уже
-# свежее (как почти всегда), первое же чтение проходит проверку и цикл
-# завершается без единой лишней паузы. Настоящий провал (мутация правда не
-# применилась) по-прежнему остаётся ❌ — просто после исчерпания попыток, а
-# не после одной.
-_POSTVERIFY_RETRY_ATTEMPTS = 2
-_POSTVERIFY_RETRY_DELAY_S = 0.7
+# он просто даёт TickTick время «долиться», прежде чем звать расхождение
+# окончательным. Цена в общем случае — НОЛЬ: если состояние уже свежее (как
+# почти всегда), первое же чтение проходит проверку и цикл завершается без
+# единой лишней паузы. Настоящий провал (мутация правда не применилась)
+# по-прежнему остаётся ❌ — просто после исчерпания расписания, а не после
+# одной попытки.
+#
+# ОБНОВЛЕНО (дефект №4, ПОВТОРНЫЙ живой прогон 2026-08-06 23:38 PT, УЖЕ на
+# фиксе выше, манифест b87428f1b426): окно в 2 попытки по 0.7с (макс. 1.4с
+# ожидания, 3 чтения) оказалось СНОВА недостаточным — задача
+# «__AUTOTEST__dup-src» реально переместилась (независимо подтверждено
+# немедленным чтением через get_project_tasks, ОФИЦИАЛЬНЫЙ Open API), но обе
+# v2-перепроверки (_move_tasks_impl И independent operation_report) отчитались
+# ❌ «не найдена среди открытых» — то есть реальное отставание v2-синка
+# TickTick иногда превышает 1.4с. Переход на официальный Open API вместо
+# расширения окна РАССМОТРЕН и ОТКЛОНЁН как основной путь: официальный клиент
+# (ticktick_client.py) физически не знает о project groups/папках (нет
+# groupId — move_project_to_group немыслим без него) и о корзине/restore
+# (get_trash/restore_task есть только в ticktick_v2_client.py) — то есть
+# Open API не покрывает 2 из 6 точек ретрая ВООБЩЕ, а собирать пост-проверку
+# из двух разных backend'ов (Open API для part точек, v2 для остальных) —
+# больше риска (два разных пути дают два разных класса багов) при частичной
+# выгоде. Вместо этого — то же самое решение, но с бОльшим и НЕРАВНОМЕРНЫМ
+# бюджетом ожидания: список пауз вместо одного числа попыток×паузы,
+# экспоненциально нарастающий (короткие первые попытки покрывают типичную
+# долю секунды лага почти без задержки отчёта; редкий длинный хвост лага —
+# длинными последними). Суммарно ~9с в худшем случае (задача реально не
+# такая уж редкая по докладу Максима — второй раз подряд на одном и том же
+# инструменте), но эта пауза срабатывает ТОЛЬКО когда чтение всё ещё
+# расходится с ожиданием; счастливый путь как был, так и остаётся без единой
+# лишней паузы.
+_POSTVERIFY_RETRY_DELAYS_S: Tuple[float, ...] = (0.5, 1.0, 1.5, 2.5, 3.5)
+# Бэккомпат-алиас для мест/тестов, которым нужно только число попыток
+# (например верхнеуровневый цикл _build_operation_report ниже).
+_POSTVERIFY_RETRY_ATTEMPTS = len(_POSTVERIFY_RETRY_DELAYS_S)
 
 
-def _reread_open_until(check, attempts: int = _POSTVERIFY_RETRY_ATTEMPTS,
-                       delay: float = _POSTVERIFY_RETRY_DELAY_S,
+def _reread_open_until(check, delays: Tuple[float, ...] = _POSTVERIFY_RETRY_DELAYS_S,
                        ) -> Optional[Dict[str, Dict]]:
-    """_open_by_id(fresh=True), retried a bounded number of times while
-    `check(live_map) is False` — see the block comment above for why this
-    exists. `check` receives the freshly re-fetched {taskId: task} map and
-    returns True once it confirms whatever the caller is waiting to see
+    """_open_by_id(fresh=True), retried on a bounded, growing-pause schedule
+    while `check(live_map) is False` — see the block comment above for why
+    this exists. `check` receives the freshly re-fetched {taskId: task} map
+    and returns True once it confirms whatever the caller is waiting to see
     (e.g. every moved task's projectId now equals the destination).
+
+    `delays` is the pause taken BEFORE each retry read, in order — e.g.
+    (0.5, 1.0) means: read, and if `check` is still False sleep 0.5s and
+    read again, and if STILL False sleep 1.0s and read a third and final
+    time. len(delays) is the max number of retries (reads = 1 + len(delays)
+    in the worst case); an empty tuple disables retrying entirely (single
+    read, exactly the old no-retry behaviour — used by tests to prove a
+    narrower window would have failed where the real schedule succeeds).
 
     Returns the LAST fetched map regardless of outcome — None only when a
     fetch itself failed (v2 unavailable), exactly like a plain
@@ -809,33 +843,32 @@ def _reread_open_until(check, attempts: int = _POSTVERIFY_RETRY_ATTEMPTS,
     this helper only decides how many times to look, never what counts as
     success."""
     fresh = _open_by_id(fresh=True)
-    tries = 0
-    while fresh is not None and not check(fresh) and tries < attempts:
+    for delay in delays:
+        if fresh is None or check(fresh):
+            break
         time.sleep(delay)
         fresh = _open_by_id(fresh=True)
-        tries += 1
     return fresh
 
 
-def _reread_projects_until(check, attempts: int = _POSTVERIFY_RETRY_ATTEMPTS,
-                           delay: float = _POSTVERIFY_RETRY_DELAY_S,
+def _reread_projects_until(check, delays: Tuple[float, ...] = _POSTVERIFY_RETRY_DELAYS_S,
                            ) -> List[Dict]:
     """Project-list analogue of _reread_open_until — used only by
     move_project_to_group's post-verify, which checks a PROJECT's live
     groupId rather than a task's projectId/parentId, so it can't share the
     task-keyed map _open_by_id builds. Same contract: `check` gets the fresh
     project list and returns True once it confirms the expected groupId;
-    retried on the same bounded schedule and for the same reason (a v2
-    /batch/check/0 re-read can lag a moment behind a write just made through
-    the same v2 API — see the block comment above _POSTVERIFY_RETRY_ATTEMPTS)."""
+    retried on the same growing-pause schedule and for the same reason (a v2
+    /batch/check/0 re-read can lag behind a write just made through the same
+    v2 API — see the block comment above _POSTVERIFY_RETRY_DELAYS_S)."""
     ticktick_v2.get_state(force=True)
     projs = ticktick_v2.list_projects()
-    tries = 0
-    while not check(projs) and tries < attempts:
+    for delay in delays:
+        if check(projs):
+            break
         time.sleep(delay)
         ticktick_v2.get_state(force=True)
         projs = ticktick_v2.list_projects()
-        tries += 1
     return projs
 
 
@@ -4995,8 +5028,9 @@ def _build_operation_report(record_id: str) -> str:
         # пункт печатался, но никогда не учитывался).
         verdicts = _compute_op_verdicts(records, live, names)
         # Ретрай ТОЛЬКО для identity-changing операций (move/parent/restore —
-        # см. _POSTVERIFY_RETRY_ATTEMPTS): та же гонка с v2-синком TickTick,
-        # найденная живьём 2026-08-06 на move_tasks, бьёт и по НЕЗАВИСИМОЙ
+        # см. _POSTVERIFY_RETRY_DELAYS_S): та же гонка с v2-синком TickTick,
+        # найденная живьём 2026-08-06 (дважды — второй раз уже НА фиксе
+        # с более узким окном) на move_tasks, бьёт и по НЕЗАВИСИМОЙ
         # перепроверке, не только по post-verify самого исполнителя — «not
         # found among open at all» сразу после мутации был именно этот
         # случай. Не трогает delete/create/tags/complete/abandon — там ❌
@@ -5006,16 +5040,15 @@ def _build_operation_report(record_id: str) -> str:
         if (any(status == "bad" for status, _ in verdicts)
                 and any((rec.get("op") or "delete") in retryable_ops
                         for rec in records)):
-            tries = 0
-            while (any(status == "bad" for status, _ in verdicts)
-                   and tries < _POSTVERIFY_RETRY_ATTEMPTS):
-                time.sleep(_POSTVERIFY_RETRY_DELAY_S)
+            for delay in _POSTVERIFY_RETRY_DELAYS_S:
+                if not any(status == "bad" for status, _ in verdicts):
+                    break
+                time.sleep(delay)
                 live2 = _open_by_id(fresh=True)
                 if live2 is None:
                     break
                 live = live2
                 verdicts = _compute_op_verdicts(records, live, names)
-                tries += 1
         lines.extend(line for _, line in verdicts)
         ok = sum(1 for status, _ in verdicts if status == "ok")
         warn = sum(1 for status, _ in verdicts if status == "warn")

@@ -25,21 +25,42 @@ inverted-логика, а стейл снимок). Официальный Open 
 объясняется, почему ручная независимая проверка Максима увидела успех
 мгновенно, а серверный post-verify — нет.
 
-Фикс: _reread_open_until/_reread_projects_until (server.py, рядом с
-_open_by_id) — ограниченный ретрай (_POSTVERIFY_RETRY_ATTEMPTS попыток,
-_POSTVERIFY_RETRY_DELAY_S пауза) поверх ТОГО ЖЕ строгого сравнения «там, куда
-перемещали» — цена ноль, когда состояние уже свежее (обычный случай),
-и ограниченная пауза только когда снимок реально отстаёт. Применено во ВСЕХ
-identity-changing мутациях: move_tasks, set_task_parent, unset_task_parent,
-move_project_to_group, restore_tasks (обе точки — восстановление и
-починочное перемещение), плюс независимая перепроверка _build_operation_report
-(она поймала тот же симптом живьём, значит гонка бьёт и туда).
+Фикс (первая версия, c1de039): _reread_open_until/_reread_projects_until
+(server.py, рядом с _open_by_id) — ограниченный ретрай (2 попытки, пауза
+0.7с) поверх ТОГО ЖЕ строгого сравнения «там, куда перемещали» — цена ноль,
+когда состояние уже свежее, и ограниченная пауза только когда снимок реально
+отстаёт. Применено во ВСЕХ identity-changing мутациях: move_tasks,
+set_task_parent, unset_task_parent, move_project_to_group, restore_tasks
+(обе точки), плюс независимая перепроверка _build_operation_report.
+
+ПОВТОРНЫЙ живой прогон (2026-08-06 23:38 PT, уже НА этом фиксе, манифест
+b87428f1b426): того же дефекта — «__AUTOTEST__dup-src» реально
+переместилась (независимо подтверждено немедленным чтением через
+get_project_tasks, официальный Open API), но ОБЕ v2-перепроверки
+(_move_tasks_impl И operation_report) снова отчитались ❌ «не найдена среди
+открытых». Окно в 2×0.7с=1.4с максимум — оказалось НЕДОСТАТОЧНЫМ: реальное
+отставание v2-синка TickTick иногда превышает эту величину. Переход
+пост-проверки на официальный Open API целиком РАССМОТРЕН и ОТКЛОНЁН —
+official-клиент физически не знает о project groups/папках (move_project_to_
+group) и о корзине (restore_tasks), так что не покрывает 2 из 6 точек ретрая
+вообще (см. блок-комментарий над _POSTVERIFY_RETRY_DELAYS_S в server.py).
+
+Фикс v2 (этот файл): _reread_open_until/_reread_projects_until и отдельный
+цикл в _build_operation_report переведены с (attempts × delay) на РАСПИСАНИЕ
+растущих пауз _POSTVERIFY_RETRY_DELAYS_S = (0.5, 1.0, 1.5, 2.5, 3.5) —
+суммарно ~9с в худшем случае (5 повторов вместо 2), но всё так же с нулевой
+ценой на счастливом пути (первое же чтение проходит проверку без единой
+паузы). Настоящий провал (мутация правда не применилась) по-прежнему остаётся
+❌ после исчерпания расписания — расширение окна не ослабляет сравнение.
 
 Каждый тест ниже — пара (позитив: гонка не должна превращать реальный успех
 в ложный ❌; негатив: настоящий провал ОБЯЗАН остаться ❌, ретрай никогда не
-превращает провал в успех), плюс отдельные юнит-тесты на сам
-_reread_open_until, чтобы поведение ретрая было закреплено независимо от
-того, какой именно метод его вызывает."""
+превращает провал в успех), плюс отдельные юнит-тесты на сами
+_reread_open_until/_reread_projects_until (поведение ретрая закреплено
+независимо от того, какой именно метод его вызывает), плюс
+«*_deeper_than_old_window» тесты — доказательство, что окно РЕАЛЬНО
+расширено: лаг глубже старого предела (2 повтора) падал бы на старом коде и
+проходит на новом, на ДЕФОЛТНЫХ (не инжектированных) константах продакшена."""
 import json
 
 import pytest
@@ -66,7 +87,7 @@ def _stale_then_fresh(states):
 
 @pytest.fixture(autouse=True)
 def _no_real_sleep(monkeypatch):
-    # Тесты не должны реально ждать _POSTVERIFY_RETRY_DELAY_S секунд —
+    # Тесты не должны реально ждать секунды из _POSTVERIFY_RETRY_DELAYS_S —
     # ретраится логика, а не секундомер.
     monkeypatch.setattr(s.time, "sleep", lambda *a, **k: None)
 
@@ -105,10 +126,48 @@ def test_reread_open_until_gives_up_after_exhausting_attempts(monkeypatch):
 
     result = s._reread_open_until(
         lambda m: m.get("t1", {}).get("projectId") == "p_new",
-        attempts=2, delay=0)
+        delays=(0, 0))
 
     assert result["t1"]["projectId"] == "p_old"  # честный провал, не подделан
     assert reads.calls["n"] == 3  # 1 исходное + 2 повтора, не бесконечно
+
+
+def test_reread_open_until_gives_up_after_exhausting_default_schedule(monkeypatch):
+    """То же самое, но на РЕАЛЬНОМ дефолтном расписании продакшена
+    (_POSTVERIFY_RETRY_DELAYS_S), а не на инжектированном — доказывает, что
+    честный провал остаётся честным и на текущем расширенном окне, не только
+    в теории с delays=(0, 0)."""
+    reads = _stale_then_fresh([{"t1": {"id": "t1", "projectId": "p_old"}}])
+    monkeypatch.setattr(s, "_open_by_id", reads)
+
+    result = s._reread_open_until(lambda m: m.get("t1", {}).get("projectId") == "p_new")
+
+    assert result["t1"]["projectId"] == "p_old"
+    assert reads.calls["n"] == 1 + len(s._POSTVERIFY_RETRY_DELAYS_S)
+
+
+def test_reread_open_until_survives_lag_deeper_than_old_window(monkeypatch):
+    """Ключевое доказательство расширения окна: 4 стейл-чтения подряд после
+    мутации (задача «не видна» дольше, чем позволяло СТАРОЕ окно — 2 попытки
+    по 0.7с, то есть максимум 2 повторных чтения), и лишь 5-е чтение видит
+    свежее состояние. Старое окно (2 повтора) сдалось бы на 3-м чтении и
+    вернуло бы стейл — новое (5 повторов по умолчанию) обязано дотянуть до
+    5-го и вернуть success. Использует ДЕФОЛТНОЕ расписание продакшена, не
+    инжектированное — это тест реальных констант, а не абстрактного
+    механизма."""
+    stale = {"t1": {"id": "t1", "projectId": "p_old"}}
+    fresh_state = {"t1": {"id": "t1", "projectId": "p_new"}}
+    reads = _stale_then_fresh([stale, stale, stale, stale, fresh_state])
+    monkeypatch.setattr(s, "_open_by_id", reads)
+
+    result = s._reread_open_until(lambda m: m.get("t1", {}).get("projectId") == "p_new")
+
+    assert result["t1"]["projectId"] == "p_new"  # догнало на 5-м чтении
+    assert reads.calls["n"] == 5
+    # Явная проверка, что это ДЕЙСТВИТЕЛЬНО глубже старого окна (иначе тест
+    # ничего не доказывает про РАСШИРЕНИЕ, а не про факт наличия ретрая).
+    OLD_WINDOW_READS = 3  # 1 исходное + 2 старых повтора (0.7с каждый)
+    assert reads.calls["n"] > OLD_WINDOW_READS
 
 
 def test_reread_open_until_returns_none_immediately_when_state_unavailable(monkeypatch):
@@ -119,6 +178,67 @@ def test_reread_open_until_returns_none_immediately_when_state_unavailable(monke
 
     assert result is None
     assert reads.calls["n"] == 1  # None не путается с «check вернул False» — не ретраится
+
+
+# ---------------------------------------------------------------------------
+# _reread_projects_until напрямую — тот же контракт, что у _reread_open_until,
+# но для move_project_to_group (список проектов, не карта задач по id).
+# ---------------------------------------------------------------------------
+
+class _FakeV2ProjectsOnly:
+    """Заглушка ticktick_v2 только для _reread_projects_until: список
+    состояний по очереди, как _stale_then_fresh, но под интерфейс
+    get_state/list_projects."""
+
+    def __init__(self, states):
+        self.states = states
+        self.calls = 0
+
+    def get_state(self, force=False):
+        return {}
+
+    def list_projects(self):
+        i = min(self.calls, len(self.states) - 1)
+        self.calls += 1
+        return self.states[i]
+
+
+def test_reread_projects_until_succeeds_immediately_when_already_settled(monkeypatch):
+    fake = _FakeV2ProjectsOnly([[{"id": "p1", "groupId": "g_new"}]])
+    monkeypatch.setattr(s, "ticktick_v2", fake)
+
+    result = s._reread_projects_until(lambda ps: ps[0].get("groupId") == "g_new")
+
+    assert result == [{"id": "p1", "groupId": "g_new"}]
+    assert fake.calls == 1  # ни одной лишней попытки
+
+
+def test_reread_projects_until_survives_lag_deeper_than_old_window(monkeypatch):
+    """Проектный аналог test_reread_open_until_survives_lag_deeper_than_old_window
+    — 4 стейл-чтения подряд (глубже старого окна в 2 повтора), 5-е видит
+    свежий groupId. Дефолтное расписание продакшена, не инжектированное."""
+    stale = [{"id": "p1", "groupId": None}]
+    fresh_state = [{"id": "p1", "groupId": "g_new"}]
+    fake = _FakeV2ProjectsOnly([stale, stale, stale, stale, fresh_state])
+    monkeypatch.setattr(s, "ticktick_v2", fake)
+
+    result = s._reread_projects_until(lambda ps: ps[0].get("groupId") == "g_new")
+
+    assert result[0]["groupId"] == "g_new"
+    assert fake.calls == 5
+    OLD_WINDOW_READS = 3
+    assert fake.calls > OLD_WINDOW_READS
+
+
+def test_reread_projects_until_gives_up_after_exhausting_default_schedule(monkeypatch):
+    stale = [{"id": "p1", "groupId": None}]  # никогда не меняется
+    fake = _FakeV2ProjectsOnly([stale])
+    monkeypatch.setattr(s, "ticktick_v2", fake)
+
+    result = s._reread_projects_until(lambda ps: ps[0].get("groupId") == "g_new")
+
+    assert result[0]["groupId"] is None  # честный провал
+    assert fake.calls == 1 + len(s._POSTVERIFY_RETRY_DELAYS_S)
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +284,30 @@ async def test_move_tasks_postverify_survives_transient_v2_sync_lag(monkeypatch)
     assert "«Задача»" in result
     assert "❌" not in result
     assert "НЕ ПОДТВЕРЖДЁН" not in result
+
+
+async def test_move_tasks_postverify_survives_lag_deeper_than_old_window(monkeypatch):
+    """Сквозной (tool-level, не только _reread_open_until напрямую) вариант
+    ПОВТОРНОГО живого дефекта 2026-08-06 23:38 PT: задача «__AUTOTEST__dup-src»
+    реально переместилась, но v2-снимок ЕЩЁ не видел её вовсе на 4 чтениях
+    подряд после мутации — глубже, чем позволяло СТАРОЕ окно (2 попытки по
+    0.7с = максимум 2 повторных чтения). На РЕАЛЬНОМ дефолтном расписании
+    (не инжектированном) 5-е чтение обязано увидеть свежее состояние и
+    итог — success, не ложный ❌."""
+    before = {"t1": {"id": "t1", "title": "__AUTOTEST__dup-src", "projectId": "p_old"}}
+    stale_after_move = {}  # «не найдена среди открытых» — точный симптом из живого прогона
+    fresh_after_move = {"t1": {"id": "t1", "title": "__AUTOTEST__dup-src", "projectId": "p_new"}}
+    reads = _stale_then_fresh(
+        [before, stale_after_move, stale_after_move, stale_after_move,
+         stale_after_move, fresh_after_move])
+    _wire_move(monkeypatch, reads)
+
+    result = await s._move_tasks_impl(
+        "Перемещаю", [{"taskId": "t1", "title": "__AUTOTEST__dup-src"}], "p_new", "Новый")
+
+    assert "Перемещено 1" in result
+    assert "❌" not in result
+    assert reads.calls["n"] == 6  # 1 pre-mutation + 1 initial post-verify + 4 повтора
 
 
 async def test_move_tasks_postverify_stays_failed_when_move_never_lands(monkeypatch):
@@ -516,6 +660,32 @@ def test_operation_report_survives_transient_v2_sync_lag_for_move(tmp_path, monk
     assert "✅ 1 подтверждено, ⚠️ 0 не проверено, ❌ 0 расхождений" in report
     assert "Статус операции: ✅" in report
     assert reads.calls["n"] == 2  # ровно та гонка, что была в проде — не больше
+
+
+def test_operation_report_survives_lag_deeper_than_old_window(tmp_path, monkeypatch):
+    """ВТОРОЙ живой прогон 2026-08-06 23:38 PT показал ложный ❌ ИМЕННО здесь,
+    в operation_report, а не только в _move_tasks_impl — и уже НА фиксе со
+    старым узким окном. 4 стейл-чтения подряд (глубже старых 2 повторов),
+    5-е видит целевой projectId. Дефолтное расписание продакшена."""
+    record = {"record": "move-deep-lag", "op": "move", "ts": "2026-08-06T23:38:00+00:00",
+              "items": [{"taskId": "t1", "title": "__AUTOTEST__dup-src",
+                        "expect": {"projectId": "p_new"}}]}
+    _write_journal(tmp_path, monkeypatch, record)
+    monkeypatch.setattr(s, "_v2_project_names",
+                        lambda: {"p_old": "Старый", "p_new": "Новый"})
+
+    stale = {}  # «не найдена среди открытых» — точная формулировка из живого прогона
+    fresh = {"t1": {"id": "t1", "title": "__AUTOTEST__dup-src", "projectId": "p_new"}}
+    reads = _stale_then_fresh([stale, stale, stale, stale, fresh])
+    monkeypatch.setattr(s, "_open_by_id", reads)
+
+    report = s._build_operation_report("move-deep-lag")
+
+    assert "✅ 1 подтверждено, ⚠️ 0 не проверено, ❌ 0 расхождений" in report
+    assert "Статус операции: ✅" in report
+    assert reads.calls["n"] == 5  # 1 исходное + 4 повтора — глубже старого окна (макс. 3)
+    OLD_WINDOW_READS = 3
+    assert reads.calls["n"] > OLD_WINDOW_READS
 
 
 def test_operation_report_stays_failed_when_move_genuinely_never_lands(tmp_path, monkeypatch):
