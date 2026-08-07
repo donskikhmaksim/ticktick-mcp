@@ -13381,6 +13381,19 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
         "",
         basis,
     ])
+    # РАЗВЕДЕНИЕ КАНАЛОВ (2026-08-06, fix/agent-tail-in-verify-report, тот же
+    # принцип, что у `agent_tail` в `_maybe_tg_notify_plan`). `full_md` уходит
+    # ТОЛЬКО в Telegram (`_publish_auto_execute_outcome` → post_report_to_group
+    # / send_message_chunked) — этот путь запускает фоновый поллер кнопки ✅,
+    # модели тут нет вообще, значит и служебной строке "[агенту: ...]" здесь
+    # взяться неоткуда легитимно. `independent_block` выше — это дословный
+    # вывод `_build_operation_report()`, который ЗАКОНОМЕРНО несёт такую
+    # строку для СВОЕГО легитимного канала (возврат тула модели, см. вызовы
+    # `_build_operation_report` в execute_task_creation/execute_task_deletion
+    # и др.) — здесь она лишний груз, а не инструкция кому-то. Чистим ВЕСЬ
+    # `full_md`, а не только `independent_block`, — так же ловится случайная
+    # инструкция, просочившаяся через `exec_self` (самоотчёт исполнителя).
+    full_md = tg_approval.strip_agent_instructions(full_md)
     return full_md, verdict
 
 

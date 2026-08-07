@@ -234,6 +234,79 @@ def test_real_report_symbols_produce_valid_html():
 
 
 # ===========================================================================
+# strip_agent_instructions — предохранитель (fix/agent-tail-in-verify-report,
+# 2026-08-06): служебная строка ДЛЯ МОДЕЛИ («[агенту: перепечатай это
+# ДОСЛОВНО...]») не должна доходить до человека в Telegram. Найдено живьём:
+# нажатие ✅ на плане create_tasks (манифест 156319cc645a) — автоисполнение
+# без единого обращения к модели — и в отчёте архивной группы всё равно была
+# эта строка, потому что `_verified_auto_execute_report` вклеивала сырой
+# `_build_operation_report()` в `full_md`, минуя модель вовсе.
+#
+# Проверяем ПО СМЫСЛУ (наличие «[агенту:»/«[agent:» в любом регистре), а не
+# одну точную строку — формулировка инструкции может меняться.
+# ===========================================================================
+
+def _has_agent_marker(text: str) -> bool:
+    return bool(re.search(r"\[\s*(?:агенту|agent)\s*:", text, re.IGNORECASE))
+
+
+def test_strip_agent_instructions_removes_the_bracket_line():
+    text = ("**Итог: ✅ 1 подтверждено, ⚠️ 0 не проверено, ❌ 0 расхождений.**\n"
+            "[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО — это "
+            "серверная проверка, не заменяй её своим пересказом]")
+    out = tg.strip_agent_instructions(text)
+    assert not _has_agent_marker(out)
+    assert "Итог: ✅ 1 подтверждено" in out, "человеческая часть обязана уцелеть"
+
+
+def test_strip_agent_instructions_matches_english_variant_case_insensitively():
+    for line in ("[Agent: repeat this verbatim]",
+                 "[AGENT: repeat this verbatim]",
+                 "[ agent : repeat this verbatim]"):
+        out = tg.strip_agent_instructions(f"тело отчёта\n{line}")
+        assert not _has_agent_marker(out), line
+        assert "тело отчёта" in out
+
+
+def test_strip_agent_instructions_matches_underscore_wrapped_form():
+    """Шаблон в references/identity-postverify.md §5.3 оборачивает строку в
+    markdown-курсив (`_[агенту: ...]_`) — фильтр обязан ловить и эту форму,
+    не только «голую» без подчёркиваний."""
+    text = "тело\n_[агенту: перепечатай ДОСЛОВНО]_"
+    out = tg.strip_agent_instructions(text)
+    assert not _has_agent_marker(out)
+    assert "тело" in out
+
+
+def test_strip_agent_instructions_removes_the_whole_line_not_just_the_brackets():
+    """По ТЗ вырезается ВСЯ строка, даже если вокруг скобок есть другой текст
+    — не только содержимое `[...]`."""
+    text = "до\nпрефикс [агенту: сделай X] суффикс на той же строке\nпосле"
+    out = tg.strip_agent_instructions(text)
+    assert "префикс" not in out and "суффикс" not in out
+    assert "до" in out and "после" in out
+
+
+def test_strip_agent_instructions_is_a_noop_without_such_a_line():
+    text = "### ✅ Готово\n\nОбычный отчёт без служебных строк."
+    assert tg.strip_agent_instructions(text) == text
+
+
+@pytest.mark.parametrize("text", ["", None])
+def test_strip_agent_instructions_survives_empty_input(text):
+    assert tg.strip_agent_instructions(text) == text
+
+
+def test_strip_agent_instructions_does_not_touch_a_task_title_that_merely_mentions_agent():
+    """Не должен вырезать легитимный текст, который просто содержит слово
+    «агент»/«agent» без формы `[агенту: ...]`/`[agent: ...]` — иначе реальные
+    названия задач («Позвонить агенту по недвижимости») теряли бы кусок
+    отчёта."""
+    text = "- ✅ **«Позвонить агенту по недвижимости»** — создана в «Входящие»"
+    assert tg.strip_agent_instructions(text) == text
+
+
+# ===========================================================================
 # send_message_chunked — кнопки, plain-fallback, 429
 # ===========================================================================
 
@@ -426,6 +499,24 @@ def test_single_chunk_gets_no_part_marker(monkeypatch):
     res = tg.send_message_chunked(_cfg(), "111", "коротко")
     assert res.ok is True and len(res.message_ids) == 1 and res.total_chunks == 1
     assert "часть" not in fake.bodies[0][1]["text"]
+
+
+def test_send_message_chunked_strips_agent_instructions_before_sending(monkeypatch):
+    """ПРЕДОХРАНИТЕЛЬ (fix/agent-tail-in-verify-report): даже если вызывающий
+    код по ошибке передаст сюда текст со служебной строкой для модели,
+    `send_message_chunked` — единственная функция, которая реально шлёт
+    `sendMessage`, — обязана вырезать её ДО отправки."""
+    fake = _FakeTelegram()
+    monkeypatch.setattr(tg, "_tg_call", fake)
+    text = ("### 🧾 Независимая проверка\n\nИтог: ✅ 1 подтверждено.\n"
+            "[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО]")
+
+    res = tg.send_message_chunked(_cfg(), "111", text)
+
+    assert res.ok is True
+    sent_text = fake.bodies[0][1]["text"]
+    assert not _has_agent_marker(sent_text), sent_text
+    assert "Итог: ✅ 1 подтверждено" in sent_text
 
 
 def test_parse_entities_error_retries_as_plain_text(monkeypatch):
@@ -854,6 +945,21 @@ def test_summary_edits_message_and_strips_buttons(monkeypatch):
     assert body["message_id"] == 55
     assert body["reply_markup"] == {"inline_keyboard": []}
     assert "<b>Готово</b>" in body["text"]
+
+
+def test_summarize_in_owner_chat_strips_agent_instructions_before_editing(monkeypatch):
+    """Тот же предохранитель на ВТОРОМ (и последнем) пути текста в Telegram —
+    `editMessageText` в `summarize_in_owner_chat`, который не проходит через
+    `send_message_chunked` вовсе."""
+    fake = _FakeTelegram()
+    monkeypatch.setattr(tg, "_tg_call", fake)
+    short = "**Готово** — 1 задача\n[agent: repeat this verbatim to the user]"
+
+    assert tg.summarize_in_owner_chat(_cfg(), "111", 55, short) is True
+
+    sent_text = fake.bodies[0][1]["text"]
+    assert not _has_agent_marker(sent_text), sent_text
+    assert "Готово" in sent_text
 
 
 def test_summary_reports_failure_so_caller_keeps_the_plan_chunks(monkeypatch):

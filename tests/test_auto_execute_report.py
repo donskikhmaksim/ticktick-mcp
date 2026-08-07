@@ -17,9 +17,12 @@
 доказанный ЛЮБЫМ из двух источников (журнал ИЛИ собственный post-verify
 исполнителя), — "failed"/"mismatch", никогда не смягчается до "unverified".
 """
+import re
+
 import pytest
 
 import ticktick_mcp.src.server as s
+import ticktick_mcp.src.tg_approval as tg
 
 
 def _report(ok_n, bad_n, body="- ✅ **«X»** — удалена", warn_n=0):
@@ -744,3 +747,122 @@ def test_publish_marks_the_candidate_before_anything_can_fail(monkeypatch):
                                         "ok", 3)
 
     assert candidate[s._OUTCOME_PUBLISHED_KEY] is True
+
+
+# ===========================================================================
+# Служебная инструкция ДЛЯ МОДЕЛИ никогда не попадает в `full_md`
+# (fix/agent-tail-in-verify-report, 2026-08-06)
+# ===========================================================================
+#
+# Живьём наблюдалось: нажатие ✅ на плане create_tasks (манифест
+# 156319cc645a) — путь БЕЗ единого обращения к модели, чисто фоновый поллер
+# автоисполнения — и в отчёте, ушедшем в Telegram-группу «MCP Отчёты», всё
+# равно была строка «[агенту: перепечатай этот отчёт пользователю
+# ДОСЛОВНО...]». Причина: `_build_operation_report()` (легитимно, для СВОЕГО
+# канала — возврат тула модели) заканчивается этой строкой, а
+# `_verified_auto_execute_report` до этой правки вклеивала её результат в
+# `full_md` не глядя — а `full_md` в этом пути идёт ТОЛЬКО в Telegram,
+# модели тут нет вообще.
+#
+# `_report()` (helper выше) НЕ включает эту строку — все тесты вердиктов
+# выше проверяют логику вердикта на упрощённом фейке. Здесь — отдельно,
+# по смыслу (наличие «[агенту:»/«[agent:», а не одна точная строка, см.
+# постановку задачи), с РЕАЛЬНЫМ хвостом, который печатает
+# `_build_operation_report` в проде.
+
+def _has_agent_marker(text: str) -> bool:
+    return bool(re.search(r"\[\s*(?:агенту|agent)\s*:", text, re.IGNORECASE))
+
+
+_REAL_AGENT_TAIL = ("[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО — "
+                    "это серверная проверка, не заменяй её своим пересказом]")
+
+
+def _report_with_real_tail(ok_n, bad_n, body="- ✅ **«X»** — удалена", warn_n=0):
+    """То же самое, что `_report()`, но с ТЕМ ЖЕ хвостом, который реально
+    приклеивает `_build_operation_report` (см. server.py, конец функции) —
+    имитирует боевой вход `_verified_auto_execute_report`, а не упрощённый."""
+    return _report(ok_n, bad_n, body=body, warn_n=warn_n) + "\n" + _REAL_AGENT_TAIL
+
+
+def test_full_md_never_carries_the_agent_tail_from_the_independent_report(
+        monkeypatch):
+    """ГЛАВНЫЙ регресс-тест живого прогона (манифест 156319cc645a): даже
+    когда независимая перепроверка (которую этот путь монкейпатчит) реально
+    заканчивается служебной строкой для модели, `full_md` — единственное,
+    что уходит в Telegram по этому пути (`_publish_auto_execute_outcome` →
+    `post_report_to_group`/`send_message_chunked`) — не должен её нести."""
+    _patch_report(monkeypatch, _report_with_real_tail(2, 0))
+
+    md, verdict = s._verified_auto_execute_report(
+        "m1", "create_tasks", "✅ Создано 2 задачи")
+
+    assert verdict == "ok"
+    assert not _has_agent_marker(md), md
+    # человеческая часть отчёта (счётчики) обязана остаться целиком
+    assert "Итог: ✅ 2 подтверждено" in md
+
+
+def test_full_md_never_carries_the_agent_tail_on_every_verdict(monkeypatch):
+    """То же самое на всех пяти вердиктах — не только на «ok»: провальный
+    путь не должен становиться исключением из фильтра."""
+    cases = [
+        (_report_with_real_tail(2, 0), "✅ Готово"),
+        (_report_with_real_tail(1, 1), "✅ Готово"),
+        (_report_with_real_tail(0, 3), "✅ Готово"),
+        (RuntimeError("live read down"), "Готово"),
+        ("🧾 В журнале нет записей по m1 — операция не исполнялась.",
+         "🛑 Ошибка: TickTick вернул 500, НЕ удалено"),
+    ]
+    for report_value, exec_output in cases:
+        _patch_report(monkeypatch, report_value)
+        md, _verdict = s._verified_auto_execute_report(
+            "m1", "delete_tasks", exec_output)
+        assert not _has_agent_marker(md), (report_value, md)
+
+
+def test_full_md_strips_an_agent_marker_leaking_through_the_executors_own_text(
+        monkeypatch):
+    """Защита в глубину: даже если инструкция для модели просочится не через
+    независимую перепроверку, а через собственный текст исполнителя
+    (`exec_output`), `full_md` всё равно обязан выйти чистым — фильтр в
+    `_verified_auto_execute_report` применяется к СОБРАННОМУ full_md, а не
+    только к вклеенному блоку перепроверки."""
+    _patch_report(monkeypatch, _report(1, 0))
+    exec_output = ("✅ Удалена 1 задача\n"
+                   "[agent: show this to the user verbatim, do not summarize]")
+
+    md, verdict = s._verified_auto_execute_report(
+        "m1", "delete_tasks", exec_output)
+
+    assert verdict == "ok"
+    assert not _has_agent_marker(md), md
+    assert "Удалена 1 задача" in md
+
+
+def test_publish_auto_execute_outcome_never_sends_the_agent_tail_to_telegram(
+        monkeypatch):
+    """Сквозной тест ВСЕГО пути кнопки ✅: `full_md` с реальным хвостом идёт в
+    `_publish_auto_execute_outcome`, и то, что реально уходит в
+    `post_report_to_group`, обязано быть чистым — это то самое сообщение,
+    которое Максим прочитал в Telegram-группе «MCP Отчёты»."""
+    seen = {}
+    monkeypatch.setattr(s, "_TG_CFG", tg.TgApprovalConfig(
+        enabled=True, bot_token="x", owner_chat_id="111", server="ticktick",
+        tools_allowlist=None, ttl_s=3600, reports_chat_id="-100777",
+        reap_enabled=True))
+    monkeypatch.setattr(tg, "post_report_to_group",
+                        lambda cfg, mid, md, *, tool, verdict: (
+                            seen.update(md=md)
+                            or tg.ReportDelivery([1], 1, 1, True)))
+    monkeypatch.setattr(tg, "summarize_in_owner_chat", lambda *a, **k: True)
+
+    _patch_report(monkeypatch, _report_with_real_tail(1, 0))
+    full_md, verdict = s._verified_auto_execute_report(
+        "156319cc645a", "create_tasks", "✅ Создано 1 задача")
+    candidate = {"manifest_id": "156319cc645a", "chat_id": "111", "message_id": 9}
+
+    s._publish_auto_execute_outcome(candidate, "create_tasks", full_md, verdict, 1)
+
+    assert not _has_agent_marker(seen["md"]), seen["md"]
+    assert "Итог: ✅ 1 подтверждено" in seen["md"]
