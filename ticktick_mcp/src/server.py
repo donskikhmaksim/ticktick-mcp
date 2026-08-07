@@ -12868,12 +12868,18 @@ async def get_task_info(task_id: str) -> str:
             parent = next((x for x in all_tasks if x.get("id") == t["parentId"]), None)
             pname = parent.get("title") if parent else t["parentId"]
             out += f"  parent: «{pname}»  (id:{t['parentId']})\n"
+        # Same renderer as format_task()/format_task_line() — deliberately not
+        # a second, local implementation. This branch printed the raw stored
+        # instant for any TIMED deadline ("2026-08-08T21:00:00.000+0000"),
+        # while get_task and the listings had already moved to the owner's
+        # zone: one live task then answered 2026-08-06 in one tool and
+        # 2026-08-07 in this one, with no third source to break the tie.
+        # _local_datetime_str keeps all-day values verbatim (#36) and appends
+        # its own "(all-day)" marker, so no extra suffix here.
         if t.get("startDate"):
-            sd = t["startDate"][:10] if t.get("isAllDay") else t["startDate"]
-            out += f"  start: {sd}\n"
+            out += f"  start: {_local_datetime_str(t, 'startDate')}\n"
         if t.get("dueDate"):
-            d = t["dueDate"][:10] if t.get("isAllDay") else t["dueDate"]
-            out += f"  due: {d}{'  (all-day)' if t.get('isAllDay') else ''}\n"
+            out += f"  due: {_local_datetime_str(t, 'dueDate')}\n"
         repeat = t.get("repeatFlag") or t.get("repeatRule")
         if repeat:
             out += f"  repeat: {repeat}\n"
