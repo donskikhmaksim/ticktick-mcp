@@ -1391,6 +1391,16 @@ def format_task_tree(tasks: List[Dict], limit: int = 200) -> str:
 _ALL_TASKS_PAGE = 200
 _PROJECT_TASKS_PAGE = 50
 
+# Page size for the other two compact-tree readers (run_filter,
+# get_inbox_tasks). They print the SAME compact line as get_all_tasks
+# (format_task_tree), measured at 135 chars per task on a realistic task
+# (title + due date + priority + tag + ids): a 200-task page is ~27 KB (~14k
+# tokens), the whole 1436-match filter would be 194 185 chars (~102k tokens).
+# 200 is also the ceiling format_task_tree already applied on its own — so the
+# default page stays exactly the size it was; what changes is that the tail is
+# now reachable instead of being announced as "... and 1236 more." and dropped.
+_TREE_PAGE = 200
+
 
 def _page_task_forest(tasks: List[Dict], limit: int, offset: int):
     """One page of a task FOREST: whole subtrees only, never a torn-off child.
@@ -1560,6 +1570,10 @@ async def get_project_tasks(project_id: str, limit: int = _PROJECT_TASKS_PAGE,
     the project and which range is shown, and when it doesn't fit, the last
     line says how many are left and which offset continues the list.
 
+    The Inbox id is served by get_inbox_tasks (the official API knows nothing
+    about the Inbox): limit/offset are passed through unchanged, but that
+    listing is a compact tree, so `offset` counts TOP-LEVEL tasks there.
+
     Args:
         project_id: ID of the project (the Inbox id from get_projects works too)
         limit: Maximum tasks to show in one call (default 50 — a full task card
@@ -1575,13 +1589,13 @@ async def get_project_tasks(project_id: str, limit: int = _PROJECT_TASKS_PAGE,
     # instead of returning its "project not found" to the caller.
     inbox = await _run_blocking(_inbox_project)
     if inbox and project_id == inbox["id"]:
-        out = await get_inbox_tasks()
-        # get_inbox_tasks pages on its own terms; silently dropping the
-        # caller's limit/offset would look like they were honoured.
-        if limit != _PROJECT_TASKS_PAGE or offset:
-            out += ("\n\n⚠️ limit/offset not applied: the Inbox is served by "
-                    "get_inbox_tasks, which pages on its own.")
-        return out
+        # The caller's limit/offset go THROUGH to get_inbox_tasks, which takes
+        # the same pair. Until 2026-08-07 they were dropped here with a warning
+        # that pointed at get_inbox_tasks "which pages on its own" — a method
+        # that had no parameters at all, i.e. the tail of a big Inbox was
+        # unreachable down either path. `offset` counts top-level tasks there
+        # (the Inbox is printed as a compact tree, not as task cards).
+        return await get_inbox_tasks(limit=limit, offset=offset)
 
     try:
         project_data = await _run_blocking(lambda: ticktick.get_project_with_data(project_id))
@@ -8367,8 +8381,22 @@ async def get_tasks_by_tag(tag: str) -> str:
 
 
 @mcp.tool(annotations=READONLY)
-async def get_inbox_tasks() -> str:
-    """Get open tasks in the Inbox (requires v2 API)."""
+async def get_inbox_tasks(limit: int = _TREE_PAGE, offset: int = 0) -> str:
+    """Get open tasks in the Inbox (requires v2 API).
+
+    The output is paged: the header always states the TOTAL number of Inbox
+    tasks and which range is shown, and when they don't fit, the last line says
+    how many top-level tasks are left and which offset continues the list.
+    Subtasks always travel with their parent, so no page ever shows a subtask
+    torn off the task it belongs to.
+
+    Args:
+        limit: Maximum tasks per call (default 200, same page size as
+            get_all_tasks) — a soft ceiling: the subtree that crosses it is
+            finished rather than cut in half
+        offset: Skip this many TOP-LEVEL tasks — use it to read the tail; the
+            footer prints the exact offset that continues the list
+    """
     err = _ensure_ready()
     if err:
         return err
@@ -8376,8 +8404,27 @@ async def get_inbox_tasks() -> str:
         tasks = await _run_blocking(lambda: ticktick_v2.get_inbox_tasks())
         if not tasks:
             return "No open tasks in the Inbox."
-        out = f"Inbox tasks ({len(tasks)}):\n\n"
-        return out + format_task_tree(tasks)
+        # def-E1 (2-я волна): раньше сюда уходил весь Inbox, а format_task_tree
+        # резал его на своём потолке в 200 строк — на боевых 344 задачах 144 из
+        # них были недостижимы этим инструментом вовсе (а get_project_tasks
+        # отсылал за постраничным чтением Входящих именно сюда).
+        page, total_roots, offset, shown_to = _page_task_forest(tasks, limit, offset)
+        if not page:
+            # Пустая страница за концом списка — это НЕ «Входящие пусты».
+            return (f"Inbox: {len(tasks)} task(s) ({total_roots} top-level), but "
+                    f"offset={offset} is past the end (valid offsets are "
+                    f"0-{total_roots - 1}).")
+        if offset or shown_to < total_roots:
+            out = (f"Inbox tasks ({len(tasks)} total, {total_roots} top-level; "
+                   f"showing top-level {offset + 1}-{shown_to} with their "
+                   f"subtasks):\n\n")
+        else:
+            out = f"Inbox tasks ({len(tasks)}):\n\n"
+        out += format_task_tree(page, max(len(page), 1))
+        if shown_to < total_roots:
+            out += (f"\n... and {total_roots - shown_to} more top-level tasks — "
+                    f"call again with offset={shown_to}.\n")
+        return out
     except Exception as e:
         logger.error(f"Error in get_inbox_tasks: {e}")
         return f"Error fetching inbox tasks: {str(e)}"
@@ -10047,12 +10094,23 @@ async def build_reminder(minutes_before: int = 0) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool(annotations=READONLY)
-async def run_filter(filter: str) -> str:
+async def run_filter(filter: str, limit: int = _TREE_PAGE, offset: int = 0) -> str:
     """
     Run a saved smart-list filter and return the open tasks it matches (requires v2 API).
 
+    The output is paged: the header always states the TOTAL number of matches
+    and which range is shown, and when they don't fit, the last line says how
+    many top-level tasks are left and which offset continues the list.
+    Subtasks always travel with their parent, so no page ever shows a subtask
+    torn off the task it belongs to.
+
     Args:
         filter: Filter name or ID (from list_filters)
+        limit: Maximum tasks per call (default 200, same page size as
+            get_all_tasks) — a soft ceiling: the subtree that crosses it is
+            finished rather than cut in half
+        offset: Skip this many TOP-LEVEL matches — use it to read the tail; the
+            footer prints the exact offset that continues the list
     """
     err = _ensure_ready()
     if err:
@@ -10072,8 +10130,33 @@ async def run_filter(filter: str) -> str:
                        f"могут быть лишние задачи.\n\n")
         if not tasks:
             return warning + f"Filter '{filter}' matched no open tasks."
-        out = warning + f"Filter '{filter}' — {len(tasks)} task(s):\n\n"
-        return out + format_task_tree(tasks)
+        # def-E1 (2-я волна): раньше сюда уходил ВЕСЬ пул, а format_task_tree
+        # молча резал его на своём потолке в 200 строк и приписывал
+        # «... and 1236 more.» — то есть инструмент сам сообщал, что 86 %
+        # найденного отброшено, и не давал способа это дочитать. Срез теперь
+        # считается по КОРНЯМ и уезжает вместе с поддеревьями, чтобы подзадача
+        # не осиротела на границе страницы (_page_task_forest).
+        page, total_roots, offset, shown_to = _page_task_forest(tasks, limit, offset)
+        if not page:
+            # Пустая страница за концом списка — это НЕ «фильтр ничего не нашёл».
+            # Страницы плавающие (поддерево дописывается целиком), поэтому
+            # называется диапазон допустимых offset, а не «начало последней».
+            return (warning + f"Filter '{filter}' — {len(tasks)} task(s) "
+                    f"({total_roots} top-level), but offset={offset} is past the "
+                    f"end (valid offsets are 0-{total_roots - 1}).")
+        if offset or shown_to < total_roots:
+            out = (warning + f"Filter '{filter}' — {len(tasks)} task(s) "
+                   f"({total_roots} top-level; showing top-level "
+                   f"{offset + 1}-{shown_to} with their subtasks):\n\n")
+        else:
+            out = warning + f"Filter '{filter}' — {len(tasks)} task(s):\n\n"
+        # Потолок дерева = размер уже нарезанной страницы: резать второй раз
+        # (и снова печатать «... and N more.») больше нечего.
+        out += format_task_tree(page, max(len(page), 1))
+        if shown_to < total_roots:
+            out += (f"\n... and {total_roots - shown_to} more top-level tasks — "
+                    f"call again with offset={shown_to}.\n")
+        return out
     except Exception as e:
         logger.error(f"Error in run_filter: {e}")
         return f"Error running filter: {str(e)}"
