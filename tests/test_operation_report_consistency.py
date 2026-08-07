@@ -349,3 +349,106 @@ def test_post_verify_reads_a_fresh_state_not_the_cache(monkeypatch, tmp_path):
 
     assert seen and all(seen), (
         "отчёт сверялся с кэшем: перепроверка обязана перечитать состояние")
+
+
+# ===========================================================================
+# def-119 (2026-08-07), часть 1: пустой список проверок (ok=warn=bad=0 —
+# журнальная запись есть, но `_compute_op_verdicts` не извлекла из неё ни
+# одного объекта) раньше читался как «Статус операции: ✅ — всё
+# подтверждено»: `bad` и `warn` оба falsy, а «нечего проверять» от «проверили
+# и всё чисто» никак не отличались. Живой симптом (delete_habit, часть 2
+# ниже): заголовок «❓ НЕ подтверждено» соседствовал с «✅ — всё подтверждено»
+# в ОДНОМ сообщении — два взаимоисключающих вывода.
+# ===========================================================================
+
+async def test_empty_verdict_list_reads_as_unverified_not_success(
+        monkeypatch, tmp_path):
+    """Прямое, не привязанное к конкретному тулу воспроизведение: журнальная
+    запись без items/deleted — общий предохранитель, а не патч под один
+    случай."""
+    _wire(monkeypatch, {}, tmp_path)
+
+    rid = "empty-verdicts-01"
+    s._journal_write({"ts": "2026-08-07T14:00:00+00:00", "record": rid,
+                      "op": "delete", "summary": "t"})  # ни items, ни deleted
+
+    report = s._build_operation_report(rid)
+    summary = _parse_summary(report)
+
+    assert summary == {"ok": 0, "warn": 0, "bad": 0}
+    assert "Статус операции: ❓" in report
+    assert "Статус операции: ✅" not in report
+    assert "проверять было нечего" in report
+
+
+# ===========================================================================
+# def-119 (2026-08-07), часть 2: delete_habit'а journal-запись несёт
+# ОДИНОЧНЫЙ "snapshot", а не "items"/"deleted" списком (см.
+# _delete_habit_impl) — `_compute_op_verdicts` эту форму не понимала, и
+# _verify_item для delete_habit не вызывался НИ РАЗУ, что и производило
+# пустой список из части 1 выше. Образец «правильного» поведения — обычный
+# delete: подтверждение через ОТСУТСТВИЕ объекта в свежем чтении.
+# ===========================================================================
+
+async def test_delete_habit_operation_report_confirms_via_absence(
+        monkeypatch, tmp_path):
+    """Живой пример из отчёта Максима: привычка реально удалена — отчёт
+    обязан сказать «✅ 1 подтверждено» и «Статус операции: ✅», а не
+    0/0/0 + ❓/✅-разнобой."""
+    _wire(monkeypatch, {}, tmp_path)
+    monkeypatch.setattr(s, "_v2_habits_or_none", lambda: [])  # привычки нет
+
+    rid = "delete-habit-01"
+    s._journal_write({"ts": "2026-08-07T14:00:01+00:00", "record": rid,
+                      "op": "delete_habit", "summary": "t",
+                      "snapshot": {"id": "h1", "name": "Растяжка",
+                                  "totalCheckIns": 18}})
+
+    report = s._build_operation_report(rid)
+    summary = _parse_summary(report)
+
+    assert summary == {"ok": 1, "warn": 0, "bad": 0}
+    assert "Статус операции: ✅" in report
+    assert "«Растяжка»" in report
+    assert "привычка удалена" in report
+
+
+async def test_delete_habit_operation_report_catches_survivor(
+        monkeypatch, tmp_path):
+    """Обратный случай: привычка всё ещё в живом списке — расхождение,
+    а не тихий успех."""
+    _wire(monkeypatch, {}, tmp_path)
+    monkeypatch.setattr(s, "_v2_habits_or_none",
+                        lambda: [{"id": "h1", "name": "Растяжка"}])
+
+    rid = "delete-habit-02"
+    s._journal_write({"ts": "2026-08-07T14:00:02+00:00", "record": rid,
+                      "op": "delete_habit", "summary": "t",
+                      "snapshot": {"id": "h1", "name": "Растяжка"}})
+
+    report = s._build_operation_report(rid)
+    summary = _parse_summary(report)
+
+    assert summary == {"ok": 0, "warn": 0, "bad": 1}
+    assert "Статус операции: ❌" in report
+    assert "ВСЁ ЕЩЁ существует" in report
+
+
+async def test_delete_habit_operation_report_unverified_on_read_failure(
+        monkeypatch, tmp_path):
+    """Чтение списка привычек упало — «не удалось перечитать», а НЕ тихий
+    успех (тот же контракт, что у delete_project's _v2_project_names_or_none)."""
+    _wire(monkeypatch, {}, tmp_path)
+    monkeypatch.setattr(s, "_v2_habits_or_none", lambda: None)
+
+    rid = "delete-habit-03"
+    s._journal_write({"ts": "2026-08-07T14:00:03+00:00", "record": rid,
+                      "op": "delete_habit", "summary": "t",
+                      "snapshot": {"id": "h1", "name": "Растяжка"}})
+
+    report = s._build_operation_report(rid)
+    summary = _parse_summary(report)
+
+    assert summary == {"ok": 0, "warn": 1, "bad": 0}
+    assert "Статус операции: ⚠️" in report
+    assert "НЕ ПОДТВЕРЖДЁН" in report

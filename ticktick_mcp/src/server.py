@@ -603,6 +603,21 @@ def _v2_project_names_or_none() -> Optional[Dict]:
     return None
 
 
+def _v2_habits_or_none() -> Optional[List[Dict]]:
+    """def-119 (2026-08-07): свежий список привычек для post-verify, или
+    None (никогда []) когда чтение упало — тот же контракт «не путать пусто
+    с недоступно», что у _v2_project_names_or_none чуть выше (см. её
+    докстринг): нужен _verify_item's "delete_habit" branch, чтобы пустой
+    список честно означал «привычки нет», а не «чтение не состоялось».
+    Привычки есть только в v2 API — фолбэка на v1 нет."""
+    if not ticktick_v2:
+        return None
+    try:
+        return ticktick_v2.get_habits()
+    except Exception:
+        return None
+
+
 def _v2_project_names() -> Dict:
     """Map projectId -> name (incl. Inbox) from the cached v2 state,
     falling back to the official v1 API so results stay human-readable
@@ -4967,6 +4982,20 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         return (("bad", f"- ❌ **«{title}»** — проект ВСЁ ЕЩЁ существует "
                  "(удаление не подтвердилось)") if still else
                 ("ok", f"- ✅ **«{title}»** — проект удалён"))
+    if op == "delete_habit":
+        # def-119 (2026-08-07), часть 2: `tid` — id ПРИВЫЧКИ, не задачи. Тот
+        # же приём, что у delete_project чуть выше (CONFIRMED ABSENCE): фреш-
+        # чтение через хелпер, различающий «пусто» и «не смогли прочитать»,
+        # иначе неудачный фетч читался бы как подтверждённое удаление.
+        fresh_habits = _v2_habits_or_none()
+        if fresh_habits is None:
+            return ("warn", f"- ⚠️ **«{title}»** — привычка: проверка не "
+                    "удалась (не получилось перечитать список привычек), "
+                    "исход НЕ ПОДТВЕРЖДЁН")
+        still = any(h.get("id") == tid for h in fresh_habits)
+        return (("bad", f"- ❌ **«{title}»** — привычка ВСЁ ЕЩЁ существует "
+                 "(удаление не подтвердилось)") if still else
+                ("ok", f"- ✅ **«{title}»** — привычка удалена"))
     if live is None:
         return ("bad", f"- ❌ **«{title}»** — не найдена среди открытых "
                 "(ожидалась живой)")
@@ -5066,10 +5095,22 @@ def _compute_op_verdicts(records: List[Dict], live: Dict[str, Dict],
     verdicts: List[Tuple[str, str]] = []
     for rec in records:
         op = rec.get("op") or "delete"
-        items = rec.get("items") or [
-            {"taskId": s.get("taskId"), "title": s.get("title"), "snapshot": s}
-            for s in rec.get("deleted", [])
-        ]
+        if op == "delete_habit":
+            # def-119 (2026-08-07), часть 2: журнальная запись delete_habit
+            # (см. _delete_habit_impl) несёт ОДИНОЧНЫЙ "snapshot" — не
+            # "items"/"deleted" списком, как у остальных операций. Без этой
+            # ветки `items` ниже молчаливо получался пустым: цикл
+            # `_verify_item` не вызывался НИ РАЗУ, verdicts оставался
+            # пустым, и итог читался как «0/0/0» — вакуумная истина (см.
+            # часть 1 def-119 чуть выше по файлу).
+            snap = rec.get("snapshot") or {}
+            items = ([{"taskId": snap.get("id"), "title": snap.get("name")}]
+                     if snap.get("id") else [])
+        else:
+            items = rec.get("items") or [
+                {"taskId": s.get("taskId"), "title": s.get("title"), "snapshot": s}
+                for s in rec.get("deleted", [])
+            ]
         for item in items:
             verdicts.append(_verify_item(op, item, live, names))
     return verdicts
@@ -5186,10 +5227,26 @@ def _build_operation_report(record_id: str) -> str:
         # потребителей (например, бота tg-ai-assistant) — они не должны
         # прочитать отчёт с хотя бы одним расхождением или непроверенным
         # пунктом как успех.
-        overall = "❌" if bad else ("⚠️" if warn else "✅")
-        tail = ("есть расхождения — это НЕ успех." if bad else
-                "есть непроверенные пункты — это НЕ полный успех." if warn else
-                "всё подтверждено.")
+        #
+        # def-119 (2026-08-07), часть 1: ПУСТОЙ список проверок (ok=warn=
+        # bad=0 — не было ни одной строки `_verify_item`, например журнальная
+        # запись есть, но `_compute_op_verdicts` не смогла извлечь из неё ни
+        # одного объекта) раньше читался как «✅ — всё подтверждено»: и bad,
+        # и warn были falsy, а условие ниже не отличало «нечего проверять» от
+        # «проверили и всё чисто». Это вакуумная истина — «Итог: ✅ 0
+        # подтверждено…» само по себе уже говорит, что подтверждать было
+        # нечего, а следующая строка утверждала обратное. Живой пример:
+        # delete_habit (см. часть 2 ниже) — заголовок «❓ НЕ подтверждено»
+        # соседствовал с «Статус операции: ✅ — всё подтверждено» в одном
+        # сообщении.
+        if bad:
+            overall, tail = "❌", "есть расхождения — это НЕ успех."
+        elif warn:
+            overall, tail = "⚠️", "есть непроверенные пункты — это НЕ полный успех."
+        elif ok:
+            overall, tail = "✅", "всё подтверждено."
+        else:
+            overall, tail = "❓", "проверять было нечего — исход НЕ подтверждён."
         lines.append(f"**Статус операции: {overall}** — {tail}")
         lines.append("[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО — "
                      "это серверная проверка, не заменяй её своим пересказом]")
