@@ -13048,10 +13048,18 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
             "T_TAG":     "changed tags",
         }
 
-        out = f"Activity log ({len(events)} events):\n\n"
+        # Times are the OWNER's, and the zone is named ONCE in the header
+        # rather than on each of N lines (with_zone=False below) — a log of 40
+        # events would otherwise repeat "(America/Los_Angeles)" 40 times. The
+        # old `[:19]` slice just chopped the offset off the raw UTC string, so
+        # an event at 23:30 local was logged under the NEXT calendar day.
+        # Seconds are kept: `[:19]` carried them and an edit log is exactly
+        # where two changes a minute apart need distinguishing.
+        out = (f"Activity log ({len(events)} events; times in "
+               f"{_USER_TZ.key}):\n\n")
         for e in events:
             action = e.get("action", "?")
-            when = (e.get("when") or "?")[:19].replace("T", " ")
+            when = _local_stamp_str(e.get("when"), with_zone=False, seconds=True)
             who = e.get("whoProfile", {})
             actor = "you" if who.get("isMyself") else who.get("displayName") or "someone"
             channel = e.get("deviceChannel", "")

@@ -256,3 +256,24 @@ async def test_activity_fallback_stamps_are_local(monkeypatch):
         assert local_d.isoformat() in ln, ln
         assert utc_d.isoformat() not in ln, ln
         assert LA in ln, ln
+
+
+# ==========================================================================
+# Место 4 — get_task_activity: `when` каждого события
+# ==========================================================================
+
+async def test_activity_event_when_is_local_day(monkeypatch):
+    """`when` резалось `[:19]` — зона просто отбрасывалась, и событие
+    «переименовал в 23:30 вечера» попадало в СЛЕДУЮЩИЙ календарный день."""
+    monkeypatch.setattr(s, "_USER_TZ", ZoneInfo(LA))
+    when, local_d, utc_d = _at_local(LA, 23, 30, -2)
+    events = [{"action": "T_TITLE", "when": when, "title": "New name",
+               "whoProfile": {"isMyself": True}}]
+    monkeypatch.setattr(s, "ticktick_v2", FakeV2(activity=events))
+
+    out = await s.get_task_activity(task_id="t1", project_id="p1")
+    assert local_d.isoformat() in out, out
+    assert utc_d.isoformat() not in out, out
+    # Зона обязана быть НАЗВАНА — иначе число снова без системы отсчёта.
+    assert LA in out, out
+    assert "renamed" in out and "New name" in out, out
