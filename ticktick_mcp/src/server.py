@@ -26,7 +26,7 @@ from starlette.responses import (JSONResponse, PlainTextResponse, Response,
                                  StreamingResponse)
 
 from .ticktick_client import TickTickClient, _normalize_date
-from .ticktick_v2_client import (ATTACHMENT_MAX_BYTES,
+from .ticktick_v2_client import (ATTACHMENT_MAX_BYTES, COMPLETED_MAX_LIMIT,
                                  TRASH_MAX_LIMIT, TickTickAuthError,
                                  TickTickV2Client, id2error_failures,
                                  new_attachment_id)
@@ -7932,6 +7932,10 @@ async def get_completed_tasks(limit: int = 100) -> str:
     """
     Get recently completed tasks across all lists (requires v2 API).
 
+    Asking for more than the feed can serve is answered honestly: the reply
+    says the feed's own per-call ceiling was hit, instead of passing off
+    "the newest 100" as "all of them".
+
     Args:
         limit: Maximum number of completed tasks to return (default 100 —
             the API's own hard cap, so there's no reason to default lower)
@@ -7944,7 +7948,20 @@ async def get_completed_tasks(limit: int = 100) -> str:
         if not tasks:
             return "No completed tasks found."
         out = f"Completed tasks ({len(tasks)}):\n\n"
-        return out + format_task_list(tasks)
+        # limit=len(tasks), NOT format_task_list's default 100: the client has
+        # already applied the caller's limit (and the feed's ceiling) when
+        # asking TickTick, and a second, hidden cut here is the get_trash
+        # defect of 2026-08-07. It happens to be harmless today only because
+        # COMPLETED_MAX_LIMIT is also 100 — correctness must not rest on two
+        # unrelated constants in two files staying equal.
+        out += format_task_list(tasks, limit=len(tasks))
+        if limit > COMPLETED_MAX_LIMIT and len(tasks) >= COMPLETED_MAX_LIMIT:
+            # The caller asked for more than TickTick serves per call. Silence
+            # here reads as "that's all there is"; say it's a ceiling.
+            out += (f"\n(Asked for {limit}, but TickTick's completed feed caps "
+                    f"at {COMPLETED_MAX_LIMIT} per call — these are the "
+                    f"{COMPLETED_MAX_LIMIT} most recent, not everything.)")
+        return out
     except Exception as e:
         logger.error(f"Error in get_completed_tasks: {e}")
         return f"Error fetching completed tasks: {str(e)}"
