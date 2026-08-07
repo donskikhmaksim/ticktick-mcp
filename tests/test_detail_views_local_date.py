@@ -277,3 +277,60 @@ async def test_activity_event_when_is_local_day(monkeypatch):
     # Зона обязана быть НАЗВАНА — иначе число снова без системы отсчёта.
     assert LA in out, out
     assert "renamed" in out and "New name" in out, out
+
+
+# ==========================================================================
+# Место 5 — get_task_activity: dueDateBefore → dueDate у события T_DUE
+# ==========================================================================
+
+async def test_activity_due_change_shows_owner_days(monkeypatch):
+    """История «когда сдвинули дедлайн» резалась `[:10]` от UTC-строки, то
+    есть показывала ЧУЖИЕ календарные дни у обоих концов перехода."""
+    monkeypatch.setattr(s, "_USER_TZ", ZoneInfo(LA))
+    when, _, _ = _at_local(LA, 12, 0, -2)
+    before, b_local, b_utc = _at_local(LA, 23, 59, -5)
+    after, a_local, a_utc = _at_local(LA, 23, 59, 3)
+    events = [{"action": "T_DUE", "when": when, "whoProfile": {"isMyself": True},
+               "dueDateBefore": before, "dueDate": after}]
+    monkeypatch.setattr(s, "ticktick_v2", FakeV2(activity=events))
+
+    out = await s.get_task_activity(task_id="t1", project_id="p1")
+    line = _line(out, "changed due date")
+    assert b_local.isoformat() in line, line
+    assert a_local.isoformat() in line, line
+    assert b_utc.isoformat() not in line, line
+    assert a_utc.isoformat() not in line, line
+
+
+async def test_activity_due_change_all_day_is_verbatim(monkeypatch):
+    """all-day перенос — календарные даты, читаются буквально в любой зоне."""
+    monkeypatch.setattr(s, "_USER_TZ", ZoneInfo(LA))
+    when, _, _ = _at_local(LA, 12, 0, -2)
+    d1 = (datetime.now(ZoneInfo(LA)) - timedelta(days=5)).date()
+    d2 = (datetime.now(ZoneInfo(LA)) + timedelta(days=3)).date()
+    events = [{"action": "T_DUE", "when": when, "whoProfile": {"isMyself": True},
+               "isAllDay": True,
+               "dueDateBefore": d1.isoformat() + "T00:00:00.000+0000",
+               "dueDate": d2.isoformat() + "T00:00:00.000+0000"}]
+    monkeypatch.setattr(s, "ticktick_v2", FakeV2(activity=events))
+
+    line = _line(await s.get_task_activity(task_id="t1", project_id="p1"),
+                 "changed due date")
+    assert d1.isoformat() in line and d2.isoformat() in line, line
+
+
+async def test_activity_due_change_keeps_none_marker(monkeypatch):
+    """Регресс: «срока не было» обязано остаться словом «none», а не
+    превратиться в строку «None» из str(None)[:10]."""
+    monkeypatch.setattr(s, "_USER_TZ", ZoneInfo(LA))
+    when, _, _ = _at_local(LA, 12, 0, -2)
+    after, a_local, _ = _at_local(LA, 23, 59, 3)
+    events = [{"action": "T_DUE", "when": when, "whoProfile": {"isMyself": True},
+               "dueDate": after}]
+    monkeypatch.setattr(s, "ticktick_v2", FakeV2(activity=events))
+
+    line = _line(await s.get_task_activity(task_id="t1", project_id="p1"),
+                 "changed due date")
+    assert "none" in line, line
+    assert "None" not in line, line
+    assert a_local.isoformat() in line, line

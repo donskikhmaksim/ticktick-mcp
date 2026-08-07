@@ -13069,8 +13069,19 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
             if action == "T_TITLE" and e.get("title"):
                 line += f' → "{e["title"]}"'
             elif action == "T_DUE":
-                before = (e.get("dueDateBefore") or "")[:10] or "none"
-                after = (e.get("dueDate") or "")[:10] or "none"
+                # Both ends of the move are CALENDAR DAYS in the owner's zone,
+                # so they go through the same _local_date_str() the listings
+                # use. The old [:10] slice off the raw UTC string made the
+                # history of "when did we push this deadline" show days the
+                # owner never saw — worse here than in a list, because this is
+                # the record people reconstruct decisions from. The event dict
+                # carries its own isAllDay, which _local_date_str honours, so
+                # an all-day move stays verbatim (#36). "none" stays the word
+                # "none" — str(None)[:10] would have printed "None".
+                before = (_local_date_str(e, "dueDateBefore")
+                          if e.get("dueDateBefore") else "none")
+                after = (_local_date_str(e, "dueDate")
+                         if e.get("dueDate") else "none")
                 line += f"  {before} → {after}"
                 if e.get("isAllDay"):
                     line += " (all-day)"
