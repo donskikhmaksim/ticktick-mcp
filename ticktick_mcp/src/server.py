@@ -598,6 +598,15 @@ def format_task_line(task: Dict, project_name: str = None) -> str:
         meta.append(pr)
     if task.get("tags"):
         meta.append(" ".join("#" + t for t in task["tags"]))
+    # def-D5: статус не печатался НИКОГДА, поэтому в выводе
+    # search_all_tasks(include_completed=True) сделанная задача выглядела
+    # ровно как активная. Метка ставится только для НЕ-активных статусов,
+    # чтобы обычные списки не раздувались.
+    _status = task.get("status", 0)
+    if _status == 2:
+        meta.append("✅ completed")
+    elif _status == -1:
+        meta.append("✖ won't do")
     line = "- " + " ".join(bits)
     if meta:
         line += " · " + ", ".join(meta)
@@ -7480,13 +7489,17 @@ def _task_matches_search(task: Dict[str, Any], search_term: str) -> bool:
     
     return False
 
-def _get_project_tasks_by_filter(filter_func, filter_name: str) -> str:
+def _get_project_tasks_by_filter(filter_func, filter_name: str,
+                                 limit: int = 200, offset: int = 0) -> str:
     """
     Helper function to filter tasks across all projects.
 
     Args:
         filter_func: Function that takes a task and returns True if it matches the filter
         filter_name: Name of the filter for output formatting
+        limit: Page size on the v2 path (default 200 — the historical cut-off)
+        offset: How many matches to skip, so the tail past `limit` is reachable
+            at all instead of being permanently cut off (def-D4)
 
     Returns:
         Formatted string of filtered tasks
@@ -7504,8 +7517,28 @@ def _get_project_tasks_by_filter(filter_func, filter_name: str) -> str:
             matched = [t for t in tasks if filter_func(t)]
             if not matched:
                 return f"No tasks found that are '{filter_name}'."
-            out = f"Tasks that are '{filter_name}' ({len(matched)}):\n"
-            return out + format_task_tree(matched)
+            total = len(matched)
+            offset = max(0, offset)
+            limit = max(1, limit)
+            page = matched[offset:offset + limit]
+            if not page:
+                # def-D4: пустая страница за концом списка — это НЕ «задач нет».
+                return (f"Tasks that are '{filter_name}': {total} total, but offset={offset} "
+                        f"is past the end (last page starts at offset="
+                        f"{max(0, (total - 1) // limit * limit)}).")
+            shown_to = offset + len(page)
+            if offset or shown_to < total:
+                out = (f"Tasks that are '{filter_name}' ({total} total; "
+                       f"showing {offset + 1}-{shown_to}):\n")
+            else:
+                out = f"Tasks that are '{filter_name}' ({total}):\n"
+            body = out + format_task_tree(page, limit)
+            if shown_to < total:
+                # Раньше здесь была голая пометка «... and N more.» из
+                # format_task_tree — она говорила, что список неполон, но не
+                # давала способа его дочитать: параметров у инструмента не было.
+                body += f"\n... and {total - shown_to} more — call again with offset={shown_to}."
+            return body
         except Exception as e:
             logger.warning(f"v2 task pool failed, falling back to official API: {e}")
 
@@ -7595,26 +7628,33 @@ async def get_all_tasks() -> str:
         return f"Error retrieving tasks: {str(e)}"
 
 @mcp.tool(annotations=READONLY)
-async def get_tasks_by_priority(priority_id: int) -> str:
+async def get_tasks_by_priority(priority_id: int, limit: int = 200, offset: int = 0) -> str:
     """
     Get all tasks from TickTick by priority. Ignores closed projects.
 
+    The output is paged: the header always states the TOTAL number of matches,
+    and when it doesn't fit, the last line says how many are left and which
+    offset continues the list.
+
     Args:
         priority_id: Priority of tasks to retrieve {0: "None", 1: "Low", 3: "Medium", 5: "High"}
+        limit: Maximum tasks to show in one call (default 200)
+        offset: Skip this many matches — use it to read the tail past `limit`
     """
     err = _ensure_official()
     if err:
         return err
-    
+
     if priority_id not in PRIORITY_MAP:
         return f"Invalid priority_id. Valid values: {list(PRIORITY_MAP.keys())}"
-    
+
     try:
         def priority_filter(task: Dict[str, Any]) -> bool:
             return task.get('priority', 0) == priority_id
 
         priority_name = f"{PRIORITY_MAP[priority_id]} ({priority_id})"
-        return _get_project_tasks_by_filter(priority_filter, f"priority '{priority_name}'")
+        return _get_project_tasks_by_filter(priority_filter, f"priority '{priority_name}'",
+                                            limit=limit, offset=offset)
 
     except Exception as e:
         logger.error(f"Error in get_tasks_by_priority: {e}")
@@ -9664,31 +9704,124 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
 # Builder helpers (no API call — produce strings for create_task/update_task)
 # ---------------------------------------------------------------------------
 
+# def-D3: BYDAY-токен по RFC 5545 — необязательный порядковый номер
+# (±1..53, "2TU" = второй вторник периода, "-1FR" = последняя пятница) плюс
+# двухбуквенный день недели. Раньше by_day уходил в правило как есть, так что
+# опечатка ("MOND") давала синтаксически битое, но принятое правило.
+_BYDAY_TOKEN = re.compile(r"^([+-]?(?:[1-9]|[1-4]\d|5[0-3]))?(MO|TU|WE|TH|FR|SA|SU)$")
+
+
 @mcp.tool(annotations=READONLY)
 async def build_recurrence_rule(frequency: str, interval: int = 1,
                                 by_day: List[str] = None, count: int = None,
-                                until: str = None) -> str:
+                                until: str = None, by_month_day: List[int] = None,
+                                by_month: List[int] = None,
+                                by_set_pos: List[int] = None) -> str:
     """
     Build an RRULE recurrence string to pass as repeat_flag in create_task/update_task.
 
+    The FIRST line of the output is the rule itself — that is what goes into
+    repeat_flag. Anything after it is a warning about a rule that is valid but
+    probably not what was meant (read it, don't paste it).
+
     Args:
         frequency: DAILY, WEEKLY, MONTHLY, or YEARLY
-        interval: Repeat every N units (default 1)
-        by_day: For weekly rules, days like ["MO","WE","FR"] (optional)
-        count: Stop after this many occurrences (optional)
-        until: Stop on this date YYYY-MM-DD (optional)
+        interval: Repeat every N units (default 1; must be >= 1)
+        by_day: Days like ["MO","WE","FR"]. Works with ANY frequency, not just
+            WEEKLY. An optional ordinal prefix picks the Nth such day of the
+            period: "2TU" = 2nd Tuesday, "-1FR" = last Friday (MONTHLY/YEARLY).
+        count: Stop after this many occurrences (optional). Mutually exclusive
+            with `until` (RFC 5545 forbids both in one rule).
+        until: Stop on this date YYYY-MM-DD (optional, INCLUSIVE). Relative
+            words ("tomorrow"/"завтра", a weekday name) are resolved on this
+            server's clock. The date is read as the END of that day in the
+            OWNER's timezone (USER_TIMEZONE) and converted to UTC, so "until
+            2026-08-31" really covers all of 31 August locally.
+        by_month_day: Days of the month, 1..31 or -1..-31 counting back from
+            its end (BYMONTHDAY). [-1] = last day of every month; [31] = the
+            31st, which simply does not occur in short months.
+        by_month: Months, 1..12 (BYMONTH). Needed for yearly rules like
+            "2nd Tuesday of March": by_month=[3], by_day=["2TU"].
+        by_set_pos: Pick the Nth match within each period (BYSETPOS), e.g.
+            by_day=["MO","TU","WE","TH","FR"] + by_set_pos=[-1] = last weekday
+            of the month. RFC 5545 requires another BY-rule alongside it.
     """
     freq = frequency.upper()
     if freq not in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY"):
         return "Invalid frequency. Use DAILY, WEEKLY, MONTHLY, or YEARLY."
-    parts = [f"FREQ={freq}", f"INTERVAL={max(1, interval)}"]
+    if count and until:
+        return ("Invalid rule: COUNT and UNTIL cannot both be set (RFC 5545). "
+                "Pass either count= (stop after N occurrences) or until= (stop on a date).")
+    if interval < 1:
+        # Раньше здесь стоял max(1, interval): 0 и -3 молча становились 1.
+        return f"Invalid interval={interval}: must be 1 or greater."
+    bad_days = [d for d in (by_day or []) if not _BYDAY_TOKEN.match(str(d).strip().upper())]
+    if bad_days:
+        return (f"Invalid by_day entries: {bad_days}. Use MO/TU/WE/TH/FR/SA/SU, "
+                'optionally with an ordinal prefix ("2TU" = 2nd Tuesday, "-1FR" = last Friday).')
+    bad_mdays = [d for d in (by_month_day or []) if not (1 <= abs(int(d)) <= 31 and int(d) != 0)]
+    if bad_mdays:
+        return (f"Invalid by_month_day entries: {bad_mdays}. Use 1..31, or -1..-31 "
+                "to count back from the end of the month (-1 = last day).")
+    bad_months = [m for m in (by_month or []) if not 1 <= int(m) <= 12]
+    if bad_months:
+        return f"Invalid by_month entries: {bad_months}. Use 1..12."
+    bad_pos = [p for p in (by_set_pos or []) if int(p) == 0 or abs(int(p)) > 366]
+    if bad_pos:
+        return f"Invalid by_set_pos entries: {bad_pos}. Use -366..-1 or 1..366 (0 is not valid)."
+    if by_set_pos and not (by_day or by_month_day or by_month):
+        return ("Invalid rule: by_set_pos needs another BY-rule to pick from (RFC 5545). "
+                'Add by_day (e.g. ["MO","TU","WE","TH","FR"] + by_set_pos=[-1] = '
+                "last weekday of the month).")
+
+    parts = [f"FREQ={freq}", f"INTERVAL={interval}"]
+    if by_month:
+        parts.append("BYMONTH=" + ",".join(str(int(m)) for m in by_month))
+    if by_month_day:
+        parts.append("BYMONTHDAY=" + ",".join(str(int(d)) for d in by_month_day))
     if by_day:
-        parts.append("BYDAY=" + ",".join(d.upper() for d in by_day))
+        parts.append("BYDAY=" + ",".join(str(d).strip().upper() for d in by_day))
+    if by_set_pos:
+        parts.append("BYSETPOS=" + ",".join(str(int(p)) for p in by_set_pos))
     if count:
         parts.append(f"COUNT={count}")
     if until:
-        parts.append("UNTIL=" + until.replace("-", "") + "T000000Z")
-    return "RRULE:" + ";".join(parts)
+        # def-D2: раньше здесь было `until.replace("-", "") + "T000000Z"` —
+        # календарная дата владельца объявлялась ПОЛНОЧЬЮ UTC. В
+        # America/Los_Angeles «до 31 августа» становилось 17:00 30 августа по
+        # местному: правило обрывалось на ~7 часов раньше ожидаемого, молча.
+        # Теперь дата читается как КОНЕЦ этого дня в таймзоне владельца и
+        # честно переводится в UTC (RFC 5545 требует UNTIL в UTC при
+        # Z-форме), а неразобранная дата отвергается вместо мусора в правиле.
+        until_resolved = _resolve_relative_date(until.strip())
+        try:
+            d = datetime.strptime(until_resolved, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return (f"Invalid until={until!r}: expected a date as YYYY-MM-DD "
+                    "(or a relative word like 'tomorrow' / 'завтра' / a weekday name).")
+        end_local = datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=_USER_TZ)
+        parts.append("UNTIL=" + end_local.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+
+    rule = "RRULE:" + ";".join(parts)
+
+    # def-D3: правило может быть синтаксически безупречным и при этом значить
+    # не то, что просили. Такие случаи не переписываются молча — они
+    # называются вслух ПОД правилом (первая строка остаётся чистым RRULE).
+    warnings = []
+    if freq == "YEARLY" and not by_month and any(
+            _BYDAY_TOKEN.match(str(d).strip().upper()).group(1) for d in (by_day or [])):
+        warnings.append(
+            '⚠️ YEARLY + ordinal by_day without by_month: "2TU" here means the 2nd Tuesday '
+            "of the YEAR, not of a month. Add by_month=[3] for \"2nd Tuesday of March\".")
+    short_days = sorted({int(d) for d in (by_month_day or []) if int(d) in (29, 30, 31)})
+    if short_days:
+        warnings.append(
+            f"⚠️ by_month_day={short_days}: months that are shorter simply have no such day, "
+            "so the repeat is SKIPPED there (RFC 5545) — February never fires on 30/31. "
+            "Use by_month_day=[-1] if you meant \"the last day of every month\".")
+    if not warnings:
+        return rule
+    return rule + "\n\n" + "\n".join(warnings)
 
 
 @mcp.tool(annotations=READONLY)
@@ -9697,9 +9830,20 @@ async def build_reminder(minutes_before: int = 0) -> str:
     Build a reminder TRIGGER string to pass in the reminders list of create_task/update_task.
 
     Args:
-        minutes_before: Minutes before the due time to remind. 0 = at the time of the event.
+        minutes_before: Minutes before the due time to remind. 0 = at the time
+            of the event. Must not be negative — a negative value is rejected
+            with an error instead of being silently treated as 0 (reminders
+            AFTER the due time are not supported here).
     """
-    if minutes_before <= 0:
+    if minutes_before < 0:
+        # def-D1: раньше любое отрицательное значение молча становилось
+        # "TRIGGER:PT0S" — ошибка в знаке превращалась в «напомнить ровно в
+        # момент события» и выглядела как успех. Ошибочный ввод должен быть
+        # отвергнут, а не подменён на ближайший возможный.
+        return (f"Invalid minutes_before={minutes_before}: must be 0 or positive. "
+                "0 = remind at the due time; a positive number = that many minutes "
+                "before it. Reminders after the due time are not supported.")
+    if minutes_before == 0:
         return "TRIGGER:PT0S"
     if minutes_before % (24 * 60) == 0:
         return f"TRIGGER:-P{minutes_before // (24 * 60)}D"
@@ -12751,7 +12895,8 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
 
 @mcp.tool(annotations=READONLY)
 async def get_changes(since: str, until: str = None,
-                      project_id: str = None) -> str:
+                      project_id: str = None, limit: int = 100,
+                      offset: int = 0) -> str:
     """
     Audit feed: everything that changed across the account in a date range —
     what was CREATED, COMPLETED, DELETED, and MODIFIED (requires v2 API).
@@ -12764,10 +12909,17 @@ async def get_changes(since: str, until: str = None,
     Dates are matched at day granularity in UTC; a task completed late at night
     local time may land on the next UTC day.
 
+    Newest events come first. The header always states the TOTAL number of
+    events in the range; when they don't fit in one page, the footer says how
+    many are left and which offset continues the feed.
+
     Args:
         since: Start date YYYY-MM-DD (inclusive)
         until: End date YYYY-MM-DD (inclusive; defaults to today)
         project_id: Optional — limit the feed to one list/project
+        limit: Maximum events per call (default 100, same shape as
+            get_completed_tasks / get_trash)
+        offset: Skip this many events — use it to read the tail
     """
     err = _ensure_ready()
     if err:
@@ -12791,10 +12943,11 @@ async def get_changes(since: str, until: str = None,
         def pname(pid):
             return names.get(pid, pid or "?")
 
+        _COMPLETED_SRC_CAP, _TRASH_SRC_CAP = 100, 300
         open_tasks = await _run_blocking(lambda: ticktick_v2.get_open_tasks())
         completed = await _run_blocking(lambda: ticktick_v2.get_completed_tasks(
-            limit=100, from_str=since + " 00:00:00", to_str=until + " 23:59:59"))
-        trash = await _run_blocking(lambda: ticktick_v2.get_trash(limit=300))
+            limit=_COMPLETED_SRC_CAP, from_str=since + " 00:00:00", to_str=until + " 23:59:59"))
+        trash = await _run_blocking(lambda: ticktick_v2.get_trash(limit=_TRASH_SRC_CAP))
 
         if project_id:
             open_tasks = [t for t in open_tasks if t.get("projectId") == project_id]
@@ -12829,10 +12982,41 @@ async def get_changes(since: str, until: str = None,
             return f"С {since} по {until} изменений не найдено."
 
         events.sort(key=lambda e: e[0] or "", reverse=True)
-        header = f"Изменения с {since} по {until} ({len(events)}):\n\n"
-        body = "\n".join(f"{icon} {line}" for _, icon, line in events)
-        note = ("\n\nℹ️ Для точной истории конкретной задачи (кто/куда перенёс, "
-                "что переименовал) используй get_task_activity.")
+
+        # def-D6: раньше здесь печаталась ВСЯ лента — реальный вызов на три дня
+        # выдал 461 событие (~56 КБ) и упёрся в лимит токенов при чтении, то
+        # есть аудит-фид было физически не прочитать. Теперь страница
+        # ограничена (как у get_completed_tasks / get_trash), общее число
+        # названо, а хвост достижим через offset.
+        total = len(events)
+        offset = max(0, offset)
+        limit = max(1, limit)
+        page = events[offset:offset + limit]
+        if not page:
+            return (f"Изменений с {since} по {until}: всего {total}, но offset={offset} "
+                    f"уже за концом ленты (последняя страница начинается с offset="
+                    f"{max(0, (total - 1) // limit * limit)}).")
+        shown_to = offset + len(page)
+        if offset or shown_to < total:
+            header = (f"Изменения с {since} по {until} (всего {total}, "
+                      f"показаны {offset + 1}-{shown_to}):\n\n")
+        else:
+            header = f"Изменения с {since} по {until} ({total}):\n\n"
+        body = "\n".join(f"{icon} {line}" for _, icon, line in page)
+        note = ""
+        if shown_to < total:
+            note += (f"\n\n… ещё {total - shown_to} событий — повтори вызов "
+                     f"с offset={shown_to}.")
+        # Источники тоже имеют свои потолки: когда пачка пришла ровно по
+        # лимиту, лента заведомо неполна — молчать об этом нельзя.
+        if len(completed) >= _COMPLETED_SRC_CAP:
+            note += (f"\n⚠️ Завершённых пришло ровно {_COMPLETED_SRC_CAP} (потолок API) — "
+                     "в диапазоне их может быть больше, сузь период.")
+        if len(trash) >= _TRASH_SRC_CAP:
+            note += (f"\n⚠️ Корзина отдала ровно {_TRASH_SRC_CAP} записей (потолок запроса) — "
+                     "более старые удаления в ленту не попали.")
+        note += ("\n\nℹ️ Для точной истории конкретной задачи (кто/куда перенёс, "
+                 "что переименовал) используй get_task_activity.")
         return header + body + note
     except Exception as e:
         logger.error(f"Error in get_changes: {e}")
