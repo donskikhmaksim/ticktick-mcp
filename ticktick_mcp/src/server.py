@@ -9092,16 +9092,42 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
     unchanged). If the live read itself fails while building the plan, the
     plan still gets built (a read hiccup must not block every detach), but
     its text says so honestly — the call #2 check is unconditional and still
-    guards the mutation either way. NOTE: parent_task_title (the PARENT's
-    claimed name) is NOT verified by this guard, on either call — see
-    def-126 for that separate, pre-existing gap.
+    guards the mutation either way.
+
+    parent_task_id and parent_task_title (the claimed PARENT — NOT the
+    subtask being detached) are cross-checked against the LIVE task list
+    TWICE (def-126, 2026-08-07): once while BUILDING the plan (call #1,
+    before anything is shown to the owner — a mismatched parent name never
+    reaches the plan card at all) and again, independently, right before the
+    actual detach (call #2, inside `_unset_task_parent_impl`). Unlike
+    set_task_parent (where a MISSING parent is refused outright, because
+    nesting under a dead parent orphans the child), a missing/unreadable
+    PARENT here does NOT block: the whole point of this tool is to sever a
+    link, and a parent that is completed/deleted (so it no longer shows up
+    live) is exactly the ordinary case for wanting to detach from it — the
+    subtask's own live parentId is still cross-checked against
+    parent_task_id further down (_unset_task_parent_impl, unchanged), so the
+    RELATIONSHIP itself is never taken on faith either way. Only a live
+    parent that resolves to a DIFFERENT name than claimed is refused (🛑) —
+    that is the actual "owner approved a card with the wrong name" defect
+    this closes. A read hiccup while building the plan does not block either
+    (fail-open, honestly noted in the card); the execution-side check is
+    unconditional either way.
+
+    The two guards above are INDEPENDENT and BOTH run on call #1 — the
+    subtask's own name and the parent's name are separate claims on the plan
+    card («Отцепляю «X» от родителя «Y»»), and each can be wrong on its own.
+    Whichever soft warnings they produce are BOTH appended to that card (see
+    `describe_fn` below): a card that could only carry one of them would
+    silently hide the other from the owner.
     """
     err = _ensure_ready()
     if err:
         return err
     # Перенос identity-guard (task_id↔task_title, ТОЛЬКО субтаска, который
-    # отцепляем — не родителя, см. def-126) на построение плана — тот же
-    # _guard_task, что уже стоит в _unset_task_parent_impl НА ИСПОЛНЕНИИ.
+    # отцепляем — родителя проверяет ВТОРОЙ блок ниже, def-126) на построение
+    # плана — тот же _guard_task, что уже стоит в _unset_task_parent_impl
+    # НА ИСПОЛНЕНИИ.
     # mismatch И missing здесь блокируют план целиком — _unset_task_parent_impl
     # уже трактует ОБА как 🛑 на исполнении, перенос это не ужесточает.
     # Временная недоступность живого чтения — fail-open с предупреждением, а
@@ -9122,11 +9148,58 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
                             "состоянием (чтение не удалось) — сверка "
                             "повторится при подтверждении, и расхождение "
                             "остановит исполнение.")
+    # def-126: parent_task_id/parent_task_title (заявленный РОДИТЕЛЬ) не
+    # сверялись НИ С ЧЕМ — ни здесь, ни в _unset_task_parent_impl, где есть
+    # только проверка СВЯЗИ («live parentId субтаска == parent_task_id»), а не
+    # сверка имя↔id самого родителя. Карточка «Отцепляю «X» от родителя «Y»»
+    # могла нести любое Y. Добавляем ТОТ ЖЕ _guard_task, что уже используется
+    # для субтаска в других инструментах, но здесь — для родителя, ДО
+    # построения плана. Строгость: mismatch (родитель жив и назван иначе) —
+    # 🛑, план не строится (владелец не должен одобрять по чужому имени).
+    # missing/unavailable — сознательно НЕ блокируют: unset_task_parent
+    # РАЗРЫВАЕТ связь, а не создаёт её (в отличие от set_task_parent, где
+    # missing родитель — 🛑, «вложение под мёртвого родителя осиротит
+    # задачи»); родитель, который завершён/удалён (потому и не резолвится
+    # живьём), — обычный, ожидаемый повод отцепить subtask именно от него, и
+    # блокировать это значило бы придумать более жёсткую политику, чем
+    # принята в соседних методах. Имя в этом случае просто нельзя сверить —
+    # карточка честно предупреждает, а связь (id) всё равно перепроверяется
+    # ниже, в _unset_task_parent_impl. automation_key эту проверку не
+    # обходит — она стоит раньше самого гейта (_gate_single).
+    parent_name_warning = ""
+    if not manifest_id:
+        pg = _guard_task(parent_task_id, parent_task_title or "", project_id)
+        if pg.status == "mismatch":
+            return (f"🛑 План НЕ построен — родитель по id это «{pg.title}», а "
+                    f"НЕ «{parent_task_title}» (защита от «не той задачи»). "
+                    "Ничего не изменено.")
+        elif pg.status == "missing":
+            parent_name_warning = (" ⚠️ Родитель не среди открытых задач "
+                                   "(возможно завершён/удалён) — имя не "
+                                   "сверено; связь перепроверится при "
+                                   "подтверждении.")
+        elif pg.status == "unavailable":
+            parent_name_warning = (" ⚠️ Имя родителя НЕ удалось сверить с "
+                                   "живым состоянием (чтение не удалось) — "
+                                   "сверка повторится при подтверждении.")
     params = {"task_title": task_title, "parent_task_title": parent_task_title,
               "task_id": task_id, "parent_task_id": parent_task_id,
               "project_id": project_id}
-    describe_fn = ((lambda p: _describe_unset_task_parent(p) + name_warning)
-                   if name_warning else _describe_unset_task_parent)
+    # ОБА мягких предупреждения складываются в ОДНУ карточку плана. Здесь
+    # сошлись две независимые правки (def-125 — имя субтаска, def-126 — имя
+    # родителя), и каждая приносила СВОЁ присваивание describe_fn с одним и
+    # тем же именем. Два присваивания подряд Python молча схлопнул бы в
+    # последнее, и одно из предупреждений исчезло бы из карточки, которую
+    # читает владелец, — без конфликта при мерже, без падения тестов (каждый
+    # набор тестов проверяет только своё предупреждение) и вообще без единого
+    # признака. Поэтому присваивание РОВНО ОДНО и складывает оба слагаемых
+    # безусловно: при пустых warning'ах текст побайтово равен
+    # _describe_unset_task_parent(p). Не разделять обратно на две ветки.
+    # ЖЁСТКИЕ блокировки (🛑) обеих правок этим не затронуты — они
+    # возвращаются выше и независимо друг от друга.
+    def describe_fn(p):
+        return (_describe_unset_task_parent(p)
+                + name_warning + parent_name_warning)
     outcome = await _gate_single("unset_task_parent", "unset_task_parent",
                                  params if not manifest_id else None,
                                  manifest_id, user_reply, describe_fn,
@@ -9160,6 +9233,23 @@ async def _unset_task_parent_impl(task_title: str, parent_task_title: str,
             real_pname = (by_id.get(live_parent) or {}).get("title") or live_parent
             return (f"🛑 НЕ отцепил — «{task_title}» является подзадачей "
                     f"«{real_pname}», а НЕ «{parent_task_title}». Ничего не тронул.")
+        # def-126, вторая линия защиты: связь id↔id выше (live_parent ==
+        # parent_task_id) подтверждает, что это ДЕЙСТВИТЕЛЬНО текущий
+        # родитель — но само ИМЯ parent_task_title до сих пор не сверялось ни
+        # с чем (проверка выше — это сверка id с id, не имени с id). Между
+        # планом (call #1) и подтверждением (call #2) проходит до часа —
+        # состояние могло смениться, поэтому перепроверяем заново тем же
+        # _guard_task, что и на плане. Строгость СИММЕТРИЧНА плану: mismatch
+        # (родитель жив, но назван иначе) — 🛑, ничего не мутируем; missing
+        # (родитель завершён/удалён — обычный повод отцеплять именно от
+        # него, см. docstring unset_task_parent) молча пропускаем, связь уже
+        # подтверждена по id.
+        pg = _guard_task(parent_task_id, parent_task_title or "", project_id,
+                         by_id=by_id)
+        if pg.status == "mismatch":
+            return (f"🛑 НЕ отцепил — родитель по id это «{pg.title}», а НЕ "
+                    f"«{parent_task_title}» (защита от «не той задачи»). "
+                    "Ничего не тронул.")
         resp = await _run_blocking(lambda: ticktick_v2.unset_task_parent(
             task_id, live_parent, g.project_id or project_id))
         api_err = id2error_failures(resp, [task_id]).get(task_id)
