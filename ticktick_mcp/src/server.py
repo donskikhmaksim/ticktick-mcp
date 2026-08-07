@@ -7450,9 +7450,16 @@ async def get_all_tasks() -> str:
             out = f"All open tasks ({len(tasks)}):\n\n"
             for pid, ptasks in by_project.items():
                 pname = names.get(pid, pid or "Inbox")
-                top = [t for t in ptasks if not t.get("parentId")]
-                out += f"── {pname} ({len(top)} tasks) ──\n"
-                out += format_task_tree(top, 500)
+                # The WHOLE per-project list goes in, subtasks included:
+                # format_task_tree builds the hierarchy itself (children nested
+                # under their parent, orphans promoted to top level). Handing it
+                # only parent-less tasks — as this did until 2026-08-07 — dropped
+                # every subtask from the output while the header kept counting
+                # them, so the tool under-reported by hundreds of tasks (1477
+                # promised vs 1234 printed) with no marker that anything was
+                # missing. Never pre-filter on parentId here.
+                out += f"── {pname} ({len(ptasks)} tasks) ──\n"
+                out += format_task_tree(ptasks, 500)
                 out += "\n"
             return out
 
