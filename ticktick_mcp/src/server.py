@@ -7775,6 +7775,16 @@ async def create_subtask(
     call #2 is refused whatever `user_reply` says — before the press (wait for
     it) and after it too (the server is already running the operation). Do not
     retry it; just tell the user to tap the button.
+
+    parent_task_id and parent_task_title are cross-checked against the LIVE
+    task list TWICE (same pattern as delete_habit, def-116, 2026-08-07): once
+    while BUILDING the plan (call #1, before anything is shown to the owner —
+    a mismatched or gone parent never reaches the plan card at all) and again,
+    independently, right before the actual create (call #2, unchanged). If the
+    live read itself fails while building the plan, the plan still gets built
+    (a read hiccup must not block every subtask creation), but its text says
+    so honestly — the call #2 check is unconditional and still guards the
+    mutation either way.
     """
     err = _ensure_official()
     if err:
@@ -7784,12 +7794,46 @@ async def create_subtask(
     if priority not in [0, 1, 3, 5]:
         return "Invalid priority. Must be 0 (None), 1 (Low), 3 (Medium), or 5 (High)."
 
+    # Перенос identity-guard (parent_task_id↔parent_task_title) на построение
+    # плана — тот же _guard_task, что уже стоит в _create_subtask_impl НА
+    # ИСПОЛНЕНИИ, но здесь — ДО показа карточки владельцу (тот же перенос,
+    # что в delete_habit, def-116, и в группе A: attach_file_to_task/
+    # update_task_comment/delete_task_comment). mismatch И missing здесь
+    # блокируют план целиком — _create_subtask_impl уже трактует ОБА как 🛑
+    # на исполнении (не только mismatch, в отличие от add_task_comment, где
+    # missing мягче), перенос это не ужесточает. Временная недоступность
+    # живого чтения — fail-open с предупреждением в тексте плана, а
+    # исполнение (не тронуто) перепроверит заново и остаётся последней
+    # линией защиты. Действует только на call #1 (manifest_id пуст):
+    # call #2 обслуживает СОХРАНЁННЫЕ параметры плана, а не свежие аргументы
+    # вызова, и identity guard на исполнении там уже стоит. automation_key
+    # НЕ пропускает эту проверку — она стоит раньше самого гейта, поэтому
+    # headless-путь (карточки с кнопками не видит вовсе) тоже защищён.
+    name_warning = ""
+    if not manifest_id:
+        g = _guard_task(parent_task_id, parent_task_title or "", project_id)
+        if g.status == "mismatch":
+            return (f"🛑 План НЕ построен — родитель по id это «{g.title}», а "
+                    f"НЕ «{parent_task_title}» (защита от «не той задачи»). "
+                    "Ничего не изменено.")
+        elif g.status == "missing":
+            return (f"🛑 План НЕ построен — родитель «{parent_task_title}» не "
+                    "среди открытых задач (завершён/удалён/неверный id). "
+                    "Ничего не изменено.")
+        elif g.status == "unavailable":
+            name_warning = (" ⚠️ Название родительской задачи НЕ удалось "
+                            "сверить с живым состоянием (чтение не удалось) — "
+                            "сверка повторится при подтверждении, и "
+                            "расхождение остановит исполнение.")
+
     params = {"parent_task_title": parent_task_title, "subtask_title": subtask_title,
               "parent_task_id": parent_task_id, "project_id": project_id,
               "content": content, "priority": priority}
+    describe_fn = ((lambda p: _describe_create_subtask(p) + name_warning)
+                   if name_warning else _describe_create_subtask)
     outcome = await _gate_single("create_subtask", "create_subtask",
                                  params if not manifest_id else None,
-                                 manifest_id, user_reply, _describe_create_subtask,
+                                 manifest_id, user_reply, describe_fn,
                                  automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
