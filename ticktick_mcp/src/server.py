@@ -5229,7 +5229,12 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         if live.get("columnId"):
             facts.append("раздел применён")
         if live.get("dueDate"):
-            facts.append(f"срок {str(live['dueDate'])[:10]}")
+            # Это текст РЕШЕНИЯ: по нему владелец принимает результат
+            # создания, а не просматривает список. Сырой срез [:10] от
+            # UTC-строки называл здесь чужой календарный день — тот же
+            # дефект, что чинили в списках (f85fc76), но с более дорогой
+            # ценой ошибки. _local_date_str() держит и all-day буквально.
+            facts.append(f"срок {_local_date_str(live, 'dueDate')}")
         if live.get("priority"):
             facts.append(f"приоритет {PRIORITY_MAP.get(live['priority'], live['priority'])}")
         return ("ok", f"- ✅ **«{title}»** — создана {', '.join(facts)}")

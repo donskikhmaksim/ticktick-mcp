@@ -334,3 +334,32 @@ async def test_activity_due_change_keeps_none_marker(monkeypatch):
     assert "none" in line, line
     assert "None" not in line, line
     assert a_local.isoformat() in line, line
+
+
+# ==========================================================================
+# Место 6 — _verify_item: «срок …» в отчёте о создании
+# ==========================================================================
+
+def test_verify_item_create_reports_owner_day(monkeypatch):
+    """Это текст РЕШЕНИЯ («создана, срок такой-то»), по нему человек
+    подтверждает результат — врать в нём дороже, чем в списке."""
+    monkeypatch.setattr(s, "_USER_TZ", ZoneInfo(LA))
+    due, local_d, utc_d = _at_local(LA, 23, 59)
+    live = {"id": "t1", "projectId": "p1", "title": "Deliver the door",
+            "dueDate": due}
+    status, line = s._verify_item("create", {"taskId": "t1", "title": "Deliver the door"},
+                                  {"t1": live}, {"p1": "Работа"})
+
+    assert status == "ok", (status, line)
+    assert f"срок {local_d.isoformat()}" in line, line
+    assert utc_d.isoformat() not in line, line
+
+
+def test_verify_item_create_all_day_verbatim(monkeypatch):
+    monkeypatch.setattr(s, "_USER_TZ", ZoneInfo(LA))
+    day = (datetime.now(ZoneInfo(LA)) + timedelta(days=2)).date()
+    live = {"id": "t1", "projectId": "p1", "title": "x", "isAllDay": True,
+            "dueDate": day.isoformat() + "T00:00:00.000+0000"}
+    _, line = s._verify_item("create", {"taskId": "t1", "title": "x"},
+                             {"t1": live}, {"p1": "Работа"})
+    assert f"срок {day.isoformat()}" in line, line
