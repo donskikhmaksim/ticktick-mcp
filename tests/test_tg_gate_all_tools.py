@@ -215,11 +215,25 @@ def _tg_off(monkeypatch):
 
 
 # Детерминированное «живое состояние» для тулов, которые сверяют переданные
-# id ДО гейта (сегодня это только manual_triage — его identity guard обязан
-# работать на фазе плана, иначе человек увидел бы план по несуществующим
-# задачам). Остальные 20 тулов сюда не заглядывают вовсе.
-_LIVE_TASKS = {"t1": {"id": "t1", "title": "A", "projectId": "p1"}}
-_LIVE_PROJECTS = {"p1": "Проект-1", "p2": "Проект-2"}
+# id ДО гейта. Раньше (до def-116 follow-up, group B, 2026-08-07) это был
+# только manual_triage — его identity guard обязан работать на фазе плана,
+# иначе человек увидел бы план по несуществующим задачам. Group B добавила
+# ТУ ЖЕ фазу плана к ещё шести тулам (create_subtask, unset_task_parent,
+# delete_project_group, move_project_to_group, add_task_comment,
+# duplicate_task), поэтому "par1" (использован как parent_task_id в
+# create_subtask/unset_task_parent/set_task_parent) должен резолвиться в то
+# же "Родитель", что и в ALL_TOOLS ниже, а "p1" — в то же "Проект", что и в
+# create_project_column/archive_project/update_project/
+# move_project_to_group. Раньше p1 здесь значился как "Проект-1" — это
+# расхождение с таблицей было безвредным, пока ни один из этих тулов не
+# читал живое состояние на плане; move_project_to_group's identity-guard
+# теперь его ловит, поэтому исправлено на "Проект" (p2 не трогаю — его
+# "Проект-2" уже совпадает с move_tasks' to_project_name).
+_LIVE_TASKS = {
+    "t1": {"id": "t1", "title": "A", "projectId": "p1"},
+    "par1": {"id": "par1", "title": "Родитель", "projectId": "p1"},
+}
+_LIVE_PROJECTS = {"p1": "Проект", "p2": "Проект-2"}
 
 
 def _no_client_checks(monkeypatch):

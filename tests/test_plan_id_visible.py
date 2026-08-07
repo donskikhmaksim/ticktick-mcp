@@ -113,13 +113,22 @@ def _capture_notify(monkeypatch):
 
 
 # Детерминированное «живое состояние» для тулов, которые сверяют переданные
-# id ДО гейта. Сегодня это только `manual_triage`: его identity guard обязан
-# работать на фазе плана, поэтому call #1 читает живые задачи и без этой
-# подмены отвечает «состояние TickTick недоступно» — то есть до печати id
-# дело просто не доходит. Ровно та же обвязка стоит в соседнем
-# tests/test_tg_gate_all_tools.py, откуда берётся таблица ALL_TOOLS.
-_LIVE_TASKS = {"t1": {"id": "t1", "title": "A", "projectId": "p1"}}
-_LIVE_PROJECTS = {"p1": "Проект-1", "p2": "Проект-2"}
+# id ДО гейта. Раньше это был только `manual_triage`; def-116 follow-up
+# (group B, 2026-08-07) добавила ТУ ЖЕ фазу плана к ещё шести тулам
+# (create_subtask, unset_task_parent, delete_project_group,
+# move_project_to_group, add_task_comment, duplicate_task) — без этой
+# подмены их call #1 либо отвечает «состояние TickTick недоступно», либо (что
+# опаснее для ЭТОГО файла) честно отказывает по несовпавшей паре id/название,
+# и до печати id дело просто не доходит. Держать в синхроне с ТОЙ ЖЕ правкой
+# в tests/test_tg_gate_all_tools.py, откуда берётся таблица ALL_TOOLS —
+# "par1"/"p1" обязаны резолвиться в те же "Родитель"/"Проект", что таблица
+# заявляет для create_subtask/unset_task_parent/move_project_to_group и
+# соседей (create_project_column/archive_project/update_project).
+_LIVE_TASKS = {
+    "t1": {"id": "t1", "title": "A", "projectId": "p1"},
+    "par1": {"id": "par1", "title": "Родитель", "projectId": "p1"},
+}
+_LIVE_PROJECTS = {"p1": "Проект", "p2": "Проект-2"}
 
 
 def _no_client_checks(monkeypatch):
