@@ -329,6 +329,40 @@ class _V2Transport:
                 tid = t.get("taskId") if isinstance(t, dict) else t
                 rows[:] = [r for r in rows if r.get("id") != tid]
             return {}
+        if path == "/trash/restore":
+            # Восстановление из корзины. Ключевое, ради чего этот путь здесь
+            # вообще появился: задача возвращается ИМЕННО В ТОМ СТАТУСЕ, в
+            # каком её удалили. Завершённую (status 2 / -1) живой TickTick
+            # после восстановления в /batch/check/0 НЕ отдаёт — она снова
+            # лежит в ленте завершённых. Двойник, который клал бы её в
+            # открытые «чтобы тест был зелёным», подтверждал бы пост-проверку
+            # сервера сам собой, а не фактом.
+            rows = self.state.setdefault("syncTaskBean", {}).setdefault("update", [])
+            for r in (body if isinstance(body, list) else []):
+                tid = r.get("taskId")
+                entry = next((x for x in self.trash if x.get("id") == tid), None)
+                if not entry:
+                    continue
+                self.trash[:] = [x for x in self.trash if x.get("id") != tid]
+                task = dict(entry)
+                task["projectId"] = r.get("toProjectId") or entry.get("projectId")
+                if task.get("status") in (2, -1):
+                    self.completed.insert(0, task)
+                else:
+                    rows.append(task)
+            return {}
+        if path == "/batch/taskProject":
+            # Сырое перемещение (batch_move_tasks_raw). Двигает задачу там,
+            # где она лежит: открытую — в снимке открытых, завершённую — в
+            # ленте завершённых (иначе перемещение завершённой «терялось» бы
+            # у двойника, а не у сервера).
+            rows = self.state.setdefault("syncTaskBean", {}).setdefault("update", [])
+            for r in (body if isinstance(body, list) else []):
+                for pool in (rows, self.completed):
+                    for t in pool:
+                        if t.get("id") == r.get("taskId"):
+                            t["projectId"] = r.get("toProjectId")
+            return {}
         raise AssertionError(f"стенд не знает пути v2: {method} {path} {kwargs}")
 
     # ---- лента активности ходит мимо _request, через session.get ----
