@@ -511,6 +511,38 @@ def format_task(task: Dict, trash_state: Optional[bool] = None) -> str:
     formatted += f"(id: {task.get('id', '?')} | project: {task.get('projectId', '?')})\n"
     return formatted
 
+def _identity_or_refusal(obj: Optional[Dict], wanted_id: str, kind: str,
+                         missing: str = "не найдена", hint: str = "") -> Optional[str]:
+    """None if `obj` really is the object with id `wanted_id`; otherwise the
+    refusal text to return to the caller INSTEAD of a formatted card.
+
+    Why this exists: the official v1 API answers an unknown id with an EMPTY
+    body, and `_make_request` turns an empty body into `{}` (its normal
+    convention for 204/empty). `{}` carries no `error` key, so a plain
+    "if 'error' in resp" check let it through into format_task()/
+    format_project(), where every field fell back to a placeholder — «No
+    title», «No name», «(id: ?)» — and format_task's default status 0 printed
+    a cheerful «Status: Active». The result was a plausible card for an object
+    that does not exist, i.e. an answer from which «exists» and «does not
+    exist» are indistinguishable.
+
+    The id check (not just emptiness) is the same invariant
+    `_official_task_snapshot()` already enforces: an object whose id isn't the
+    requested one cannot be printed as an answer ABOUT the requested one.
+    """
+    if not isinstance(obj, dict) or not obj:
+        return (f"🛑 {kind} с id «{wanted_id}» {missing}: TickTick вернул "
+                f"пустой ответ. Такого объекта нет, либо id неверный.\n"
+                f"Карточку не печатаю — выдумывать поля не буду." +
+                (f"\n{hint}" if hint else ""))
+    got = obj.get("id")
+    if got != wanted_id:
+        return (f"🛑 Не подтверждаю: по id «{wanted_id}» TickTick вернул объект "
+                f"с ДРУГИМ id «{got}». Печатать его как запрошенный объект "
+                f"нельзя." + (f"\n{hint}" if hint else ""))
+    return None
+
+
 def _format_folder_line(project: Dict, group_names: Optional[Dict] = None) -> str:
     """The "Folder:" line of format_project().
 
@@ -1549,8 +1581,16 @@ async def get_project(project_id: str) -> str:
 
     try:
         project = await _run_blocking(lambda: ticktick.get_project(project_id))
-        if 'error' in project:
+        if isinstance(project, dict) and 'error' in project:
             return f"Error fetching project: {project['error']}"
+
+        # Тот же отказ, что и в get_task: пустой ответ печатался как проект
+        # «No name / (id: ?)», то есть как существующий.
+        refusal = _identity_or_refusal(
+            project, project_id, "Проект", "не найден",
+            hint="Список живых проектов и их id — get_projects().")
+        if refusal:
+            return refusal
 
         # Folder name comes from the v2 state — resolve it off the event loop
         # instead of letting format_project() do it inline.
@@ -1697,8 +1737,17 @@ async def get_task(project_id: str, task_id: str) -> str:
 
     try:
         task = await _run_blocking(lambda: ticktick.get_task(project_id, task_id))
-        if 'error' in task:
+        if isinstance(task, dict) and 'error' in task:
             return f"Error fetching task: {task['error']}"
+
+        # Пустой/чужой ответ — это ОТКАЗ, а не карточка «No title / Active».
+        refusal = _identity_or_refusal(
+            task, task_id, "Задача", "не найдена",
+            hint=(f"Проверял в проекте «{project_id}» — задача может лежать в "
+                  "другом списке. Попробуй get_task_info(task_id) (ищет по "
+                  "всем спискам, включая завершённые и корзину)."))
+        if refusal:
+            return refusal
 
         in_trash, note = await _trash_state(task_id)
         return format_task(task, trash_state=in_trash) + note
@@ -8617,11 +8666,19 @@ async def get_habits() -> str:
         habits = await _run_blocking(lambda: ticktick_v2.get_habits())
         if not habits:
             return "No habits found."
-        out = f"Habits ({len(habits)}):\n\n"
+        # totalCheckIns считает ТОЛЬКО успешные отметки — проверено живьём:
+        # привычка с «totalCheckIns: 18» отдаёт 31 запись в get_habit_checkins
+        # (18 выполнено + 13 провалено/пропущено). Слово «total» читалось как
+        # «все отметки», то есть завышало регулярность: 18 из 18 вместо 18 из
+        # 31. Поле не пересчитываем (это счётчик TickTick), но называем честно
+        # и говорим, где смотреть полную историю.
+        out = (f"Habits ({len(habits)}):\n"
+               "(«done» = SUCCESSFUL check-ins only — failed and skipped days are "
+               "NOT in that number; get_habit_checkins lists every entry)\n\n")
         for h in habits:
             out += (f"- {h.get('name','?')}  (id: {h.get('id')})\n"
                     f"    goal: {h.get('goal')} {h.get('unit','')} | type: {h.get('type')} | "
-                    f"total check-ins: {h.get('totalCheckIns', 0)}\n"
+                    f"done: {h.get('totalCheckIns', 0)}\n"
                     f"    repeat: {h.get('repeatRule','')}\n")
         return out
     except Exception as e:
@@ -8630,6 +8687,28 @@ async def get_habits() -> str:
 
 
 _HABIT_STATUS_LABELS = {2: "выполнено", 1: "провалено", 0: "не выполнено"}
+
+
+def _checkin_date_str(stamp) -> str:
+    """Дата отметки привычки по-человечески: 20260529 → «2026-05-29».
+
+    TickTick хранит день привычки как целое YYYYMMDD, и оно печаталось как
+    есть — читать «20260529» и мысленно резать на части приходилось человеку.
+    Значение неожиданной формы отдаём как есть: подгонять его под маску
+    значило бы выдумать дату."""
+    text = str(stamp or "").strip()
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    return text or "?"
+
+
+def _checkin_sort_key(stamp) -> tuple:
+    """Ключ сортировки отметок по дате. Значения непонятной формы уезжают в
+    конец, но НЕ выбрасываются — молча потерянная отметка хуже некрасивой."""
+    text = str(stamp or "").strip()
+    if text.isdigit():
+        return (0, int(text))
+    return (1, 0)
 
 
 def _describe_checkin_habit(p: Dict) -> str:
@@ -8915,7 +8994,7 @@ async def _create_habit_impl(name: str, goal: float = 1.0, unit: str = "Count",
         if twin is not None:
             return (f"### ↷ Привычка «{name}» не создана\n\n"
                     f"- такая привычка **уже есть** (id: {twin.get('id')}, "
-                    f"отметок: {twin.get('totalCheckIns', 0)})\n"
+                    f"успешных отметок: {twin.get('totalCheckIns', 0)})\n"
                     "- второй одноимённой не завожу — их было бы не отличить "
                     "друг от друга; ничего не изменено")
         hid = await _run_blocking(lambda: ticktick_v2.create_habit(
@@ -9132,7 +9211,8 @@ async def _delete_habit_impl(habit_name: str, habit_id: str) -> str:
                      "записать НЕ удалось (журнал недоступен) — вернуть её "
                      "по данным сервера не выйдет")
         return (f"### ✅ Привычка «{real_name}» удалена (проверено)\n\n"
-                f"- вместе с ней ушла история отметок: **{checkins}**\n"
+                f"- вместе с ней ушла вся история отметок (успешных было "
+                f"**{checkins}**, провалы и пропуски тоже стёрты)\n"
                 f"{snap_line}\n"
                 "- 🧾 подтверждено отдельным живым чтением списка привычек "
                 "(`get_habits`) сразу после удаления")
@@ -9163,9 +9243,22 @@ async def get_habit_checkins(habit_name: str, habit_id: str, after_date: str) ->
         if not entries:
             return f"No check-ins for '{habit_name}' since {after_date}."
         labels = {2: "✓ done", 1: "✗ failed", 0: "○ not done"}
-        lines = [f"- {e.get('checkinStamp')}: {labels.get(e.get('status'), e.get('status'))} "
+        # API отдаёт записи в произвольном порядке (живьём: 20260529 → 20260531
+        # → 20260530 → 20260605) — серию по такому списку глазами не посчитать.
+        # Сортируем по дате, от старых к новым: это календарь, а не лента
+        # событий.
+        entries = sorted(entries, key=lambda e: _checkin_sort_key(e.get("checkinStamp")))
+        done = sum(1 for e in entries if e.get("status") == 2)
+        failed = sum(1 for e in entries if e.get("status") == 1)
+        skipped = len(entries) - done - failed
+        lines = [f"- {_checkin_date_str(e.get('checkinStamp'))}: "
+                 f"{labels.get(e.get('status'), e.get('status'))} "
                  f"(value {e.get('value')}/{e.get('goal')})" for e in entries]
-        return f"Check-ins for '{habit_name}' ({len(entries)}):\n" + "\n".join(lines)
+        # Одно число «(31)» прочитывалось как «31 раз сделал» — разбивка не
+        # даёт спутать записи в журнале с выполнениями.
+        return (f"Check-ins for '{habit_name}' — {len(entries)} entries: "
+                f"{done} done, {failed} failed, {skipped} not done "
+                f"(oldest first):\n" + "\n".join(lines))
     except Exception as e:
         logger.error(f"Error in get_habit_checkins: {e}")
         return f"Error fetching habit check-ins: {str(e)}"
@@ -10749,9 +10842,36 @@ async def _add_task_comment_impl(task_title: str, text: str, project_id: str,
 # Statistics & trash (v2)
 # ---------------------------------------------------------------------------
 
+# Расследование расхождения (живая приёмка 2026-08-07/08), чтобы следующий не
+# начинал с нуля. get_statistics отдавал «today 2 | yesterday 6», а независимая
+# сверка по get_changes за те же дни показывала СЕМЬ завершений с датой
+# 2026-08-07 (09:10, 18:14, 18:15, 18:16, 18:16, 21:04, 21:28 UTC; что метки
+# ленты именно UTC — подтверждено get_task_activity: T_DONE в 14:28:59
+# America/Los_Angeles = 21:28 UTC). Ни UTC-сутки, ни сутки владельца (те же 7)
+# не дают 2.
+#
+# Решающее наблюдение — повторный вызов ПОСЛЕ полуночи UTC вернул те же
+# «today 2 | yesterday 6». Считай TickTick по UTC, «today» обнулилось бы.
+# Значит окно «сегодня» — сутки ЧУЖОЙ зоны: граница между 18:16 и 21:04 UTC,
+# то есть зона аккаунта TickTick со смещением примерно UTC+3…+5, куда попали
+# ровно два завершения. Наш код при этом ничего не считает — все три числа
+# приходят полями todayCompleted/yesterdayCompleted/totalCompleted.
+#
+# Отсюда и правка: не «чинить» арифметикой (нечего чинить), а назвать
+# происхождение чисел и нарезку суток. Встречная лента тоже не эталон:
+# get_changes режет календарные UTC-сутки, тянет завершения с капом 100 и
+# корзину с капом 300, а завершённую-и-затем-удалённую задачу показывает как
+# «удалено», то есть недосчитывает завершения.
 @mcp.tool(annotations=READONLY)
 async def get_statistics() -> str:
-    """Get productivity statistics: achievement score/level and completion counts (requires v2 API)."""
+    """Get productivity statistics: achievement score/level and completion
+    counts (requires v2 API).
+
+    The counts are TickTick's OWN counters, passed through untouched. TickTick
+    slices "today"/"yesterday" in ITS ACCOUNT's timezone — neither UTC nor this
+    server's USER_TIMEZONE — so they are not expected to match a get_changes
+    feed (which slices calendar days in UTC). A mismatch between the two is not
+    evidence that either is broken."""
     err = _ensure_ready()
     if err:
         return err
@@ -10759,11 +10879,25 @@ async def get_statistics() -> str:
         s = await _run_blocking(lambda: ticktick_v2.get_statistics())
         if not s:
             return "No statistics available."
+
+        def num(key: str) -> str:
+            # Отсутствующее поле — «нет данных», а не 0: ноль здесь читается
+            # как утверждение «сегодня ничего не завершено», которого источник
+            # не делал (и «None» — тоже не ответ человеку).
+            v = s.get(key)
+            return "—" if v is None else str(v)
+
         return (
-            f"Achievement score: {s.get('score')}  |  Level: {s.get('level')}\n"
-            f"Completed today: {s.get('todayCompleted')}  |  "
-            f"yesterday: {s.get('yesterdayCompleted')}  |  "
-            f"total: {s.get('totalCompleted')}"
+            f"Achievement score: {num('score')}  |  Level: {num('level')}\n"
+            f"Completed today: {num('todayCompleted')}  |  "
+            f"yesterday: {num('yesterdayCompleted')}  |  "
+            f"total: {num('totalCompleted')}\n"
+            "\nℹ️ Это счётчики самого TickTick, отданные как есть — мы их не "
+            "пересчитываем. «Сегодня»/«вчера» он нарезает по зоне АККАУНТА "
+            f"TickTick, а не по зоне этого сервера ({_USER_TZ.key}) и не по "
+            "UTC, по которому режет сутки лента get_changes. Поэтому числа "
+            "здесь и в ленте сходиться не обязаны — расхождение само по себе "
+            "не значит, что одна из сторон врёт."
         )
     except Exception as e:
         logger.error(f"Error in get_statistics: {e}")
@@ -13095,6 +13229,45 @@ def _task_activity_fallback(task_id: str) -> Optional[str]:
         return None
 
 
+# Коды действий в логе активности — ПО ФАКТИЧЕСКОМУ трафику TickTick, а не по
+# догадке о названиях. Предыдущая версия словаря жила внутри
+# get_task_activity() и содержала выдуманный "T_COMPLETE", которого TickTick не
+# шлёт, при этом не содержала реального "T_DONE" (каждое завершение), а также
+# "T_ASSIGN", "T_COLUMN", "T_ADD_FILE", "T_DEL_FILE" — и все они вываливались
+# сырьём в середину фразы («someone T_DONE»). Каждый код здесь наблюдался в
+# живом ответе; расширять список — только по новому наблюдению.
+ACTIVITY_ACTION_LABELS = {
+    "T_TITLE":    "renamed",
+    "T_CONTENT":  "edited description",
+    "T_DUE":      "changed due date",
+    "T_MOVE":     "moved to another list",
+    "T_PARENT":   "changed parent/subtask",
+    "T_CREATE":   "created",
+    "T_DONE":     "completed",
+    "T_DELETE":   "deleted",
+    "T_PRIORITY": "changed priority",
+    "T_TAG":      "changed tags",
+    "T_ASSIGN":   "changed the assignee",
+    "T_COLUMN":   "moved to another column",
+    "T_ADD_FILE": "attached a file",
+    "T_DEL_FILE": "removed a file",
+}
+
+
+def _activity_label(action: str) -> str:
+    """Человеческая подпись действия, а для незнакомого кода — ЗАМЕТНАЯ
+    заглушка вместе с самим кодом.
+
+    Голый код («someone T_DONE») читался как название действия, поэтому
+    пропуск в словаре был невидим — именно так T_DONE и прожил незамеченным.
+    Заглушка обязана и признаваться в незнании, и печатать код, чтобы
+    следующий пропуск был виден с первого взгляда."""
+    label = ACTIVITY_ACTION_LABELS.get(action)
+    if label:
+        return label
+    return f"did something unrecognised ({action or '?'})"
+
+
 @mcp.tool(annotations=READONLY)
 async def get_task_activity(task_id: str, project_id: str) -> str:
     """
@@ -13128,19 +13301,6 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
                 base += "\n\nWhat we do know from the task itself:\n" + fallback
             return base
 
-        ACTION_LABELS = {
-            "T_TITLE":   "renamed",
-            "T_CONTENT": "edited description",
-            "T_DUE":     "changed due date",
-            "T_MOVE":    "moved to another list",
-            "T_PARENT":  "changed parent/subtask",
-            "T_CREATE":  "created",
-            "T_COMPLETE":"completed",
-            "T_DELETE":  "deleted",
-            "T_PRIORITY":"changed priority",
-            "T_TAG":     "changed tags",
-        }
-
         # Times are the OWNER's, and the zone is named ONCE in the header
         # rather than on each of N lines (with_zone=False below) — a log of 40
         # events would otherwise repeat "(America/Los_Angeles)" 40 times. The
@@ -13156,7 +13316,7 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
             who = e.get("whoProfile", {})
             actor = "you" if who.get("isMyself") else who.get("displayName") or "someone"
             channel = e.get("deviceChannel", "")
-            label = ACTION_LABELS.get(action, action)
+            label = _activity_label(action)
 
             line = f"  {when}  {actor} {label}"
             if action == "T_TITLE" and e.get("title"):
