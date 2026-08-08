@@ -2019,8 +2019,8 @@ def _flatten_task_tree(node: Dict, project_id: str, parent_id: str = None,
 
 @mcp.tool()
 async def create_tasks(
-    summary: str,
-    tasks: List[Dict[str, Any]],
+    summary: str = "",
+    tasks: List[Dict[str, Any]] = None,
     automation_key: str = ""
 ) -> str:
     """
@@ -2097,7 +2097,11 @@ async def create_tasks(
       [{"title": "New step", "project_id": "x", "parent_id": "<existing_task_id>"}]
 
     Args:
-        summary: Human-readable confirmation line (see above)
+        summary: Human-readable confirmation line (see above). NOT required by
+            the schema: an interactive call is refused whatever it says, so
+            omitting it still gets you the refusal (with the correct route)
+            instead of a validation error. Headless automation should still
+            pass it — it is what the operation journal records.
         tasks: List of task definition objects — one item for a single task
 
     Returns:
@@ -2120,7 +2124,14 @@ async def create_tasks(
                 "plan_task_creation (покажи эхо пользователю дословно) → явное "
                 "«да» → execute_task_creation(manifest_id, user_reply=<реплика>) "
                 "→ operation_report. Ничего не создано.")
-    return await _create_tasks_impl(summary, tasks)
+    # `summary`/`tasks` необязательны В СХЕМЕ (2026-08-07): интерактивный
+    # вызывающий всё равно получает отказ выше, и требовать от него поля,
+    # которые ни на что не влияют, значило отдавать ему `1 validation error`
+    # вместо маршрута. Для автоматики, дошедшей сюда, summary по-прежнему
+    # нужен — он идёт в журнал операций, поэтому пустой заменяется явной
+    # подписью, а не уезжает в журнал безымянной строкой.
+    return await _create_tasks_impl(summary or "Создание задач (автоматика)",
+                                    tasks or [])
 
 
 async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
@@ -2827,9 +2838,20 @@ async def update_tasks(
             for key in ("due_date", "start_date"):
                 if key in t:
                     t[key] = _resolve_relative_date(t[key])
+    # Сверка с живым состоянием на фазе ПЛАНА: строка, которую исполнитель
+    # заведомо отвергнет, обязана быть видна КАК ТАКАЯ до подтверждения, а не
+    # только в отчёте после нажатия (см. _unapplicable_update_rows).
+    describe, notes = _describe_update_item, None
+    if not manifest_id and tasks:
+        unapplicable = _unapplicable_update_rows(tasks)
+        if unapplicable:
+            describe = _describe_update_item_marking(unapplicable)
+            notes = [f"⚠️ Не применится строк: {len(unapplicable)} из "
+                     f"{len(tasks)} — они помечены ⛔ выше. Подтверждение их "
+                     "не оживит; остальные будут выполнены."]
     outcome = await _gate_batch("update", "update_tasks", tasks, summary,
-                                manifest_id, user_reply, _describe_update_item,
-                                automation_key=automation_key)
+                                manifest_id, user_reply, describe,
+                                notes=notes, automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _update_tasks_impl(outcome.summary, outcome.tasks)
@@ -2872,6 +2894,60 @@ def _update_change_bits(t: Dict[str, Any], sep: str = "; ") -> str:
 def _describe_update_item(t: Dict[str, Any]) -> str:
     title = t.get("title") or t.get("taskId") or t.get("task_id") or "?"
     return f"**«{title}»** — {_update_change_bits(t)}"
+
+
+def _unapplicable_update_rows(tasks: List[Dict[str, Any]]) -> Dict[str, str]:
+    """{taskId: причина} для строк плана, которые ЗАВЕДОМО не исполнятся —
+    сверка живого состояния на фазе ПЛАНА (2026-08-07).
+
+    Зачем. До этой правки update_tasks сверял задачи с живым состоянием
+    ТОЛЬКО в исполнителе. Живой прогон: батч из пяти задач, одна из которых
+    лежала в корзине ещё до построения плана, — карточка перечислила все пять
+    одинаково, и человек подтверждал операцию, часть которой была обречена
+    заранее. Отчёт потом честно говорил «НЕ применилось 1», но постфактум:
+    согласие уже получено на то, чего не будет. У manual_triage такая сверка
+    (пометка ПРОПУЩЕНО) есть с самого начала — здесь закрывается тот же
+    пробел тем же способом.
+
+    Причины ровно те, по которым `_update_tasks_impl` откажет: задачи нет
+    среди открытых (закрыта/удалена/в корзине) или id указывает на ДРУГУЮ
+    задачу. Ничего не отсеивается: план строится целиком, строки только
+    помечаются — решает человек.
+
+    BEST-EFFORT: недоступное живое состояние не имеет права ронять фазу
+    плана (то же правило, что у превью «тег будет создан» в set_task_tags).
+    Тогда возвращается пустой словарь и не помечается ничего — сервер честно
+    не знает, а не выдаёт незнание за «всё в порядке». Настоящая защита
+    стоит там же, где стояла: fail-closed guard в исполнителе."""
+    try:
+        by_id = _open_by_id(fresh=True)
+        if by_id is None:
+            return {}
+        _found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
+    except Exception as e:
+        logger.warning(f"update_tasks: сверка плана с живым состоянием не "
+                       f"удалась ({e}) — строки плана не помечаются")
+        return {}
+    out: Dict[str, str] = {}
+    for m in missing:
+        out[str(m.get("taskId"))] = ("этой задачи нет среди открытых "
+                                     "(закрыта, удалена или в корзине)")
+    for m in mismatch:
+        out[str(m.get("taskId"))] = (f"id указывает на другую задачу — "
+                                     f"живое название «{m.get('actual')}»")
+    return out
+
+
+def _describe_update_item_marking(unapplicable: Dict[str, str]):
+    """`_describe_update_item` + пометка обречённой строки. Пометка живёт
+    ТОЛЬКО в тексте превью и не попадает в сами элементы манифеста: на
+    исполнении состояние перечитывается заново, и вчерашняя пометка не должна
+    ни отменять строку, ни выдавать себя за проверку."""
+    def describe(t: Dict[str, Any]) -> str:
+        line = _describe_update_item(t)
+        why = unapplicable.get(str(t.get("taskId") or t.get("task_id") or ""))
+        return f"{line}\n   ⛔ НЕ БУДЕТ ПРИМЕНЕНО: {why}" if why else line
+    return describe
 
 
 async def _update_tasks_impl(
@@ -7219,9 +7295,9 @@ async def set_declutter_decision(manifest_id: str, row_ids: List[int],
 
 @mcp.tool()
 async def delete_task_with_subtasks(
-    summary: str,
-    task_id: str,
-    project_id: str,
+    summary: str = "",
+    task_id: str = "",
+    project_id: str = "",
     task_title: str = None,
     project_name: str = None,
 ) -> str:
@@ -7233,7 +7309,9 @@ async def delete_task_with_subtasks(
     manifest for approval (already gated 🔴 — plan_task_deletion →
     execute_task_deletion(manifest_id, user_reply=...)). No argument below
     has any effect; nothing is ever deleted by THIS tool, regardless of what
-    you pass.
+    you pass. None of them is required either (2026-08-07): a tool whose whole
+    answer is a refusal must not demand a value to hand that refusal over —
+    calling it with no arguments at all returns the same redirect.
 
     Args:
         summary: unused — has no effect, kept for backward-compatible calls
@@ -10124,6 +10202,22 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
         # uses, BEFORE touching any task — and post-verify the registration
         # itself, not just assume the 200 meant it worked.
         requested = sorted({t for c in changes for t in c["tags"] if t})
+        # Регистр (2026-08-07). У тега ДВА поля: `name` — ключ, всегда нижним
+        # регистром (по нему тег ищется, он же пишется на задачу), и `label`
+        # — написание, которое человек видит в списке тегов. Настоящий
+        # `TickTickV2Client.create_tag` это уважает сам: он понижает `name` и
+        # кладёт в `label` строку КАК ПЕРЕДАЛИ. Раньше сюда уходил уже
+        # пониженный ключ — нормализация, нужная для записи на задачу,
+        # утекала и в регистрацию, — и «Работа», заведённая постановкой на
+        # задачу, оседала в аккаунте как «работа», хотя через create_tag то
+        # же слово сохраняло регистр. Здесь запоминается первое встреченное
+        # написание каждого ключа и отдаётся в регистрацию именно оно.
+        display_by_key: Dict[str, str] = {}
+        for t in tasks:
+            for raw in (t.get("tags") or []):
+                bare = str(raw).lstrip("#")
+                if bare:
+                    display_by_key.setdefault(bare.lower(), bare)
         # force=False: _open_by_id(fresh=True) just above already forced a
         # fresh sync-state fetch (tags included) within the TTL window — no
         # need for a second network round-trip for the same snapshot.
@@ -10131,7 +10225,8 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
         to_register = [t for t in requested if t not in existing_tags]
         for tag_name in to_register:
             try:
-                await _run_blocking(lambda tn=tag_name: ticktick_v2.create_tag(tn))
+                shown = display_by_key.get(tag_name, tag_name)
+                await _run_blocking(lambda tn=shown: ticktick_v2.create_tag(tn))
             except Exception as e:
                 logger.error(
                     f"set_task_tags: auto-registration of tag '{tag_name}' "
@@ -10187,15 +10282,19 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
             lines.append(f"🏷 Теги обновлены у {len(applied)} (проверено): "
                          + ", ".join(f"«{t}»" for t in applied))
         if registered:
+            # Печатается написание, под которым тег ЗАВЕДЁН (то же, что
+            # покажет list_tags), а не внутренний ключ — иначе отчёт
+            # рассказывал бы про «работа» там, где в приложении «Работа».
             lines.append(
                 f"🆕 Новые теги зарегистрированы в аккаунте (проверено — видны "
                 f"в list_tags, удаляются delete_tag), {len(registered)}: "
-                + ", ".join(f"«{t}»" for t in registered))
+                + ", ".join(f"«{display_by_key.get(t, t)}»" for t in registered))
         if failed_register:
             lines.append(
                 f"⚠️ Не удалось зарегистрировать в аккаунте {len(failed_register)} "
                 "тег(ов) — они НЕ проставлены ни на одну задачу (во избежание "
-                "тега-сироты): " + ", ".join(f"«{t}»" for t in failed_register))
+                "тега-сироты): "
+                + ", ".join(f"«{display_by_key.get(t, t)}»" for t in failed_register))
         if skipped_tasks:
             parts = "; ".join(
                 f"«{title}» (тег{'и' if len(bad) > 1 else ''} "
@@ -14755,8 +14854,15 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
     ready-to-run plan and was disabled forever). EVERY operation must
     correspond to a concrete sentence the human said, and that sentence goes
     into that operation's `said` field, VERBATIM (or tightly condensed).
-    A blanket phrase reused on every row («разобрать инбокс», «cleanup») is a
-    protocol violation — `said` must be what the human said about THAT task.
+    A blanket phrase reused on every row («разобрать инбокс», «cleanup») is
+    NOT what this field is for — `said` must be what the human said about
+    THAT task — but the server does not block it: when two or more rows carry
+    the same `said`, the preview gets a ⚠️ warning naming how many, and the
+    human decides with open eyes. Telling a lazy copy-paste from a legitimate
+    one is impossible from the string alone («эти пять удали» genuinely is
+    one sentence about five tasks), so an automatic block would hit honest
+    plans — and would push you to invent five different phrasings, the exact
+    fabrication this field exists to prevent.
     Empty `said` → the whole plan is refused.
 
     Call #1 (manifest_id omitted): each `task_id` is checked against LIVE
