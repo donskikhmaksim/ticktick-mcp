@@ -1249,7 +1249,10 @@ def _names_agree(expected: str, actual: str) -> bool:
 
 class _Guard:
     """Result of the identity guard for one task.
-    status ∈ {ok, mismatch, missing, unavailable}."""
+    status ∈ {ok, mismatch, missing, unavailable} — plus 'completed', which
+    ONLY `_guard_task_incl_completed` ever returns (the task exists and its
+    title checks out, it is simply no longer open). `ok` stays strictly
+    "open and verified", so nothing that switches on `.ok` is affected."""
     __slots__ = ("status", "project_id", "title", "message")
 
     def __init__(self, status, project_id="", title="", message=""):
