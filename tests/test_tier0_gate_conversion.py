@@ -30,9 +30,11 @@ so the plan card shown on call #1 printed `task_title` straight from the
 caller with ZERO verification against the live task the id actually points
 at. The three tests that used to sit here
 (test_attach_file_to_task_full_gate_cycle,
-test_attach_file_to_task_missing_identity_downgrades_to_warn,
+test_attach_file_to_task_missing_identity_refuses,
 test_update_task_comment_full_gate_cycle,
-test_update_task_comment_missing_identity_downgrades_to_warn) all passed
+test_update_task_comment_missing_identity_refuses — последние два носили
+тогда имена ..._missing_identity_downgrades_to_warn и переписаны 2026-08-07,
+см. дефект №2 в их собственных докстрингах) all passed
 `_guard_task` stand-ins that never distinguished call #1 from call #2 — every
 one of them would have happily built a plan carrying a WRONG title if the
 stand-in had been "mismatch" instead of "ok"/"missing", and nothing below
@@ -1576,16 +1578,25 @@ async def test_add_task_comment_plan_identity_guard_blocks_wrong_title(
     assert fake_v2.calls == []
 
 
-async def test_add_task_comment_plan_missing_identity_does_not_block_but_warns(
-        monkeypatch):
-    """The id is genuinely not among open tasks (most likely: the task was
-    already completed) — _add_task_comment_impl treats this as LEGITIMATE on
-    execution (commenting a completed task is a normal thing to do), only
-    downgrading the confirmation to a warning because the title could not be
-    cross-checked. The plan-phase transfer MUST reproduce that same
-    softness, not silently upgrade "missing" into a hard block: the plan is
-    still built (manifest_id present, no 🛑 anywhere), and its text honestly
-    says the title wasn't verified."""
+async def test_add_task_comment_plan_missing_identity_refuses(monkeypatch):
+    """ПЕРЕПИСАН 2026-08-07 (дефект №2). Раньше этот тест назывался
+    ..._does_not_block_but_warns и фиксировал прежнюю политику: `missing` →
+    план строится с пометкой «название НЕ проверено», потому что «скорее
+    всего задача просто завершена».
+
+    Политика изменилась там, где ей и место — в решении КЛАССА операций
+    (add/attach/update/delete comment + duplicate_task), см.
+    `_guard_task_incl_completed`. Завершённая задача теперь опознаётся ПО
+    ИМЕНИ через источник, где она живёт, и получает отдельный статус
+    `completed` (операция разрешена, название сверено). Поэтому `missing`
+    больше не значит «может быть, завершена» — он значит «не нашли НИ В
+    ОДНОМ источнике», и строить на нём план операции над несуществующим
+    объектом нельзя (тот же инвариант, что в
+    tests/test_missing_object_refused.py).
+
+    Согласованность всех пяти инструментов класса на одном входе проверяется
+    на настоящих клиентах в tests/test_completed_task_class_consistency.py —
+    подменять там `_guard_task`, как здесь, было бы проверкой мока."""
     fake_v2 = FakeV2(live={})
     _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
     monkeypatch.setattr(
@@ -1595,9 +1606,8 @@ async def test_add_task_comment_plan_missing_identity_does_not_block_but_warns(
 
     preview = await s.add_task_comment("Купить молоко", "не забыть", "p1", "t1")
 
-    assert "🛑" not in preview, "missing на плане должен предупреждать, не блокировать"
-    assert "manifest_id" in preview, "план обязан построиться — missing здесь мягкий"
-    assert "не среди открытых задач" in preview
+    assert preview.startswith("🛑 План НЕ построен"), preview
+    assert "manifest_id" not in preview, preview
     assert fake_v2.calls == []
 
 
@@ -1704,11 +1714,12 @@ async def test_attach_file_to_task_full_gate_cycle(monkeypatch):
     assert s._auto_execute_report_is_success(result), result
 
 
-async def test_attach_file_to_task_missing_identity_downgrades_to_warn(monkeypatch):
-    """Симметрично update_task_comment/delete_task_comment: identity-guard не
-    смог сверить название → ⚠️, даже если вложение реально прикрепилось и
-    post-verify его видит. ✅ значит «подтверждено ПОЛНОСТЬЮ» (output-
-    format.md §7.2) — название здесь не проверено, значит не полностью."""
+async def test_attach_file_to_task_missing_identity_refuses(monkeypatch):
+    """ПЕРЕПИСАН 2026-08-07 (дефект №2) — обоснование целиком в
+    test_add_task_comment_plan_missing_identity_refuses выше. Коротко:
+    `missing` больше не покрывает «возможно, завершена» (для этого есть
+    статус `completed` с проверенным названием), а значит означает «объекта
+    нет ни в одном источнике» — прикреплять к нему файл нечего."""
     fake_v2 = FakeV2(live={"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}})
     _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
     monkeypatch.setattr(
@@ -1717,14 +1728,10 @@ async def test_attach_file_to_task_missing_identity_downgrades_to_warn(monkeypat
 
     preview = await s.attach_file_to_task("Купить молоко", "t1", "p1",
                                           url="https://x/file.pdf")
-    mid = _extract_manifest_id(preview)
-    result = await s.attach_file_to_task("Купить молоко", "t1", "p1",
-                                         url="https://x/file.pdf",
-                                         manifest_id=mid, user_reply="да")
 
-    assert ("attach", "t1") in fake_v2.calls
-    assert result.startswith("⚠️"), result
-    assert not s._auto_execute_report_is_success(result), result
+    assert preview.startswith("🛑 План НЕ построен"), preview
+    assert "manifest_id" not in preview, preview
+    assert fake_v2.calls == []
 
 
 async def test_attach_file_to_task_missing_source_refused_before_gate(monkeypatch):
@@ -2067,12 +2074,11 @@ async def test_update_task_comment_full_gate_cycle(monkeypatch):
     assert s._auto_execute_report_is_success(result), result
 
 
-async def test_update_task_comment_missing_identity_downgrades_to_warn(monkeypatch):
-    """Когда identity-guard НЕ смог сверить название (id не среди открытых
-    задач — например, задача завершена), маркер обязан быть ⚠️, а не ✅: сама
-    правка комментария подтверждена, но НЕ ВСЁ подтверждено (название — нет).
-    ✅ по замороженной легенде (output-format.md §7.2) значит «подтверждено
-    ПОЛНОСТЬЮ» — раздача его здесь была бы новой дырой того же типа."""
+async def test_update_task_comment_missing_identity_refuses(monkeypatch):
+    """ПЕРЕПИСАН 2026-08-07 (дефект №2) — обоснование целиком в
+    test_add_task_comment_plan_missing_identity_refuses выше. Правка
+    комментария на объекте, которого нет ни в одном источнике, теперь
+    отказ — и, что важнее, комментарий при этом НЕ ТРОГАЕТСЯ."""
     fake_v2 = FakeV2(live={}, comments={"t1": [{"id": "c1", "title": "старый текст"}]})
     _wire(monkeypatch, fake_v2=fake_v2, guard_task=False)
     monkeypatch.setattr(
@@ -2080,13 +2086,10 @@ async def test_update_task_comment_missing_identity_downgrades_to_warn(monkeypat
         lambda *a, **k: s._Guard("missing", project_id="p1"))
 
     preview = await s.update_task_comment("Купить молоко", "новый текст", "p1", "t1", "c1")
-    mid = _extract_manifest_id(preview)
-    result = await s.update_task_comment("Купить молоко", "новый текст", "p1", "t1", "c1",
-                                         manifest_id=mid, user_reply="да")
 
-    assert fake_v2.comments["t1"][0]["title"] == "новый текст"
-    assert result.startswith("⚠️"), result
-    assert not s._auto_execute_report_is_success(result), result
+    assert preview.startswith("🛑 План НЕ построен"), preview
+    assert "manifest_id" not in preview, preview
+    assert fake_v2.comments["t1"][0]["title"] == "старый текст"
 
 
 # ---------------------------------------------------------------------------
