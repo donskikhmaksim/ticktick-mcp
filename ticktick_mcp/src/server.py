@@ -13634,6 +13634,29 @@ def _activity_label(action: str) -> str:
     return f"did something unrecognised ({action or '?'})"
 
 
+def _activity_project_label(pid: str, names: Dict) -> str:
+    """Имя проекта для строки ленты активности — и ЧЕСТНАЯ пометка, когда
+    имени нет.
+
+    Дефект №3 (живая приёмка 2026-08-07): событие перемещения печаталось
+    сырыми идентификаторами — «you moved to another list
+    6a755ff58f08e34527a29b31 → 6a752d718f083125df116c9d», хотя оба проекта
+    живые и резолвятся, а соседний `get_changes` в этом же файле уже
+    переводит id в имена тем же `_v2_project_names()`. Лента активности —
+    именно то место, куда приходят с вопросом «куда делась задача»; 24
+    hex-символа на него не отвечают.
+
+    Неудачный резолвинг не заминается: id остаётся видимым (по нему хотя бы
+    можно спросить дальше), но рядом сказано, что имени нет — иначе голый
+    id снова читается как название (то же правило, что для карточек
+    подтверждения: у отображающего пути пустой ответ значит «не знаю», и это
+    надо произнести)."""
+    if not pid:
+        return "(проект не указан)"
+    name = names.get(pid)
+    return f"«{name}»" if name else f"{pid} (имя неизвестно)"
+
+
 @mcp.tool(annotations=READONLY)
 async def get_task_activity(task_id: str, project_id: str) -> str:
     """
@@ -13676,6 +13699,10 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
         # where two changes a minute apart need distinguishing.
         out = (f"Activity log ({len(events)} events; times in "
                f"{_USER_TZ.key}):\n\n")
+        # Имена проектов читаются ОДИН раз на всю ленту (кэшированный
+        # v2-снапшот с фолбэком на официальный API) — тем же хелпером, что
+        # уже применён в get_changes ниже.
+        project_names = _v2_project_names()
         for e in events:
             action = e.get("action", "?")
             when = _local_stamp_str(e.get("when"), with_zone=False, seconds=True)
@@ -13705,7 +13732,8 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
                 if e.get("isAllDay"):
                     line += " (all-day)"
             elif action == "T_MOVE":
-                line += f"  {e.get('fromProjectId', '?')} → {e.get('toProjectId', '?')}"
+                line += (f"  {_activity_project_label(e.get('fromProjectId'), project_names)}"
+                         f" → {_activity_project_label(e.get('toProjectId'), project_names)}")
             elif action == "T_CONTENT" and e.get("content"):
                 snippet = str(e["content"])[:80].replace("\n", " ")
                 line += f'  "{snippet}…"' if len(str(e["content"])) > 80 else f'  "{snippet}"'
