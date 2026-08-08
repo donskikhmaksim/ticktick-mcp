@@ -8666,11 +8666,19 @@ async def get_habits() -> str:
         habits = await _run_blocking(lambda: ticktick_v2.get_habits())
         if not habits:
             return "No habits found."
-        out = f"Habits ({len(habits)}):\n\n"
+        # totalCheckIns считает ТОЛЬКО успешные отметки — проверено живьём:
+        # привычка с «totalCheckIns: 18» отдаёт 31 запись в get_habit_checkins
+        # (18 выполнено + 13 провалено/пропущено). Слово «total» читалось как
+        # «все отметки», то есть завышало регулярность: 18 из 18 вместо 18 из
+        # 31. Поле не пересчитываем (это счётчик TickTick), но называем честно
+        # и говорим, где смотреть полную историю.
+        out = (f"Habits ({len(habits)}):\n"
+               "(«done» = SUCCESSFUL check-ins only — failed and skipped days are "
+               "NOT in that number; get_habit_checkins lists every entry)\n\n")
         for h in habits:
             out += (f"- {h.get('name','?')}  (id: {h.get('id')})\n"
                     f"    goal: {h.get('goal')} {h.get('unit','')} | type: {h.get('type')} | "
-                    f"total check-ins: {h.get('totalCheckIns', 0)}\n"
+                    f"done: {h.get('totalCheckIns', 0)}\n"
                     f"    repeat: {h.get('repeatRule','')}\n")
         return out
     except Exception as e:
@@ -8679,6 +8687,28 @@ async def get_habits() -> str:
 
 
 _HABIT_STATUS_LABELS = {2: "выполнено", 1: "провалено", 0: "не выполнено"}
+
+
+def _checkin_date_str(stamp) -> str:
+    """Дата отметки привычки по-человечески: 20260529 → «2026-05-29».
+
+    TickTick хранит день привычки как целое YYYYMMDD, и оно печаталось как
+    есть — читать «20260529» и мысленно резать на части приходилось человеку.
+    Значение неожиданной формы отдаём как есть: подгонять его под маску
+    значило бы выдумать дату."""
+    text = str(stamp or "").strip()
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    return text or "?"
+
+
+def _checkin_sort_key(stamp) -> tuple:
+    """Ключ сортировки отметок по дате. Значения непонятной формы уезжают в
+    конец, но НЕ выбрасываются — молча потерянная отметка хуже некрасивой."""
+    text = str(stamp or "").strip()
+    if text.isdigit():
+        return (0, int(text))
+    return (1, 0)
 
 
 def _describe_checkin_habit(p: Dict) -> str:
@@ -8964,7 +8994,7 @@ async def _create_habit_impl(name: str, goal: float = 1.0, unit: str = "Count",
         if twin is not None:
             return (f"### ↷ Привычка «{name}» не создана\n\n"
                     f"- такая привычка **уже есть** (id: {twin.get('id')}, "
-                    f"отметок: {twin.get('totalCheckIns', 0)})\n"
+                    f"успешных отметок: {twin.get('totalCheckIns', 0)})\n"
                     "- второй одноимённой не завожу — их было бы не отличить "
                     "друг от друга; ничего не изменено")
         hid = await _run_blocking(lambda: ticktick_v2.create_habit(
@@ -9181,7 +9211,8 @@ async def _delete_habit_impl(habit_name: str, habit_id: str) -> str:
                      "записать НЕ удалось (журнал недоступен) — вернуть её "
                      "по данным сервера не выйдет")
         return (f"### ✅ Привычка «{real_name}» удалена (проверено)\n\n"
-                f"- вместе с ней ушла история отметок: **{checkins}**\n"
+                f"- вместе с ней ушла вся история отметок (успешных было "
+                f"**{checkins}**, провалы и пропуски тоже стёрты)\n"
                 f"{snap_line}\n"
                 "- 🧾 подтверждено отдельным живым чтением списка привычек "
                 "(`get_habits`) сразу после удаления")
@@ -9212,9 +9243,22 @@ async def get_habit_checkins(habit_name: str, habit_id: str, after_date: str) ->
         if not entries:
             return f"No check-ins for '{habit_name}' since {after_date}."
         labels = {2: "✓ done", 1: "✗ failed", 0: "○ not done"}
-        lines = [f"- {e.get('checkinStamp')}: {labels.get(e.get('status'), e.get('status'))} "
+        # API отдаёт записи в произвольном порядке (живьём: 20260529 → 20260531
+        # → 20260530 → 20260605) — серию по такому списку глазами не посчитать.
+        # Сортируем по дате, от старых к новым: это календарь, а не лента
+        # событий.
+        entries = sorted(entries, key=lambda e: _checkin_sort_key(e.get("checkinStamp")))
+        done = sum(1 for e in entries if e.get("status") == 2)
+        failed = sum(1 for e in entries if e.get("status") == 1)
+        skipped = len(entries) - done - failed
+        lines = [f"- {_checkin_date_str(e.get('checkinStamp'))}: "
+                 f"{labels.get(e.get('status'), e.get('status'))} "
                  f"(value {e.get('value')}/{e.get('goal')})" for e in entries]
-        return f"Check-ins for '{habit_name}' ({len(entries)}):\n" + "\n".join(lines)
+        # Одно число «(31)» прочитывалось как «31 раз сделал» — разбивка не
+        # даёт спутать записи в журнале с выполнениями.
+        return (f"Check-ins for '{habit_name}' — {len(entries)} entries: "
+                f"{done} done, {failed} failed, {skipped} not done "
+                f"(oldest first):\n" + "\n".join(lines))
     except Exception as e:
         logger.error(f"Error in get_habit_checkins: {e}")
         return f"Error fetching habit check-ins: {str(e)}"
