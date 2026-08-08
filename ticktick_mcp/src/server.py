@@ -13144,6 +13144,45 @@ def _task_activity_fallback(task_id: str) -> Optional[str]:
         return None
 
 
+# Коды действий в логе активности — ПО ФАКТИЧЕСКОМУ трафику TickTick, а не по
+# догадке о названиях. Предыдущая версия словаря жила внутри
+# get_task_activity() и содержала выдуманный "T_COMPLETE", которого TickTick не
+# шлёт, при этом не содержала реального "T_DONE" (каждое завершение), а также
+# "T_ASSIGN", "T_COLUMN", "T_ADD_FILE", "T_DEL_FILE" — и все они вываливались
+# сырьём в середину фразы («someone T_DONE»). Каждый код здесь наблюдался в
+# живом ответе; расширять список — только по новому наблюдению.
+ACTIVITY_ACTION_LABELS = {
+    "T_TITLE":    "renamed",
+    "T_CONTENT":  "edited description",
+    "T_DUE":      "changed due date",
+    "T_MOVE":     "moved to another list",
+    "T_PARENT":   "changed parent/subtask",
+    "T_CREATE":   "created",
+    "T_DONE":     "completed",
+    "T_DELETE":   "deleted",
+    "T_PRIORITY": "changed priority",
+    "T_TAG":      "changed tags",
+    "T_ASSIGN":   "changed the assignee",
+    "T_COLUMN":   "moved to another column",
+    "T_ADD_FILE": "attached a file",
+    "T_DEL_FILE": "removed a file",
+}
+
+
+def _activity_label(action: str) -> str:
+    """Человеческая подпись действия, а для незнакомого кода — ЗАМЕТНАЯ
+    заглушка вместе с самим кодом.
+
+    Голый код («someone T_DONE») читался как название действия, поэтому
+    пропуск в словаре был невидим — именно так T_DONE и прожил незамеченным.
+    Заглушка обязана и признаваться в незнании, и печатать код, чтобы
+    следующий пропуск был виден с первого взгляда."""
+    label = ACTIVITY_ACTION_LABELS.get(action)
+    if label:
+        return label
+    return f"did something unrecognised ({action or '?'})"
+
+
 @mcp.tool(annotations=READONLY)
 async def get_task_activity(task_id: str, project_id: str) -> str:
     """
@@ -13177,19 +13216,6 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
                 base += "\n\nWhat we do know from the task itself:\n" + fallback
             return base
 
-        ACTION_LABELS = {
-            "T_TITLE":   "renamed",
-            "T_CONTENT": "edited description",
-            "T_DUE":     "changed due date",
-            "T_MOVE":    "moved to another list",
-            "T_PARENT":  "changed parent/subtask",
-            "T_CREATE":  "created",
-            "T_COMPLETE":"completed",
-            "T_DELETE":  "deleted",
-            "T_PRIORITY":"changed priority",
-            "T_TAG":     "changed tags",
-        }
-
         # Times are the OWNER's, and the zone is named ONCE in the header
         # rather than on each of N lines (with_zone=False below) — a log of 40
         # events would otherwise repeat "(America/Los_Angeles)" 40 times. The
@@ -13205,7 +13231,7 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
             who = e.get("whoProfile", {})
             actor = "you" if who.get("isMyself") else who.get("displayName") or "someone"
             channel = e.get("deviceChannel", "")
-            label = ACTION_LABELS.get(action, action)
+            label = _activity_label(action)
 
             line = f"  {when}  {actor} {label}"
             if action == "T_TITLE" and e.get("title"):
