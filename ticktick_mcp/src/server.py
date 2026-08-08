@@ -925,6 +925,34 @@ def _official_task_scan(task_id: str) -> Optional[Dict]:
     return None
 
 
+def _live_task_title(task_id: str, project_id: str = "") -> Optional[str]:
+    """Живое НАЗВАНИЕ задачи по её id — для КАРТОЧКИ подтверждения, чтобы
+    человек читал «в задачу «Купить молоко»», а не 24 hex-символа, которые
+    глазами не сверяет никто.
+
+    Возвращает None, когда имя установить не удалось. Это НЕ отказ и не
+    identity-guard: вызывающий обязан сказать про неудачу вслух в тексте
+    карточки (молчаливый показ сырого id и был дефектом), но продолжить —
+    защиту от «не той задачи» здесь строить не на чем, вызывающему не
+    передают ожидаемое название, сверять нечего с чем.
+
+    Цена намеренно минимальная: сначала УЖЕ закэшированный v2-снапшот
+    открытых задач (fresh=False — карточке хватает состояния возрастом
+    ≤20 c, force-refetch ради отображаемого имени не оправдан), и лишь
+    если задачи там нет — одно точечное чтение официального API, и только
+    когда известен project_id. Полного скана аккаунта (_official_task_scan,
+    запрос на каждый проект) здесь НЕТ намеренно: он оправдан для guard'а,
+    решающего «трогать или нет», а не для строчки в превью."""
+    try:
+        by_id = _open_by_id(fresh=False)
+    except Exception:
+        by_id = None
+    live = (by_id or {}).get(task_id)
+    if not live and project_id:
+        live = _official_task_snapshot(project_id, task_id)
+    return ((live or {}).get("title") or "").strip() or None
+
+
 # Сколько раз и с какой паузой повторно перечитывать живое состояние ПОСЛЕ
 # identity-changing мутации (меняет проект/родителя/группу задачи —
 # move_tasks, set_task_parent, unset_task_parent, move_project_to_group,
@@ -10417,6 +10445,36 @@ def _describe_delete_project_group(p: Dict) -> str:
             "останутся, просто без папки)")
 
 
+def _group_members_note(projects: Optional[List[Dict]], group_id: str) -> str:
+    """Что именно лежит внутри папки — приписка к КАРТОЧКЕ её удаления.
+
+    Живая приёмка 2026-08-07: папка с одним проектом и папка с двумя давали
+    ПОБАЙТОВО одинаковый текст плана — ни числа, ни имён, пустая папка
+    неотличима от полной. Образец обратного уже в этом файле:
+    plan_task_deletion для задачи с подзадачами разворачивает всё поддерево
+    и показывает список на одобрение. Ситуация та же — действие над
+    контейнером.
+
+    `projects` — сырой список проектов из живого снапшота, или None, когда
+    прочитать его не удалось: None печатается ВСЛУХ как неизвестность и
+    НИКОГДА не выдаётся за пустую папку (это разные вещи для того, кто
+    решает, нажимать ли). Список режется тем же _GROUP_MEMBERS_CAP, что и
+    вывод list_project_groups, но остаток называется числом, а не молча
+    отбрасывается."""
+    if projects is None:
+        return (" ⚠️ Состав папки прочитать НЕ УДАЛОСЬ — какие проекты внутри "
+                "и сколько их, неизвестно.")
+    names = [p.get("name") or "?" for p in projects
+             if not p.get("deleted") and p.get("groupId") == group_id]
+    if not names:
+        return " Папка пуста — внутри нет ни одного проекта."
+    shown = names[:_GROUP_MEMBERS_CAP]
+    tail = f" и ещё {len(names) - len(shown)}" if len(names) > len(shown) else ""
+    word = _ru_plural(len(names), "проект", "проекта", "проектов")
+    return (f" Внутри {len(names)} {word}: "
+            + ", ".join(f"«{n}»" for n in shown) + tail + ".")
+
+
 @mcp.tool()
 async def delete_project_group(group_name: str, group_id: str,
                                manifest_id: str = "", user_reply: str = "",
@@ -10466,6 +10524,11 @@ async def delete_project_group(group_name: str, group_id: str,
     built (a read hiccup must not block every deletion), but its text says
     so honestly — the call #2 check is unconditional and still guards the
     mutation either way.
+
+    The plan card also NAMES the projects currently inside the folder (count
+    + names, long lists capped with "и ещё N"), so an empty folder can never
+    read the same as a folder holding eight live projects. If that list
+    can't be read, the card says exactly that instead of looking empty.
     """
     err = _ensure_ready()
     if err:
@@ -10505,9 +10568,27 @@ async def delete_project_group(group_name: str, group_id: str,
                             "групп (чтение не удалось) — сверка повторится "
                             "при подтверждении, и расхождение остановит "
                             "удаление.")
+    # Состав папки — В КАРТОЧКУ. Читается из ТОГО ЖЕ живого снапшота, что
+    # _live_groups() выше уже обновил (list_projects() берёт projectProfiles
+    # из кэша get_state), поэтому сетевого запроса это не добавляет — тот же
+    # довод, по которому list_project_groups показывает состав папок «at no
+    # extra network request». Приписка не гейт: она ничего не блокирует,
+    # неудачное чтение печатается как неизвестность (см. _group_members_note)
+    # и НЕ выдаётся за пустую папку.
+    members_note = ""
+    if not manifest_id:
+        try:
+            projects = await _run_blocking(lambda: ticktick_v2.list_projects())
+        except Exception as e:
+            projects = None
+            logger.warning("delete_project_group: не удалось прочитать состав "
+                           f"папки на этапе плана ({e}) — план всё равно "
+                           "строится, но состав в нём назван неизвестным.")
+        members_note = _group_members_note(projects, group_id)
     params = {"group_name": group_name, "group_id": group_id}
-    describe_fn = ((lambda p: _describe_delete_project_group(p) + name_warning)
-                   if name_warning else _describe_delete_project_group)
+    plan_note = members_note + name_warning
+    describe_fn = ((lambda p: _describe_delete_project_group(p) + plan_note)
+                   if plan_note else _describe_delete_project_group)
     outcome = await _gate_single("delete_project_group", "delete_project_group",
                                  params if not manifest_id else None,
                                  manifest_id, user_reply, describe_fn,
@@ -10546,8 +10627,27 @@ async def _delete_project_group_impl(group_name: str, group_id: str) -> str:
         return f"Error deleting project group: {str(e)}"
 
 
-def _describe_move_project_to_group(p: Dict) -> str:
-    dest = "без папки" if p.get("group_id") == "NONE" else f'в папку id:{p.get("group_id")}'
+def _describe_move_project_to_group(p: Dict, dest_name: Optional[str] = None,
+                                    unknown_reason: str = "") -> str:
+    # Живая приёмка 2026-08-07: «Перемещаю проект «__AUTOTEST__btn-tt-01-
+    # retest» в папку id:c4d38a807dfe452e964e89b9» — источник по имени,
+    # назначение идентификатором. Имя папки сервер знает (тот же кэшированный
+    # v2-снапшот, из которого читает list_project_groups), и
+    # _move_project_to_group_impl уже печатает его в ОТЧЁТЕ после нажатия
+    # кнопки — то есть имя было там, где оно уже не нужно, и его не было
+    # там, где человек принимает решение.
+    #
+    # `dest_name` резолвит вызывающий ДО гейта. None означает «установить не
+    # удалось» и печатается ВСЛУХ вместе с причиной: молчаливый показ сырого
+    # id и есть дефект.
+    gid = p.get("group_id")
+    if gid == "NONE":
+        dest = "без папки"
+    elif dest_name:
+        dest = f'в папку «{dest_name}» (id {gid})'
+    else:
+        dest = (f'в папку id {gid} — ⚠️ ИМЯ ПАПКИ УСТАНОВИТЬ НЕ УДАЛОСЬ'
+                + (f' ({unknown_reason})' if unknown_reason else ''))
     return f'Перемещаю проект «{p.get("project_name")}» {dest}'
 
 
@@ -10614,9 +10714,9 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
     # «Ничего не изменено») — это текстовая правка отображения, сама
     # сверка/строгость не меняется. Проверка группы-назначения (group_id
     # существует) НЕ переносится: владелец не передаёт group_name для
-    # сверки (карточка печатает id как есть, см.
-    # _describe_move_project_to_group) — подменить нечего, это остаётся
-    # проверкой исполнения, как было. Действует только на call #1
+    # сверки — подменить нечего, это остаётся проверкой исполнения, как
+    # было. Но карточка теперь папку НАЗЫВАЕТ (блок ниже) — это
+    # отображение, а не гейт. Действует только на call #1
     # (manifest_id пуст); automation_key НЕ пропускает эту проверку — она
     # стоит раньше самого гейта.
     if not manifest_id:
@@ -10625,10 +10725,39 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
         if refuse:
             return (refuse.replace("🛑 Отказ —", "🛑 План НЕ построен —", 1)
                           .replace("Ничего не тронул.", "Ничего не изменено."))
+    # Имя папки-НАЗНАЧЕНИЯ для карточки. Читается из ТОГО ЖЕ кэшированного
+    # v2-снапшота, из которого работает list_project_groups (fresh=False —
+    # _guard_project выше уже сбросил кэш, так что снапшот свежий и лишнего
+    # сетевого запроса тут нет), и уходит в описание замыканием, а НЕ ключом
+    # в `params`: params едут в манифест, в object_hash и дословно в
+    # `_impl(**params)`. Ни отказать, ни заблокировать план резолвинг не
+    # может — сверять переданное имя не с чем (group_name владелец не
+    # передаёт), а сама проверка существования группы как стояла на
+    # исполнении, так и стоит. Неудача печатается вслух вместе с причиной.
+    dest_name: Optional[str] = None
+    dest_unknown = ""
+    if not manifest_id and group_id != "NONE":
+        try:
+            groups = await _live_groups(fresh=False)
+        except Exception as e:
+            groups = None
+            logger.warning("move_project_to_group: не удалось прочитать список "
+                           f"групп на этапе плана ({e}) — имя папки в карточке "
+                           "не будет названо.")
+        if groups is None:
+            dest_unknown = "живой список групп прочитать не удалось"
+        else:
+            grp = next((g for g in groups if g.get("id") == group_id), None)
+            dest_name = (grp or {}).get("name") or None
+            if not dest_name:
+                dest_unknown = ("папки с таким id нет в живом списке групп — "
+                                "перемещение сорвётся на исполнении")
     params = {"project_name": project_name, "project_id": project_id, "group_id": group_id}
     outcome = await _gate_single("move_project_to_group", "move_project_to_group",
                                  params if not manifest_id else None,
-                                 manifest_id, user_reply, _describe_move_project_to_group,
+                                 manifest_id, user_reply,
+                                 lambda p: _describe_move_project_to_group(
+                                     p, dest_name, dest_unknown),
                                  automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
@@ -11626,12 +11755,26 @@ async def get_attachment_download_url(task_id: str, project_id: str = None,
         return f"Error building download link: {str(e)}"
 
 
-def _describe_create_attachment_upload_url(p: Dict) -> str:
+def _describe_create_attachment_upload_url(p: Dict,
+                                           task_title: Optional[str] = None) -> str:
     # НИ ОДНОГО фрагмента будущей ссылки/токена здесь быть не может: токен
     # подписывается только в `_impl`, уже ПОСЛЕ подтверждения. Иначе пропуск
     # утёк бы в превью (и в сообщение Telegram) ещё до согласия человека.
+    #
+    # `task_title` — живое название задачи, добытое вызывающим до гейта
+    # (_live_task_title). Живая приёмка 2026-08-07 дала карточку «Выдаю
+    # ссылку на загрузку «файл.txt» в задачу 6a7571238f0854e347f51407»: файл
+    # назван по-человечески, задача — голым id. Это тот самый метод, который
+    # ВРУЧАЕТ право записи в аккаунт, и подтверждающий не мог глазами
+    # сверить, куда ляжет файл. None (имя не установлено) печатается ВСЛУХ
+    # как неизвестность — молчаливый показ id и был дефектом.
     name = p.get("filename") or "файл без имени"
-    return (f'Выдаю ссылку на загрузку «{name}» в задачу {p.get("task_id")} '
+    tid = p.get("task_id")
+    target = (f'в задачу «{task_title}» (id {tid})' if task_title else
+              f'в задачу id {tid} — ⚠️ НАЗВАНИЕ ЗАДАЧИ УСТАНОВИТЬ НЕ УДАЛОСЬ '
+              '(её нет в живом состоянии аккаунта или оно недоступно), '
+              'сверить глазами, в какую задачу ляжет файл, нельзя')
+    return (f'Выдаю ссылку на загрузку «{name}» {target} '
             f'(действует {_clamp_link_ttl(p.get("ttl_minutes"))} мин; по ней '
             'кто угодно сможет положить файл в аккаунт)')
 
@@ -11723,11 +11866,19 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
                 f"максимум {ATTACHMENT_MAX_BYTES // (1024*1024)} МБ. Ссылку не делаю.")
     params = {"task_id": task_id, "project_id": project_id,
               "filename": filename, "ttl_minutes": ttl_minutes}
+    # Имя задачи для карточки резолвится ДО гейта и уходит в describe
+    # замыканием, а НЕ ключом в `params`: `params` уезжают в манифест, в его
+    # object_hash и дословно в `_impl(**params)` — лишний ключ сломал бы и
+    # вызов исполнителя, и привязку одобренного плана к тому, что показали.
+    # На call #2 карточка не строится, поэтому и резолвить нечего.
+    task_title = (_live_task_title(task_id, project_id or "")
+                  if not manifest_id else None)
     outcome = await _gate_single("create_attachment_upload_url",
                                  "create_attachment_upload_url",
                                  params if not manifest_id else None,
                                  manifest_id, user_reply,
-                                 _describe_create_attachment_upload_url,
+                                 lambda p: _describe_create_attachment_upload_url(
+                                     p, task_title),
                                  automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
@@ -13627,8 +13778,23 @@ async def list_project_columns(project_id: str) -> str:
         return f"Error fetching columns: {str(e)}"
 
 
-def _describe_create_project_column(p: Dict) -> str:
-    dest = p.get("project_name") or p.get("project_id")
+def _describe_create_project_column(p: Dict, live_name: Optional[str] = None) -> str:
+    # `live_name` — живое имя проекта, прочитанное вызывающим ДО гейта.
+    # Раньше здесь стояло `project_name or project_id`, то есть при не
+    # переданном имени карточка показывала сырой id («в проекте «p1»») —
+    # тот же класс, что «в задачу 6a7571…» и «в папку id:c4d38a…».
+    # Оправдания «имени неоткуда взять» больше нет: стоящий выше
+    # _guard_project(require_known=True) ОТКАЗЫВАЕТ строить план, если id не
+    # резолвится в живое имя, — значит везде, где карточка вообще строится,
+    # имя известно. Ветки «установить не удалось» тут поэтому нет: она
+    # недостижима, а `project_name`/id остаются просто фолбэком на случай
+    # вызова описателя вне этого пути.
+    #
+    # Живое написание предпочтительнее переданного даже когда сверка прошла:
+    # _names_agree допускает разницу в регистре/маркерах («работа» ≡
+    # «🔥 Работа»), а карточка должна показывать состояние аккаунта, а не
+    # пересказ вызывающего.
+    dest = live_name or p.get("project_name") or p.get("project_id")
     return f'Создаю раздел (колонку) «{p.get("name")}» в проекте «{dest}»'
 
 
@@ -13667,7 +13833,8 @@ async def create_project_column(project_id: str, name: str,
         name: Name of the new column/section
         project_name: Name of the project (recommended — arms the identity
             guard so a stale/wrong project_id is refused instead of silently
-            creating the column elsewhere)
+            creating the column elsewhere; the check runs BEFORE the plan
+            card is built, so a wrong pair never reaches your approval)
         manifest_id: from call #1's response — pass on call #2 to actually create
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
@@ -13680,14 +13847,51 @@ async def create_project_column(project_id: str, name: str,
     call #2 is refused whatever `user_reply` says — before the press (wait for
     it) and after it too (the server is already running the operation). Do not
     retry it; just tell the user to tap the button.
+
+    project_id and project_name are cross-checked against the LIVE project
+    list TWICE (same pattern as update_project / move_project_to_group): once
+    while BUILDING the plan (call #1, before the card is shown to the owner —
+    a wrong pair never reaches the approval) and again, independently, right
+    before the column is actually created (call #2, unchanged).
     """
     err = _ensure_ready()
     if err:
         return err
+    # Перенос identity-guard (project_id↔project_name) на построение плана —
+    # тот же _guard_project(..., require_known=True) с ТЕМИ ЖЕ аргументами,
+    # что уже стоит в _create_project_column_impl НА ИСПОЛНЕНИИ (образец:
+    # update_project / move_project_to_group).
+    #
+    # Живая приёмка 2026-08-07: докстринг `project_name` обещал «arms the
+    # identity guard so a stale/wrong project_id is refused instead of
+    # silently creating the column elsewhere», но на call #1 не проверялось
+    # НИЧЕГО — верный project_id и заведомо ложное имя «Совершенно другой
+    # проект» дали карточку «📋 План — Создаю раздел (колонку) «…» в проекте
+    # «Совершенно другой проект»». Человек подтверждал по имени, которое
+    # сервер даже не сверял; обещанной защиты не существовало до момента,
+    # когда подтверждение уже получено.
+    #
+    # Строгость НЕ меняется, меняется момент: `project_name or ""` +
+    # require_known=True — ровно то, чем зовёт impl, включая фейл-клоуз на
+    # id, который не резолвится ни в одно живое имя (там же, ниже).
+    # automation_key НЕ пропускает эту проверку — она стоит раньше гейта.
+    if not manifest_id:
+        refuse = _guard_project(project_id, project_name or "", fresh=True,
+                                require_known=True)
+        if refuse:
+            return (refuse.replace("🛑 Отказ —", "🛑 План НЕ построен —", 1)
+                          .replace("Ничего не тронул.", "Ничего не изменено."))
+    # Живое имя проекта для карточки — читается из снапшота, который
+    # _guard_project(fresh=True) выше только что обновил (лишнего сетевого
+    # запроса нет), и уходит в описание замыканием, а НЕ ключом в `params`:
+    # params едут в манифест, в object_hash и дословно в `_impl(**params)`.
+    live_pname = (_v2_project_names().get(project_id) if not manifest_id else None)
     params = {"project_id": project_id, "name": name, "project_name": project_name}
     outcome = await _gate_single("create_project_column", "create_project_column",
                                  params if not manifest_id else None,
-                                 manifest_id, user_reply, _describe_create_project_column,
+                                 manifest_id, user_reply,
+                                 lambda p: _describe_create_project_column(
+                                     p, live_pname),
                                  automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message

@@ -1179,6 +1179,107 @@ async def test_delete_project_group_plan_read_failure_still_lets_execution_catch
     assert any(g["id"] == "g1" for g in fake_v2.groups)
 
 
+# ---------------------------------------------------------------------------
+# 2026-08-07, живая приёмка: карточка удаления папки НЕ называла проекты
+# внутри. Проверено дважды — папка с ОДНИМ проектом и папка с ДВУМЯ дают
+# ПОБАЙТОВО ОДИНАКОВЫЙ текст:
+#
+#   📋 План — Удаляю папку проектов «X» (сами проекты останутся, просто без
+#   папки)
+#
+# Ни числа, ни имён: карточка не отличает пустую папку от папки с
+# содержимым. Отговорка «так нельзя» снимается соседним методом —
+# plan_task_deletion для задачи с подзадачами разворачивает ВСЁ поддерево и
+# показывает полный список на одобрение; ситуация идентична, действие над
+# контейнером. При двух тестовых проектах это терпимо, при папке уровня
+# «Active» с восемью боевыми — человек нажимает вслепую.
+# ---------------------------------------------------------------------------
+
+async def test_delete_group_plan_lists_the_projects_inside(monkeypatch):
+    """Главный тест пункта: папка с ДВУМЯ проектами — оба имени обязаны
+    быть в тексте плана."""
+    fake_v2 = FakeV2(groups=[{"id": "g1", "name": "Личное"}],
+                     projects=[{"id": "p1", "name": "Дом", "groupId": "g1"},
+                               {"id": "p2", "name": "Финансы", "groupId": "g1"},
+                               {"id": "p3", "name": "Чужой", "groupId": "g2"},
+                               {"id": "p4", "name": "Без папки", "groupId": None}])
+    _wire(monkeypatch, fake_v2=fake_v2)
+
+    preview = await s.delete_project_group("Личное", "g1")
+
+    assert "«Дом»" in preview and "«Финансы»" in preview, (
+        f"проекты внутри папки не названы:\n{preview}")
+    assert "2" in preview, "число проектов внутри не показано"
+    assert "«Чужой»" not in preview and "«Без папки»" not in preview, (
+        "в карточку попали проекты из ДРУГОЙ папки")
+    assert fake_v2.calls == []
+
+
+async def test_delete_group_plan_distinguishes_one_project_from_two(monkeypatch):
+    """Дословное воспроизведение приёмки: раньше эти два плана были
+    побайтово одинаковы. Теперь они обязаны различаться."""
+    one = FakeV2(groups=[{"id": "g1", "name": "Личное"}],
+                 projects=[{"id": "p1", "name": "Дом", "groupId": "g1"}])
+    _wire(monkeypatch, fake_v2=one)
+    plan_one = (await s.delete_project_group("Личное", "g1")).split("_Манифест")[0]
+
+    two = FakeV2(groups=[{"id": "g1", "name": "Личное"}],
+                 projects=[{"id": "p1", "name": "Дом", "groupId": "g1"},
+                           {"id": "p2", "name": "Финансы", "groupId": "g1"}])
+    _wire(monkeypatch, fake_v2=two)
+    plan_two = (await s.delete_project_group("Личное", "g1")).split("_Манифест")[0]
+
+    assert plan_one != plan_two, (
+        "папка с одним проектом и папка с двумя дают одинаковый текст:\n"
+        f"{plan_one!r}")
+
+
+async def test_delete_group_plan_says_when_the_folder_is_empty(monkeypatch):
+    """Пустая папка обязана читаться как пустая, а не как «неизвестно»."""
+    fake_v2 = FakeV2(groups=[{"id": "g1", "name": "Личное"}], projects=[])
+    _wire(monkeypatch, fake_v2=fake_v2)
+
+    preview = await s.delete_project_group("Личное", "g1")
+
+    assert "пуст" in preview.lower(), preview
+    assert "manifest_id" in preview
+
+
+async def test_delete_group_plan_caps_a_long_list(monkeypatch):
+    """Папка уровня «Active»: список режется, но остаток назван числом —
+    «и ещё N», а не молча обрезан."""
+    many = [{"id": f"p{i}", "name": f"Проект {i}", "groupId": "g1"}
+            for i in range(1, 16)]
+    fake_v2 = FakeV2(groups=[{"id": "g1", "name": "Личное"}], projects=many)
+    _wire(monkeypatch, fake_v2=fake_v2)
+
+    preview = await s.delete_project_group("Личное", "g1")
+
+    assert "15" in preview, "общее число проектов внутри не названо"
+    assert "и ещё" in preview, f"хвост списка обрезан молча:\n{preview}"
+    assert "«Проект 1»" in preview
+
+
+async def test_delete_group_plan_membership_read_failure_is_spoken_not_silent(
+        monkeypatch):
+    """Состав прочитать не удалось — карточка обязана сказать об этом, а не
+    выглядеть как карточка пустой папки. План при этом строится (сверка
+    имени папки уже прошла, а состав — справка, не гейт)."""
+    fake_v2 = FakeV2(groups=[{"id": "g1", "name": "Личное"}], projects=[])
+
+    def _boom():
+        raise RuntimeError("v2 упал")
+    fake_v2.list_projects = _boom
+    _wire(monkeypatch, fake_v2=fake_v2)
+
+    preview = await s.delete_project_group("Личное", "g1")
+
+    assert "manifest_id" in preview and "🛑" not in preview
+    assert "не удалось" in preview.lower(), preview
+    assert "пуст" not in preview.lower(), (
+        "неудачное чтение состава выдано за пустую папку")
+
+
 async def test_delete_project_group_automation_key_mismatch_is_refused_before_plan(
         monkeypatch):
     """Headless path (#118): a valid automation_key runs on the FIRST call,
@@ -1313,6 +1414,84 @@ async def test_move_project_to_group_automation_key_mismatch_is_refused_before_p
     assert "«Работа»" in result
     assert fake_v2.calls == []
     assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-07, живая приёмка: карточка называла ПАПКУ-НАЗНАЧЕНИЕ сырым id.
+# Дословно:
+#
+#   📋 План — Перемещаю проект «__AUTOTEST__btn-tt-01-retest» в папку
+#   id:c4d38a807dfe452e964e89b9
+#
+# Объект-источник (проект) резолвился и печатался по-человечески, объект-
+# назначение (папка) — нет, хотя имя папки сервер знает: оно лежит в том же
+# кэшированном v2-снапшоте, из которого читается list_project_groups, и
+# _move_project_to_group_impl уже достаёт его на ИСПОЛНЕНИИ (dest_name) —
+# то есть в отчёте после нажатия кнопки имя было, а в карточке ДО нажатия
+# его не было. Ровно наоборот тому, что нужно человеку.
+# ---------------------------------------------------------------------------
+
+async def test_move_plan_names_the_destination_folder(monkeypatch):
+    """Главный тест пункта: в карточке — имя папки, а не «id:g1»."""
+    fake_v2 = FakeV2(groups=[{"id": "g1", "name": "Активные"}],
+                     projects=[{"id": "p1", "name": "Работа", "groupId": None}])
+    _wire(monkeypatch, fake_v2=fake_v2)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Работа"})
+
+    preview = await s.move_project_to_group("Работа", "p1", "g1")
+
+    assert "«Активные»" in preview, f"папка не названа по имени:\n{preview}"
+    assert "id:g1" not in preview, f"сырой id вместо имени:\n{preview}"
+    assert fake_v2.calls == []
+
+
+async def test_move_plan_says_out_loud_when_the_folder_name_is_unknown(monkeypatch):
+    """Резолвинг не удался — молчать нельзя: карточка обязана сказать, что
+    имя папки установить не удалось, и показать id. Молчаливый показ id и
+    есть дефект, поэтому «просто id» тут недостаточно."""
+    fake_v2 = FakeV2(groups=[], projects=[{"id": "p1", "groupId": None}])
+    _wire(monkeypatch, fake_v2=fake_v2)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Работа"})
+
+    preview = await s.move_project_to_group("Работа", "p1", "g-неизвестная")
+
+    assert "не удалось" in preview.lower(), (
+        f"неудачный резолвинг остался молчаливым:\n{preview}")
+    assert "g-неизвестная" in preview, "при неизвестном имени id обязан быть виден"
+
+
+async def test_move_plan_ungroup_wording_is_unchanged(monkeypatch):
+    """group_id="NONE" — разгруппировка, резолвить нечего: формулировка
+    «без папки» остаётся как была, без всяких «имя не удалось»."""
+    fake_v2 = FakeV2(groups=[{"id": "g1", "name": "Активные"}],
+                     projects=[{"id": "p1", "groupId": "g1"}])
+    _wire(monkeypatch, fake_v2=fake_v2)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Работа"})
+
+    preview = await s.move_project_to_group("Работа", "p1", "NONE")
+
+    assert "без папки" in preview
+    assert "не удалось" not in preview.lower()
+
+
+async def test_move_plan_folder_lookup_never_blocks_the_plan(monkeypatch):
+    """Резолвинг имени папки — украшение карточки, не право вето: падение
+    чтения групп не должно мешать построить план (сверка назначения на
+    ИСПОЛНЕНИИ, где она и живёт, никуда не делась)."""
+    fake_v2 = FakeV2(groups=[{"id": "g1", "name": "Активные"}],
+                     projects=[{"id": "p1", "groupId": None}])
+    _wire(monkeypatch, fake_v2=fake_v2)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Работа"})
+
+    async def _boom(*a, **k):
+        raise RuntimeError("v2 упал")
+    monkeypatch.setattr(s, "_live_groups", _boom)
+
+    preview = await s.move_project_to_group("Работа", "p1", "g1")
+
+    assert "manifest_id" in preview and "🛑" not in preview
+    assert "не удалось" in preview.lower()
+    assert "g1" in preview
 
 
 # ===========================================================================

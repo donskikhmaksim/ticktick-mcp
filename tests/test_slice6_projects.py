@@ -482,3 +482,145 @@ async def test_create_project_column_postverify_fetch_failure_is_unverified(monk
     result = await _gated_call(s.create_project_column, "p1", "В работе", project_name="Работа")
     assert result.startswith("### ⚠️")
     assert "НЕ подтверждён" in result
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-07, живая приёмка: create_project_column ОБЕЩАЛ защиту, которой не
+# было. Его докстринг про project_name говорит дословно: «recommended — arms
+# the identity guard so a stale/wrong project_id is refused instead of
+# silently creating the column elsewhere». На деле _guard_project стоял
+# ТОЛЬКО внутри _create_project_column_impl, то есть на call #2 — а карточка
+# call #1 печатала имя проекта ровно так, как его прислал вызывающий, без
+# единой сверки с id. Живая проверка: ВЕРНЫЙ project_id + заведомо ЛОЖНОЕ
+# project_name «Совершенно другой проект» → карточка «📋 План — Создаю раздел
+# (колонку) «__AUTOTEST__col-guard-test» в проекте «Совершенно другой
+# проект»». Человек подтверждает по имени, которого сервер даже не проверял.
+#
+# Тесты ниже проверяют не «сверка где-то в коде вызвана», а наблюдаемый
+# результат: план НЕ построен (нет ни карточки, ни manifest_id), колонка не
+# создана. Тот же перенос и та же строгость, что уже сделаны для
+# update_project / archive_project / move_project_to_group выше в этом файле
+# и в test_tier0_gate_conversion.py — _guard_project(require_known=True) с
+# ТЕМИ ЖЕ аргументами, что уже стоят на исполнении. _guard_project здесь НЕ
+# мокается (в отличие от _wire_column): работает настоящая функция, подменён
+# только источник живых имён.
+# ---------------------------------------------------------------------------
+
+def _wire_column_real_guard(monkeypatch, fake_v2, fake_official, names):
+    """Как _wire_column, но БЕЗ подмены _guard_project — сверка настоящая."""
+    monkeypatch.setattr(s, "ticktick_v2", fake_v2)
+    monkeypatch.setattr(s, "ticktick", fake_official)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: names)
+
+
+async def test_create_project_column_plan_identity_guard_blocks_wrong_name(monkeypatch):
+    """Дословное воспроизведение живой приёмки: id указывает на «Работа»,
+    вызывающий называет «Совершенно другой проект». План строиться не
+    должен, колонка — не создаваться."""
+    fake_v2 = FakeV2Column()
+    fake_official = FakeOfficialColumns([{"id": "col1", "name": "В работе"}])
+    _wire_column_real_guard(monkeypatch, fake_v2, fake_official, {"p1": "Работа"})
+    created = []
+    fake_v2.create_column = lambda project_id, name: created.append((project_id, name))
+
+    result = await s.create_project_column(
+        "p1", "__AUTOTEST__col-guard-test", project_name="Совершенно другой проект")
+
+    assert result.startswith("🛑 План НЕ построен"), result
+    assert "«Работа»" in result, "в отказе должно быть НАСТОЯЩЕЕ имя проекта"
+    assert "manifest_id" not in result, "план для несовпавшей пары строиться не должен"
+    assert "📋 План" not in result, "карточка плана не должна быть построена"
+    assert created == [], "колонка не должна быть создана"
+
+
+async def test_create_project_column_plan_identity_guard_blocks_missing_project(monkeypatch):
+    """require_known=True: id не резолвится ни в одно живое имя (удалён /
+    неверный id / имена недоступны) — _create_project_column_impl уже
+    отказывает так на исполнении, план обязан отказывать так же."""
+    fake_v2 = FakeV2Column()
+    fake_official = FakeOfficialColumns([])
+    _wire_column_real_guard(monkeypatch, fake_v2, fake_official, {})
+    created = []
+    fake_v2.create_column = lambda project_id, name: created.append((project_id, name))
+
+    result = await s.create_project_column("p-нет-такого", "В работе")
+
+    assert result.startswith("🛑 План НЕ построен"), result
+    assert "manifest_id" not in result
+    assert created == []
+
+
+async def test_create_project_column_plan_is_built_when_name_agrees(monkeypatch):
+    """Контроль на пере-ужесточение: совпавшая пара (и пустое project_name
+    при живом id) по-прежнему доходят до карточки плана."""
+    fake_v2 = FakeV2Column()
+    fake_official = FakeOfficialColumns([{"id": "col1", "name": "В работе"}])
+    _wire_column_real_guard(monkeypatch, fake_v2, fake_official, {"p1": "Работа"})
+
+    matched = await s.create_project_column("p1", "В работе", project_name="Работа")
+    assert "📋 План" in matched and "manifest_id" in matched
+    assert "🛑" not in matched
+
+    unnamed = await s.create_project_column("p1", "В работе")
+    assert "📋 План" in unnamed and "manifest_id" in unnamed
+    assert "🛑" not in unnamed
+
+
+# ---------------------------------------------------------------------------
+# Остаток того же класса, что и три «сырой id вместо имени» из этого захода:
+# при пустом project_name карточка печатала `project_name or project_id`, то
+# есть сам идентификатор — «в проекте «p1»». После фикса выше это уже нельзя
+# оправдать «имени неоткуда взять»: _guard_project(require_known=True)
+# ОТКАЗЫВАЕТ построить план, если id не резолвится в живое имя, — значит
+# всюду, где карточка вообще строится, живое имя ГАРАНТИРОВАННО известно.
+# Ветки «установить не удалось» здесь поэтому и нет: она недостижима.
+# ---------------------------------------------------------------------------
+
+async def test_create_project_column_plan_names_the_project_without_project_name(
+        monkeypatch):
+    """project_name не передан — карточка обязана назвать проект живым
+    именем, а не показать сырой id."""
+    fake_v2 = FakeV2Column()
+    fake_official = FakeOfficialColumns([{"id": "col1", "name": "В работе"}])
+    _wire_column_real_guard(monkeypatch, fake_v2, fake_official, {"p1": "Работа"})
+
+    preview = await s.create_project_column("p1", "В работе")
+
+    assert "в проекте «Работа»" in preview, f"проект не назван по имени:\n{preview}"
+    assert "«p1»" not in preview, f"сырой id вместо имени:\n{preview}"
+
+
+async def test_create_project_column_plan_prefers_the_live_project_name(monkeypatch):
+    """Имя передано и сверку прошло (_names_agree допускает разницу в
+    регистре/маркерах) — печатается ЖИВОЕ написание, а не то, что прислал
+    вызывающий: карточка показывает состояние аккаунта, а не пересказ."""
+    fake_v2 = FakeV2Column()
+    fake_official = FakeOfficialColumns([{"id": "col1", "name": "В работе"}])
+    _wire_column_real_guard(monkeypatch, fake_v2, fake_official, {"p1": "🔥 Работа"})
+
+    preview = await s.create_project_column("p1", "В работе", project_name="работа")
+
+    assert "🛑" not in preview
+    assert "в проекте «🔥 Работа»" in preview, preview
+
+
+async def test_create_project_column_automation_key_mismatch_is_refused_before_plan(
+        monkeypatch):
+    """Headless-путь (#118): ВЕРНЫЙ automation_key исполняет с первого
+    вызова, без плана и без кнопки. Если бы сверка жила только внутри
+    _gate_single/исполнения, ложная пара имя+id проехала бы тихо — проверка
+    стоит ДО гейта, поэтому действует и здесь."""
+    fake_v2 = FakeV2Column()
+    fake_official = FakeOfficialColumns([])
+    _wire_column_real_guard(monkeypatch, fake_v2, fake_official, {"p1": "Работа"})
+    created = []
+    fake_v2.create_column = lambda project_id, name: created.append((project_id, name))
+    monkeypatch.setattr(s, "SECRET", "test-secret")
+
+    result = await s.create_project_column(
+        "p1", "В работе", project_name="Совершенно другой проект",
+        automation_key="test-secret")
+
+    assert result.startswith("🛑 План НЕ построен"), result
+    assert "«Работа»" in result
+    assert created == []
