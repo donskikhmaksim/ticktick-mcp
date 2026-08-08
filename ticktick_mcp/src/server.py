@@ -2,6 +2,7 @@ import asyncio
 import base64
 import collections
 import contextvars
+import functools
 import hashlib
 import hmac
 import json
@@ -1071,6 +1072,128 @@ def _locate_task_any_state(task_id: str) -> Tuple[Optional[Dict], Optional[str],
         logger.warning(f"не удалось определить состояние задачи "
                        f"{str(task_id)[:8]}…: {e}")
         return None, None, False
+
+
+# ---------------------------------------------------------------------------
+# НАЗЫВАТЬ ОБЪЕКТ, А НЕ ПОКАЗЫВАТЬ ЕГО id.
+#
+# Класс дефекта, добитый 2026-08-07 живой приёмкой. Describe-функции гейта
+# печатали `t.get('title') or taskId` — то есть при не переданном названии в
+# позицию НАЗВАНИЯ, внутрь кавычек, попадали 24 hex-символа: «**«6a7571238f
+# 0854e347f51407»**». Человек читает это как имя и не может сверить, тот ли
+# объект; id глазами не сверяет никто. То же было с проектом назначения
+# (`to_project_name or to_project_id`) и с родительской задачей
+# (`parent_task_title or parent_task_id`).
+#
+# ПРАВИЛО: идентификатор РЯДОМ с именем — нормально; идентификатор ВМЕСТО
+# имени — дефект. Не удалось установить имя — сказать это ВСЛУХ, а не
+# показывать id молча (молчание читается как «имя такое и есть»).
+_NO_NAME_TASK = ("⚠️ НАЗВАНИЕ ЗАДАЧИ УСТАНОВИТЬ НЕ УДАЛОСЬ (её нет в живом "
+                 "состоянии аккаунта или оно недоступно) — сверить глазами, "
+                 "та ли это задача, нельзя")
+_NO_NAME_PROJECT = ("⚠️ НАЗВАНИЕ СПИСКА УСТАНОВИТЬ НЕ УДАЛОСЬ (его нет в "
+                    "живом состоянии аккаунта или оно недоступно) — сверить "
+                    "глазами, тот ли это список, нельзя")
+_NO_NAME_PERSON = ("⚠️ ИМЯ УЧАСТНИКА УСТАНОВИТЬ НЕ УДАЛОСЬ (его нет среди "
+                   "участников проекта или список недоступен)")
+
+
+def _plan_task_titles(tasks: Optional[List[Dict]], *,
+                      source: str = "open") -> Dict[str, str]:
+    """{taskId: живое название} для строк карточки плана.
+
+    Платит ТОЛЬКО за то, чего не хватает: если вызывающий дал название
+    каждому элементу (обычный случай — этого требуют докстринги тулов),
+    возвращается пустой словарь и не делается ни одного запроса. Иначе —
+    ОДНО чтение на весь батч, а не по чтению на строку.
+
+    `source="open"` — снимок открытых задач (кэш ≤20 c: карточке хватает, а
+    force-refetch ради отображаемого имени не оправдан). `source="trash"` —
+    корзина, для restore_tasks: его задачи по определению не открыты, и
+    искать их в открытых бессмысленно.
+
+    BEST-EFFORT: недоступное чтение не имеет права ронять фазу плана — тогда
+    пустой словарь, и строка честно скажет, что имя неизвестно (см.
+    `_plan_task_name`), а не выдаст незнание за имя."""
+    need = {str(t.get("taskId") or t.get("task_id") or "")
+            for t in (tasks or []) if not (t.get("title") or "").strip()}
+    need.discard("")
+    if not need:
+        return {}
+    try:
+        if source == "trash":
+            rows = ticktick_v2.get_trash(_TRASH_SCAN_LIMIT) if ticktick_v2 else []
+            live = {r.get("id"): r for r in (rows or [])}
+        else:
+            live = _open_by_id(fresh=False) or {}
+    except Exception as e:
+        logger.warning(f"карточка плана: живые названия ({source}) прочитать "
+                       f"не удалось ({e}) — строки скажут об этом вслух")
+        return {}
+    out = {}
+    for tid in need:
+        name = ((live.get(tid) or {}).get("title") or "").strip()
+        if name:
+            out[tid] = name
+    return out
+
+
+def _plan_task_name(t: Dict[str, Any],
+                    titles: Optional[Dict[str, str]] = None) -> str:
+    """Кусок строки карточки, НАЗЫВАЮЩИЙ задачу: «Купить молоко» — либо, если
+    имени нет ниоткуда, id вместе с прямым признанием, что имя неизвестно."""
+    tid = str(t.get("taskId") or t.get("task_id") or "")
+    name = (t.get("title") or "").strip() or (titles or {}).get(tid, "")
+    return f"«{name}»" if name else f"id {tid} — {_NO_NAME_TASK}"
+
+
+def _plan_project_name(project_id: str, given: str = "") -> str:
+    """То же для проекта/списка. Живое написание предпочтительнее
+    переданного даже когда переданное есть: карточка обязана показывать
+    состояние аккаунта, а не пересказ вызывающего (тот же довод, что в
+    `_describe_create_project_column`)."""
+    live = (_v2_project_names_or_none() or {}).get(project_id) if project_id else None
+    name = ((live or "") or (given or "")).strip()
+    return f"«{name}»" if name else f"id {project_id} — {_NO_NAME_PROJECT}"
+
+
+def _member_names(project_id: str) -> Dict[str, str]:
+    """{userId: отображаемое имя} участников проекта — best-effort (пустой
+    словарь, когда проект не расшарен или список недоступен)."""
+    if not project_id or not ticktick_v2:
+        return {}
+    out: Dict[str, str] = {}
+    try:
+        for m in (ticktick_v2.get_project_members(project_id) or []):
+            uid = str(m.get("userId") or m.get("userCode") or "")
+            nm = m.get("displayName") or m.get("username")
+            if uid and nm:
+                out[uid] = nm
+    except Exception as e:
+        logger.warning(f"участники проекта {project_id} недоступны: {e}")
+    return out
+
+
+def _column_names(project_id: str) -> Dict[str, str]:
+    """{columnId: имя раздела} проекта — best-effort, тем же правилом, что
+    `_member_names` выше: недоступность списка не должна ронять чтение."""
+    if not project_id or not ticktick_v2:
+        return {}
+    try:
+        return {c.get("id"): (c.get("name") or c.get("title") or "")
+                for c in (ticktick_v2.get_project_columns(project_id) or [])
+                if c.get("id")}
+    except Exception as e:
+        logger.warning(f"разделы проекта {project_id} недоступны: {e}")
+        return {}
+
+
+def _person_label(user_id, names: Dict[str, str]) -> str:
+    """«Ирина (userId: 333444)» — имя, а рядом id (он реально нужен: именно
+    его кладут в поле assignee). Имя неизвестно — сказать это вслух."""
+    uid = str(user_id or "")
+    name = (names.get(uid) or "").strip()
+    return f"{name} (userId: {uid})" if name else f"userId {uid} — {_NO_NAME_PERSON}"
 
 
 # Сколько раз и с какой паузой повторно перечитывать живое состояние ПОСЛЕ
@@ -2868,9 +2991,13 @@ async def update_tasks(
     # только в отчёте после нажатия (см. _unapplicable_update_rows).
     describe, notes = _describe_update_item, None
     if not manifest_id and tasks:
+        # Живые названия для строк, которым вызывающий их не дал: карточка
+        # обязана называть задачу, а не показывать её id (_plan_task_name).
+        titles = _plan_task_titles(tasks)
+        describe = functools.partial(_describe_update_item, titles=titles)
         unapplicable = _unapplicable_update_rows(tasks)
         if unapplicable:
-            describe = _describe_update_item_marking(unapplicable)
+            describe = _describe_update_item_marking(unapplicable, titles)
             notes = [f"⚠️ Не применится строк: {len(unapplicable)} из "
                      f"{len(tasks)} — они помечены ⛔ выше. Подтверждение их "
                      "не оживит; остальные будут выполнены."]
@@ -2916,9 +3043,9 @@ def _update_change_bits(t: Dict[str, Any], sep: str = "; ") -> str:
     return sep.join(bits) or "(поля изменений не распознаны)"
 
 
-def _describe_update_item(t: Dict[str, Any]) -> str:
-    title = t.get("title") or t.get("taskId") or t.get("task_id") or "?"
-    return f"**«{title}»** — {_update_change_bits(t)}"
+def _describe_update_item(t: Dict[str, Any],
+                          titles: Optional[Dict[str, str]] = None) -> str:
+    return f"**{_plan_task_name(t, titles)}** — {_update_change_bits(t)}"
 
 
 def _unapplicable_update_rows(tasks: List[Dict[str, Any]]) -> Dict[str, str]:
@@ -2963,13 +3090,14 @@ def _unapplicable_update_rows(tasks: List[Dict[str, Any]]) -> Dict[str, str]:
     return out
 
 
-def _describe_update_item_marking(unapplicable: Dict[str, str]):
+def _describe_update_item_marking(unapplicable: Dict[str, str],
+                                  titles: Optional[Dict[str, str]] = None):
     """`_describe_update_item` + пометка обречённой строки. Пометка живёт
     ТОЛЬКО в тексте превью и не попадает в сами элементы манифеста: на
     исполнении состояние перечитывается заново, и вчерашняя пометка не должна
     ни отменять строку, ни выдавать себя за проверку."""
     def describe(t: Dict[str, Any]) -> str:
-        line = _describe_update_item(t)
+        line = _describe_update_item(t, titles)
         why = unapplicable.get(str(t.get("taskId") or t.get("task_id") or ""))
         return f"{line}\n   ⛔ НЕ БУДЕТ ПРИМЕНЕНО: {why}" if why else line
     return describe
@@ -3274,9 +3402,12 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]] = None,
     err = _ensure_official()
     if err:
         return err
+    # Живые названия для строк, которым вызывающий их не дал: карточка
+    # обязана называть задачу, а не показывать её id (_plan_task_name).
+    titles = _plan_task_titles(tasks) if not manifest_id else {}
     outcome = await _gate_batch(
         "complete", "complete_tasks", tasks, summary, manifest_id, user_reply,
-        lambda t: f"**«{t.get('title') or t.get('taskId')}»**",
+        lambda t: f"**{_plan_task_name(t, titles)}**",
         automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
@@ -8865,9 +8996,16 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]] = None,
     err = _ensure_ready()
     if err:
         return err
+    # И задача, и СПИСОК НАЗНАЧЕНИЯ должны быть названы: «→ 6a21home»
+    # человек сверить не может — а именно этим и решается, туда ли уедет
+    # задача. Оба резолвятся один раз, до гейта (describe зовётся только на
+    # call #1, поэтому при manifest_id не платим ничем).
+    titles = _plan_task_titles(tasks) if not manifest_id else {}
+    dest = (_plan_project_name(to_project_id, to_project_name)
+            if not manifest_id else "")
     outcome = await _gate_batch(
         "move", "move_tasks", tasks, summary, manifest_id, user_reply,
-        lambda t: f"**«{t.get('title') or t.get('taskId')}»** → {to_project_name or to_project_id}",
+        lambda t: f"**{_plan_task_name(t, titles)}** → {dest}",
         extra={"to_project_id": to_project_id, "to_project_name": to_project_name},
         automation_key=automation_key)
     if not outcome.proceed:
@@ -9723,7 +9861,15 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
     # этой правки: «переносишь момент, не меняешь строгость», а не
     # «придумываешь новую защиту».
     notes = None
+    titles: Dict[str, str] = {}
+    # Как называется РОДИТЕЛЬ в карточке. Живое имя тут уже прочитано
+    # guard'ом строкой ниже — и раньше выбрасывалось: печаталось
+    # `parent_task_title or parent_task_id`, то есть при не переданном
+    # названии человек видел «→ под «6a7571238f0854e347f51407»» и сверить,
+    # под ту ли задачу вкладывают, не мог.
+    parent_label = ""
     if not manifest_id:
+        titles = _plan_task_titles(tasks)
         pg = _guard_task(parent_task_id, parent_task_title or "", project_id)
         if pg.status == "mismatch":
             return (f"🛑 План НЕ построен — родитель по id это «{pg.title}», а "
@@ -9739,9 +9885,17 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
                      "живым состоянием (чтение не удалось) — сверка "
                      "повторится при подтверждении, и расхождение остановит "
                      "исполнение."]
+        # ЖИВОЕ написание побеждает переданное: `_names_agree` пропускает
+        # разницу в регистре/маркерах, а карточка должна показывать
+        # состояние аккаунта, а не пересказ вызывающего. При недоступном
+        # чтении `pg.title` — это переданное название (guard возвращает
+        # ожидаемое), и предупреждение об этом уже стоит в notes выше.
+        parent_label = _plan_task_name(
+            {"taskId": parent_task_id,
+             "title": (pg.title or parent_task_title or "")})
     outcome = await _gate_batch(
         "parent", "set_task_parent", tasks, summary, manifest_id, user_reply,
-        lambda t: f"**«{t.get('title') or t.get('taskId')}»** → под «{parent_task_title or parent_task_id}»",
+        lambda t: f"**{_plan_task_name(t, titles)}** → под {parent_label}",
         extra={"parent_task_id": parent_task_id, "project_id": project_id,
                "parent_task_title": parent_task_title},
         notes=notes,
@@ -10204,6 +10358,9 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
             logger.warning(f"set_task_tags: не удалось прочитать список тегов "
                            f"для превью плана ({e}) — пометка «будет создан» "
                            "в этом плане не показывается")
+    # Живые названия для строк, которым вызывающий их не дал: карточка
+    # обязана называть задачу, а не показывать её id (_plan_task_name).
+    titles = _plan_task_titles(tasks) if not manifest_id else {}
 
     def _describe_tags(t: Dict) -> str:
         wanted = t.get("tags") or []
@@ -10214,7 +10371,7 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
                 parts.append(f"{tag} (тег не существует — будет создан)")
             else:
                 parts.append(tag)
-        return (f"**«{t.get('title') or t.get('taskId')}»** → теги: "
+        return (f"**{_plan_task_name(t, titles)}** → теги: "
                 + (", ".join(parts) or "(пусто)"))
 
     outcome = await _gate_batch(
@@ -11477,9 +11634,14 @@ async def restore_tasks(summary: str, tasks: List[Dict[str, str]] = None,
     err = _ensure_ready()
     if err:
         return err
+    # Живые названия — ИЗ КОРЗИНЫ: задачи этого тула по определению не
+    # открыты, искать их в снимке открытых бессмысленно. Тот же источник, с
+    # которым ниже сверяется identity-guard самого восстановления.
+    titles = (_plan_task_titles(tasks, source="trash")
+              if not manifest_id else {})
     outcome = await _gate_batch(
         "restore", "restore_tasks", tasks, summary, manifest_id, user_reply,
-        lambda t: f"**«{t.get('title') or t.get('taskId')}»**",
+        lambda t: f"**{_plan_task_name(t, titles)}**",
         extra={"to_project_id": to_project_id},
         automation_key=automation_key)
     if not outcome.proceed:
@@ -12641,9 +12803,15 @@ async def _delete_tag_impl(name: str) -> str:
 # Won't-do / duplicate (v2)
 # ---------------------------------------------------------------------------
 
-def _describe_abandon_task(p: Dict) -> str:
+def _describe_abandon_task(p: Dict, live_title: Optional[str] = None) -> str:
+    # `live_title` — живое название, УЖЕ прочитанное identity-guard'ом
+    # вызывающего (см. abandon_task ниже). Раньше сюда доставался фолбэк
+    # `task_title or task_id`: при пустом summary карточка говорила «задачу
+    # «6a7571238f0854e347f51407»» — id в позиции имени, в кавычках.
     return p.get("summary") or (
-        f'Отмечаю «не буду делать» задачу «{p.get("task_title") or p.get("task_id")}»')
+        "Отмечаю «не буду делать» задачу "
+        + _plan_task_name({"taskId": p.get("task_id"),
+                           "title": live_title or p.get("task_title")}))
 
 
 @mcp.tool()
@@ -12719,6 +12887,7 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None,
     # заново. automation_key НЕ пропускает эту проверку — она стоит раньше
     # самого гейта.
     name_warning = ""
+    live_title = None
     if not manifest_id:
         g = _guard_task(task_id, task_title or "")
         if g.status == "mismatch":
@@ -12735,9 +12904,13 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None,
                             "состоянием (чтение не удалось) — сверка "
                             "повторится при подтверждении, и расхождение "
                             "остановит исполнение.")
+        # Живое название для карточки: guard его уже прочитал (status "ok"),
+        # и это оно, а не переданное, должно стоять в позиции имени.
+        live_title = g.title if g.ok else None
     params = {"summary": summary, "task_id": task_id, "task_title": task_title}
-    describe_fn = ((lambda p: _describe_abandon_task(p) + name_warning)
-                   if name_warning else _describe_abandon_task)
+    describe_fn = (functools.partial(_describe_abandon_task, live_title=live_title)
+                   if not name_warning else
+                   (lambda p: _describe_abandon_task(p, live_title) + name_warning))
     outcome = await _gate_single("abandon_task", "abandon_task",
                                  params if not manifest_id else None,
                                  manifest_id, user_reply, describe_fn,
@@ -12783,8 +12956,13 @@ async def _abandon_task_impl(summary: str, task_id: str,
         return f"Error abandoning task: {str(e)}"
 
 
-def _describe_duplicate_task(p: Dict) -> str:
-    return p.get("summary") or f'Дублирую задачу «{p.get("task_title") or p.get("task_id")}»'
+def _describe_duplicate_task(p: Dict, live_title: Optional[str] = None) -> str:
+    # `live_title` — то же, что у _describe_abandon_task выше: живое имя,
+    # уже добытое guard'ом вызывающего, вместо голого id в позиции имени.
+    return p.get("summary") or (
+        "Дублирую задачу "
+        + _plan_task_name({"taskId": p.get("task_id"),
+                           "title": live_title or p.get("task_title")}))
 
 
 @mcp.tool()
@@ -12866,6 +13044,7 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
     # портит, а «продублировать завершённое как шаблон» — обычный сценарий.
     # Решение принято один раз для всего класса в _guard_task_incl_completed.
     name_warning = ""
+    live_title = None
     if not manifest_id:
         g = _guard_task_incl_completed(task_id, task_title or "")
         if g.status == "mismatch":
@@ -12881,9 +13060,15 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
                             "состоянием (чтение не удалось) — сверка "
                             "повторится при подтверждении, и расхождение "
                             "остановит исполнение.")
+        # Живое название для карточки — и для ЗАВЕРШЁННОЙ задачи тоже
+        # (status "completed" означает, что источник её знает и имя
+        # сверено): голый id в позиции имени не оправдан ни в одном из
+        # двух состояний, с которыми работает этот тул.
+        live_title = g.title if g.status in ("ok", "completed") else None
     params = {"summary": summary, "task_id": task_id, "task_title": task_title}
-    describe_fn = ((lambda p: _describe_duplicate_task(p) + name_warning)
-                   if name_warning else _describe_duplicate_task)
+    describe_fn = (functools.partial(_describe_duplicate_task, live_title=live_title)
+                   if not name_warning else
+                   (lambda p: _describe_duplicate_task(p, live_title) + name_warning))
     outcome = await _gate_single("duplicate_task", "duplicate_task",
                                  params if not manifest_id else None,
                                  manifest_id, user_reply, describe_fn,
@@ -13715,7 +13900,21 @@ async def get_task_info(task_id: str) -> str:
         pr = PRIORITY_MAP.get(t.get("priority", 0))
         status = {0: "Active", 2: "Completed", -1: "Won't do"}.get(t.get("status", 0), t.get("status"))
         creator = str(t.get("creator", ""))
-        who = "you" if creator == owner else f"user {creator}"
+        # Люди в этом выводе назывались номерами: «assignee: 333444» и
+        # «created … by user 333444». Номер участника человек глазами не
+        # сверяет — а в аккаунте с общими проектами именно по этой строке
+        # понимают, КТО поставил задачу и на кого она. Список участников
+        # проекта читается только когда есть кого называть, и его
+        # недоступность честно печатается словами, а не молчаливым номером.
+        members: Dict[str, str] = {}
+        if t.get("assignee") or (creator and creator != owner):
+            members = await _run_blocking(_member_names, t.get("projectId") or "")
+        if not creator:
+            who = "автор неизвестен (TickTick не вернул поле creator)"
+        elif creator == owner:
+            who = "you"
+        else:
+            who = _person_label(creator, members)
 
         out = f"Task: {t.get('title')}\n"
         out += f"  id: {t.get('id')}  |  project: {names.get(t.get('projectId'), t.get('projectId'))}\n"
@@ -13744,11 +13943,19 @@ async def get_task_info(task_id: str) -> str:
         if reminders:
             out += f"  reminders: {', '.join(str(r) for r in reminders)}\n"
         if t.get("assignee"):
-            out += f"  assignee: {t['assignee']}\n"
+            out += f"  assignee: {_person_label(t['assignee'], members)}\n"
         if t.get("tags"):
             out += f"  tags: {', '.join('#'+x for x in t['tags'])}\n"
         if t.get("columnId"):
-            out += f"  columnId: {t['columnId']}\n"
+            # Раздел (колонка) назывался голым id — «columnId: 6a75…».
+            # Название читается из того же места, что list_project_columns;
+            # id остаётся рядом (он нужен как column_id в create/update).
+            cols = await _run_blocking(_column_names, t.get("projectId") or "")
+            cname = (cols.get(t["columnId"]) or "").strip()
+            out += (f"  columnId: «{cname}» (id: {t['columnId']})\n" if cname else
+                    f"  columnId: id {t['columnId']} — ⚠️ НАЗВАНИЕ РАЗДЕЛА "
+                    "УСТАНОВИТЬ НЕ УДАЛОСЬ (раздела нет в проекте или список "
+                    "недоступен)\n")
         content = t.get("content") or t.get("desc") or ""
         if content:
             out += f"  content: {content[:300]}\n"
@@ -13818,7 +14025,16 @@ def _task_activity_fallback(task_id: str) -> Optional[str]:
         if not t:
             return None
         creator = str(t.get("creator", ""))
-        who = "you" if creator == owner else (f"user {creator}" if creator else "?")
+        # Тот же класс, что в get_task_info: автор назывался номером
+        # («by user 333444»). Эта подстановка — то, что читатель видит
+        # ВМЕСТО настоящего лога, и называть в ней человека номером тем
+        # более нечестно.
+        if not creator:
+            who = "автор неизвестен (TickTick не вернул поле creator)"
+        elif creator == owner:
+            who = "you"
+        else:
+            who = _person_label(creator, _member_names(t.get("projectId") or ""))
         # Same three stamps get_task_info shows, so they are rendered by the
         # same helper: this fallback is what the reader sees INSTEAD of the
         # real log, and a substitute that dates events differently from the
@@ -14504,17 +14720,23 @@ def _describe_triage_op(op: Dict) -> str:
     proj = op.get("_project_name") or ""
     where = f" (проект «{proj}»)" if proj else ""
     if op.get("_skip"):
-        shown = op.get("title") or op.get("_live_title") or op.get("task_id") or "?"
-        return f"⚠️ ПРОПУЩЕНО — «{shown}»: {op['_skip']}"
-    title = op.get("_live_title") or op.get("title") or op.get("task_id") or "?"
+        # Фолбэк «... or task_id» в позиции имени убран (2026-08-07, тот же
+        # класс, что в карточках гейта): молчаливый показ id читается как
+        # имя. Здесь он и достижим-то только когда имени нет НИОТКУДА —
+        # значит это надо сказать словами.
+        shown = _plan_task_name({"task_id": op.get("task_id"),
+                                 "title": op.get("title") or op.get("_live_title")})
+        return f"⚠️ ПРОПУЩЕНО — {shown}: {op['_skip']}"
+    title = _plan_task_name({"task_id": op.get("task_id"),
+                             "title": op.get("_live_title") or op.get("title")})
     orphan = _triage_orphan_note(op.get("_open_children") or 0)
     if kind in ("delete", "complete"):
         bits = ([f"проект «{proj}»"] if proj else []) + ([orphan] if orphan else [])
         note = f" ({'; '.join(bits)})" if bits else ""
         verb = "🗑 Удалить" if kind == "delete" else "✅ Закрыть"
-        return f"{verb} «{title}»{note}{tail}"
+        return f"{verb} {title}{note}{tail}"
     if kind == "update":
-        return (f"✏️ Изменить «{title}»{where}: "
+        return (f"✏️ Изменить {title}{where}: "
                 f"{_update_change_bits(op.get('changes') or {}, sep=', ')}{tail}")
     if kind == "move":
         to = op.get("_to_project_name") or op.get("to_project") \
@@ -14522,7 +14744,7 @@ def _describe_triage_op(op: Dict) -> str:
         # Пустое имя исходного проекта печаталось как «» → «Работа» — строка,
         # из которой человек не может понять, откуда задача переезжает.
         frm = proj or "неизвестный проект"
-        return f"↪ Перенести «{title}»: «{frm}» → «{to}»{tail}"
+        return f"↪ Перенести {title}: «{frm}» → «{to}»{tail}"
     if kind == "merge":
         keep_title = op.get("_keep_live_title") or op.get("keep_title") or "?"
         keep_proj = op.get("_keep_project_name") or ""
@@ -14536,9 +14758,9 @@ def _describe_triage_op(op: Dict) -> str:
         bits = ([f"проект «{proj}»"] if proj else []) \
             + ["его заметки, срок и теги НЕ переносятся"] \
             + ([orphan] if orphan else [])
-        return (f"🔗 Объединить дубли: удалить «{title}» ({'; '.join(bits)}), "
+        return (f"🔗 Объединить дубли: удалить {title} ({'; '.join(bits)}), "
                 f"оставить «{keep_title}»{keep_where}{tail}")
-    return f"• {kind} «{title}»{tail}"
+    return f"• {kind} {title}{tail}"
 
 
 def _triage_change_refusal(i: int, title: str, changes: Dict) -> Optional[str]:
@@ -14935,10 +15157,11 @@ def _verify_triage_op(op: Dict, live_map: Dict[str, Dict],
 def _triage_blocked_lines(blocked: List[Tuple[Dict, str]]) -> List[str]:
     out = ["#### ⏭ Пропущено — НЕ выполнено"]
     for op, why in blocked:
-        shown = op.get("_live_title") or op.get("title") or op.get("task_id") or "?"
+        shown = _plan_task_name({"task_id": op.get("task_id"),
+                                 "title": op.get("_live_title") or op.get("title")})
         emoji = _TRIAGE_EMOJI.get(op.get("op"), "•")
         verb = _TRIAGE_VERB.get(op.get("op"), op.get("op"))
-        out.append(f"- {emoji} «{shown}» ({verb}): {why}")
+        out.append(f"- {emoji} {shown} ({verb}): {why}")
     return out
 
 
