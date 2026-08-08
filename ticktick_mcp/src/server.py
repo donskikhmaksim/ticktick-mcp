@@ -14586,8 +14586,15 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
     ready-to-run plan and was disabled forever). EVERY operation must
     correspond to a concrete sentence the human said, and that sentence goes
     into that operation's `said` field, VERBATIM (or tightly condensed).
-    A blanket phrase reused on every row («разобрать инбокс», «cleanup») is a
-    protocol violation — `said` must be what the human said about THAT task.
+    A blanket phrase reused on every row («разобрать инбокс», «cleanup») is
+    NOT what this field is for — `said` must be what the human said about
+    THAT task — but the server does not block it: when two or more rows carry
+    the same `said`, the preview gets a ⚠️ warning naming how many, and the
+    human decides with open eyes. Telling a lazy copy-paste from a legitimate
+    one is impossible from the string alone («эти пять удали» genuinely is
+    one sentence about five tasks), so an automatic block would hit honest
+    plans — and would push you to invent five different phrasings, the exact
+    fabrication this field exists to prevent.
     Empty `said` → the whole plan is refused.
 
     Call #1 (manifest_id omitted): each `task_id` is checked against LIVE
