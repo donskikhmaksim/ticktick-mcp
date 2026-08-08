@@ -10842,9 +10842,36 @@ async def _add_task_comment_impl(task_title: str, text: str, project_id: str,
 # Statistics & trash (v2)
 # ---------------------------------------------------------------------------
 
+# Расследование расхождения (живая приёмка 2026-08-07/08), чтобы следующий не
+# начинал с нуля. get_statistics отдавал «today 2 | yesterday 6», а независимая
+# сверка по get_changes за те же дни показывала СЕМЬ завершений с датой
+# 2026-08-07 (09:10, 18:14, 18:15, 18:16, 18:16, 21:04, 21:28 UTC; что метки
+# ленты именно UTC — подтверждено get_task_activity: T_DONE в 14:28:59
+# America/Los_Angeles = 21:28 UTC). Ни UTC-сутки, ни сутки владельца (те же 7)
+# не дают 2.
+#
+# Решающее наблюдение — повторный вызов ПОСЛЕ полуночи UTC вернул те же
+# «today 2 | yesterday 6». Считай TickTick по UTC, «today» обнулилось бы.
+# Значит окно «сегодня» — сутки ЧУЖОЙ зоны: граница между 18:16 и 21:04 UTC,
+# то есть зона аккаунта TickTick со смещением примерно UTC+3…+5, куда попали
+# ровно два завершения. Наш код при этом ничего не считает — все три числа
+# приходят полями todayCompleted/yesterdayCompleted/totalCompleted.
+#
+# Отсюда и правка: не «чинить» арифметикой (нечего чинить), а назвать
+# происхождение чисел и нарезку суток. Встречная лента тоже не эталон:
+# get_changes режет календарные UTC-сутки, тянет завершения с капом 100 и
+# корзину с капом 300, а завершённую-и-затем-удалённую задачу показывает как
+# «удалено», то есть недосчитывает завершения.
 @mcp.tool(annotations=READONLY)
 async def get_statistics() -> str:
-    """Get productivity statistics: achievement score/level and completion counts (requires v2 API)."""
+    """Get productivity statistics: achievement score/level and completion
+    counts (requires v2 API).
+
+    The counts are TickTick's OWN counters, passed through untouched. TickTick
+    slices "today"/"yesterday" in ITS ACCOUNT's timezone — neither UTC nor this
+    server's USER_TIMEZONE — so they are not expected to match a get_changes
+    feed (which slices calendar days in UTC). A mismatch between the two is not
+    evidence that either is broken."""
     err = _ensure_ready()
     if err:
         return err
@@ -10852,11 +10879,25 @@ async def get_statistics() -> str:
         s = await _run_blocking(lambda: ticktick_v2.get_statistics())
         if not s:
             return "No statistics available."
+
+        def num(key: str) -> str:
+            # Отсутствующее поле — «нет данных», а не 0: ноль здесь читается
+            # как утверждение «сегодня ничего не завершено», которого источник
+            # не делал (и «None» — тоже не ответ человеку).
+            v = s.get(key)
+            return "—" if v is None else str(v)
+
         return (
-            f"Achievement score: {s.get('score')}  |  Level: {s.get('level')}\n"
-            f"Completed today: {s.get('todayCompleted')}  |  "
-            f"yesterday: {s.get('yesterdayCompleted')}  |  "
-            f"total: {s.get('totalCompleted')}"
+            f"Achievement score: {num('score')}  |  Level: {num('level')}\n"
+            f"Completed today: {num('todayCompleted')}  |  "
+            f"yesterday: {num('yesterdayCompleted')}  |  "
+            f"total: {num('totalCompleted')}\n"
+            "\nℹ️ Это счётчики самого TickTick, отданные как есть — мы их не "
+            "пересчитываем. «Сегодня»/«вчера» он нарезает по зоне АККАУНТА "
+            f"TickTick, а не по зоне этого сервера ({_USER_TZ.key}) и не по "
+            "UTC, по которому режет сутки лента get_changes. Поэтому числа "
+            "здесь и в ленте сходиться не обязаны — расхождение само по себе "
+            "не значит, что одна из сторон врёт."
         )
     except Exception as e:
         logger.error(f"Error in get_statistics: {e}")
