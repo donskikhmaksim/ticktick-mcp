@@ -36,6 +36,8 @@
 транспорт. `_guard_task` и родня НЕ подменяются — иначе тест проверял бы
 мок, а не фикс (ровно эта подмена и прятала расхождение в прежних тестах).
 """
+import re
+
 import pytest
 
 import ticktick_mcp.src.server as s
@@ -166,7 +168,47 @@ async def test_nonexistent_task_refused_by_every_tool(monkeypatch):
 
 
 # ===========================================================================
-# 3. Счастливый путь не тронут
+# 3. Не только план: операция реально ДОХОДИТ до TickTick
+# ===========================================================================
+
+async def test_completed_task_operation_actually_executes(monkeypatch):
+    """План — половина дела: guard стоит и на ИСПОЛНЕНИИ (call #2), и если бы
+    там осталась прежняя трактовка, комментарий к завершённой задаче не ушёл
+    бы никуда. Здесь проверяется весь цикл до записи в TickTick.
+
+    Подменяется РОВНО ТРАНСПОРТ (как во всём стенде): запись комментария
+    добавляется в тот же journal вызовов, а любой незнакомый путь остаётся
+    ошибкой, как у живого API."""
+    v2, _v1, transport = _wire(monkeypatch)
+    base_request = v2._request
+    written = []
+
+    def request(method, path, **kwargs):
+        if method == "POST" and path.endswith("/comment"):
+            written.append((path, (kwargs.get("json") or {}).get("title")))
+            return dict(kwargs.get("json") or {})
+        return base_request(method, path, **kwargs)
+
+    v2._request = request
+
+    plan = await rs.call("add_task_comment",
+                         **_args("add_task_comment", rs.TASK_COMPLETED, DONE_TITLE))
+    mid = re.search(r'manifest_id="([0-9a-f]+)"', plan)
+    assert mid, plan
+    result = await rs.call("add_task_comment",
+                           **_args("add_task_comment", rs.TASK_COMPLETED, DONE_TITLE),
+                           manifest_id=mid.group(1), user_reply="да")
+
+    assert written, f"комментарий к завершённой задаче не ушёл в TickTick:\n{result}"
+    assert written[0][0] == f"/project/{rs.P_WORK}/task/{rs.TASK_COMPLETED}/comment"
+    assert "🛑" not in result, result
+    assert "завершена" in result.lower(), (
+        f"исполнение молчит о том, что задача завершена:\n{result}")
+    del transport
+
+
+# ===========================================================================
+# 4. Счастливый путь не тронут
 # ===========================================================================
 
 async def test_open_task_unchanged_for_every_tool(monkeypatch):
