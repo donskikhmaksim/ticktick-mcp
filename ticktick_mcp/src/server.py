@@ -10481,8 +10481,27 @@ async def _delete_project_group_impl(group_name: str, group_id: str) -> str:
         return f"Error deleting project group: {str(e)}"
 
 
-def _describe_move_project_to_group(p: Dict) -> str:
-    dest = "без папки" if p.get("group_id") == "NONE" else f'в папку id:{p.get("group_id")}'
+def _describe_move_project_to_group(p: Dict, dest_name: Optional[str] = None,
+                                    unknown_reason: str = "") -> str:
+    # Живая приёмка 2026-08-07: «Перемещаю проект «__AUTOTEST__btn-tt-01-
+    # retest» в папку id:c4d38a807dfe452e964e89b9» — источник по имени,
+    # назначение идентификатором. Имя папки сервер знает (тот же кэшированный
+    # v2-снапшот, из которого читает list_project_groups), и
+    # _move_project_to_group_impl уже печатает его в ОТЧЁТЕ после нажатия
+    # кнопки — то есть имя было там, где оно уже не нужно, и его не было
+    # там, где человек принимает решение.
+    #
+    # `dest_name` резолвит вызывающий ДО гейта. None означает «установить не
+    # удалось» и печатается ВСЛУХ вместе с причиной: молчаливый показ сырого
+    # id и есть дефект.
+    gid = p.get("group_id")
+    if gid == "NONE":
+        dest = "без папки"
+    elif dest_name:
+        dest = f'в папку «{dest_name}» (id {gid})'
+    else:
+        dest = (f'в папку id {gid} — ⚠️ ИМЯ ПАПКИ УСТАНОВИТЬ НЕ УДАЛОСЬ'
+                + (f' ({unknown_reason})' if unknown_reason else ''))
     return f'Перемещаю проект «{p.get("project_name")}» {dest}'
 
 
@@ -10549,9 +10568,9 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
     # «Ничего не изменено») — это текстовая правка отображения, сама
     # сверка/строгость не меняется. Проверка группы-назначения (group_id
     # существует) НЕ переносится: владелец не передаёт group_name для
-    # сверки (карточка печатает id как есть, см.
-    # _describe_move_project_to_group) — подменить нечего, это остаётся
-    # проверкой исполнения, как было. Действует только на call #1
+    # сверки — подменить нечего, это остаётся проверкой исполнения, как
+    # было. Но карточка теперь папку НАЗЫВАЕТ (блок ниже) — это
+    # отображение, а не гейт. Действует только на call #1
     # (manifest_id пуст); automation_key НЕ пропускает эту проверку — она
     # стоит раньше самого гейта.
     if not manifest_id:
@@ -10560,10 +10579,39 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
         if refuse:
             return (refuse.replace("🛑 Отказ —", "🛑 План НЕ построен —", 1)
                           .replace("Ничего не тронул.", "Ничего не изменено."))
+    # Имя папки-НАЗНАЧЕНИЯ для карточки. Читается из ТОГО ЖЕ кэшированного
+    # v2-снапшота, из которого работает list_project_groups (fresh=False —
+    # _guard_project выше уже сбросил кэш, так что снапшот свежий и лишнего
+    # сетевого запроса тут нет), и уходит в описание замыканием, а НЕ ключом
+    # в `params`: params едут в манифест, в object_hash и дословно в
+    # `_impl(**params)`. Ни отказать, ни заблокировать план резолвинг не
+    # может — сверять переданное имя не с чем (group_name владелец не
+    # передаёт), а сама проверка существования группы как стояла на
+    # исполнении, так и стоит. Неудача печатается вслух вместе с причиной.
+    dest_name: Optional[str] = None
+    dest_unknown = ""
+    if not manifest_id and group_id != "NONE":
+        try:
+            groups = await _live_groups(fresh=False)
+        except Exception as e:
+            groups = None
+            logger.warning("move_project_to_group: не удалось прочитать список "
+                           f"групп на этапе плана ({e}) — имя папки в карточке "
+                           "не будет названо.")
+        if groups is None:
+            dest_unknown = "живой список групп прочитать не удалось"
+        else:
+            grp = next((g for g in groups if g.get("id") == group_id), None)
+            dest_name = (grp or {}).get("name") or None
+            if not dest_name:
+                dest_unknown = ("папки с таким id нет в живом списке групп — "
+                                "перемещение сорвётся на исполнении")
     params = {"project_name": project_name, "project_id": project_id, "group_id": group_id}
     outcome = await _gate_single("move_project_to_group", "move_project_to_group",
                                  params if not manifest_id else None,
-                                 manifest_id, user_reply, _describe_move_project_to_group,
+                                 manifest_id, user_reply,
+                                 lambda p: _describe_move_project_to_group(
+                                     p, dest_name, dest_unknown),
                                  automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message

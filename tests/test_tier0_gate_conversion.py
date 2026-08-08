@@ -1315,6 +1315,84 @@ async def test_move_project_to_group_automation_key_mismatch_is_refused_before_p
     assert len(calls) == 1
 
 
+# ---------------------------------------------------------------------------
+# 2026-08-07, живая приёмка: карточка называла ПАПКУ-НАЗНАЧЕНИЕ сырым id.
+# Дословно:
+#
+#   📋 План — Перемещаю проект «__AUTOTEST__btn-tt-01-retest» в папку
+#   id:c4d38a807dfe452e964e89b9
+#
+# Объект-источник (проект) резолвился и печатался по-человечески, объект-
+# назначение (папка) — нет, хотя имя папки сервер знает: оно лежит в том же
+# кэшированном v2-снапшоте, из которого читается list_project_groups, и
+# _move_project_to_group_impl уже достаёт его на ИСПОЛНЕНИИ (dest_name) —
+# то есть в отчёте после нажатия кнопки имя было, а в карточке ДО нажатия
+# его не было. Ровно наоборот тому, что нужно человеку.
+# ---------------------------------------------------------------------------
+
+async def test_move_plan_names_the_destination_folder(monkeypatch):
+    """Главный тест пункта: в карточке — имя папки, а не «id:g1»."""
+    fake_v2 = FakeV2(groups=[{"id": "g1", "name": "Активные"}],
+                     projects=[{"id": "p1", "name": "Работа", "groupId": None}])
+    _wire(monkeypatch, fake_v2=fake_v2)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Работа"})
+
+    preview = await s.move_project_to_group("Работа", "p1", "g1")
+
+    assert "«Активные»" in preview, f"папка не названа по имени:\n{preview}"
+    assert "id:g1" not in preview, f"сырой id вместо имени:\n{preview}"
+    assert fake_v2.calls == []
+
+
+async def test_move_plan_says_out_loud_when_the_folder_name_is_unknown(monkeypatch):
+    """Резолвинг не удался — молчать нельзя: карточка обязана сказать, что
+    имя папки установить не удалось, и показать id. Молчаливый показ id и
+    есть дефект, поэтому «просто id» тут недостаточно."""
+    fake_v2 = FakeV2(groups=[], projects=[{"id": "p1", "groupId": None}])
+    _wire(monkeypatch, fake_v2=fake_v2)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Работа"})
+
+    preview = await s.move_project_to_group("Работа", "p1", "g-неизвестная")
+
+    assert "не удалось" in preview.lower(), (
+        f"неудачный резолвинг остался молчаливым:\n{preview}")
+    assert "g-неизвестная" in preview, "при неизвестном имени id обязан быть виден"
+
+
+async def test_move_plan_ungroup_wording_is_unchanged(monkeypatch):
+    """group_id="NONE" — разгруппировка, резолвить нечего: формулировка
+    «без папки» остаётся как была, без всяких «имя не удалось»."""
+    fake_v2 = FakeV2(groups=[{"id": "g1", "name": "Активные"}],
+                     projects=[{"id": "p1", "groupId": "g1"}])
+    _wire(monkeypatch, fake_v2=fake_v2)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Работа"})
+
+    preview = await s.move_project_to_group("Работа", "p1", "NONE")
+
+    assert "без папки" in preview
+    assert "не удалось" not in preview.lower()
+
+
+async def test_move_plan_folder_lookup_never_blocks_the_plan(monkeypatch):
+    """Резолвинг имени папки — украшение карточки, не право вето: падение
+    чтения групп не должно мешать построить план (сверка назначения на
+    ИСПОЛНЕНИИ, где она и живёт, никуда не делась)."""
+    fake_v2 = FakeV2(groups=[{"id": "g1", "name": "Активные"}],
+                     projects=[{"id": "p1", "groupId": None}])
+    _wire(monkeypatch, fake_v2=fake_v2)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Работа"})
+
+    async def _boom(*a, **k):
+        raise RuntimeError("v2 упал")
+    monkeypatch.setattr(s, "_live_groups", _boom)
+
+    preview = await s.move_project_to_group("Работа", "p1", "g1")
+
+    assert "manifest_id" in preview and "🛑" not in preview
+    assert "не удалось" in preview.lower()
+    assert "g1" in preview
+
+
 # ===========================================================================
 # add_task_comment
 # ===========================================================================
