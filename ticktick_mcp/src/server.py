@@ -1408,6 +1408,33 @@ def _names_agree(expected: str, actual: str) -> bool:
     return a == _norm_name(actual)
 
 
+def _task_is_in_trash(task_id: str) -> bool:
+    """Лежит ли задача в КОРЗИНЕ. False и когда её там нет, и когда спросить
+    не удалось.
+
+    Источник один — v2 (`_locate_task_any_state` → `find_task_any_state`,
+    результат кэшируется по id): официальный Open API про удаление не знает
+    вообще, он отдаёт корзинную задачу как живую (см. `_trash_state`).
+
+    ПОЧЕМУ НЕ FAIL-CLOSED. Сбой чтения корзины здесь возвращает False, то
+    есть поведение остаётся ровно тем, каким было до появления этой
+    проверки, — не хуже. Обратный выбор («не смогли проверить → считаем
+    удалённой») превратил бы разовую сетевую ошибку в отказ по ЛЮБОЙ задаче,
+    которой нет в снимке открытых, — цена, несоизмеримая с риском: на этой
+    ветке за спиной уже стоят и сверка названия, и пост-проверка исполнителя.
+
+    ЧЕСТНОЕ ОГРАНИЧЕНИЕ: лента корзины — страница на `TRASH_MAX_LIMIT`
+    записей, а не индекс. Задача, удалённая давно, из неё выпадает, и тогда
+    ответ здесь — False, как и для неудалённой. Это ограничение источника,
+    единственного, который вообще знает про удаление."""
+    try:
+        _found, where, readable = _locate_task_any_state(task_id)
+    except Exception as e:            # pragma: no cover — оно уже ловит своё
+        logger.warning(f"проверка корзины для {str(task_id)[:8]}… не удалась: {e}")
+        return False
+    return bool(readable) and where == "trash"
+
+
 class _Guard:
     """Result of the identity guard for one task.
     status ∈ {ok, mismatch, missing, unavailable} — plus 'completed', which
@@ -1467,6 +1494,33 @@ def _guard_task(
     if not live:
         live = (_official_task_snapshot(project_id, task_id) if project_id
                 else _official_task_scan(task_id))
+        # ЗАДАЧА В КОРЗИНЕ ВЫГЛЯДИТ ОТКРЫТОЙ (дефект живой приёмки
+        # 2026-08-07). TickTick НЕ меняет `status` при удалении — он остаётся
+        # 0, — а официальный Open API отдаёт удалённую задачу точечным
+        # чтением как ни в чём не бывало (то же свойство описано в
+        # `_trash_state`). Фильтр `_official_task_snapshot` отсеивает только
+        # `status != 0`, поэтому корзинная задача проходила через этот фолбэк
+        # КАК ОТКРЫТАЯ: план строился на удалённый объект, а батч
+        # `update_tasks` не помечал такую строку ⛔ и обещал применить
+        # больше, чем мог.
+        #
+        # Спрашиваем лишь у того источника, который знает про удаление
+        # (v2-лента корзины), и ТОЛЬКО на этой ветке: задача, найденная в
+        # снимке открытых, в корзине лежать не может по определению, поэтому
+        # счастливый путь не платит за проверку ни одним запросом.
+        #
+        # Ответ здесь — "missing" (а не отдельный статус): `_guard_task`
+        # зовут десятки мутаторов, и новый статус, которого никто из них не
+        # ждёт, провалился бы у них в ветку «можно менять». Класс, которому
+        # корзину надо отличать от «просто не найдено», делает это ниже —
+        # `_guard_task_incl_completed`. Сообщение при этом называет причину
+        # своими словами: «в корзине», а не «завершена/удалена/неверный id».
+        if live and _task_is_in_trash(task_id):
+            return _Guard("missing", live.get("projectId") or project_id,
+                          live.get("title") or "",
+                          f"задача «{live.get('title') or task_id}» лежит В "
+                          "КОРЗИНЕ (удалена) — верните её через restore_tasks, "
+                          "прежде чем работать с ней")
     if not live:
         return _Guard("missing", project_id, expected_title,
                       f"id {str(task_id)[:8]}… не среди открытых задач "
@@ -1486,8 +1540,33 @@ def _guard_task(
 # Единая пометка класса «операции над завершённой задачей» — один текст на
 # все пять инструментов, чтобы подтверждающий читал одно и то же, у какого бы
 # из них он ни оказался.
+#
+# ЗНАЧОК ℹ️, А НЕ ⚠️ — и это не косметика (2026-08-07, дефект «вердикт не
+# различает успех и провал»). До этой правки ОДИН символ ⚠️ означал две
+# РАЗНЫЕ вещи: «часть операции не подтверждена» (оценка ПРОВЕРКИ) и «задача
+# завершена» (ФАКТ о состоянии объекта). Пока символ один, любой честный
+# факт о состоянии автоматически понижает вердикт: `_EXEC_WARN_MARKERS`
+# ищет ⚠️ где угодно в самоотчёте исполнителя, поэтому пометка, вклеенная
+# сюда, ЛИЧНО стоила исполнителю его собственного «✅» — успешный
+# комментарий к завершённой задаче приходил владельцу как
+# «❓ НЕ подтверждено», неотличимо от упавшей операции.
+#
+# ПРАВИЛО, закрывающее класс: ⚠️ — сомнение В ПРОВЕРКЕ («исход не
+# подтверждён», «проверить не удалось»); ℹ️ — факт о состоянии объекта или
+# о продукте операции, который проверке не противоречит. Вердикт понижают
+# только первые. Симметрично помечен и другой такой факт — оговорка
+# `duplicate_task` про поля, которые в копию не переносятся.
 _COMPLETED_TASK_NOTE = ("задача ЗАВЕРШЕНА (не среди открытых) — операция над "
                         "ней допустима, название сверено с живым состоянием")
+
+# Единый текст отказа для второго состояния того же класса — задача в
+# КОРЗИНЕ. Тоже один на все пять инструментов: подтверждающий обязан читать
+# одно и то же, у какого бы из них он ни оказался, и обязан узнать, ЧТО
+# случилось с задачей и КАК её вернуть (без этого «операция не выполнена»
+# читается как сбой сервера, а не как состояние объекта).
+_TRASHED_TASK_NOTE = ("задача «{title}» лежит В КОРЗИНЕ (удалена): операция "
+                      "над удалённым объектом не выполняется — верните её "
+                      "через restore_tasks, и тогда повторите.")
 
 
 def _guard_task_incl_completed(
@@ -1502,13 +1581,31 @@ def _guard_task_incl_completed(
     LEGITIMATE on a completed task: add_task_comment, attach_file_to_task,
     update_task_comment, delete_task_comment, duplicate_task.
 
-    Same guard as `_guard_task`, one status richer:
+    Same guard as `_guard_task`, two statuses richer:
 
       - task is open                        → whatever _guard_task says
       - task is NOT open but a source knows
         it, and the title agrees            → status 'completed'
       - …and the title does NOT agree       → status 'mismatch' (as always)
+      - task is IN THE TRASH                → status 'trashed' (REFUSE)
       - no source knows it at all           → status 'missing'
+
+    ПОЧЕМУ КОРЗИНА — ОТДЕЛЬНЫЙ СТАТУС, А НЕ РАЗНОВИДНОСТЬ «completed»
+    (политика, 2026-08-07). Оба состояния означают «задачи нет среди
+    открытых», но требуют РАЗНОГО решения, и слить их — значит либо
+    запретить законное, либо разрешить ошибочное:
+      * ЗАВЕРШЁННАЯ задача — нормальный конечный объект. Приложить к ней
+        чек, дописать вывод, продублировать как шаблон — обычные сценарии,
+        и результат такой операции владелец увидит там же, где саму задачу.
+        Операция ДОПУСТИМА.
+      * КОРЗИНА — заявленное «я это убрал». Комментарий, дописанный в
+        корзину, не увидит никто; файл, приложенный туда, уедет вместе с
+        задачей, когда корзина очистится; «дубликат удалённого» почти
+        всегда означает, что человек хотел restore_tasks, а не копию.
+        Операция над удалённым объектом — почти всегда ошибка, поэтому
+        ОТКАЗ с подсказкой, как вернуть задачу.
+    Статус назван состоянием объекта, а не решением («refused»), чтобы
+    политику можно было поменять в вызывающих, не переписывая guard.
 
     ПОЧЕМУ ЭТО ОТДЕЛЬНАЯ ФУНКЦИЯ, а не правка `_guard_task` (дефект №2,
     живая приёмка 2026-08-07). На завершённой задаче `_guard_task` возвращал
@@ -1531,7 +1628,15 @@ def _guard_task_incl_completed(
     g = _guard_task(task_id, expected_title, project_id, fresh=fresh, by_id=by_id)
     if g.status != "missing":
         return g
-    live = _closed_task_snapshot(task_id, project_id)
+    # ГДЕ задача сейчас, спрошено У ТОГО, КТО ЗНАЕТ ПРО УДАЛЕНИЕ. Это первым
+    # шагом, а не после `_closed_task_snapshot`: тот начинает с официального
+    # точечного чтения, которое флага удаления не несёт вовсе и вернуло бы
+    # корзинную задачу как обычную завершённую. `find_task_any_state` уже
+    # знает место находки — «trash» здесь просто перестал выбрасываться.
+    # Кэш у неё общий с `_task_is_in_trash` выше, так что повторный вопрос
+    # внутри одного хода бесплатен.
+    found, where, _readable = _locate_task_any_state(task_id)
+    live = found or _closed_task_snapshot(task_id, project_id)
     if not live:
         return _Guard("missing", project_id, expected_title,
                       f"id {str(task_id)[:8]}… не найден ни среди открытых "
@@ -1539,9 +1644,15 @@ def _guard_task_incl_completed(
                       "или задача слишком старая для этих выборок)")
     real_title = live.get("title") or ""
     real_pid = live.get("projectId") or project_id
+    # Сверка названия — РАНЬШЕ решения о состоянии: защита от «не той задачи»
+    # сильнее всего остального, и подлог обязан читаться как подлог, что бы
+    # ни было с самим объектом.
     if not _names_agree(expected_title, real_title):
         return _Guard("mismatch", real_pid, real_title,
                       f"id указывает на «{real_title}», а НЕ «{expected_title}»")
+    if where == "trash":
+        return _Guard("trashed", real_pid, real_title, _TRASHED_TASK_NOTE.format(
+            title=real_title or str(task_id)[:8] + "…"))
     return _Guard("completed", real_pid, real_title, _COMPLETED_TASK_NOTE)
 
 
@@ -11413,8 +11524,14 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
                             "остановит исполнение.")
         elif g.status == "missing":
             return f"🛑 План НЕ построен — {g.message}. Ничего не изменено."
+        elif g.status == "trashed":
+            # Политика класса для УДАЛЁННОЙ задачи — отказ на плане, до
+            # всякого согласия (см. _guard_task_incl_completed). Раньше
+            # такая задача проходила как открытая: `status` в корзине
+            # остаётся 0.
+            return f"🛑 План НЕ построен — {g.message} Ничего не изменено."
         elif g.status == "completed":
-            name_warning = f" ⚠️ {_COMPLETED_TASK_NOTE}."
+            name_warning = f" ℹ️ {_COMPLETED_TASK_NOTE}."
     params = {"task_title": task_title, "text": text, "project_id": project_id,
               "task_id": task_id}
     describe_fn = ((lambda p: _describe_add_task_comment(p) + name_warning)
@@ -11431,7 +11548,23 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
 async def _add_task_comment_impl(task_title: str, text: str, project_id: str,
                                  task_id: str) -> str:
     """Pure mutation logic for add_task_comment — no consent gate. Called
-    only by the gated add_task_comment() above once the plan is approved."""
+    only by the gated add_task_comment() above once the plan is approved.
+
+    POST-VERIFY И ФОРМАТ ОТЧЁТА (2026-08-07). Раньше отсюда возвращалось
+    `f"Comment added to '{task_title}'."` — без ведущего ✅ и по-английски, —
+    хотя соседи по классу (update_task_comment, delete_task_comment,
+    attach_file_to_task) к единому формату уже приведены. Цена была не
+    косметическая: когда журнала мутаций для инструмента нет (а для
+    комментариев его нет вообще), ЕДИНСТВЕННОЕ доказательство успеха для
+    `_verified_auto_execute_report` — ведущий ✅ самоотчёта
+    (`_auto_execute_report_is_success`). Без него РЕАЛЬНО созданный
+    комментарий приходил владельцу как «❓ НЕ подтверждено», то есть
+    неотличимо от упавшей операции.
+
+    И ✅ теперь заслуженный, а не переписанный: комментарий перечитывается
+    свежим чтением списка и ищется ПО СВОЕМУ id (тот, что клиент минтит при
+    создании), а не «последним в списке» — хвост списка не доказывает
+    авторство записи."""
     try:
         g = _guard_task_incl_completed(task_id, task_title or "", project_id)
         if g.status == "unavailable":
@@ -11439,18 +11572,42 @@ async def _add_task_comment_impl(task_title: str, text: str, project_id: str,
         if g.status == "mismatch":
             return (f"🛑 НЕ добавил комментарий — id это «{g.title}», а НЕ "
                     f"«{task_title}». Ничего не тронул.")
+        if g.status == "trashed":
+            return f"🛑 НЕ добавил комментарий — {g.message} Ничего не тронул."
         if g.status == "missing":
             return f"🛑 НЕ добавил комментарий — {g.message}. Ничего не тронул."
-        warn = ""
+        note = ""
         if g.status == "completed":
             # Комментировать завершённую задачу законно (дописать вывод,
             # отметить исход) — и название при этом СВЕРЕНО с живой записью,
             # так что это пометка о состоянии задачи, а не о пробеле в
-            # проверке.
-            warn = f"\n⚠️ {_COMPLETED_TASK_NOTE}."
-        await _run_blocking(lambda: ticktick_v2.add_task_comment(
-            g.project_id or project_id, task_id, text))
-        return f"Comment added to '{task_title}'.{warn}"
+            # проверке (значок ℹ️, см. _COMPLETED_TASK_NOTE).
+            note = f"\nℹ️ {_COMPLETED_TASK_NOTE}."
+        name = g.title or task_title
+        pid = g.project_id or project_id
+        created = await _run_blocking(
+            lambda: ticktick_v2.add_task_comment(pid, task_id, text))
+        new_id = (created or {}).get("id") if isinstance(created, dict) else None
+        # Post-verify отдельным чтением. Его собственный сбой — это НЕ провал
+        # операции: комментарий уже отправлен, поэтому здесь ⚠️ «исход не
+        # подтверждён» (настоящее сомнение проверки), а не ❌ и не «Error …»,
+        # которое читалось бы как «мутация не прошла».
+        try:
+            cms = await _run_blocking(
+                lambda: ticktick_v2.get_task_comments(pid, task_id))
+        except Exception as e:
+            logger.warning(f"add_task_comment: post-verify чтение не удалось: {e}")
+            return (f"⚠️ Комментарий отправлен в «{name}», но исход НЕ "
+                    f"ПОДТВЕРЖДЁН (перечитать комментарии не удалось: {e}) — "
+                    f"проверь вручную.{note}")
+        found = next((c for c in (cms or [])
+                      if (new_id and c.get("id") == new_id)
+                      or (not new_id and (c.get("title") or "") == text)), None)
+        if found is None:
+            return (f"❌ Комментарий к «{name}» после добавления НЕ найден в "
+                    f"свежем списке — исход не подтверждён, проверь "
+                    f"вручную.{note}")
+        return f"✅ Комментарий добавлен к «{name}» (проверено).{note}"
     except Exception as e:
         logger.error(f"Error in add_task_comment: {e}")
         return f"Error adding comment: {str(e)}"
@@ -11982,8 +12139,14 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
                             "остановит исполнение.")
         elif g.status == "missing":
             return f"🛑 План НЕ построен — {g.message}. Ничего не изменено."
+        elif g.status == "trashed":
+            # Политика класса для УДАЛЁННОЙ задачи — отказ на плане, до
+            # всякого согласия (см. _guard_task_incl_completed). Раньше
+            # такая задача проходила как открытая: `status` в корзине
+            # остаётся 0.
+            return f"🛑 План НЕ построен — {g.message} Ничего не изменено."
         elif g.status == "completed":
-            name_warning = f" ⚠️ {_COMPLETED_TASK_NOTE}."
+            name_warning = f" ℹ️ {_COMPLETED_TASK_NOTE}."
     params = {"task_title": task_title, "task_id": task_id, "project_id": project_id,
               "url": url, "content_base64": content_base64, "filename": filename}
     describe_fn = ((lambda p: _describe_attach_file_to_task(p) + name_warning)
@@ -12015,14 +12178,24 @@ async def _attach_file_to_task_impl(task_title: str, task_id: str, project_id: s
     if g.status == "mismatch":
         return (f"🛑 НЕ прикрепил — id это «{g.title}», а НЕ «{task_title}». "
                 "Ничего не тронул.")
+    if g.status == "trashed":
+        return f"🛑 НЕ прикрепил — {g.message} Ничего не тронул."
     if g.status == "missing":
         return f"🛑 НЕ прикрепил — {g.message}. Ничего не тронул."
-    warn = ""
+    note = ""
     if g.status == "completed":
-        warn = f"\n⚠️ {_COMPLETED_TASK_NOTE}."
+        note = f"\nℹ️ {_COMPLETED_TASK_NOTE}."
     try:
         pid = g.project_id or _resolve_project_id(task_id, project_id)
-        pre_count = len((pre.get(task_id) or {}).get("attachments") or [])
+        # Счётчик ДО — из источника, который знает задачу В ЕЁ состоянии.
+        # Для открытой это снимок открытых (уже прочитан, бесплатно), для
+        # завершённой — тот же слитый список вложений, которым их читает
+        # list_task_attachments.
+        if task_id in pre:
+            pre_atts = list((pre.get(task_id) or {}).get("attachments") or [])
+        else:
+            pre_atts = await _run_blocking(_attachments_any_state, task_id)
+        pre_count = len(pre_atts) if pre_atts is not None else None
         att = await _run_blocking(lambda: ticktick_v2.upload_attachment(
             pid, task_id, url=url, content_base64=content_base64, filename=filename))
         # The endpoint can return a 2xx with an empty body — don't fabricate
@@ -12042,14 +12215,33 @@ async def _attach_file_to_task_impl(task_title: str, task_id: str, project_id: s
                 marker, verify = ("⚠️",
                     " вложение НЕ видно на задаче — проверь вручную")
         else:
-            # Завершённая задача: снапшот открытых её не содержит, а
-            # источники, которые её знают, вложений не несут (официальный
-            # Open API не отдаёт `attachments`, а ленты completed/trash
-            # кэшируются) — поэтому здесь честное «не проверить», а не
-            # выдуманное «не видно». Маркер ⚠️ ставится ИМЕННО ПОЭТОМУ, а не
-            # из-за названия: оно теперь сверено (см. guard выше).
-            marker, verify = "⚠️", " (задача не среди открытых — вложение не проверить)"
-        return f"{marker} Прикреплён файл «{shown_name}» ({size_str}) к «{title}»{verify}{warn}"
+            # ЗАДАЧА НЕ СРЕДИ ОТКРЫТЫХ (завершена). Раньше здесь стояло
+            # честное на тот момент «вложение не проверить»: пост-проверка
+            # смотрела в выборку ОТКРЫТЫХ задач, где завершённой нет по
+            # определению. Но источник, знающий её вложения, существует и уже
+            # используется соседним инструментом — `list_task_attachments`
+            # читает ту же завершённую задачу и отдаёт её файлы без единой
+            # жалобы (`_merged_task_attachments` → `find_task_any_state`).
+            # Тот же корень, что чинили eee96d8/15898e6: источник для guard'а
+            # ≠ источник для ФАКТА, — здесь он не был доведён до третьего
+            # потребителя. Цена — те же 1-2 запроса, что платит чтение
+            # вложений, и только на этой ветке.
+            post_atts = await _run_blocking(_attachments_any_state, task_id)
+            if post_atts is None:
+                marker, verify = ("⚠️", " (перечитать вложения задачи не "
+                                        "удалось — проверь вручную)")
+            elif pre_count is not None and len(post_atts) > pre_count:
+                marker, verify = "✅", " (проверено: вложение видно на задаче)"
+            elif pre_count is None and any(
+                    (a.get("fileName") or a.get("name")) == shown_name
+                    for a in post_atts):
+                # Счётчика «до» нет (то чтение не удалось) — доказываем
+                # наличием файла С ЭТИМ ИМЕНЕМ, а не молчанием.
+                marker, verify = "✅", " (проверено: файл виден на задаче)"
+            else:
+                marker, verify = ("⚠️",
+                    " вложение НЕ видно на задаче — проверь вручную")
+        return f"{marker} Прикреплён файл «{shown_name}» ({size_str}) к «{title}»{verify}{note}"
     except Exception as e:
         logger.error(f"Error in attach_file_to_task: {e}")
         return f"Error attaching file: {str(e)}"
@@ -12088,6 +12280,25 @@ def _merged_task_attachments(task_id: str) -> List[Dict]:
             merged.append(dict(r))
             seen_ids.add(r["id"])
     return merged
+
+
+def _attachments_any_state(task_id: str) -> Optional[List[Dict]]:
+    """Вложения задачи В ЛЮБОМ ЕЁ СОСТОЯНИИ — или None, если прочитать не
+    удалось. Ровно `_merged_task_attachments`, только неудача чтения здесь не
+    исключение, а честное «не знаю».
+
+    Нужна пост-проверке `attach_file_to_task`: та смотрела в выборку ОТКРЫТЫХ
+    задач и поэтому на ЗАВЕРШЁННОЙ задаче всегда писала «вложение не
+    проверить» — хотя источник, знающий её файлы, тут же рядом и уже работает
+    (list_task_attachments читает ту же задачу без единой жалобы). Разделять
+    надо не «удалось/не удалось», а «не смогли прочитать» и «прочитали, файла
+    нет» — первое это ⚠️, второе это факт."""
+    try:
+        return _merged_task_attachments(task_id)
+    except Exception as e:
+        logger.warning(f"вложения задачи {str(task_id)[:8]}… прочитать не "
+                       f"удалось: {e}")
+        return None
 
 
 @mcp.tool(annotations=READONLY)
@@ -13053,8 +13264,14 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
                     "изменено.")
         elif g.status == "missing":
             return f"🛑 План НЕ построен — {g.message}. Ничего не изменено."
+        elif g.status == "trashed":
+            # Политика класса для УДАЛЁННОЙ задачи — отказ на плане, до
+            # всякого согласия (см. _guard_task_incl_completed). Раньше
+            # такая задача проходила как открытая: `status` в корзине
+            # остаётся 0.
+            return f"🛑 План НЕ построен — {g.message} Ничего не изменено."
         elif g.status == "completed":
-            name_warning = f" ⚠️ {_COMPLETED_TASK_NOTE}."
+            name_warning = f" ℹ️ {_COMPLETED_TASK_NOTE}."
         elif g.status == "unavailable":
             name_warning = (" ⚠️ Задачу НЕ удалось сверить с живым "
                             "состоянием (чтение не удалось) — сверка "
@@ -13088,9 +13305,11 @@ async def _duplicate_task_impl(summary: str, task_id: str, task_title: str = Non
     if g.status == "mismatch":
         return (f"🛑 НЕ дублировал — id это «{g.title}», а НЕ «{task_title}». "
                 "Ничего не тронул.")
+    if g.status == "trashed":
+        return f"🛑 НЕ дублировал — {g.message} Ничего не тронул."
     if g.status == "missing":
         return f"🛑 НЕ дублировал — {g.message}. Ничего не тронул."
-    warn = f"\n⚠️ {_COMPLETED_TASK_NOTE}." if g.status == "completed" else ""
+    warn = f"\nℹ️ {_COMPLETED_TASK_NOTE}." if g.status == "completed" else ""
     title = title if title != f"[task {task_id[:8]}…]" else (g.title or title)
     try:
         copy = await _run_blocking(lambda: ticktick_v2.duplicate_task(task_id))
@@ -13117,7 +13336,11 @@ async def _duplicate_task_impl(summary: str, task_id: str, task_title: str = Non
         else:
             verdict = (f"✅ Дублировано (проверено): «{title}» → копия "
                        f"«{copy.get('title') or title}»")
-        return (verdict + warn + "\n⚠️ В копию НЕ переносятся: чек-лист (items), "
+        # ℹ️, а не ⚠️: это ФАКТ о продукте копирования, известный заранее и
+        # проверке не противоречащий. Пока он нёс ⚠️, `_EXEC_WARN_MARKERS`
+        # понижал по нему вердикт КАЖДОГО успешного дублирования до
+        # «⚠️ подтверждено частично» — оговорка стоила операции её «✅».
+        return (verdict + warn + "\nℹ️ В копию НЕ переносятся: чек-лист (items), "
                 "kanban-раздел (column) и привязка к родителю.\n"
                 + _report_line(rid))
     except Exception as e:
@@ -13213,8 +13436,14 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
                             "остановит исполнение.")
         elif g.status == "missing":
             return f"🛑 План НЕ построен — {g.message}. Ничего не изменено."
+        elif g.status == "trashed":
+            # Политика класса для УДАЛЁННОЙ задачи — отказ на плане, до
+            # всякого согласия (см. _guard_task_incl_completed). Раньше
+            # такая задача проходила как открытая: `status` в корзине
+            # остаётся 0.
+            return f"🛑 План НЕ построен — {g.message} Ничего не изменено."
         elif g.status == "completed":
-            name_warning = f" ⚠️ {_COMPLETED_TASK_NOTE}."
+            name_warning = f" ℹ️ {_COMPLETED_TASK_NOTE}."
     params = {"task_title": task_title, "text": text, "project_id": project_id,
               "task_id": task_id, "comment_id": comment_id}
     describe_fn = ((lambda p: _describe_update_task_comment(p) + name_warning)
@@ -13239,6 +13468,8 @@ async def _update_task_comment_impl(task_title: str, text: str, project_id: str,
         if g.status == "mismatch":
             return (f"🛑 НЕ изменил комментарий — id это «{g.title}», а НЕ "
                     f"«{task_title}». Ничего не тронул.")
+        if g.status == "trashed":
+            return f"🛑 НЕ изменил комментарий — {g.message} Ничего не тронул."
         if g.status == "missing":
             return f"🛑 НЕ изменил комментарий — {g.message}. Ничего не тронул."
         pid = g.project_id or project_id
@@ -13260,7 +13491,7 @@ async def _update_task_comment_impl(task_title: str, text: str, project_id: str,
         # требует от ✅. Пометка про завершённость — это факт о состоянии
         # задачи, а не пробел в проверке (раньше здесь стояло «название НЕ
         # проверено», и это была правда лишь потому, что проверку не делали).
-        warn = f"\n⚠️ {_COMPLETED_TASK_NOTE}." if g.status == "completed" else ""
+        warn = f"\nℹ️ {_COMPLETED_TASK_NOTE}." if g.status == "completed" else ""
         return f"✅ Комментарий на «{task_title}» обновлён (проверено).{warn}"
     except Exception as e:
         logger.error(f"Error in update_task_comment: {e}")
@@ -13341,8 +13572,14 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str,
                             "остановит исполнение.")
         elif g.status == "missing":
             return f"🛑 План НЕ построен — {g.message}. Ничего не изменено."
+        elif g.status == "trashed":
+            # Политика класса для УДАЛЁННОЙ задачи — отказ на плане, до
+            # всякого согласия (см. _guard_task_incl_completed). Раньше
+            # такая задача проходила как открытая: `status` в корзине
+            # остаётся 0.
+            return f"🛑 План НЕ построен — {g.message} Ничего не изменено."
         elif g.status == "completed":
-            name_warning = f" ⚠️ {_COMPLETED_TASK_NOTE}."
+            name_warning = f" ℹ️ {_COMPLETED_TASK_NOTE}."
     params = {"task_title": task_title, "project_id": project_id,
               "task_id": task_id, "comment_id": comment_id}
     describe_fn = ((lambda p: _describe_delete_task_comment(p) + name_warning)
@@ -13367,6 +13604,8 @@ async def _delete_task_comment_impl(task_title: str, project_id: str,
         if g.status == "mismatch":
             return (f"🛑 НЕ удалил комментарий — id это «{g.title}», а НЕ "
                     f"«{task_title}». Ничего не тронул.")
+        if g.status == "trashed":
+            return f"🛑 НЕ удалил комментарий — {g.message} Ничего не тронул."
         if g.status == "missing":
             return f"🛑 НЕ удалил комментарий — {g.message}. Ничего не тронул."
         pid = g.project_id or project_id
@@ -13382,7 +13621,7 @@ async def _delete_task_comment_impl(task_title: str, project_id: str,
             return (f"❌ Комментарий на '{task_title}' ВСЁ ЕЩЁ существует — "
                     "удаление не сработало.")
         # См. тот же комментарий про маркер в _update_task_comment_impl выше.
-        warn = f"\n⚠️ {_COMPLETED_TASK_NOTE}." if g.status == "completed" else ""
+        warn = f"\nℹ️ {_COMPLETED_TASK_NOTE}." if g.status == "completed" else ""
         return f"✅ Комментарий на «{task_title}» удалён (проверено).{warn}"
     except Exception as e:
         logger.error(f"Error in delete_task_comment: {e}")
@@ -15989,9 +16228,29 @@ _VERIFY_TOTALS_RE = re.compile(
     re.MULTILINE)
 
 # Маркеры в тексте САМОГО исполнителя (у него уже есть свой read-back).
-# Явный провал: 🛑 / «Ошибка» / «НЕ удалено». Частичный успех/сомнение:
-# ⚠️ / ⏭ / «не подтверждён» (последнее — из _UNVERIFIED_MSG и родственных).
-_EXEC_FAILURE_MARKERS = ("🛑", "Ошибка", "ошибка при", "НЕ удалено", "не удалено")
+# Явный провал: 🛑 / «Ошибка» / «Error …» / «НЕ удалено». Частичный
+# успех/сомнение: ⚠️ / ⏭ / «не подтверждён» (последнее — из _UNVERIFIED_MSG
+# и родственных).
+#
+# ℹ️ ЗДЕСЬ НЕТ И НЕ ДОЛЖНО БЫТЬ (2026-08-07). Это второй канал самоотчёта —
+# ФАКТ о состоянии объекта или о продукте операции («задача завершена»,
+# «в копию не переносится чек-лист»), который проверке не противоречит и
+# вердикт понижать не имеет права. Пока такие факты носили ⚠️, каждая
+# честная оговорка исполнителя стоила ему собственного «✅»: успешная
+# операция над завершённой задачей приходила владельцу как
+# «❓ НЕ подтверждено» — ровно так же, как упавшая. См. _COMPLETED_TASK_NOTE.
+#
+# «Error » (2026-08-07, та же живая приёмка). Русское «Ошибка» здесь стояло
+# с самого начала, но КАЖДАЯ except-ветка мутаторов этого файла печатает
+# английское `f"Error <verb>ing …: {e}"` — то есть ровно та же мысль
+# («операция упала») этими маркерами не ловилась, и упавший инструмент
+# получал не "failed", а "unverified", неотличимый от успеха, который просто
+# нечем перепроверить. Ложное срабатывание на слове «Error» внутри НАЗВАНИЯ
+# задачи ограничено вторым условием ветки `exec_failed` — в самоотчёте не
+# должно быть НИ ОДНОГО ✅, а успешный отчёт по стандарту начинается именно
+# с него.
+_EXEC_FAILURE_MARKERS = ("🛑", "Ошибка", "ошибка при", "Error ",
+                         "НЕ удалено", "не удалено")
 _EXEC_WARN_MARKERS = ("⚠️", "⚠", "⏭", "не подтверждён", "не подтверждена",
                       "НЕ ПОДТВЕРЖДЁН", "не подтвердилось")
 
