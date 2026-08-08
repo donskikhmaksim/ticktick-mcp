@@ -866,22 +866,29 @@ def _open_by_id(fresh: bool = False) -> Optional[Dict[str, Dict]]:
 # остаётся таким же, как был) и только как ДОПОЛНИТЕЛЬНЫЙ источник данных:
 # сама сверка id/названия/контейнера (_guard_task ниже) не меняется — меняется
 # только СПОСОБ добыть объект для этой сверки.
-def _official_task_snapshot(project_id: str, task_id: str) -> Optional[Dict]:
-    """Single-task fallback read via the OFFICIAL Open API (`GET
-    /project/{projectId}/task/{taskId}`) — used by the identity guard ONLY
-    when the v2 open-task snapshot didn't have the task. Requires the
-    CURRENT project_id (the official endpoint 404s on a stale one, which is
-    fine: that's the same "can't confirm" outcome the caller already handles
-    as missing/mismatch).
+def _official_task_read(project_id: str, task_id: str) -> Optional[Dict]:
+    """Single-task point read via the OFFICIAL Open API (`GET
+    /project/{projectId}/task/{taskId}`), WHATEVER the task's status —
+    the raw "does this id name a real task, and which one" question.
 
-    Returns a dict shaped like a v2 task ({id, title, projectId, status, …})
-    on success. Returns None on ANY failure: no official client configured,
-    no project_id given, a network/HTTP error, a 404 (wrong container or
-    truly gone), an id that doesn't match, or a task that exists but is no
-    longer OPEN (completed/won't-do) — the OPEN restriction mirrors what
-    _open_by_id already enforces via get_open_tasks(), so this fallback
-    can't accidentally make the guard MORE permissive than the primary path,
-    only more resilient to the primary path's staleness."""
+    Requires the CURRENT project_id (the official endpoint 404s on a stale
+    one). Returns a dict shaped like a v2 task ({id, title, projectId,
+    status, …}) on success, None on ANY failure: no official client
+    configured, no project_id given, a network/HTTP error, a 404 (wrong
+    container or truly gone), or an id that doesn't match what was asked
+    for (the same invariant `_identity_or_refusal` enforces: an object
+    whose id isn't the requested one can never answer FOR it).
+
+    NOTE the deliberate absence of a status filter here. Two DIFFERENT
+    questions used to share one function, and that was defect №1 (live
+    acceptance 2026-08-07): "may I touch this?" (identity guard — completed
+    tasks are out of the OPEN pool by policy, see _official_task_snapshot
+    right below) versus "what is this called?" (display — a completed
+    task's name is perfectly well known and refusing to print it protects
+    nobody). For a guard an empty answer means «I won't risk it»; for a
+    display path it means «I don't know». One function cannot serve both,
+    so it no longer does: guards go through _official_task_snapshot, which
+    keeps the OPEN restriction; display goes through this one."""
     if not ticktick or not project_id or not task_id:
         return None
     try:
@@ -891,6 +898,25 @@ def _official_task_snapshot(project_id: str, task_id: str) -> Optional[Dict]:
     if not isinstance(t, dict) or "error" in t:
         return None
     if t.get("id") != task_id:
+        return None
+    return t
+
+
+def _official_task_snapshot(project_id: str, task_id: str) -> Optional[Dict]:
+    """Single-task fallback read via the OFFICIAL Open API — used by the
+    identity guard ONLY when the v2 open-task snapshot didn't have the task.
+    Thin OPEN-only wrapper over `_official_task_read` above.
+
+    Returns a dict shaped like a v2 task on success, and None on everything
+    `_official_task_read` rejects PLUS one more case: a task that exists but
+    is no longer OPEN (completed/won't-do). That OPEN restriction mirrors
+    what _open_by_id already enforces via get_open_tasks(), so this fallback
+    can't accidentally make the guard MORE permissive than the primary path,
+    only more resilient to the primary path's staleness. It is a guard
+    policy, NOT a fact about the data — anything that merely needs to NAME
+    the task must call `_official_task_read` instead."""
+    t = _official_task_read(project_id, task_id)
+    if t is None:
         return None
     if t.get("status", 0) != 0:
         return None  # completed / won't-do — not part of the OPEN pool
@@ -942,14 +968,25 @@ def _live_task_title(task_id: str, project_id: str = "") -> Optional[str]:
     если задачи там нет — одно точечное чтение официального API, и только
     когда известен project_id. Полного скана аккаунта (_official_task_scan,
     запрос на каждый проект) здесь НЕТ намеренно: он оправдан для guard'а,
-    решающего «трогать или нет», а не для строчки в превью."""
+    решающего «трогать или нет», а не для строчки в превью.
+
+    Точечное чтение идёт через `_official_task_read` — БЕЗ фильтра «только
+    открытые». Дефект №1 (живая приёмка 2026-08-07) был ровно в том, что
+    здесь звался `_official_task_snapshot`, у которого этот фильтр есть по
+    guard-политике: две карточки, отличавшиеся ТОЛЬКО статусом задачи,
+    давали «в задачу «__AUTOTEST__upd-B1» (id …)» для открытой и «в задачу
+    id 6a7571238f0854e347f51407 — ⚠️ НАЗВАНИЕ ЗАДАЧИ УСТАНОВИТЬ НЕ УДАЛОСЬ»
+    для завершённой. Имя завершённой задачи известно, и отказ его печатать
+    не защищал ничего — он лишь прятал от подтверждающего, КУДА ляжет файл.
+    Ветка «имя не установить» осталась на месте для настоящих случаев:
+    задачи нет вовсе, или чтение недоступно."""
     try:
         by_id = _open_by_id(fresh=False)
     except Exception:
         by_id = None
     live = (by_id or {}).get(task_id)
     if not live and project_id:
-        live = _official_task_snapshot(project_id, task_id)
+        live = _official_task_read(project_id, task_id)
     return ((live or {}).get("title") or "").strip() or None
 
 

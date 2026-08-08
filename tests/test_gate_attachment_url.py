@@ -422,7 +422,7 @@ async def test_preview_says_out_loud_when_the_task_name_is_unknown(monkeypatch):
     и показать id, по которому человек хотя бы поймёт, что сверять нечего."""
     _wire(monkeypatch)
     monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
-    monkeypatch.setattr(s, "_official_task_snapshot", lambda pid, tid: None)
+    monkeypatch.setattr(s, "_official_task_read", lambda pid, tid: None)
 
     preview = await s.create_attachment_upload_url(**KWARGS)
 
@@ -439,7 +439,7 @@ async def test_bearer_warning_survives_in_both_branches(monkeypatch):
     named = await s.create_attachment_upload_url(**KWARGS)
 
     monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
-    monkeypatch.setattr(s, "_official_task_snapshot", lambda pid, tid: None)
+    monkeypatch.setattr(s, "_official_task_read", lambda pid, tid: None)
     unnamed = await s.create_attachment_upload_url(**KWARGS)
 
     for preview in (named, unnamed):
@@ -450,10 +450,18 @@ async def test_bearer_warning_survives_in_both_branches(monkeypatch):
 async def test_task_name_lookup_falls_back_to_the_official_point_read(monkeypatch):
     """Завершённой/не попавшей в v2-снапшот задачи нет в _open_by_id — но
     точечное чтение официального API её знает. Полного скана аккаунта здесь
-    НЕ делаем намеренно: карточке нужно имя, а не обход всех проектов."""
+    НЕ делаем намеренно: карточке нужно имя, а не обход всех проектов.
+
+    ПОДМЕНЯЕТСЯ `_official_task_read` (сырое чтение), а НЕ
+    `_official_task_snapshot` (guard-политика «только открытые»). До
+    2026-08-07 здесь стоял второй — и именно поэтому дефект №1 прожил до
+    прода: подменённый снапшот отдавал задачу в тесте, а боевой отбрасывал
+    её по статусу, так что тест утверждал не то, что делает код. Сквозная
+    проверка на настоящих клиентах — tests/test_completed_task_display_name.py
+    (там не подменяется ни одна из этих функций)."""
     _wire(monkeypatch)
     monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: {})
-    monkeypatch.setattr(s, "_official_task_snapshot",
+    monkeypatch.setattr(s, "_official_task_read",
                         lambda pid, tid: dict(LIVE_TASK) if tid == TASK_ID else None)
 
     preview = await s.create_attachment_upload_url(**KWARGS)
@@ -469,7 +477,7 @@ async def test_task_name_lookup_never_breaks_the_tool(monkeypatch):
     def _boom(fresh=False):
         raise RuntimeError("v2 упал")
     monkeypatch.setattr(s, "_open_by_id", _boom)
-    monkeypatch.setattr(s, "_official_task_snapshot", lambda pid, tid: None)
+    monkeypatch.setattr(s, "_official_task_read", lambda pid, tid: None)
 
     preview = await s.create_attachment_upload_url(**KWARGS)
 
