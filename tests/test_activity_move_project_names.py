@@ -80,6 +80,29 @@ async def test_unresolvable_project_says_so_out_loud(activity_stand):
         f"неудачный резолвинг остался молчаливым:\n{move_line}")
 
 
+async def test_get_changes_says_out_loud_when_a_project_name_is_unknown(monkeypatch):
+    """Тот же инвариант в СОСЕДНЕЙ функции (найдено при проверке пункта 4).
+
+    `get_changes` имена резолвит (это и был образец для фикса выше), но при
+    ПРОМАХЕ печатает голый id молча: `names.get(pid, pid or "?")`. Читается
+    это как «проект называется 6a20work», то есть ровно та же неотличимость
+    «не знаю» от «вот название», из-за которой и заводился фикс №3."""
+    ghost_task = {"id": "6a77ghost", "projectId": GHOST_PROJECT,
+                  "title": "Задача в неизвестном проекте", "status": 0,
+                  "priority": 0,
+                  "createdTime": rs._stamp(rs.TODAY),
+                  "modifiedTime": rs._stamp(rs.TODAY)}
+    rs.wire(monkeypatch, state=rs.build_state(tasks=[ghost_task]))
+
+    out = await rs.call("get_changes", since=rs.TODAY.strftime("%Y-%m-%d"))
+
+    line = next(ln for ln in out.splitlines()
+                if "Задача в неизвестном проекте" in ln)
+    assert GHOST_PROJECT in line, line
+    assert "имя неизвестно" in line.lower(), (
+        f"неизвестное имя проекта напечатано молча:\n{line}")
+
+
 async def test_other_events_unchanged(activity_stand):
     """Контроль: остальные события ленты этой правкой не задеты."""
     activity_stand(list(rs.ACTIVITY))

@@ -13803,7 +13803,13 @@ async def get_changes(since: str, until: str = None,
         names = _v2_project_names()
 
         def pname(pid):
-            return names.get(pid, pid or "?")
+            # При промахе печатался ГОЛЫЙ id — и читался как название
+            # проекта. Тот же класс, что дефект №3 в get_task_activity
+            # (найдено при его разборе): у отображающего пути пустой ответ
+            # значит «не знаю», и это надо произнести, а не выдать id за имя.
+            if not pid:
+                return "проект не указан"
+            return names.get(pid) or f"{pid} — имя неизвестно"
 
         _COMPLETED_SRC_CAP, _TRASH_SRC_CAP = 100, 300
         open_tasks = await _run_blocking(lambda: ticktick_v2.get_open_tasks())
