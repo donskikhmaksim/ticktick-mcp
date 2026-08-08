@@ -1048,6 +1048,31 @@ def _live_task_title(task_id: str, project_id: str = "") -> Optional[str]:
     return ((live or {}).get("title") or "").strip() or None
 
 
+def _locate_task_any_state(task_id: str) -> Tuple[Optional[Dict], Optional[str], bool]:
+    """ГДЕ задача сейчас — по всем трём лентам v2: (задача, где, прочиталось).
+
+    `где` ∈ {"open", "completed", "trash", None}; третий элемент — УДАЛОСЬ ЛИ
+    ВООБЩЕ ПРОЧИТАТЬ. Это разные вещи, и путать их нельзя: (None, None, True)
+    значит «искали везде и не нашли», а (None, None, False) — «спросить не
+    получилось». Первое имеет право стать ❌, второе — только ⚠️ «не
+    подтверждено».
+
+    Нужно там, где «нет среди открытых» НЕ равно «операция провалилась»:
+    задача, завершённая ДО удаления, возвращается из корзины ЗАВЕРШЁННОЙ и в
+    снимок открытых (/batch/check/0) не попадает никогда — пост-проверка,
+    которая смотрит только туда, называла успешное восстановление
+    «❌ НЕ восстановлено» (живая приёмка 2026-08-07)."""
+    if not ticktick_v2:
+        return None, None, False
+    try:
+        found, where = ticktick_v2.find_task_any_state(task_id)
+        return found, where, True
+    except Exception as e:
+        logger.warning(f"не удалось определить состояние задачи "
+                       f"{str(task_id)[:8]}…: {e}")
+        return None, None, False
+
+
 # Сколько раз и с какой паузой повторно перечитывать живое состояние ПОСЛЕ
 # identity-changing мутации (меняет проект/родителя/группу задачи —
 # move_tasks, set_task_parent, unset_task_parent, move_project_to_group,
@@ -5496,8 +5521,35 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         # «вернулась, но не туда» — это именно ⚠️/"warn", то самое
         # расхождение, потеря которого и была багом «расхождений: 0».
         if not live:
-            return ("bad", f"- ❌ **«{title}»** — НЕ появилась среди открытых "
-                    "(восстановление не подтвердилось)")
+            # «Нет среди открытых» — ещё не провал. Задача, завершённая ДО
+            # удаления, возвращается из корзины ЗАВЕРШЁННОЙ, и в снимке
+            # открытых её не будет никогда: прежний безусловный ❌ здесь был
+            # красным вердиктом об удавшейся операции (живая приёмка
+            # 2026-08-07). Спрашиваем те же три ленты, что и identity-guard
+            # самого restore_tasks, — включая КОРЗИНУ, по которой только и
+            # видно настоящий провал «так и не восстановилась».
+            found, where, readable = _locate_task_any_state(tid)
+            if not readable:
+                return ("warn", f"- ⚠️ **«{title}»** — среди открытых нет, а "
+                        "проверить остальные состояния не удалось (чтение не "
+                        "прошло): исход НЕ ПОДТВЕРЖДЁН")
+            if where == "trash":
+                return ("bad", f"- ❌ **«{title}»** — ВСЁ ЕЩЁ В КОРЗИНЕ "
+                        "(восстановление не состоялось)")
+            if where != "completed":
+                return ("bad", f"- ❌ **«{title}»** — не найдена нигде: ни "
+                        "среди открытых, ни среди завершённых, ни в корзине "
+                        "(восстановление не подтвердилось)")
+            want_pid = exp.get("projectId")
+            got_pid = (found or {}).get("projectId")
+            if want_pid and got_pid != want_pid:
+                return ("warn", f"- ⚠️ **«{title}»** — восстановлена, но "
+                        "вернулась ЗАВЕРШЁННОЙ и лежит в «"
+                        f"{names.get(got_pid, got_pid)}», а не в «"
+                        f"{names.get(want_pid, want_pid)}» (не тот список)")
+            return ("ok", f"- ✅ **«{title}»** — восстановлена; вернулась "
+                    "ЗАВЕРШЁННОЙ (потому её и нет среди открытых), в нужном "
+                    "списке")
         want_pid = exp.get("projectId")
         if want_pid and live.get("projectId") != want_pid:
             return ("warn", f"- ⚠️ **«{title}»** — среди открытых, но в «"
@@ -11500,7 +11552,12 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
         # фикс, идёт в вывод как расхождение — никогда молча как успех.
         names = _v2_project_names()
         restored, unknown_dest, failed = [], [], []
+        # Вернулись, но ЗАВЕРШЁННЫМИ (были завершены до удаления): успех,
+        # который нельзя ни назвать провалом, ни свалить в общую кучу с
+        # «снова среди открытых» — статус обязан быть назван вслух.
+        restored_completed: List[str] = []
         wrong_project = []  # [(title, want_pid, got_pid)] — так и не туда даже после фикса
+        wrong_project_completed: List[Tuple[str, str, str]] = []  # то же, но для вернувшихся завершёнными
         unverified = False
         if ok_items:
             # Retried re-read (see _reread_open_until / _POSTVERIFY_RETRY_*):
@@ -11519,6 +11576,43 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
                 to_fix = []
                 for i in ok_items:
                     live = fresh.get(i["taskId"])
+                    if live is None and i["taskId"] not in api_fail:
+                        # НЕ провал сам по себе. Задача, завершённая ДО
+                        # удаления, возвращается из корзины ЗАВЕРШЁННОЙ — в
+                        # снимке открытых её не будет никогда, сколько ни
+                        # перечитывай. Прежний код объявлял такой исход
+                        # «❌ НЕ восстановлено», хотя операция УДАЛАСЬ (живая
+                        # приёмка 2026-08-07): человек получал красный
+                        # вердикт и шёл перепроверять руками то, что
+                        # сработало. Спрашиваем ровно те же три ленты, что
+                        # уже спрашивает identity-guard в начале этой же
+                        # функции, — и КОРЗИНУ в том числе: только по ней
+                        # видно настоящий провал.
+                        found, where, readable = _locate_task_any_state(i["taskId"])
+                        if not readable:
+                            unverified = True
+                            continue
+                        if where == "completed":
+                            got_pid = (found or {}).get("projectId")
+                            if not i["want_pid"]:
+                                unknown_dest.append(i["title"])
+                            elif got_pid != i["want_pid"]:
+                                # Починочное перемещение здесь НЕ делается
+                                # намеренно: перемещать завершённую задачу
+                                # этим сырым вызовом живьём не проверено, а
+                                # выдавать непроверенное за исправленное —
+                                # тот же дефект наизнанку. Расхождение
+                                # называется вслух — отдельным списком,
+                                # потому что формулировка соседнего («и
+                                # попытка переместить не помогла») тут была
+                                # бы ложью: попытки не было.
+                                wrong_project_completed.append(
+                                    (i["title"], i["want_pid"], got_pid))
+                            else:
+                                restored_completed.append(i["title"])
+                            continue
+                        failed.append(i["title"])
+                        continue
                     if live is None or i["taskId"] in api_fail:
                         failed.append(i["title"])
                     elif not i["want_pid"]:
@@ -11580,6 +11674,11 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
             lines.append(f"↩ Восстановлено из корзины {len(restored)} "
                          "(проверено — снова среди открытых, в нужном "
                          "списке): " + ", ".join(f"«{t}»" for t in restored))
+        if restored_completed:
+            lines.append(f"↩ Восстановлено из корзины {len(restored_completed)} "
+                         "(проверено — вернулись ЗАВЕРШЁННЫМИ, поэтому их нет "
+                         "среди открытых; список нужный): "
+                         + ", ".join(f"«{t}»" for t in restored_completed))
         if unverified:
             lines.append(f"Восстановление {len(ok_items)} отправлено, но "
                          f"{_UNVERIFIED_MSG}")
@@ -11590,6 +11689,13 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
                     for t, want, got in wrong_project]
             lines.append("⚠️ Восстановлено НЕ в исходный/запрошенный список "
                         f"{len(wrong_project)}: " + "; ".join(parts))
+        if wrong_project_completed:
+            parts = [f"«{t}» — вернулась ЗАВЕРШЁННОЙ и лежит в "
+                     f"«{names.get(got, got)}», а не в «{names.get(want, want)}» "
+                     "(перемещать завершённую сервер не пробовал)"
+                     for t, want, got in wrong_project_completed]
+            lines.append("⚠️ Восстановлено НЕ в исходный/запрошенный список "
+                         f"{len(wrong_project_completed)}: " + "; ".join(parts))
         if unknown_dest:
             lines.append(f"⚠️ Восстановлено {len(unknown_dest)}, но исходный "
                         "список не удалось определить из записи в корзине — "

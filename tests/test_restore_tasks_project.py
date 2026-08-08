@@ -21,6 +21,7 @@ TickTick /trash/restore проходил полностью незамеченн
 import json
 
 import ticktick_mcp.src.server as s
+from tests import read_stand as stand
 
 
 class _FakeV2Restore:
@@ -315,12 +316,36 @@ def test_verify_item_confirms_restore_in_correct_project():
     assert "нужном списке" in line
 
 
-def test_verify_item_restore_not_reappeared_is_still_a_plain_failure():
+def test_verify_item_restore_not_reappeared_is_still_a_plain_failure(monkeypatch):
+    """Задачи нет НИГДЕ — ни среди открытых, ни среди завершённых, ни в
+    корзине: это по-прежнему ❌.
+
+    Тест переписан 2026-08-07 вместе с фиксом «восстановление рапортует
+    „не восстановлено" об успехе»: «нет среди открытых» само по себе больше
+    не приговор (завершённая задача возвращается из корзины завершённой и в
+    открытых не появляется НИКОГДА), поэтому проверка теперь идёт против
+    живого состояния, а не против пустого словаря открытых. Приговор здесь
+    выносится по РЕЗУЛЬТАТУ поиска во всех трёх лентах."""
     names = {"p1": "Работа"}
     item = {"taskId": "t1", "title": "Купить молоко", "expect": {"projectId": "p1"}}
+    stand.wire(monkeypatch, v2_kwargs={"trash": [], "completed": []})
 
     status, line = s._verify_item("restore", item, {}, names)
 
     assert status == "bad"
     assert "❌" in line
     assert "не подтвердилось" in line
+
+
+def test_verify_item_restore_says_unverified_when_state_cannot_be_read(monkeypatch):
+    """А вот когда живое состояние прочитать НЕ УДАЛОСЬ — вердикт ⚠️ «не
+    подтверждено», не ❌: «не смогли проверить» и «операция провалилась» —
+    разные вещи (та же политика, что у ветки delete_project выше)."""
+    names = {"p1": "Работа"}
+    item = {"taskId": "t1", "title": "Купить молоко", "expect": {"projectId": "p1"}}
+    monkeypatch.setattr(s, "ticktick_v2", None)
+
+    status, line = s._verify_item("restore", item, {}, names)
+
+    assert status == "warn"
+    assert "НЕ ПОДТВЕРЖДЁН" in line
