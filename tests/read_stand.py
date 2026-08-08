@@ -227,10 +227,19 @@ MEMBERS = [
      "accepted": True},
 ]
 
+# Комментарии задачи TASK_ROOT. Проверяемый в тестах COMMENT_ID стоит НЕ
+# последним намеренно: пост-проверка, которая смотрит только на хвост списка
+# (`cms[-1]`), обязана падать, а не проходить по совпадению позиции.
 COMMENTS = [
+    {"id": "cmt-9000", "title": "Начал собирать",
+     "userProfile": {"displayName": "Максим"},
+     "createdTime": _stamp(TODAY - timedelta(days=2))},
     {"id": COMMENT_ID, "title": "Цифры будут в пятницу",
      "userProfile": {"displayName": "Ирина"},
      "createdTime": _stamp(TODAY - timedelta(days=1))},
+    {"id": "cmt-9002", "title": "Жду ответа бухгалтерии",
+     "userProfile": {"displayName": "Максим"},
+     "createdTime": _stamp(TODAY)},
 ]
 
 ACTIVITY = [
@@ -261,7 +270,15 @@ class _V2Transport:
         self.trash = list(TRASHED if trash is None else trash)
         self.activity = list(ACTIVITY if activity is None else activity)
         self.members = list(MEMBERS if members is None else members)
-        self.comments = list(COMMENTS if comments is None else comments)
+        # Комментарии живут ПО ПАРЕ (проект, задача) — как у живого API, где
+        # путь несёт оба идентификатора. Раньше это был один плоский список,
+        # отдаваемый ровно для (P_WORK, TASK_ROOT); из-за этого запись
+        # комментария не могла быть проверена чтением: POST уходил «в
+        # никуда», а GET возвращал заготовку. Пишущие эндпоинты обязаны жить
+        # в том же снимке, что читают читающие (см. /batch/tag ниже).
+        self.comments_by_task = {
+            (P_WORK, TASK_ROOT): list(COMMENTS if comments is None else comments)
+        }
         self.columns = list(COLUMNS if columns is None else columns)
         self.checkins = list(CHECKINS if checkins is None else checkins)
         self.statistics = dict(STATISTICS if statistics is None else statistics)
@@ -287,8 +304,11 @@ class _V2Transport:
             # сдвинуть границу на день, иначе запрошенный день теряется.
             rows = [c for c in self.checkins if int(c["checkinStamp"]) > after]
             return {"checkins": {hid: rows for hid in (body.get("habitIds") or [])}}
-        if path == f"/project/{P_WORK}/task/{TASK_ROOT}/comments":
-            return list(self.comments)
+        if path.endswith("/comments") and path.startswith("/project/"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 5 and parts[2] == "task":
+                # Пары нет вовсе → пустой список, как у живого API.
+                return list(self.comments_by_task.get((parts[1], parts[3]), []))
         if path == f"/project/{P_WORK}/shares":
             return list(self.members)
         if path == "/statistics/general":
@@ -296,9 +316,6 @@ class _V2Transport:
         if path == f"/column/project/{P_WORK}":
             return list(self.columns)
         if path.startswith("/column/project/"):
-            return []
-        if path.endswith("/comments"):
-            # Существующий проект/задача, но пары такой нет — как у живого API.
             return []
         # ── ЗАПИСЬ ──────────────────────────────────────────────────────────
         # Пишущие эндпоинты живут в ТОМ ЖЕ снимке, что читают читающие: тег,
@@ -363,7 +380,40 @@ class _V2Transport:
                         if t.get("id") == r.get("taskId"):
                             t["projectId"] = r.get("toProjectId")
             return {}
+        # Комментарии: создать / изменить / удалить. Всё в том же хранилище,
+        # из которого читает GET .../comments выше, — иначе пост-проверка
+        # («комментарий виден в свежем списке») подтверждалась бы двойником.
+        parts = path.strip("/").split("/")
+        if (method == "POST" and len(parts) == 5 and parts[0] == "project"
+                and parts[2] == "task" and parts[4] == "comment"):
+            row = dict(body)
+            row.setdefault("userProfile", {"displayName": "Максим"})
+            self.comments_by_task.setdefault((parts[1], parts[3]), []).append(row)
+            return dict(row)
+        if (len(parts) == 6 and parts[0] == "project" and parts[2] == "task"
+                and parts[4] == "comment"):
+            key, cid = (parts[1], parts[3]), parts[5]
+            rows = self.comments_by_task.setdefault(key, [])
+            if method == "PUT":
+                for i, c in enumerate(rows):
+                    if c.get("id") == cid:
+                        rows[i] = dict(body)
+                return {}
+            if method == "DELETE":
+                rows[:] = [c for c in rows if c.get("id") != cid]
+                return {}
         raise AssertionError(f"стенд не знает пути v2: {method} {path} {kwargs}")
+
+    def _task_anywhere(self, task_id):
+        """Задача из ЛЮБОЙ из трёх лент — тот же поиск, что делает
+        find_task_any_state, но по снимку стенда."""
+        pools = (self.state.get("syncTaskBean", {}).get("update", []),
+                 self.completed, self.trash)
+        for pool in pools:
+            for t in pool:
+                if t.get("id") == task_id:
+                    return t
+        return None
 
     # ---- лента активности ходит мимо _request, через session.get ----
     def session_get(self, url, params=None, timeout=None):
@@ -382,6 +432,36 @@ class _V2Transport:
                 return None
 
         del outer
+        return _Resp()
+
+    # ---- загрузка вложения тоже идёт мимо _request, через session.post ----
+    def session_post(self, url, files=None, headers=None, timeout=None):
+        """POST …/attachment/upload/{projectId}/{taskId}/{attachmentId}.
+
+        Кладёт файл В ТУ ЖЕ задачу, где она лежит — открытую, завершённую или
+        корзинную. Именно это делает пост-проверку вложения настоящей: если
+        код смотрит не туда, где живёт задача, он не увидит файла, который
+        РЕАЛЬНО записан в снимок."""
+        self.calls.append(("POST", url, {"files": list((files or {}).keys())}))
+        parts = url.rstrip("/").split("/")
+        att_id, task_id = parts[-1], parts[-2]
+        name = ((files or {}).get("file") or (None,))[0] or "attachment"
+        data = ((files or {}).get("file") or (None, b""))[1] or b""
+        task = self._task_anywhere(task_id)
+        payload = {"id": att_id, "fileName": name, "size": len(data)}
+        if task is not None:
+            task.setdefault("attachments", []).append(dict(payload))
+
+        class _Resp:
+            status_code = 200
+            text = json.dumps(payload)
+
+            def json(self_inner):
+                return payload
+
+            def raise_for_status(self_inner):
+                return None
+
         return _Resp()
 
 
@@ -439,6 +519,7 @@ def wire(monkeypatch, *, state=None, v2_kwargs=None, v1_tasks=None):
 
     class _Session:
         get = staticmethod(transport.session_get)
+        post = staticmethod(transport.session_post)
 
     v2.session = _Session()
 
