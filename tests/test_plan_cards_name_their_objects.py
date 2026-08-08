@@ -20,6 +20,7 @@
 """
 import pytest
 
+import ticktick_mcp.src.server as s
 from tests import read_stand as stand
 
 GHOST = "6a99ghostghostghost0001"     # такого объекта в аккаунте нет вовсе
@@ -163,6 +164,21 @@ async def test_manual_triage_card_names_the_task():
         ])
 
     _assert_named(text, "Собрать отчёт", stand.TASK_ROOT)
+
+
+def test_describe_triage_op_never_puts_an_id_in_the_name_slot():
+    """Прямой вызов описателя строки плана manual_triage.
+
+    Через сам инструмент этот случай недостижим: пустой `title` он отвергает
+    целым планом раньше, чем дойдёт до описателя. Поэтому фолбэк на
+    `task_id` в позиции имени был МЁРТВЫМ — но именно как мина: ослабь
+    когда-нибудь ту валидацию, и карточка молча начнёт называть задачу
+    номером. Проверяется здесь напрямую, раз через тул не достать."""
+    line = s._describe_triage_op({"op": "complete", "task_id": GHOST,
+                                  "said": "закрой эту"})
+
+    assert NO_NAME in line, line
+    assert f"«{GHOST}»" not in line, line
 
 
 async def test_manual_triage_skipped_row_is_named_not_numbered():

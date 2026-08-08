@@ -118,7 +118,13 @@ def test_verify_item_confirms_restore_of_a_task_that_stayed_completed(monkeypatc
 
 def test_verify_item_still_flags_a_task_that_never_left_the_trash(monkeypatch):
     """Обратная сторона: если задача так и осталась в корзине, вердикт
-    по-прежнему ❌. Фикс не имеет права делать успехом всё подряд."""
+    по-прежнему ❌. Фикс не имеет права делать успехом всё подряд.
+
+    Проверяется ИМЕННО формулировка «всё ещё в корзине», а не просто слово
+    «корзина»: соседняя ветка («не найдена нигде: ни среди открытых, ни
+    среди завершённых, ни в корзине») это слово тоже содержит, и мягкая
+    проверка мутацию не ловила — обе ветки дают ❌, и тест переставал
+    что-либо доказывать."""
     stand.wire(monkeypatch)
     item = {"taskId": stand.TASK_TRASHED, "title": "Старая затея",
             "expect": {"projectId": stand.P_HOME}}
@@ -127,7 +133,7 @@ def test_verify_item_still_flags_a_task_that_never_left_the_trash(monkeypatch):
 
     assert status == "bad", line
     assert "❌" in line
-    assert "корзин" in line.lower()
+    assert "ВСЁ ЕЩЁ В КОРЗИНЕ" in line
 
 
 def test_verify_item_still_flags_a_task_found_nowhere(monkeypatch):
