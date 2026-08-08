@@ -947,7 +947,12 @@ class TickTickV2Client:
         mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
         upload_url = (f"{ATTACHMENT_BASE}/attachment/upload/"
                       f"{project_id}/{task_id}/{attachment_id}")
-        self._state_cache = None  # task now has an attachment
+        # Задача изменилась — сбрасываем ОБА кэша, а не только снимок
+        # открытых. `_closed_lookup_cache` держит результат
+        # find_task_any_state по id на тот же TTL, и без его сброса
+        # пост-проверка вложения у ЗАВЕРШЁННОЙ задачи перечитывала бы её
+        # состояние ДО загрузки — то есть доказывала бы старым снимком.
+        self.invalidate_cache()
         # Drop the JSON content-type so requests sets the multipart boundary;
         # cookie + x-device come from the session.
         resp = self.session.post(upload_url,
@@ -1119,13 +1124,37 @@ class TickTickV2Client:
                              json={"add": [], "update": [task], "delete": []})
 
     def duplicate_task(self, task_id: str) -> Dict:
-        """Create a copy of an open task. NOT carried over (v2 quirks): the
-        checklist items, the kanban column, and the parent link — callers must
-        say so honestly. Raises RuntimeError if TickTick rejects the create."""
+        """Create a copy of a task — open OR completed. NOT carried over (v2
+        quirks): the checklist items, the kanban column, and the parent link —
+        callers must say so honestly. Raises RuntimeError if TickTick rejects
+        the create.
+
+        SOURCE IS find_task_any_state, NOT the open-task snapshot (fix,
+        2026-08-07). This used to read `get_open_tasks()` only and raise
+        "Open task <id> not found" for anything else. Server-side policy had
+        already moved on: duplicating a COMPLETED task (as a template for next
+        month, say) is explicitly allowed and its guard lets it through — so
+        the refusal no longer stood on the plan, where a human could still
+        change course, but BEHIND the confirmation button, after the card had
+        promised the operation was fine. A refusal that moves from before the
+        consent to after it is strictly worse than the one it replaced.
+
+        The TRASH is the one state still refused, and deliberately: an
+        operation on a deleted object is a mistake far more often than an
+        intent, and what the caller almost always wanted is restore_tasks.
+        Same policy the server-side guard states — kept here too so a direct
+        client call can't quietly resurrect deleted work as a copy."""
         self.get_state(force=True)  # fresh source: copy the CURRENT task
-        src = next((t for t in self.get_open_tasks() if t.get("id") == task_id), None)
+        src, where = self.find_task_any_state(task_id)
+        if src and where == "trash":
+            raise ValueError(
+                f"Task {task_id} is in the TRASH — restore it first "
+                "(restore_tasks); a deleted task is not duplicated.")
         if not src:
-            raise ValueError(f"Open task {task_id} not found.")
+            raise ValueError(
+                f"Task {task_id} not found among open tasks, the "
+                f"{COMPLETED_MAX_LIMIT} most recently completed ones, or the "
+                f"{TRASH_MAX_LIMIT} newest trash entries.")
         copy = {k: src[k] for k in ("projectId", "content", "desc", "priority",
                                     "tags", "isAllDay", "startDate", "dueDate",
                                     "timeZone", "repeatFlag", "reminders")
