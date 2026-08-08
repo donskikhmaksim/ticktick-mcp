@@ -2678,9 +2678,20 @@ async def update_tasks(
             for key in ("due_date", "start_date"):
                 if key in t:
                     t[key] = _resolve_relative_date(t[key])
+    # Сверка с живым состоянием на фазе ПЛАНА: строка, которую исполнитель
+    # заведомо отвергнет, обязана быть видна КАК ТАКАЯ до подтверждения, а не
+    # только в отчёте после нажатия (см. _unapplicable_update_rows).
+    describe, notes = _describe_update_item, None
+    if not manifest_id and tasks:
+        unapplicable = _unapplicable_update_rows(tasks)
+        if unapplicable:
+            describe = _describe_update_item_marking(unapplicable)
+            notes = [f"⚠️ Не применится строк: {len(unapplicable)} из "
+                     f"{len(tasks)} — они помечены ⛔ выше. Подтверждение их "
+                     "не оживит; остальные будут выполнены."]
     outcome = await _gate_batch("update", "update_tasks", tasks, summary,
-                                manifest_id, user_reply, _describe_update_item,
-                                automation_key=automation_key)
+                                manifest_id, user_reply, describe,
+                                notes=notes, automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _update_tasks_impl(outcome.summary, outcome.tasks)
@@ -2723,6 +2734,60 @@ def _update_change_bits(t: Dict[str, Any], sep: str = "; ") -> str:
 def _describe_update_item(t: Dict[str, Any]) -> str:
     title = t.get("title") or t.get("taskId") or t.get("task_id") or "?"
     return f"**«{title}»** — {_update_change_bits(t)}"
+
+
+def _unapplicable_update_rows(tasks: List[Dict[str, Any]]) -> Dict[str, str]:
+    """{taskId: причина} для строк плана, которые ЗАВЕДОМО не исполнятся —
+    сверка живого состояния на фазе ПЛАНА (2026-08-07).
+
+    Зачем. До этой правки update_tasks сверял задачи с живым состоянием
+    ТОЛЬКО в исполнителе. Живой прогон: батч из пяти задач, одна из которых
+    лежала в корзине ещё до построения плана, — карточка перечислила все пять
+    одинаково, и человек подтверждал операцию, часть которой была обречена
+    заранее. Отчёт потом честно говорил «НЕ применилось 1», но постфактум:
+    согласие уже получено на то, чего не будет. У manual_triage такая сверка
+    (пометка ПРОПУЩЕНО) есть с самого начала — здесь закрывается тот же
+    пробел тем же способом.
+
+    Причины ровно те, по которым `_update_tasks_impl` откажет: задачи нет
+    среди открытых (закрыта/удалена/в корзине) или id указывает на ДРУГУЮ
+    задачу. Ничего не отсеивается: план строится целиком, строки только
+    помечаются — решает человек.
+
+    BEST-EFFORT: недоступное живое состояние не имеет права ронять фазу
+    плана (то же правило, что у превью «тег будет создан» в set_task_tags).
+    Тогда возвращается пустой словарь и не помечается ничего — сервер честно
+    не знает, а не выдаёт незнание за «всё в порядке». Настоящая защита
+    стоит там же, где стояла: fail-closed guard в исполнителе."""
+    try:
+        by_id = _open_by_id(fresh=True)
+        if by_id is None:
+            return {}
+        _found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
+    except Exception as e:
+        logger.warning(f"update_tasks: сверка плана с живым состоянием не "
+                       f"удалась ({e}) — строки плана не помечаются")
+        return {}
+    out: Dict[str, str] = {}
+    for m in missing:
+        out[str(m.get("taskId"))] = ("этой задачи нет среди открытых "
+                                     "(закрыта, удалена или в корзине)")
+    for m in mismatch:
+        out[str(m.get("taskId"))] = (f"id указывает на другую задачу — "
+                                     f"живое название «{m.get('actual')}»")
+    return out
+
+
+def _describe_update_item_marking(unapplicable: Dict[str, str]):
+    """`_describe_update_item` + пометка обречённой строки. Пометка живёт
+    ТОЛЬКО в тексте превью и не попадает в сами элементы манифеста: на
+    исполнении состояние перечитывается заново, и вчерашняя пометка не должна
+    ни отменять строку, ни выдавать себя за проверку."""
+    def describe(t: Dict[str, Any]) -> str:
+        line = _describe_update_item(t)
+        why = unapplicable.get(str(t.get("taskId") or t.get("task_id") or ""))
+        return f"{line}\n   ⛔ НЕ БУДЕТ ПРИМЕНЕНО: {why}" if why else line
+    return describe
 
 
 async def _update_tasks_impl(
