@@ -10038,6 +10038,22 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
         # uses, BEFORE touching any task — and post-verify the registration
         # itself, not just assume the 200 meant it worked.
         requested = sorted({t for c in changes for t in c["tags"] if t})
+        # Регистр (2026-08-07). У тега ДВА поля: `name` — ключ, всегда нижним
+        # регистром (по нему тег ищется, он же пишется на задачу), и `label`
+        # — написание, которое человек видит в списке тегов. Настоящий
+        # `TickTickV2Client.create_tag` это уважает сам: он понижает `name` и
+        # кладёт в `label` строку КАК ПЕРЕДАЛИ. Раньше сюда уходил уже
+        # пониженный ключ — нормализация, нужная для записи на задачу,
+        # утекала и в регистрацию, — и «Работа», заведённая постановкой на
+        # задачу, оседала в аккаунте как «работа», хотя через create_tag то
+        # же слово сохраняло регистр. Здесь запоминается первое встреченное
+        # написание каждого ключа и отдаётся в регистрацию именно оно.
+        display_by_key: Dict[str, str] = {}
+        for t in tasks:
+            for raw in (t.get("tags") or []):
+                bare = str(raw).lstrip("#")
+                if bare:
+                    display_by_key.setdefault(bare.lower(), bare)
         # force=False: _open_by_id(fresh=True) just above already forced a
         # fresh sync-state fetch (tags included) within the TTL window — no
         # need for a second network round-trip for the same snapshot.
@@ -10045,7 +10061,8 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
         to_register = [t for t in requested if t not in existing_tags]
         for tag_name in to_register:
             try:
-                await _run_blocking(lambda tn=tag_name: ticktick_v2.create_tag(tn))
+                shown = display_by_key.get(tag_name, tag_name)
+                await _run_blocking(lambda tn=shown: ticktick_v2.create_tag(tn))
             except Exception as e:
                 logger.error(
                     f"set_task_tags: auto-registration of tag '{tag_name}' "
@@ -10101,15 +10118,19 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
             lines.append(f"🏷 Теги обновлены у {len(applied)} (проверено): "
                          + ", ".join(f"«{t}»" for t in applied))
         if registered:
+            # Печатается написание, под которым тег ЗАВЕДЁН (то же, что
+            # покажет list_tags), а не внутренний ключ — иначе отчёт
+            # рассказывал бы про «работа» там, где в приложении «Работа».
             lines.append(
                 f"🆕 Новые теги зарегистрированы в аккаунте (проверено — видны "
                 f"в list_tags, удаляются delete_tag), {len(registered)}: "
-                + ", ".join(f"«{t}»" for t in registered))
+                + ", ".join(f"«{display_by_key.get(t, t)}»" for t in registered))
         if failed_register:
             lines.append(
                 f"⚠️ Не удалось зарегистрировать в аккаунте {len(failed_register)} "
                 "тег(ов) — они НЕ проставлены ни на одну задачу (во избежание "
-                "тега-сироты): " + ", ".join(f"«{t}»" for t in failed_register))
+                "тега-сироты): "
+                + ", ".join(f"«{display_by_key.get(t, t)}»" for t in failed_register))
         if skipped_tasks:
             parts = "; ".join(
                 f"«{title}» (тег{'и' if len(bad) > 1 else ''} "

@@ -300,6 +300,35 @@ class _V2Transport:
         if path.endswith("/comments"):
             # Существующий проект/задача, но пары такой нет — как у живого API.
             return []
+        # ── ЗАПИСЬ ──────────────────────────────────────────────────────────
+        # Пишущие эндпоинты живут в ТОМ ЖЕ снимке, что читают читающие: тег,
+        # созданный через /batch/tag, обязан появиться в следующем
+        # /batch/check/0 — иначе пост-проверка сервера («тег виден в свежем
+        # списке») подтверждалась бы двойником, а не фактом записи.
+        if path == "/batch/tag":
+            tags = self.state.setdefault("tags", [])
+            for t in body.get("add") or []:
+                tags.append(dict(t))
+            for t in body.get("update") or []:
+                for i, cur in enumerate(tags):
+                    if (cur.get("name") or "") == (t.get("name") or ""):
+                        tags[i] = dict(t)
+            for name in body.get("delete") or []:
+                key = name.get("name") if isinstance(name, dict) else name
+                tags[:] = [c for c in tags if (c.get("name") or "") != key]
+            return {}
+        if path == "/batch/task":
+            rows = self.state.setdefault("syncTaskBean", {}).setdefault("update", [])
+            by_id = {t.get("id"): i for i, t in enumerate(rows)}
+            for t in body.get("update") or []:
+                if t.get("id") in by_id:
+                    rows[by_id[t["id"]]] = dict(t)
+            for t in body.get("add") or []:
+                rows.append(dict(t))
+            for t in body.get("delete") or []:
+                tid = t.get("taskId") if isinstance(t, dict) else t
+                rows[:] = [r for r in rows if r.get("id") != tid]
+            return {}
         raise AssertionError(f"стенд не знает пути v2: {method} {path} {kwargs}")
 
     # ---- лента активности ходит мимо _request, через session.get ----
@@ -394,9 +423,14 @@ def wire(monkeypatch, *, state=None, v2_kwargs=None, v1_tasks=None):
     return v2, v1, transport
 
 
-async def call(name: str, **args) -> str:
+async def call(tool_name: str, /, **args) -> str:
     """Ровно то, что уедет MCP-клиенту: вызов ПО ИМЕНИ через реестр сервера,
-    склеенный текст ответа. Никакого доступа к состоянию процесса."""
-    res = await s.mcp.call_tool(name, args)
+    склеенный текст ответа. Никакого доступа к состоянию процесса.
+
+    Имя тула — ПОЗИЦИОННОЕ (`/`): у самих тулов есть аргументы `name`,
+    `tag`, `summary`, и обычный параметр отобрал бы их у вызывающего
+    (`call("create_tag", name="Работа")` падал бы как «два значения для
+    name»)."""
+    res = await s.mcp.call_tool(tool_name, args)
     blocks = res[0] if isinstance(res, tuple) else res
     return "\n".join(getattr(b, "text", "") or "" for b in blocks)
