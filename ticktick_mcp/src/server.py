@@ -1859,8 +1859,8 @@ def _flatten_task_tree(node: Dict, project_id: str, parent_id: str = None,
 
 @mcp.tool()
 async def create_tasks(
-    summary: str,
-    tasks: List[Dict[str, Any]],
+    summary: str = "",
+    tasks: List[Dict[str, Any]] = None,
     automation_key: str = ""
 ) -> str:
     """
@@ -1937,7 +1937,11 @@ async def create_tasks(
       [{"title": "New step", "project_id": "x", "parent_id": "<existing_task_id>"}]
 
     Args:
-        summary: Human-readable confirmation line (see above)
+        summary: Human-readable confirmation line (see above). NOT required by
+            the schema: an interactive call is refused whatever it says, so
+            omitting it still gets you the refusal (with the correct route)
+            instead of a validation error. Headless automation should still
+            pass it — it is what the operation journal records.
         tasks: List of task definition objects — one item for a single task
 
     Returns:
@@ -1960,7 +1964,14 @@ async def create_tasks(
                 "plan_task_creation (покажи эхо пользователю дословно) → явное "
                 "«да» → execute_task_creation(manifest_id, user_reply=<реплика>) "
                 "→ operation_report. Ничего не создано.")
-    return await _create_tasks_impl(summary, tasks)
+    # `summary`/`tasks` необязательны В СХЕМЕ (2026-08-07): интерактивный
+    # вызывающий всё равно получает отказ выше, и требовать от него поля,
+    # которые ни на что не влияют, значило отдавать ему `1 validation error`
+    # вместо маршрута. Для автоматики, дошедшей сюда, summary по-прежнему
+    # нужен — он идёт в журнал операций, поэтому пустой заменяется явной
+    # подписью, а не уезжает в журнал безымянной строкой.
+    return await _create_tasks_impl(summary or "Создание задач (автоматика)",
+                                    tasks or [])
 
 
 async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
@@ -7059,9 +7070,9 @@ async def set_declutter_decision(manifest_id: str, row_ids: List[int],
 
 @mcp.tool()
 async def delete_task_with_subtasks(
-    summary: str,
-    task_id: str,
-    project_id: str,
+    summary: str = "",
+    task_id: str = "",
+    project_id: str = "",
     task_title: str = None,
     project_name: str = None,
 ) -> str:
@@ -7073,7 +7084,9 @@ async def delete_task_with_subtasks(
     manifest for approval (already gated 🔴 — plan_task_deletion →
     execute_task_deletion(manifest_id, user_reply=...)). No argument below
     has any effect; nothing is ever deleted by THIS tool, regardless of what
-    you pass.
+    you pass. None of them is required either (2026-08-07): a tool whose whole
+    answer is a refusal must not demand a value to hand that refusal over —
+    calling it with no arguments at all returns the same redirect.
 
     Args:
         summary: unused — has no effect, kept for backward-compatible calls
