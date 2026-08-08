@@ -10352,6 +10352,36 @@ def _describe_delete_project_group(p: Dict) -> str:
             "останутся, просто без папки)")
 
 
+def _group_members_note(projects: Optional[List[Dict]], group_id: str) -> str:
+    """Что именно лежит внутри папки — приписка к КАРТОЧКЕ её удаления.
+
+    Живая приёмка 2026-08-07: папка с одним проектом и папка с двумя давали
+    ПОБАЙТОВО одинаковый текст плана — ни числа, ни имён, пустая папка
+    неотличима от полной. Образец обратного уже в этом файле:
+    plan_task_deletion для задачи с подзадачами разворачивает всё поддерево
+    и показывает список на одобрение. Ситуация та же — действие над
+    контейнером.
+
+    `projects` — сырой список проектов из живого снапшота, или None, когда
+    прочитать его не удалось: None печатается ВСЛУХ как неизвестность и
+    НИКОГДА не выдаётся за пустую папку (это разные вещи для того, кто
+    решает, нажимать ли). Список режется тем же _GROUP_MEMBERS_CAP, что и
+    вывод list_project_groups, но остаток называется числом, а не молча
+    отбрасывается."""
+    if projects is None:
+        return (" ⚠️ Состав папки прочитать НЕ УДАЛОСЬ — какие проекты внутри "
+                "и сколько их, неизвестно.")
+    names = [p.get("name") or "?" for p in projects
+             if not p.get("deleted") and p.get("groupId") == group_id]
+    if not names:
+        return " Папка пуста — внутри нет ни одного проекта."
+    shown = names[:_GROUP_MEMBERS_CAP]
+    tail = f" и ещё {len(names) - len(shown)}" if len(names) > len(shown) else ""
+    word = _ru_plural(len(names), "проект", "проекта", "проектов")
+    return (f" Внутри {len(names)} {word}: "
+            + ", ".join(f"«{n}»" for n in shown) + tail + ".")
+
+
 @mcp.tool()
 async def delete_project_group(group_name: str, group_id: str,
                                manifest_id: str = "", user_reply: str = "",
@@ -10401,6 +10431,11 @@ async def delete_project_group(group_name: str, group_id: str,
     built (a read hiccup must not block every deletion), but its text says
     so honestly — the call #2 check is unconditional and still guards the
     mutation either way.
+
+    The plan card also NAMES the projects currently inside the folder (count
+    + names, long lists capped with "и ещё N"), so an empty folder can never
+    read the same as a folder holding eight live projects. If that list
+    can't be read, the card says exactly that instead of looking empty.
     """
     err = _ensure_ready()
     if err:
@@ -10440,9 +10475,27 @@ async def delete_project_group(group_name: str, group_id: str,
                             "групп (чтение не удалось) — сверка повторится "
                             "при подтверждении, и расхождение остановит "
                             "удаление.")
+    # Состав папки — В КАРТОЧКУ. Читается из ТОГО ЖЕ живого снапшота, что
+    # _live_groups() выше уже обновил (list_projects() берёт projectProfiles
+    # из кэша get_state), поэтому сетевого запроса это не добавляет — тот же
+    # довод, по которому list_project_groups показывает состав папок «at no
+    # extra network request». Приписка не гейт: она ничего не блокирует,
+    # неудачное чтение печатается как неизвестность (см. _group_members_note)
+    # и НЕ выдаётся за пустую папку.
+    members_note = ""
+    if not manifest_id:
+        try:
+            projects = await _run_blocking(lambda: ticktick_v2.list_projects())
+        except Exception as e:
+            projects = None
+            logger.warning("delete_project_group: не удалось прочитать состав "
+                           f"папки на этапе плана ({e}) — план всё равно "
+                           "строится, но состав в нём назван неизвестным.")
+        members_note = _group_members_note(projects, group_id)
     params = {"group_name": group_name, "group_id": group_id}
-    describe_fn = ((lambda p: _describe_delete_project_group(p) + name_warning)
-                   if name_warning else _describe_delete_project_group)
+    plan_note = members_note + name_warning
+    describe_fn = ((lambda p: _describe_delete_project_group(p) + plan_note)
+                   if plan_note else _describe_delete_project_group)
     outcome = await _gate_single("delete_project_group", "delete_project_group",
                                  params if not manifest_id else None,
                                  manifest_id, user_reply, describe_fn,
