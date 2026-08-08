@@ -145,6 +145,34 @@ async def test_comment_edit_and_delete_on_completed_task_are_reported_as_done(mo
     assert verdict_d == "ok", f"удаление комментария → «{verdict_d}»"
 
 
+async def test_comment_post_verify_looks_for_its_own_record(monkeypatch):
+    """Тихий отказ: сервер отвечает 2xx, а записи не появляется. Пост-проверка
+    обязана искать СВОЮ запись по id, а не смотреть, «есть ли вообще
+    комментарии» и не брать хвост списка — иначе любой чужой комментарий,
+    лежавший на задаче раньше, сойдёт за доказательство и ✅ будет ложным."""
+    v2, _v1, transport = _wire(monkeypatch)
+    transport.comments_by_task[(rs.P_WORK, rs.TASK_COMPLETED)] = [
+        {"id": "cmt-old-1", "title": "чужой комментарий"},
+        {"id": "cmt-old-2", "title": "и ещё один"},
+    ]
+    base = v2._request
+
+    def swallowing(method, path, **kw):
+        if method == "POST" and path.endswith("/comment"):
+            return dict(kw.get("json") or {})   # 2xx, но ничего не записано
+        return base(method, path, **kw)
+
+    v2._request = swallowing
+
+    report, verdict = await _run_as_the_button_does(
+        "add_task_comment", task_id=rs.TASK_COMPLETED, task_title=DONE_TITLE,
+        project_id=rs.P_WORK, text="этот текст никуда не записался")
+
+    assert not report.lstrip().startswith("✅"), (
+        f"тихий отказ выдан за успех:\n{report!r}")
+    assert verdict != "ok", verdict
+
+
 async def test_failure_and_success_do_not_share_one_verdict(monkeypatch):
     """Тот самый вывод из живой приёмки: три успеха и один провал пришли под
     одним значком. Провал обязан читаться иначе, чем успех, — иначе вердикт

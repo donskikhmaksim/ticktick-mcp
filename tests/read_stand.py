@@ -25,6 +25,7 @@
 реальных часов, поэтому тест не может протухнуть через N дней и не может
 покраснеть в первые часы суток по UTC.
 """
+import copy
 import json
 import time
 from datetime import date, timedelta
@@ -292,10 +293,19 @@ class _V2Transport:
         body = kwargs.get("json") or {}
         if path == "/batch/check/0":
             return self.state
+        # Ленты завершённых и корзины отдают КОПИИ, а не свои объекты. Живой
+        # HTTP иначе не умеет: каждый ответ — заново разобранный JSON, и
+        # клиент, закэшировавший прошлый ответ, держит СНИМОК, который сам
+        # собой не догоняет изменения на сервере. Двойник, возвращавший свои
+        # объекты, эту разницу стирал: запись вложения «появлялась» и в уже
+        # закэшированной записи, поэтому пропущенный сброс кэша (реальный
+        # дефект: `upload_attachment_bytes` чистил только снимок открытых)
+        # не был виден ни одним тестом.
         if path == "/project/all/completed":
-            return list(self.completed)[:int(params.get("limit") or 50)]
+            return copy.deepcopy(self.completed[:int(params.get("limit") or 50)])
         if path == "/project/all/trash/pagination":
-            return {"tasks": list(self.trash)[:int(params.get("limit") or 50)]}
+            return {"tasks": copy.deepcopy(
+                self.trash[:int(params.get("limit") or 50)])}
         if path == "/habits":
             return list(self.habits)
         if path == "/habitCheckins/query":
