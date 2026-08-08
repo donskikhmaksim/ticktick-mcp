@@ -7708,26 +7708,33 @@ def _is_task_due_in_days(task: Dict[str, Any], days: int) -> bool:
     return d is not None and d == _today_local() + timedelta(days=days)
 
 def _task_matches_search(task: Dict[str, Any], search_term: str) -> bool:
-    """Check if a task matches the search term (case-insensitive)."""
+    """Check if a task matches the search term (case-insensitive).
+
+    Every field is read as `x or ''`, not `.get(k, '')`: TickTick sends an
+    explicit `null` for an empty title/content (and `null` for `items`), and
+    a default only fires when the KEY IS ABSENT. `None.lower()` then raised,
+    and the tool's own `except` turned that into «Error searching tasks:
+    'NoneType' object has no attribute 'lower'» — ONE malformed task made the
+    whole search unusable instead of just not matching."""
     search_term = search_term.lower()
-    
+
     # Search in title
-    title = task.get('title', '').lower()
+    title = (task.get('title') or '').lower()
     if search_term in title:
         return True
-    
+
     # Search in content
-    content = task.get('content', '').lower()
+    content = (task.get('content') or '').lower()
     if search_term in content:
         return True
-    
+
     # Search in subtasks
-    items = task.get('items', [])
+    items = task.get('items') or []
     for item in items:
-        item_title = item.get('title', '').lower()
+        item_title = ((item or {}).get('title') or '').lower()
         if search_term in item_title:
             return True
-    
+
     return False
 
 def _get_project_tasks_by_filter(filter_func, filter_name: str,
@@ -13190,6 +13197,13 @@ async def search_all_tasks(
             base = f"No tasks matched '{query}' (scope={scope}, match={match}, fields={fields}"
             if search_comments:
                 base += f", comments: scanned {comment_fetches} task(s)"
+                # «Не найдено» + оборванный на потолке осмотр = ответ, которого
+                # не было: без этой пометки «просмотрено 100 задач» читается
+                # как «просмотрены ВСЕ». Пометка стояла только в ветке с
+                # результатами, где она нужна меньше — там уже видно, что
+                # что-то нашлось.
+                if comment_capped:
+                    base += " — CAP HIT, not all tasks scanned"
             return base + ")."
 
         out = f"Matches for '{query}' (scope={scope}, match={match}, fields={fields}):\n\n"

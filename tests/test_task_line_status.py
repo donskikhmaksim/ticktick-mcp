@@ -24,6 +24,7 @@ class FakeV2:
     # Параметры объявлены явно, как у настоящего клиента: **kwargs проглотил
     # бы опечатку в имени поля (см. tests/test_doubles_do_not_cheat.py).
     def get_completed_tasks(self, limit=50, from_str="", to_str=None):
+        self.asked_window = (from_str, to_str)
         return self._completed[:limit]
 
     def get_state(self, force=False):

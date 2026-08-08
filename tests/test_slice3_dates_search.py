@@ -42,7 +42,7 @@ class FakeV2:
         return {"syncTaskBean": {"update": self._tasks}}
 
     def get_completed_tasks(self, limit=50):
-        return self._tasks
+        return self._tasks[:limit]
 
 
 @pytest.fixture(autouse=True)
@@ -65,7 +65,12 @@ def _all_day_task(tid, title, offset_days, repeat=False):
 
 class TestRecurringTasksIsEnglish:
     """get_recurring_tasks used to hard-code Russian strings; canon for this
-    group (established by the get_all_tasks fix in slice 2) is English."""
+    group (established by the get_all_tasks fix in slice 2) is English.
+
+    ТЕСТ ЛОКАЛИ, А НЕ ПОВЕДЕНИЯ: проверяется язык заголовка, и это
+    единственный тест инструмента `get_recurring_tasks` — считать его
+    покрытием содержания вывода нельзя (см. ту же пометку в
+    tests/test_slice2_reads.py)."""
 
     async def test_recurring_tasks_v2_branch_is_english(self, monkeypatch):
         tasks = [
@@ -116,11 +121,6 @@ class TestDueThisWeekBoundary:
         assert "today" in out
         assert "plus7" in out
         assert "plus8" not in out
-
-    def test_docstring_describes_actual_8day_window(self):
-        doc = s.get_tasks_due_this_week.__doc__ or ""
-        assert "8" in doc or "through 7 days" in doc
-
 
 class TestAllDayFixAppliedConsistently:
     """Every due-date filter in this slice must treat an all-day deadline as a

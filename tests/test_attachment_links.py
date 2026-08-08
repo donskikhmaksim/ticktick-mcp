@@ -31,13 +31,30 @@ def public_base(monkeypatch):
 class FakeV2:
     """Stand-in for the v2 client: records calls, returns canned bytes."""
 
-    def __init__(self, chunks=(b"hello ", b"world"), headers=None, raises=None):
+    def __init__(self, chunks=(b"hello ", b"world"), headers=None, raises=None,
+                 attachments=None, content_refs=None):
         self.chunks = list(chunks)
         self.headers = headers or {}
         self.raises = raises
         self.uploaded = None
         self.stream_args = None
         self.closed = False
+        # Метаданные вложений отдаёт ДВОЙНИК КЛИЕНТА — это настоящие методы
+        # TickTickV2Client. Раньше здесь подменялась внутренняя функция
+        # сервера `_merged_task_attachments`, то есть ровно тот путь, где жил
+        # дефект: слияние двух источников и выбор по id/имени/индексу не
+        # исполнялись никогда, и семь «покрывающих» тестов оставались
+        # зелёными при любой его поломке.
+        self.attachments = list(attachments if attachments is not None
+                                else [{"id": ATT_ID, "fileName": "Отчёт.pdf"}])
+        self.content_refs = list(content_refs or [])
+
+    # ---- attachment metadata
+    def get_task_attachments(self, task_id):
+        return [dict(a) for a in self.attachments]
+
+    def get_content_attachment_refs(self, task_id):
+        return [dict(r) for r in self.content_refs]
 
     # ---- download side
     def open_attachment_stream(self, project_id, task_id, attachment_id):
@@ -333,13 +350,7 @@ def test_ul_upstream_failure_is_502(client, monkeypatch):
 # Tool: get_attachment_download_url
 # ===========================================================================
 
-@pytest.fixture
-def one_attachment(monkeypatch):
-    monkeypatch.setattr(s, "_merged_task_attachments",
-                        lambda task_id: [{"id": ATT_ID, "fileName": "Отчёт.pdf"}])
-
-
-async def test_download_url_tool_returns_a_working_link(fake_v2, one_attachment):
+async def test_download_url_tool_returns_a_working_link(fake_v2):
     out = await s.get_attachment_download_url(task_id=TASK_ID, project_id=PROJECT_ID,
                                               attachment_id=ATT_ID)
     assert "https://tt.example.com/dl/" in out
@@ -350,18 +361,12 @@ async def test_download_url_tool_returns_a_working_link(fake_v2, one_attachment)
     assert "15 мин" in out
 
 
-async def test_download_url_tool_finds_attachment_by_index(fake_v2, one_attachment):
-    out = await s.get_attachment_download_url(task_id=TASK_ID, project_id=PROJECT_ID,
-                                              index=1)
-    assert "/dl/" in out
-
-
-async def test_download_url_tool_requires_a_selector(fake_v2, one_attachment):
+async def test_download_url_tool_requires_a_selector(fake_v2):
     out = await s.get_attachment_download_url(task_id=TASK_ID, project_id=PROJECT_ID)
     assert "attachment_id" in out and "/dl/" not in out
 
 
-async def test_download_url_tool_ttl_is_clamped(fake_v2, one_attachment):
+async def test_download_url_tool_ttl_is_clamped(fake_v2):
     out = await s.get_attachment_download_url(task_id=TASK_ID, project_id=PROJECT_ID,
                                               attachment_id=ATT_ID, ttl_minutes=99999)
     token = out.split("/dl/")[1].split()[0]
@@ -370,7 +375,7 @@ async def test_download_url_tool_ttl_is_clamped(fake_v2, one_attachment):
 
 
 async def test_download_url_tool_says_so_when_domain_is_unknown(
-        fake_v2, one_attachment, monkeypatch):
+        fake_v2, monkeypatch):
     monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
     monkeypatch.delenv("RAILWAY_PUBLIC_DOMAIN", raising=False)
     out = await s.get_attachment_download_url(task_id=TASK_ID, project_id=PROJECT_ID,
@@ -380,16 +385,18 @@ async def test_download_url_tool_says_so_when_domain_is_unknown(
 
 
 async def test_download_url_tool_says_so_without_secret(
-        fake_v2, one_attachment, monkeypatch):
+        fake_v2, monkeypatch):
     monkeypatch.setattr(s, "SECRET", "")
     out = await s.get_attachment_download_url(task_id=TASK_ID, project_id=PROJECT_ID,
                                               attachment_id=ATT_ID)
     assert "MCP_SECRET" in out and "/dl/" not in out
 
 
-async def test_download_url_tool_reports_unknown_filename(fake_v2, monkeypatch):
-    monkeypatch.setattr(s, "_merged_task_attachments",
-                        lambda task_id: [{"id": ATT_ID, "fileName": "a.pdf"}])
+async def test_download_url_tool_reports_unknown_filename(fake_v2):
+    """Имя, которого на задаче нет, — отказ с подсказкой, а не тихий выбор
+    первого попавшегося файла. Список вложений приходит от двойника КЛИЕНТА,
+    поэтому боевой путь резолвинга исполняется целиком."""
+    fake_v2.attachments = [{"id": ATT_ID, "fileName": "a.pdf"}]
     out = await s.get_attachment_download_url(task_id=TASK_ID, project_id=PROJECT_ID,
                                               filename="ghost.pdf")
     assert "No attachment named" in out

@@ -3,7 +3,15 @@ Russian outlier among get_projects / get_project / get_project_tasks /
 get_task / get_all_tasks / get_tasks_by_priority / get_tasks_due_today /
 get_overdue_tasks — every sibling (and the shared _get_project_tasks_by_filter
 helper they funnel through) renders in English, but get_all_tasks's v2 branch
-was hardcoded in Russian. Locks in the fix: English output, same content."""
+was hardcoded in Russian. Locks in the fix: English output, same content.
+
+ЭТО ТЕСТ ЛОКАЛИ, А НЕ ПОВЕДЕНИЯ. Он проверяет ЯЗЫК вывода, и в любой
+автоматической сводке делает перечисленные инструменты «покрытыми», хотя об
+их СОДЕРЖАНИИ (то ли посчитано, все ли строки напечатаны, доехал ли
+параметр) не утверждает ничего. Содержательное покрытие читающих
+инструментов живёт в tests/test_read_params_are_honoured.py и
+tests/test_read_output_invariants.py — при чтении карты покрытия считать
+надо их, а не этот файл."""
 import pytest
 
 import ticktick_mcp.src.server as s
