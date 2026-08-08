@@ -17,7 +17,9 @@ this date the claim above was literally true for it too, and it was a bug:
 `_guard_task` ran ONLY inside `_delete_task_comment_impl` (call #2,
 execution), so the plan card shown on call #1 printed `task_title` straight
 from the caller with ZERO verification against the live task the id actually
-points at. `test_delete_task_comment_missing_identity_downgrades_to_warn`
+points at. `test_delete_task_comment_missing_identity_refuses` (носивший
+тогда имя ..._downgrades_to_warn — переписан 2026-08-07, см. дефект №2 в
+его собственном докстринге)
 below passed a `_guard_task` stand-in that never distinguished call #1 from
 call #2 (same result on both calls) and only checked the outcome on call #2
 — it would have happily let a "mismatch" stand-in build a plan carrying a
@@ -211,11 +213,20 @@ async def test_delete_task_comment_call2_empty_reply_refused_and_retryable(monke
     assert s._auto_execute_report_is_success(result), result
 
 
-async def test_delete_task_comment_missing_identity_downgrades_to_warn(monkeypatch):
-    """Симметрично update_task_comment: когда identity-guard не смог сверить
-    название (id не среди открытых задач), маркер — ⚠️, а не ✅, даже если
-    само удаление комментария подтвердилось. ✅ значит «подтверждено
-    ПОЛНОСТЬЮ» — раздавать его на неполной проверке нельзя."""
+async def test_delete_task_comment_missing_identity_refuses(monkeypatch):
+    """ПЕРЕПИСАН 2026-08-07 (дефект №2). Прежняя версия фиксировала мягкую
+    политику: `missing` («id не среди открытых задач») → удаление всё равно
+    выполняется, только маркер понижается до ⚠️, потому что название не
+    сверено.
+
+    Теперь решение принимается ОДИН РАЗ ДЛЯ ВСЕГО КЛАССА операций, законных
+    над завершённой задачей (`_guard_task_incl_completed`): завершённая
+    задача опознаётся по имени через источник, где она живёт, и получает
+    статус `completed` (удаление разрешено, название сверено), а `missing`
+    сузился до «не нашли ни в одном источнике» — на нём удаление
+    НЕОБРАТИМОГО объекта делать нельзя. Согласованность пяти инструментов
+    класса проверяется на настоящих клиентах в
+    tests/test_completed_task_class_consistency.py."""
     fake = FakeV2(comments={"t1": [{"id": "c1", "title": "не забыть"}]})
     _wire(monkeypatch, fake, guard_task=False)
     monkeypatch.setattr(
@@ -223,13 +234,10 @@ async def test_delete_task_comment_missing_identity_downgrades_to_warn(monkeypat
         lambda *a, **k: s._Guard("missing", project_id="p1"))
 
     preview = await s.delete_task_comment("Купить молоко", "p1", "t1", "c1")
-    mid = _extract_manifest_id(preview)
-    result = await s.delete_task_comment("Купить молоко", "p1", "t1", "c1",
-                                         manifest_id=mid, user_reply="да")
 
-    assert fake.comments["t1"] == []
-    assert result.startswith("⚠️"), result
-    assert not s._auto_execute_report_is_success(result), result
+    assert preview.startswith("🛑 План НЕ построен"), preview
+    assert "manifest_id" not in preview, preview
+    assert fake.comments["t1"] == [{"id": "c1", "title": "не забыть"}]
 
 
 async def test_delete_task_comment_explicit_no_refuses_and_burns_manifest(monkeypatch):

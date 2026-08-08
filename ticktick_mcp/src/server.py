@@ -923,7 +923,7 @@ def _official_task_snapshot(project_id: str, task_id: str) -> Optional[Dict]:
     return t
 
 
-def _official_task_scan(task_id: str) -> Optional[Dict]:
+def _official_task_scan(task_id: str, *, open_only: bool = True) -> Optional[Dict]:
     """Last-resort identity-guard fallback for callers that don't have a
     project_id at all (e.g. abandon_task/duplicate_task take no project_id
     argument) — scans every official project for the task, same rationale
@@ -932,7 +932,11 @@ def _official_task_scan(task_id: str) -> Optional[Dict]:
     used by search_tasks'/get_recurring_tasks' no-v2 fallback. Only ever
     reached after the v2 snapshot already came up empty, so the extra HTTP
     calls are paid exclusively on that already-degraded path, never on the
-    common happy path. Returns None (never raises) on any failure."""
+    common happy path. Returns None (never raises) on any failure.
+
+    `open_only=False` drops the OPEN restriction — for the callers whose
+    object of interest is a task that may legitimately be COMPLETED (see
+    _closed_task_snapshot). Guards keep the default."""
     if not ticktick:
         return None
     try:
@@ -941,13 +945,54 @@ def _official_task_scan(task_id: str) -> Optional[Dict]:
         return None
     if not isinstance(projects, list):
         return None
+    read = _official_task_snapshot if open_only else _official_task_read
     for p in projects:
         pid = p.get("id") if isinstance(p, dict) else None
         if not pid:
             continue
-        t = _official_task_snapshot(pid, task_id)
+        t = read(pid, task_id)
         if t:
             return t
+    return None
+
+
+def _closed_task_snapshot(task_id: str, project_id: str = "") -> Optional[Dict]:
+    """The live record of a task that is NOT among the open ones — completed,
+    won't-do, or in the trash. Returns None only when no source knows it.
+
+    Source picked to fit the OBJECT of the operation, not out of habit — the
+    pattern `restore_tasks` already follows in this repo by checking the
+    TRASH rather than the open pool. For a class of operations that are
+    legitimate ON A COMPLETED TASK (attach the receipt to the finished job,
+    append the outcome, duplicate it as a template), the open-task snapshot
+    is simply the wrong place to look:
+      1. the official point read (`GET /project/{pid}/task/{tid}`) — knows a
+         task of ANY age and ANY status, but needs the CURRENT project_id;
+      2. v2's `find_task_any_state` — completed feed, then trash; these are
+         PAGES with a ceiling (100/500), so they cover the recent past, not
+         all history, which is why they come after the point read;
+      3. an official all-projects scan, but ONLY when no project_id was given
+         at all (duplicate_task/abandon_task take none) — it costs one request
+         per project, so it is never paid when step 1 could have run.
+
+    LIMIT worth stating where callers phrase their refusals: none of these
+    sources is an index. A task that is neither open, nor readable at its
+    given project_id, nor in the recent completed/trash pages comes back as
+    None — which honestly means "not found in any source we have", not
+    "provably does not exist"."""
+    if project_id:
+        t = _official_task_read(project_id, task_id)
+        if t:
+            return t
+    if ticktick_v2:
+        try:
+            found, _where = ticktick_v2.find_task_any_state(task_id)
+            if found:
+                return found
+        except Exception:
+            pass
+    if not project_id:
+        return _official_task_scan(task_id, open_only=False)
     return None
 
 
@@ -1272,6 +1317,68 @@ def _guard_task(
         return _Guard("mismatch", real_pid, real_title,
                       f"id в проекте «{names.get(real_pid, '')}», а НЕ «{expected_project}»")
     return _Guard("ok", real_pid, real_title)
+
+
+# Единая пометка класса «операции над завершённой задачей» — один текст на
+# все пять инструментов, чтобы подтверждающий читал одно и то же, у какого бы
+# из них он ни оказался.
+_COMPLETED_TASK_NOTE = ("задача ЗАВЕРШЕНА (не среди открытых) — операция над "
+                        "ней допустима, название сверено с живым состоянием")
+
+
+def _guard_task_incl_completed(
+    task_id: str,
+    expected_title: str = "",
+    project_id: str = "",
+    *,
+    fresh: bool = True,
+    by_id: Optional[Dict[str, Dict]] = None,
+) -> "_Guard":
+    """Identity guard for the class of single-task operations that are
+    LEGITIMATE on a completed task: add_task_comment, attach_file_to_task,
+    update_task_comment, delete_task_comment, duplicate_task.
+
+    Same guard as `_guard_task`, one status richer:
+
+      - task is open                        → whatever _guard_task says
+      - task is NOT open but a source knows
+        it, and the title agrees            → status 'completed'
+      - …and the title does NOT agree       → status 'mismatch' (as always)
+      - no source knows it at all           → status 'missing'
+
+    ПОЧЕМУ ЭТО ОТДЕЛЬНАЯ ФУНКЦИЯ, а не правка `_guard_task` (дефект №2,
+    живая приёмка 2026-08-07). На завершённой задаче `_guard_task` возвращал
+    `missing` — и это ЧЕСТНО для него: «среди открытых нет». Расходились
+    ВЫЗЫВАЮЩИЕ: четверо смягчали `missing` до ⚠️ «название НЕ проверено» и
+    работали, а `duplicate_task` тот же самый ответ превращал в 🛑 ОТКАЗ.
+    Строгость выходила обратной риску: дублирование создаёт КОПИЮ и ничего
+    не портит, но отказывало, — а изменяющие комментарии шли. Чинить guard
+    было нельзя: «только открытые» — осознанная политика для мутаций,
+    которые на завершённой задаче бессмысленны (complete_tasks, move_tasks,
+    set_task_parent, abandon_task). Поэтому решение принято ОДИН РАЗ ДЛЯ
+    ВСЕГО КЛАССА, здесь, а инструменты класса зовут эту функцию вместо
+    `_guard_task`.
+
+    Побочно это УСИЛИВАЕТ проверку, а не ослабляет: раньше на завершённой
+    задаче название не сверялось вовсе («НЕ проверено» — и подлог проходил),
+    теперь оно сверяется с живой записью, и `mismatch` ловится. А `missing`
+    после этого означает гораздо более сильное «не нашли НИ В ОДНОМ
+    источнике», поэтому вызывающим уместно на нём отказывать."""
+    g = _guard_task(task_id, expected_title, project_id, fresh=fresh, by_id=by_id)
+    if g.status != "missing":
+        return g
+    live = _closed_task_snapshot(task_id, project_id)
+    if not live:
+        return _Guard("missing", project_id, expected_title,
+                      f"id {str(task_id)[:8]}… не найден ни среди открытых "
+                      "задач, ни среди завершённых/удалённых (неверный id "
+                      "или задача слишком старая для этих выборок)")
+    real_title = live.get("title") or ""
+    real_pid = live.get("projectId") or project_id
+    if not _names_agree(expected_title, real_title):
+        return _Guard("mismatch", real_pid, real_title,
+                      f"id указывает на «{real_title}», а НЕ «{expected_title}»")
+    return _Guard("completed", real_pid, real_title, _COMPLETED_TASK_NOTE)
 
 
 def _split_tasks_by_state(
@@ -8296,8 +8403,11 @@ async def create_subtask(
     # что в delete_habit, def-116, и в группе A: attach_file_to_task/
     # update_task_comment/delete_task_comment). mismatch И missing здесь
     # блокируют план целиком — _create_subtask_impl уже трактует ОБА как 🛑
-    # на исполнении (не только mismatch, в отличие от add_task_comment, где
-    # missing мягче), перенос это не ужесточает. Временная недоступность
+    # на исполнении (не только mismatch), перенос это не ужесточает. Про
+    # класс операций, законных над ЗАВЕРШЁННОЙ задачей (комментарии,
+    # вложения, duplicate_task), см. _guard_task_incl_completed — подзадача
+    # у ЗАВЕРШЁННОГО родителя смысла не имеет, поэтому здесь по-прежнему
+    # обычный _guard_task «только открытые». Временная недоступность
     # живого чтения — fail-open с предупреждением в тексте плана, а
     # исполнение (не тронуто) перепроверит заново и остаётся последней
     # линией защиты. Действует только на call #1 (manifest_id пуст):
@@ -9443,9 +9553,10 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
     # ИСПОЛНЕНИИ для РОДИТЕЛЯ, но здесь — ДО показа карточки владельцу (тот
     # же перенос, что в create_subtask/unset_task_parent/duplicate_task).
     # mismatch И missing здесь блокируют план целиком — _set_task_parent_impl
-    # уже трактует ОБА как 🛑 («НЕ вложил») на исполнении для родителя (в
-    # отличие от add_task_comment, где missing мягче), перенос это не
-    # ужесточает. Временная недоступность живого чтения — fail-open с
+    # уже трактует ОБА как 🛑 («НЕ вложил») на исполнении для родителя,
+    # перенос это не ужесточает. Вкладывать в ЗАВЕРШЁННОГО родителя смысла
+    # нет, поэтому здесь обычный _guard_task «только открытые», а не
+    # _guard_task_incl_completed (класс операций над завершёнными). Временная недоступность живого чтения — fail-open с
     # предупреждением (через notes батч-карточки), исполнение (не тронуто)
     # перепроверит заново. Действует только на call #1 (manifest_id пуст);
     # automation_key НЕ пропускает эту проверку — она стоит раньше самого
@@ -10945,6 +11056,12 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
     built (a read hiccup must not block every comment), but its text says so
     honestly — the call #2 check is unconditional and still guards the
     mutation either way.
+
+    Works on a COMPLETED task too (attaching a receipt to a finished job,
+    appending the outcome, duplicating it as a template are all normal): the
+    check then runs against the source that still knows the task, so the
+    title IS verified, and the plan/result say the task is completed. Only
+    an id that no source knows at all is refused.
     """
     err = _ensure_ready()
     if err:
@@ -10960,7 +11077,7 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
     # гейта.
     name_warning = ""
     if not manifest_id:
-        g = _guard_task(task_id, task_title or "", project_id)
+        g = _guard_task_incl_completed(task_id, task_title or "", project_id)
         if g.status == "mismatch":
             return (f"🛑 План НЕ построен — id это «{g.title}», а НЕ "
                     f"«{task_title}» (защита от «не той задачи»). Ничего не "
@@ -10971,8 +11088,9 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
                             "повторится при подтверждении, и расхождение "
                             "остановит исполнение.")
         elif g.status == "missing":
-            name_warning = (" ⚠️ id не среди открытых задач (возможно, "
-                            "завершена) — название НЕ проверено.")
+            return f"🛑 План НЕ построен — {g.message}. Ничего не изменено."
+        elif g.status == "completed":
+            name_warning = f" ⚠️ {_COMPLETED_TASK_NOTE}."
     params = {"task_title": task_title, "text": text, "project_id": project_id,
               "task_id": task_id}
     describe_fn = ((lambda p: _describe_add_task_comment(p) + name_warning)
@@ -10991,18 +11109,21 @@ async def _add_task_comment_impl(task_title: str, text: str, project_id: str,
     """Pure mutation logic for add_task_comment — no consent gate. Called
     only by the gated add_task_comment() above once the plan is approved."""
     try:
-        g = _guard_task(task_id, task_title or "", project_id)
+        g = _guard_task_incl_completed(task_id, task_title or "", project_id)
         if g.status == "unavailable":
             return g.message
         if g.status == "mismatch":
             return (f"🛑 НЕ добавил комментарий — id это «{g.title}», а НЕ "
                     f"«{task_title}». Ничего не тронул.")
-        warn = ""
         if g.status == "missing":
-            # Commenting a completed task is legitimate, but the id↔title
-            # check could not run — say so instead of implying it did.
-            warn = ("\n⚠️ id не среди открытых задач (возможно, завершена) — "
-                    "название НЕ проверено.")
+            return f"🛑 НЕ добавил комментарий — {g.message}. Ничего не тронул."
+        warn = ""
+        if g.status == "completed":
+            # Комментировать завершённую задачу законно (дописать вывод,
+            # отметить исход) — и название при этом СВЕРЕНО с живой записью,
+            # так что это пометка о состоянии задачи, а не о пробеле в
+            # проверке.
+            warn = f"\n⚠️ {_COMPLETED_TASK_NOTE}."
         await _run_blocking(lambda: ticktick_v2.add_task_comment(
             g.project_id or project_id, task_id, text))
         return f"Comment added to '{task_title}'.{warn}"
@@ -11441,6 +11562,12 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
     built (a read hiccup must not block every attach), but its text says so
     honestly — the call #2 check is unconditional and still guards the
     mutation either way.
+
+    Works on a COMPLETED task too (attaching a receipt to a finished job,
+    appending the outcome, duplicating it as a template are all normal): the
+    check then runs against the source that still knows the task, so the
+    title IS verified, and the plan/result say the task is completed. Only
+    an id that no source knows at all is refused.
     """
     err = _ensure_ready()
     if err:
@@ -11461,7 +11588,7 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
     # защищён.
     name_warning = ""
     if not manifest_id:
-        g = _guard_task(task_id, task_title or "", project_id)
+        g = _guard_task_incl_completed(task_id, task_title or "", project_id)
         if g.status == "mismatch":
             return (f"🛑 План НЕ построен — {g.message} (защита от «не той "
                     "задачи»). Ничего не изменено.")
@@ -11471,8 +11598,9 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
                             "повторится при подтверждении, и расхождение "
                             "остановит исполнение.")
         elif g.status == "missing":
-            name_warning = (" ⚠️ id не среди открытых задач (возможно, "
-                            "завершена) — название НЕ проверено.")
+            return f"🛑 План НЕ построен — {g.message}. Ничего не изменено."
+        elif g.status == "completed":
+            name_warning = f" ⚠️ {_COMPLETED_TASK_NOTE}."
     params = {"task_title": task_title, "task_id": task_id, "project_id": project_id,
               "url": url, "content_base64": content_base64, "filename": filename}
     describe_fn = ((lambda p: _describe_attach_file_to_task(p) + name_warning)
@@ -11495,14 +11623,15 @@ async def _attach_file_to_task_impl(task_title: str, task_id: str, project_id: s
     pre = _open_by_id(fresh=True)
     if pre is None:
         return _STATE_UNAVAILABLE_MSG
-    g = _guard_task(task_id, task_title or "", project_id, by_id=pre)
+    g = _guard_task_incl_completed(task_id, task_title or "", project_id, by_id=pre)
     if g.status == "mismatch":
         return (f"🛑 НЕ прикрепил — id это «{g.title}», а НЕ «{task_title}». "
                 "Ничего не тронул.")
-    warn = ""
     if g.status == "missing":
-        warn = ("\n⚠️ id не среди открытых задач (возможно, завершена) — "
-                "название НЕ проверено.")
+        return f"🛑 НЕ прикрепил — {g.message}. Ничего не тронул."
+    warn = ""
+    if g.status == "completed":
+        warn = f"\n⚠️ {_COMPLETED_TASK_NOTE}."
     try:
         pid = g.project_id or _resolve_project_id(task_id, project_id)
         pre_count = len((pre.get(task_id) or {}).get("attachments") or [])
@@ -11525,13 +11654,13 @@ async def _attach_file_to_task_impl(task_title: str, task_id: str, project_id: s
                 marker, verify = ("⚠️",
                     " вложение НЕ видно на задаче — проверь вручную")
         else:
+            # Завершённая задача: снапшот открытых её не содержит, а
+            # источники, которые её знают, вложений не несут (официальный
+            # Open API не отдаёт `attachments`, а ленты completed/trash
+            # кэшируются) — поэтому здесь честное «не проверить», а не
+            # выдуманное «не видно». Маркер ⚠️ ставится ИМЕННО ПОЭТОМУ, а не
+            # из-за названия: оно теперь сверено (см. guard выше).
             marker, verify = "⚠️", " (задача не среди открытых — вложение не проверить)"
-        if warn:
-            # Identity-guard не смог сверить название (задача не среди
-            # открытых) — даже подтверждённое вложением ✅ здесь понижается:
-            # ✅ по легенде (output-format.md §7.2) значит «подтверждено
-            # ПОЛНОСТЬЮ», а название задачи в этой ветке не проверено.
-            marker = "⚠️"
         return f"{marker} Прикреплён файл «{shown_name}» ({size_str}) к «{title}»{verify}{warn}"
     except Exception as e:
         logger.error(f"Error in attach_file_to_task: {e}")
@@ -12348,8 +12477,9 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None,
     # же формой вызова, что duplicate_task: project_id не передаётся —
     # abandon_task его и не принимает). mismatch И missing здесь блокируют
     # план целиком — _abandon_task_impl уже трактует ОБА как 🛑 на исполнении
-    # (в отличие от add_task_comment, где missing мягче): «не буду делать»
-    # можно пометить ТОЛЬКО открытую задачу, а не любую, найденную по id —
+    # (в отличие от класса операций над завершёнными — комментарии,
+    # вложения, duplicate_task, см. _guard_task_incl_completed):
+    # «не буду делать» можно пометить ТОЛЬКО открытую задачу —
     # перенос это не ужесточает, он лишь воспроизводит существующую
     # политику раньше по времени. Временная недоступность живого чтения —
     # fail-open с предупреждением, исполнение (не тронуто) перепроверяет
@@ -12471,34 +12601,43 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
     plan still gets built (a read hiccup must not block every duplicate),
     but its text says so honestly — the call #2 check is unconditional and
     still guards the mutation either way.
+
+    Works on a COMPLETED task too (attaching a receipt to a finished job,
+    appending the outcome, duplicating it as a template are all normal): the
+    check then runs against the source that still knows the task, so the
+    title IS verified, and the plan/result say the task is completed. Only
+    an id that no source knows at all is refused.
     """
     err = _ensure_ready()
     if err:
         return err
     # Перенос identity-guard (task_id↔task_title) на построение плана — тот
-    # же _guard_task, что уже стоит в _duplicate_task_impl НА ИСПОЛНЕНИИ, но
-    # здесь — ДО показа карточки владельцу. mismatch И missing здесь
-    # блокируют план целиком — _duplicate_task_impl уже трактует ОБА как 🛑
-    # на исполнении (в отличие от add_task_comment, где missing мягче),
-    # перенос это не ужесточает. task_title опционален — guard всё равно
-    # выполняет проверку «id существует среди открытых задач» даже без него
+    # же guard, что уже стоит в _duplicate_task_impl НА ИСПОЛНЕНИИ, но
+    # здесь — ДО показа карточки владельцу. task_title опционален — guard
+    # всё равно выполняет проверку «id существует» даже без него
     # (_names_agree с пустой строкой всегда согласна), ровно как делает
     # _duplicate_task_impl. Временная недоступность живого чтения —
     # fail-open с предупреждением, исполнение (не тронуто) перепроверяет
     # заново. automation_key НЕ пропускает эту проверку — она стоит раньше
     # самого гейта.
+    #
+    # ЗАВЕРШЁННАЯ ЗАДАЧА БОЛЬШЕ НЕ ОТКАЗ (дефект №2, живая приёмка
+    # 2026-08-07): раньше этот тул превращал guard'ов `missing` в 🛑, тогда
+    # как четверо соседей по классу тот же самый ответ смягчали и работали.
+    # Строгость была обратна риску — дублирование СОЗДАЁТ КОПИЮ и ничего не
+    # портит, а «продублировать завершённое как шаблон» — обычный сценарий.
+    # Решение принято один раз для всего класса в _guard_task_incl_completed.
     name_warning = ""
     if not manifest_id:
-        g = _guard_task(task_id, task_title or "")
+        g = _guard_task_incl_completed(task_id, task_title or "")
         if g.status == "mismatch":
             return (f"🛑 План НЕ построен — id это «{g.title}», а НЕ "
                     f"«{task_title}» (защита от «не той задачи»). Ничего не "
                     "изменено.")
         elif g.status == "missing":
-            shown = task_title or _lookup_task_title(task_id)
-            return (f"🛑 План НЕ построен — «{shown}» не среди открытых "
-                    "задач (завершена/удалена/неверный id). Ничего не "
-                    "изменено.")
+            return f"🛑 План НЕ построен — {g.message}. Ничего не изменено."
+        elif g.status == "completed":
+            name_warning = f" ⚠️ {_COMPLETED_TASK_NOTE}."
         elif g.status == "unavailable":
             name_warning = (" ⚠️ Задачу НЕ удалось сверить с живым "
                             "состоянием (чтение не удалось) — сверка "
@@ -12520,15 +12659,16 @@ async def _duplicate_task_impl(summary: str, task_id: str, task_title: str = Non
     """Pure mutation logic for duplicate_task — no consent gate. Called only
     by the gated duplicate_task() above once the plan is approved."""
     title = task_title or _lookup_task_title(task_id)
-    g = _guard_task(task_id, task_title or "")
+    g = _guard_task_incl_completed(task_id, task_title or "")
     if g.status == "unavailable":
         return g.message
     if g.status == "mismatch":
         return (f"🛑 НЕ дублировал — id это «{g.title}», а НЕ «{task_title}». "
                 "Ничего не тронул.")
     if g.status == "missing":
-        return (f"🛑 НЕ дублировал — «{title}» не среди открытых задач "
-                "(завершена/удалена/неверный id). Ничего не тронул.")
+        return f"🛑 НЕ дублировал — {g.message}. Ничего не тронул."
+    warn = f"\n⚠️ {_COMPLETED_TASK_NOTE}." if g.status == "completed" else ""
+    title = title if title != f"[task {task_id[:8]}…]" else (g.title or title)
     try:
         copy = await _run_blocking(lambda: ticktick_v2.duplicate_task(task_id))
         cid = copy.get("id")
@@ -12538,15 +12678,23 @@ async def _duplicate_task_impl(summary: str, task_id: str, task_title: str = Non
             summary)
         # Post-verify: the copy must actually exist in fresh open state.
         fresh = _open_by_id(fresh=True)
+        confirmed = fresh is not None and cid in fresh
+        # Копия ЗАВЕРШЁННОЙ задачи может унаследовать её статус, и тогда её
+        # нет среди открытых — искать подтверждение надо там, где такая
+        # копия живёт, иначе законная операция систематически рапортует ❌
+        # об успешном дублировании. project_id копии известен из ответа, так
+        # что это одно точечное чтение, а не скан.
+        if not confirmed and fresh is not None and g.status == "completed" and cid:
+            confirmed = _closed_task_snapshot(cid, copy.get("projectId") or "") is not None
         if fresh is None:
             verdict = f"Дублирование отправлено, но {_UNVERIFIED_MSG}"
-        elif cid not in fresh:
-            verdict = ("❌ Копия НЕ подтвердилась — её нет среди открытых "
-                       "задач, проверь вручную.")
+        elif not confirmed:
+            verdict = ("❌ Копия НЕ подтвердилась — её нет ни среди открытых "
+                       "задач, ни среди завершённых, проверь вручную.")
         else:
             verdict = (f"✅ Дублировано (проверено): «{title}» → копия "
                        f"«{copy.get('title') or title}»")
-        return (verdict + "\n⚠️ В копию НЕ переносятся: чек-лист (items), "
+        return (verdict + warn + "\n⚠️ В копию НЕ переносятся: чек-лист (items), "
                 "kanban-раздел (column) и привязка к родителю.\n"
                 + _report_line(rid))
     except Exception as e:
@@ -12615,6 +12763,12 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
     built (a read hiccup must not block every comment edit), but its text
     says so honestly — the call #2 check is unconditional and still guards
     the mutation either way.
+
+    Works on a COMPLETED task too (attaching a receipt to a finished job,
+    appending the outcome, duplicating it as a template are all normal): the
+    check then runs against the source that still knows the task, so the
+    title IS verified, and the plan/result say the task is completed. Only
+    an id that no source knows at all is refused.
     """
     err = _ensure_ready()
     if err:
@@ -12625,7 +12779,7 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
     # же обоснованием — см. attach_file_to_task выше (та же правка).
     name_warning = ""
     if not manifest_id:
-        g = _guard_task(task_id, task_title or "", project_id)
+        g = _guard_task_incl_completed(task_id, task_title or "", project_id)
         if g.status == "mismatch":
             return (f"🛑 План НЕ построен — {g.message} (защита от «не той "
                     "задачи»). Ничего не изменено.")
@@ -12635,8 +12789,9 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
                             "повторится при подтверждении, и расхождение "
                             "остановит исполнение.")
         elif g.status == "missing":
-            name_warning = (" ⚠️ id не среди открытых задач (возможно, "
-                            "завершена) — название НЕ проверено.")
+            return f"🛑 План НЕ построен — {g.message}. Ничего не изменено."
+        elif g.status == "completed":
+            name_warning = f" ⚠️ {_COMPLETED_TASK_NOTE}."
     params = {"task_title": task_title, "text": text, "project_id": project_id,
               "task_id": task_id, "comment_id": comment_id}
     describe_fn = ((lambda p: _describe_update_task_comment(p) + name_warning)
@@ -12655,12 +12810,14 @@ async def _update_task_comment_impl(task_title: str, text: str, project_id: str,
     """Pure mutation logic for update_task_comment — no consent gate. Called
     only by the gated update_task_comment() above once the plan is approved."""
     try:
-        g = _guard_task(task_id, task_title or "", project_id)
+        g = _guard_task_incl_completed(task_id, task_title or "", project_id)
         if g.status == "unavailable":
             return g.message
         if g.status == "mismatch":
             return (f"🛑 НЕ изменил комментарий — id это «{g.title}», а НЕ "
                     f"«{task_title}». Ничего не тронул.")
+        if g.status == "missing":
+            return f"🛑 НЕ изменил комментарий — {g.message}. Ничего не тронул."
         pid = g.project_id or project_id
         # (client-side: update_task_comment fetches the comment first and
         # raises if comment_id is absent — a moved/stale pid errors loudly)
@@ -12674,14 +12831,14 @@ async def _update_task_comment_impl(task_title: str, text: str, project_id: str,
         if (cm.get("title") or "") != text:
             return (f"❌ Правка комментария к '{task_title}' НЕ применилась "
                     "(текст прежний).")
-        # Маркер — ⚠️, а не ✅, когда identity-guard не смог сверить название
-        # (задача не среди открытых): сама правка комментария подтверждена
-        # post-verify выше, но НЕ ВСЁ подтверждено — а ✅ по замороженной
-        # легенде (output-format.md §7.2) означает «подтверждено ПОЛНОСТЬЮ».
-        marker = "⚠️" if g.status == "missing" else "✅"
-        warn = ("\n⚠️ id не среди открытых задач — название НЕ проверено."
-                if g.status == "missing" else "")
-        return f"{marker} Комментарий на «{task_title}» обновлён (проверено).{warn}"
+        # ✅ остаётся ✅ и на завершённой задаче: правка комментария
+        # подтверждена post-verify выше, а название сверено с живой записью
+        # (_guard_task_incl_completed) — подтверждено ВСЁ, что легенда
+        # требует от ✅. Пометка про завершённость — это факт о состоянии
+        # задачи, а не пробел в проверке (раньше здесь стояло «название НЕ
+        # проверено», и это была правда лишь потому, что проверку не делали).
+        warn = f"\n⚠️ {_COMPLETED_TASK_NOTE}." if g.status == "completed" else ""
+        return f"✅ Комментарий на «{task_title}» обновлён (проверено).{warn}"
     except Exception as e:
         logger.error(f"Error in update_task_comment: {e}")
         return f"Error updating comment: {str(e)}"
@@ -12733,6 +12890,12 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str,
     built (a read hiccup must not block every comment deletion), but its
     text says so honestly — the call #2 check is unconditional and still
     guards the mutation either way.
+
+    Works on a COMPLETED task too (attaching a receipt to a finished job,
+    appending the outcome, duplicating it as a template are all normal): the
+    check then runs against the source that still knows the task, so the
+    title IS verified, and the plan/result say the task is completed. Only
+    an id that no source knows at all is refused.
     """
     err = _ensure_ready()
     if err:
@@ -12744,7 +12907,7 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str,
     # здесь он особенно важен: удаление комментария необратимо.
     name_warning = ""
     if not manifest_id:
-        g = _guard_task(task_id, task_title or "", project_id)
+        g = _guard_task_incl_completed(task_id, task_title or "", project_id)
         if g.status == "mismatch":
             return (f"🛑 План НЕ построен — {g.message} (защита от «не той "
                     "задачи»). Ничего не изменено.")
@@ -12754,8 +12917,9 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str,
                             "повторится при подтверждении, и расхождение "
                             "остановит исполнение.")
         elif g.status == "missing":
-            name_warning = (" ⚠️ id не среди открытых задач (возможно, "
-                            "завершена) — название НЕ проверено.")
+            return f"🛑 План НЕ построен — {g.message}. Ничего не изменено."
+        elif g.status == "completed":
+            name_warning = f" ⚠️ {_COMPLETED_TASK_NOTE}."
     params = {"task_title": task_title, "project_id": project_id,
               "task_id": task_id, "comment_id": comment_id}
     describe_fn = ((lambda p: _describe_delete_task_comment(p) + name_warning)
@@ -12774,12 +12938,14 @@ async def _delete_task_comment_impl(task_title: str, project_id: str,
     """Pure mutation logic for delete_task_comment — no consent gate. Called
     only by the gated delete_task_comment() above once the plan is approved."""
     try:
-        g = _guard_task(task_id, task_title or "", project_id)
+        g = _guard_task_incl_completed(task_id, task_title or "", project_id)
         if g.status == "unavailable":
             return g.message
         if g.status == "mismatch":
             return (f"🛑 НЕ удалил комментарий — id это «{g.title}», а НЕ "
                     f"«{task_title}». Ничего не тронул.")
+        if g.status == "missing":
+            return f"🛑 НЕ удалил комментарий — {g.message}. Ничего не тронул."
         pid = g.project_id or project_id
         # Existence pre-check: refuse a stale comment_id instead of no-opping.
         cms = await _run_blocking(lambda: ticktick_v2.get_task_comments(pid, task_id))
@@ -12793,10 +12959,8 @@ async def _delete_task_comment_impl(task_title: str, project_id: str,
             return (f"❌ Комментарий на '{task_title}' ВСЁ ЕЩЁ существует — "
                     "удаление не сработало.")
         # См. тот же комментарий про маркер в _update_task_comment_impl выше.
-        marker = "⚠️" if g.status == "missing" else "✅"
-        warn = ("\n⚠️ id не среди открытых задач — название НЕ проверено."
-                if g.status == "missing" else "")
-        return f"{marker} Комментарий на «{task_title}» удалён (проверено).{warn}"
+        warn = f"\n⚠️ {_COMPLETED_TASK_NOTE}." if g.status == "completed" else ""
+        return f"✅ Комментарий на «{task_title}» удалён (проверено).{warn}"
     except Exception as e:
         logger.error(f"Error in delete_task_comment: {e}")
         return f"Error deleting comment: {str(e)}"
