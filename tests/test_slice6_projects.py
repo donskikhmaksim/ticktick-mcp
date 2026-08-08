@@ -566,6 +566,44 @@ async def test_create_project_column_plan_is_built_when_name_agrees(monkeypatch)
     assert "🛑" not in unnamed
 
 
+# ---------------------------------------------------------------------------
+# Остаток того же класса, что и три «сырой id вместо имени» из этого захода:
+# при пустом project_name карточка печатала `project_name or project_id`, то
+# есть сам идентификатор — «в проекте «p1»». После фикса выше это уже нельзя
+# оправдать «имени неоткуда взять»: _guard_project(require_known=True)
+# ОТКАЗЫВАЕТ построить план, если id не резолвится в живое имя, — значит
+# всюду, где карточка вообще строится, живое имя ГАРАНТИРОВАННО известно.
+# Ветки «установить не удалось» здесь поэтому и нет: она недостижима.
+# ---------------------------------------------------------------------------
+
+async def test_create_project_column_plan_names_the_project_without_project_name(
+        monkeypatch):
+    """project_name не передан — карточка обязана назвать проект живым
+    именем, а не показать сырой id."""
+    fake_v2 = FakeV2Column()
+    fake_official = FakeOfficialColumns([{"id": "col1", "name": "В работе"}])
+    _wire_column_real_guard(monkeypatch, fake_v2, fake_official, {"p1": "Работа"})
+
+    preview = await s.create_project_column("p1", "В работе")
+
+    assert "в проекте «Работа»" in preview, f"проект не назван по имени:\n{preview}"
+    assert "«p1»" not in preview, f"сырой id вместо имени:\n{preview}"
+
+
+async def test_create_project_column_plan_prefers_the_live_project_name(monkeypatch):
+    """Имя передано и сверку прошло (_names_agree допускает разницу в
+    регистре/маркерах) — печатается ЖИВОЕ написание, а не то, что прислал
+    вызывающий: карточка показывает состояние аккаунта, а не пересказ."""
+    fake_v2 = FakeV2Column()
+    fake_official = FakeOfficialColumns([{"id": "col1", "name": "В работе"}])
+    _wire_column_real_guard(monkeypatch, fake_v2, fake_official, {"p1": "🔥 Работа"})
+
+    preview = await s.create_project_column("p1", "В работе", project_name="работа")
+
+    assert "🛑" not in preview
+    assert "в проекте «🔥 Работа»" in preview, preview
+
+
 async def test_create_project_column_automation_key_mismatch_is_refused_before_plan(
         monkeypatch):
     """Headless-путь (#118): ВЕРНЫЙ automation_key исполняет с первого

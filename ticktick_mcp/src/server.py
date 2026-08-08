@@ -13618,8 +13618,23 @@ async def list_project_columns(project_id: str) -> str:
         return f"Error fetching columns: {str(e)}"
 
 
-def _describe_create_project_column(p: Dict) -> str:
-    dest = p.get("project_name") or p.get("project_id")
+def _describe_create_project_column(p: Dict, live_name: Optional[str] = None) -> str:
+    # `live_name` — живое имя проекта, прочитанное вызывающим ДО гейта.
+    # Раньше здесь стояло `project_name or project_id`, то есть при не
+    # переданном имени карточка показывала сырой id («в проекте «p1»») —
+    # тот же класс, что «в задачу 6a7571…» и «в папку id:c4d38a…».
+    # Оправдания «имени неоткуда взять» больше нет: стоящий выше
+    # _guard_project(require_known=True) ОТКАЗЫВАЕТ строить план, если id не
+    # резолвится в живое имя, — значит везде, где карточка вообще строится,
+    # имя известно. Ветки «установить не удалось» тут поэтому нет: она
+    # недостижима, а `project_name`/id остаются просто фолбэком на случай
+    # вызова описателя вне этого пути.
+    #
+    # Живое написание предпочтительнее переданного даже когда сверка прошла:
+    # _names_agree допускает разницу в регистре/маркерах («работа» ≡
+    # «🔥 Работа»), а карточка должна показывать состояние аккаунта, а не
+    # пересказ вызывающего.
+    dest = live_name or p.get("project_name") or p.get("project_id")
     return f'Создаю раздел (колонку) «{p.get("name")}» в проекте «{dest}»'
 
 
@@ -13706,10 +13721,17 @@ async def create_project_column(project_id: str, name: str,
         if refuse:
             return (refuse.replace("🛑 Отказ —", "🛑 План НЕ построен —", 1)
                           .replace("Ничего не тронул.", "Ничего не изменено."))
+    # Живое имя проекта для карточки — читается из снапшота, который
+    # _guard_project(fresh=True) выше только что обновил (лишнего сетевого
+    # запроса нет), и уходит в описание замыканием, а НЕ ключом в `params`:
+    # params едут в манифест, в object_hash и дословно в `_impl(**params)`.
+    live_pname = (_v2_project_names().get(project_id) if not manifest_id else None)
     params = {"project_id": project_id, "name": name, "project_name": project_name}
     outcome = await _gate_single("create_project_column", "create_project_column",
                                  params if not manifest_id else None,
-                                 manifest_id, user_reply, _describe_create_project_column,
+                                 manifest_id, user_reply,
+                                 lambda p: _describe_create_project_column(
+                                     p, live_pname),
                                  automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
