@@ -18,9 +18,19 @@ import ticktick_mcp.src.server as s
 
 
 def _stamp(hours_ago: int) -> str:
-    """ISO-метка «столько-то часов назад» — от реальных часов, не от даты."""
-    return (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).strftime(
-        "%Y-%m-%dT%H:%M:%S.000+0000")
+    """ISO-метка «столько-то часов назад» — от реальных часов, не от даты, но
+    НЕ раньше начала текущих UTC-суток.
+
+    Вторая половина — не педантизм: get_changes фильтрует по КАЛЕНДАРНОМУ дню
+    UTC, а `since` во всех тестах ниже — сегодняшний UTC-день. Прогон вскоре
+    после полуночи UTC отправлял метку «час/два назад» во вчерашний день, лента
+    выходила пустой, и четыре теста краснели независимо от кода (поймано
+    живьём 2026-08-08 в 00:02 UTC). Это та же мина «фикстура против реальных
+    часов», что и календарная константа, только с периодом в сутки."""
+    now = datetime.now(timezone.utc)
+    ts = max(now - timedelta(hours=hours_ago),
+             now.replace(hour=0, minute=0, second=1, microsecond=0))
+    return ts.strftime("%Y-%m-%dT%H:%M:%S.000+0000")
 
 
 def _today() -> str:
