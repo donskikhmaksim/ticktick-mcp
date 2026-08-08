@@ -180,7 +180,11 @@ async def test_mismatched_title_is_marked_too():
 async def test_plan_survives_when_live_state_is_unavailable(monkeypatch):
     """Сверка — best-effort: недоступное живое состояние не имеет права
     ронять фазу плана (то же правило, что у превью тегов в set_task_tags).
-    Ничего не помечается — сервер честно не знает."""
+    Строки не помечаются — фактов о них у сервера нет.
+
+    ЧЕГО ЭТОТ ТЕСТ БОЛЬШЕ НЕ УТВЕРЖДАЕТ (круг 8): что план при этом молчит.
+    Молчание и было дефектом — см. tests/test_plan_check_failure_is_visible.py,
+    где проверяется, что сам СБОЙ СВЕРКИ виден человеку."""
     monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
 
     preview = await call("update_tasks", summary="Понижаю приоритет",

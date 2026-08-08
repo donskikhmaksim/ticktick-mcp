@@ -199,13 +199,15 @@ def test_update_plan_marks_the_trashed_row_too(monkeypatch):
     как живая, и сводка обещала применить больше, чем могла."""
     _wire(monkeypatch)
 
-    marks = s._unapplicable_update_rows([
+    check = s._check_plan_rows([
         {"taskId": rs.TASK_ROOT, "title": OPEN_TITLE},
         {"taskId": rs.TASK_TRASHED, "title": TRASH_TITLE},
         {"taskId": rs.TASK_COMPLETED, "title": DONE_TITLE},
         {"taskId": rs.TASK_KID, "title": "Совсем не та задача"},
     ])
 
+    assert check.checked, "сверка не отработала — проверять нечего"
+    marks = check.marks
     assert rs.TASK_TRASHED in marks, (
         "корзинная строка обещана к применению наравне с живой — согласие "
         f"берётся на то, чего не будет: {marks}")

@@ -362,7 +362,13 @@ async def test_no_key_at_all_still_goes_through_plan_and_button(
     live, fake = deletion
 
     single = await s.create_tag(name="из-чата")
-    batch = await s.complete_tasks("Закрываю 1", [{"title": "Отчёт", "taskId": "t9",
+    # Задача ЖИВАЯ (та же t1, что в снимке фикстуры `deletion`) — иначе план
+    # complete_tasks не строится вовсе: с 2026-08-07 батч сверяет строки с
+    # живым состоянием ещё на фазе плана и отказывается просить «да» там, где
+    # исполнять нечего (см. `_plan_live_check`). Речь этого теста — про ключ
+    # автоматики, а не про мёртвые id, поэтому берётся исполнимая строка.
+    batch = await s.complete_tasks("Закрываю 1", [{"title": "Купить молоко",
+                                                   "taskId": "t1",
                                                    "projectId": "p1"}])
     delete = await s.delete_tasks(*_DELETE_ARGS)
 
