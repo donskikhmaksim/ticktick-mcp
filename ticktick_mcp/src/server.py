@@ -10088,20 +10088,20 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
     # automation_key НЕ пропускает эту проверку — она стоит раньше самого
     # гейта.
     #
-    # СКОУП: переносится сверка ТОЛЬКО parent_task_id↔parent_task_title (сам
-    # родитель) — это единственный именованный объект, который карточка
-    # плана печатает БЕЗ сверки («… → под «{parent_task_title}»»). Личность
-    # КАЖДОЙ задачи из списка `tasks` уже разбирается в _set_task_parent_impl
-    # через _split_tasks_by_state — но это не блокирующий identity-guard
-    # ОДНОГО именованного объекта, а частичная батч-логика: found/mismatch/
-    # missing по каждому элементу обрабатываются НЕЗАВИСИМО, ни один reject
-    # не валит весь батч (mismatch-элементы просто исключаются из вложения,
-    # см. _mismatch_report в _set_task_parent_impl). Перенести её на план
-    # значило бы не «сдвинуть момент существующей проверки раньше», а
-    # переписать сам формат батч-карточки заново (нужен live-статус на
-    # КАЖДЫЙ элемент до его показа, с иным типом отчёта) — это вне мандата
-    # этой правки: «переносишь момент, не меняешь строгость», а не
-    # «придумываешь новую защиту».
+    # СКОУП ТОЙ ПРАВКИ был ТОЛЬКО parent_task_id↔parent_task_title (сам
+    # родитель) — единственный именованный объект, который карточка печатала
+    # БЕЗ сверки. Личность КАЖДОЙ задачи из списка `tasks` разбиралась лишь в
+    # _set_task_parent_impl (через _split_tasks_by_state), и переносить эту
+    # частичную батч-логику на план значило переписать формат карточки
+    # заново: «нужен live-статус на КАЖДЫЙ элемент до его показа, с иным
+    # типом отчёта».
+    #
+    # КРУГ 8: ровно такой формат теперь и существует — `_plan_live_check`
+    # (⛔ на обречённой строке + ⚠️-сводка, отказ когда исполнять нечего,
+    # честное ⚠️ когда сверка не удалась), и строки списка пропускаются через
+    # него ниже. Пропуск нашёл сплошной прогон одного корзинного входа по
+    # всем тулам: КОРЗИННАЯ ЗАДАЧА В РОЛИ РЕБЁНКА (живой родитель, мёртвый
+    # ребёнок) давала обычный план — проверялся-то только родитель.
     notes = None
     titles: Dict[str, str] = {}
     # Как называется РОДИТЕЛЬ в карточке. Живое имя тут уже прочитано
@@ -10135,9 +10135,19 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
         parent_label = _plan_task_name(
             {"taskId": parent_task_id,
              "title": (pg.title or parent_task_title or "")})
+
+    def _describe(t: Dict[str, Any]) -> str:
+        return f"**{_plan_task_name(t, titles)}** → под {parent_label}"
+
+    # Сверка ВКЛАДЫВАЕМЫХ задач с живым состоянием — см. `_plan_live_check`.
+    if not manifest_id and tasks:
+        _describe, row_notes, refusal = _plan_live_check(tasks, _describe)
+        if refusal:
+            return refusal
+        notes = ((notes or []) + (row_notes or [])) or None
     outcome = await _gate_batch(
         "parent", "set_task_parent", tasks, summary, manifest_id, user_reply,
-        lambda t: f"**{_plan_task_name(t, titles)}** → под {parent_label}",
+        _describe,
         extra={"parent_task_id": parent_task_id, "project_id": project_id,
                "parent_task_title": parent_task_title},
         notes=notes,

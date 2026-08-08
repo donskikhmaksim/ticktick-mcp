@@ -55,6 +55,10 @@ TOOLS = {
                                 "to_project_id": rs.P_WORK},
     "set_task_tags": lambda rows: {"summary": "Ставлю тег",
                                    "tasks": [dict(r, tags=["тег01"]) for r in rows]},
+    "set_task_parent": lambda rows: {"summary": "Вкладываю", "tasks": rows,
+                                     "parent_task_id": rs.TASK_HIGH_2,
+                                     "project_id": rs.P_WORK,
+                                     "parent_task_title": "Продлить домен"},
 }
 
 
@@ -107,15 +111,18 @@ def _doubt_lines(preview: str) -> list:
     return out
 
 
-def _doubt_line(preview: str) -> str:
-    """Сомнение именно в ИСПОЛНИМОСТИ СТРОК.
+# Чужие сомнения, которые тот же сбой чтения печатает В ТОТ ЖЕ план и по
+# которым тест «сбой сверки строк виден» проходил бы, ничего не проверяя.
+# Оба найдены мутационной проверкой (тест зеленел с полностью удалённым
+# фиксом): у `set_task_tags` не читается список тегов, у `set_task_parent` не
+# сверяется РОДИТЕЛЬ — и каждый печатает своё ⚠️.
+_OTHER_DOUBTS = ("тег", "родител")
 
-    Строки про теги отсеиваются НАМЕРЕННО, и это нашла мутационная проверка:
-    у `set_task_tags` тот же сбой транспорта роняет ещё и чтение списка тегов,
-    которое печатает СВОЁ предупреждение. Пока предикат смотрел на любое ⚠️,
-    тест «сбой сверки строк виден» у этого тула зеленел от ЧУЖОГО
-    предупреждения — то есть проходил с полностью удалённым фиксом."""
-    return next((ln for ln in _doubt_lines(preview) if "тег" not in ln.lower()), "")
+
+def _doubt_line(preview: str) -> str:
+    """Сомнение именно в ИСПОЛНИМОСТИ СТРОК списка."""
+    return next((ln for ln in _doubt_lines(preview)
+                 if not any(w in ln.lower() for w in _OTHER_DOUBTS)), "")
 
 
 @pytest.mark.parametrize("tool", list(TOOLS))

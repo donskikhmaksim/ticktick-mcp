@@ -54,6 +54,13 @@ BATCH_TOOLS = {
                                 "to_project_id": rs.P_WORK},
     "set_task_tags": lambda rows: {"summary": "Ставлю тег",
                                    "tasks": [dict(r, tags=["тег01"]) for r in rows]},
+    # Родитель здесь ЖИВОЙ намеренно: этот тул всегда сверял родителя и
+    # никогда — сами вкладываемые задачи, поэтому корзинная задача в роли
+    # РЕБЁНКА проходила как обычная (нашёл сплошной прогон, живой не поймал).
+    "set_task_parent": lambda rows: {"summary": "Вкладываю", "tasks": rows,
+                                     "parent_task_id": rs.TASK_HIGH_2,
+                                     "project_id": rs.P_WORK,
+                                     "parent_task_title": "Продлить домен"},
 }
 
 TRASHED_ROW = {"taskId": rs.TASK_TRASHED, "projectId": rs.P_HOME,
