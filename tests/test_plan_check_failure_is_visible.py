@@ -91,19 +91,31 @@ def _break_live_state(monkeypatch):
     return v2, transport
 
 
-def _doubt_line(preview: str) -> str:
-    """Строка плана, которая говорит человеку «проверить не удалось».
+def _doubt_lines(preview: str) -> list:
+    """Строки плана, которые говорят человеку «проверить не удалось».
 
-    Ищется по СМЫСЛУ, а не по дословному тексту: значок сомнения ⚠️ (канал
+    Ищутся по СМЫСЛУ, а не по дословному тексту: значок сомнения ⚠️ (канал
     круга 7 — сомнение проверки, в отличие от ℹ️ «факт») плюс слова про
     неудавшуюся проверку. Дословная формулировка может меняться, требование —
     нет."""
+    out = []
     for line in preview.splitlines():
         low = line.lower()
-        if "⚠️" in line and "провер" in low and ("не удал" in low
-                                                 or "не получилось" in low):
-            return line
-    return ""
+        if "⚠️" in line and ("провер" in low or "сверить" in low) \
+                and ("не удал" in low or "не получилось" in low):
+            out.append(line)
+    return out
+
+
+def _doubt_line(preview: str) -> str:
+    """Сомнение именно в ИСПОЛНИМОСТИ СТРОК.
+
+    Строки про теги отсеиваются НАМЕРЕННО, и это нашла мутационная проверка:
+    у `set_task_tags` тот же сбой транспорта роняет ещё и чтение списка тегов,
+    которое печатает СВОЁ предупреждение. Пока предикат смотрел на любое ⚠️,
+    тест «сбой сверки строк виден» у этого тула зеленел от ЧУЖОГО
+    предупреждения — то есть проходил с полностью удалённым фиксом."""
+    return next((ln for ln in _doubt_lines(preview) if "тег" not in ln.lower()), "")
 
 
 @pytest.mark.parametrize("tool", list(TOOLS))
@@ -196,7 +208,7 @@ async def test_unreadable_tag_list_does_not_invent_facts(monkeypatch):
 
     assert "будет создан" not in preview, (
         f"сервер объявил существующий тег новым, ничего не прочитав:\n{preview}")
-    assert _doubt_line(preview), (
+    assert [ln for ln in _doubt_lines(preview) if "тег" in ln.lower()], (
         f"о том, что список тегов не прочитался, человеку не сказали:\n{preview}")
 
 
