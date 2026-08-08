@@ -1009,11 +1009,19 @@ def _live_task_title(task_id: str, project_id: str = "") -> Optional[str]:
 
     Цена намеренно минимальная: сначала УЖЕ закэшированный v2-снапшот
     открытых задач (fresh=False — карточке хватает состояния возрастом
-    ≤20 c, force-refetch ради отображаемого имени не оправдан), и лишь
-    если задачи там нет — одно точечное чтение официального API, и только
-    когда известен project_id. Полного скана аккаунта (_official_task_scan,
-    запрос на каждый проект) здесь НЕТ намеренно: он оправдан для guard'а,
-    решающего «трогать или нет», а не для строчки в превью.
+    ≤20 c, force-refetch ради отображаемого имени не оправдан); если задачи
+    там нет — одно точечное чтение официального API, когда известен
+    project_id; и последним — ленты завершённых/корзины v2
+    (`find_task_any_state`, до двух запросов, результат кэшируется на тот же
+    TTL). Полного скана аккаунта (_official_task_scan, запрос на КАЖДЫЙ
+    проект) здесь НЕТ намеренно: он оправдан для guard'а, решающего
+    «трогать или нет», а не для строчки в превью.
+
+    Последний шаг добавлен 2026-08-07 по аудиту фикса №1: без него дефект
+    был закрыт только для случая «project_id передан», а
+    create_attachment_upload_url его не требует — и завершённая задача без
+    project_id снова печаталась как «⚠️ НАЗВАНИЕ ЗАДАЧИ УСТАНОВИТЬ НЕ
+    УДАЛОСЬ» в единственной карточке, выдающей право ЗАПИСИ в аккаунт.
 
     Точечное чтение идёт через `_official_task_read` — БЕЗ фильтра «только
     открытые». Дефект №1 (живая приёмка 2026-08-07) был ровно в том, что
@@ -1032,6 +1040,11 @@ def _live_task_title(task_id: str, project_id: str = "") -> Optional[str]:
     live = (by_id or {}).get(task_id)
     if not live and project_id:
         live = _official_task_read(project_id, task_id)
+    if not live and ticktick_v2:
+        try:
+            live, _where = ticktick_v2.find_task_any_state(task_id)
+        except Exception:
+            live = None
     return ((live or {}).get("title") or "").strip() or None
 
 
@@ -11627,6 +11640,11 @@ async def _attach_file_to_task_impl(task_title: str, task_id: str, project_id: s
     if pre is None:
         return _STATE_UNAVAILABLE_MSG
     g = _guard_task_incl_completed(task_id, task_title or "", project_id, by_id=pre)
+    # Имя для строки результата: _lookup_task_title выше смотрит только в
+    # ОТКРЫТЫЕ задачи, поэтому у завершённой давал «[task 6a757123…]» —
+    # хотя guard прямо здесь уже установил живое имя (тот же фолбэк, что в
+    # _duplicate_task_impl).
+    title = title if title != f"[task {task_id[:8]}…]" else (g.title or title)
     if g.status == "mismatch":
         return (f"🛑 НЕ прикрепил — id это «{g.title}», а НЕ «{task_title}». "
                 "Ничего не тронул.")
@@ -12071,7 +12089,14 @@ async def _create_attachment_upload_url_impl(task_id: str, project_id: str = Non
     if not base:
         return _NO_PUBLIC_URL_MSG
     try:
-        pid = project_id or _resolve_project_id(task_id, project_id)
+        # _attachment_project_id, а не _resolve_project_id: второй смотрит
+        # ТОЛЬКО в открытые задачи (guard-политика — мутация не должна молча
+        # перенацелиться на завершённую), и из-за этого ссылку на файл к
+        # завершённой задаче нельзя было выдать вовсе — отказ «Could not
+        # resolve project_id» прилетал УЖЕ ПОСЛЕ того, как человек одобрил
+        # выдачу права записи в аккаунт. Эталон лежал рядом и применён на
+        # download-пути (см. его докстринг).
+        pid = _attachment_project_id(task_id, project_id)
         if not pid:
             return f"Could not resolve project_id for task {task_id}; pass it explicitly."
         att_id = new_attachment_id()
@@ -12523,6 +12548,11 @@ async def _abandon_task_impl(summary: str, task_id: str,
     the gated abandon_task() above once the plan is approved."""
     title = task_title or _lookup_task_title(task_id)
     g = _guard_task(task_id, task_title or "")
+    # То же, что в _attach_file_to_task_impl/_duplicate_task_impl: задача,
+    # выпавшая из v2-снапшота, но найденная guard'ом через официальный API
+    # (реально наблюдалось — см. комментарий к _official_task_snapshot),
+    # печаталась как «[task 6a757123…]» на УСПЕШНОМ пути.
+    title = title if title != f"[task {task_id[:8]}…]" else (g.title or title)
     if g.status == "unavailable":
         return g.message
     if g.status == "mismatch":
