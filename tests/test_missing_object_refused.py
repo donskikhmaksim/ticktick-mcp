@@ -49,7 +49,7 @@ class FakeV2:
     проверкой корзины."""
 
     def get_trash(self, limit=50):
-        return []
+        return [][:limit]
 
     def get_state(self):
         return {"inboxId": "inbox1", "projectProfiles": [], "projectGroups": []}

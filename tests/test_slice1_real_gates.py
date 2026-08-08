@@ -125,7 +125,7 @@ class _FakeV2:
         return {}
 
     def get_trash(self, limit=500):
-        return list(self.trash.values())
+        return list(self.trash.values())[:limit]
 
 
 class _FakeOfficial:

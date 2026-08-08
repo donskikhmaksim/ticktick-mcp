@@ -527,7 +527,7 @@ def _wire_restore(monkeypatch, reads, trash):
 
     class _FakeV2Restore:
         def get_trash(self, limit=500):
-            return list(trash.values())
+            return list(trash.values())[:limit]
 
         def batch_restore_tasks(self, ids, to_project_id=None):
             return {}

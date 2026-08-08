@@ -218,3 +218,145 @@ def test_the_id_harvest_allowlist_has_not_gone_stale():
             stale.append(name)
     assert not stale, (
         f"в списке исключений файлы, которые уже не берут id из памяти: {stale}")
+
+
+# ═════════ 4. Путь ЧТЕНИЯ не вырезается подменой ═════════
+
+# Функции сервера, которые И ЕСТЬ предмет читающего инструмента: поиск
+# задачи, слияние двух источников ссылок на вложения, выбор вложения по
+# id/имени/индексу, разбор поиска, расшифровка кода активности, нарезка
+# страницы дерева, сборка индекса исполнителей и сами форматтеры строк.
+# Подменить любую из них — значит вырезать ровно тот участок, где живёт
+# дефект, и получить зелёный тест на сломанном коде.
+#
+# Повод, документированный мутационным прогоном: фикстура
+#   monkeypatch.setattr(s, "_merged_task_attachments", lambda task_id: [...])
+# обслуживала СЕМЬ тестов `get_attachment_download_url`, и все три поломки
+# этой функции (второй источник выброшен; всегда пусто; индекс всегда даёт
+# первое) оставляли набор из 2072 тестов полностью зелёным.
+#
+# Часы (`_today_local`, `_USER_TZ`) и предикаты готовности (`_ensure_ready`,
+# `_ensure_official`) сюда НЕ входят намеренно: это источник времени и
+# заглушка инициализации, а не путь резолвинга данных.
+_READ_PATH_INTERNALS = frozenset({
+    "_merged_task_attachments",
+    "_resolve_attachment_ref",
+    "_attachment_project_id",
+    "_task_matches_search",
+    "_activity_label",
+    "_task_activity_fallback",
+    "_build_assignee_index",
+    "_page_task_forest",
+    "format_task",
+    "format_task_line",
+    "format_task_list",
+    "format_task_tree",
+})
+
+# Единственное законное основание попасть сюда: тест, ПРЕДМЕТ которого — сама
+# подмена (например, проверка, что инструмент переживает падение этой
+# функции). Каждая запись обязана нести причину, а тест ниже следит, чтобы
+# запись не пережила свою надобность.
+_ALLOWED_READ_PATH_PATCHES: dict = {}
+
+
+def _read_path_patches(tree):
+    """Строки, где тест подменяет функцию пути чтения в модуле сервера."""
+    hits = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "setattr"
+                and len(node.args) >= 3):
+            continue
+        target, attr = node.args[0], node.args[1]
+        if not (isinstance(attr, ast.Constant)
+                and attr.value in _READ_PATH_INTERNALS):
+            continue
+        # Подменяют именно модуль сервера (импортируется как `s`/`server`),
+        # а не собственный объект теста.
+        if isinstance(target, ast.Name) and target.id in ("s", "server"):
+            hits.append((attr.value, node.lineno))
+    return hits
+
+
+def test_tests_do_not_cut_out_the_read_path_they_claim_to_cover():
+    """Читающий тест обязан подменять КЛИЕНТА (или транспорт), а не тот кусок
+    сервера, который он якобы проверяет.
+
+    Образец правильного приёма — `tests/read_stand.py`: настоящие клиенты,
+    подменён только HTTP; и `tests/test_completed_task_attachments.py`."""
+    offenders = {}
+    for path in _test_modules():
+        hits = _read_path_patches(_parse(path))
+        if hits and path.name not in _ALLOWED_READ_PATH_PATCHES:
+            offenders[path.name] = hits
+    assert not offenders, (
+        "тесты подменяют внутренние функции ПУТИ ЧТЕНИЯ вместо клиента — "
+        f"проверяемый участок при этом не исполняется вовсе: {offenders}")
+
+
+def test_the_read_path_allowlist_has_not_gone_stale():
+    stale = [name for name in _ALLOWED_READ_PATH_PATCHES
+             if not (_TESTS_DIR / name).exists()
+             or not _read_path_patches(_parse(_TESTS_DIR / name))]
+    assert not stale, (
+        f"в списке исключений файлы, которые уже не подменяют путь чтения: {stale}")
+
+
+def test_the_read_path_list_still_names_real_functions():
+    """Список имён — не документация, а фильтр. Переименовали функцию, не
+    поправив список, — ловушка молча перестаёт что-либо запрещать."""
+    server_src = pathlib.Path(
+        _TESTS_DIR.parent / "ticktick_mcp" / "src" / "server.py"
+    ).read_text(encoding="utf-8")
+    defined = {fn.name for fn in ast.walk(ast.parse(server_src))
+               if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    missing = sorted(_READ_PATH_INTERNALS - defined)
+    assert not missing, (
+        f"в списке путей чтения имена, которых в server.py больше нет: {missing} "
+        "— переименуй их здесь же, иначе запрет перестал действовать")
+
+
+# ═════════ 5. Объявил параметр — наблюдай его ═════════
+
+# Параметры, у которых «принял и выбросил» = «тест не проверяет ничего»:
+# именно так `FakeV2.get_completed_tasks(self, limit=50)` объявляла limit и не
+# смотрела на него, и «сервер передал правильный limit» не наблюдалось нигде.
+_OBSERVABLE_PARAMS = frozenset({
+    "limit", "offset", "scope", "after_stamp", "from_str", "to_str",
+})
+
+
+def _ignored_observable_params(fn):
+    """Имена наблюдаемых параметров, ни разу не упомянутых в теле метода."""
+    declared = [a.arg for a in fn.args.args[1:]] + [a.arg for a in fn.args.kwonlyargs]
+    used = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+    used |= {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)}
+    used |= {n.arg for n in ast.walk(fn) if isinstance(n, ast.keyword) and n.arg}
+    return [a for a in declared
+            if (a in _OBSERVABLE_PARAMS or a.startswith("include_"))
+            and a not in used]
+
+
+def test_a_double_that_declares_a_parameter_must_observe_it():
+    """Двойник, объявивший `limit`/`offset`/`scope`/`include_*` и ни разу его
+    не упомянувший, ОТВЕЧАЕТ ОДИНАКОВО на любое значение — тест «параметр
+    доехал» на таком двойнике невозможен, хотя выглядит написанным.
+
+    Наблюдать — значит либо применить (`self._rows[:limit]`), либо записать
+    (`self.asked_limit = limit`) для последующей проверки."""
+    real = _real_client_methods()
+    offenders = []
+    for path in _test_modules():
+        for cls in _double_classes(_parse(path)):
+            for fn in cls.body:
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if fn.name.startswith("_") or fn.name not in real:
+                    continue
+                for arg in _ignored_observable_params(fn):
+                    offenders.append(f"{path.name}::{cls.name}.{fn.name}({arg})")
+    assert not offenders, (
+        "двойники объявляют параметр и не смотрят на него — «сервер передал "
+        f"правильное значение» на них не проверяется ничем: {offenders}")

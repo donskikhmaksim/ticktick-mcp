@@ -47,6 +47,7 @@ class FakeV2:
         return self._open
 
     def get_completed_tasks(self, limit=100, from_str=None, to_str=None):
+        self.asked_window = (from_str, to_str)
         return self._completed[:limit]
 
     def get_trash(self, limit=300):

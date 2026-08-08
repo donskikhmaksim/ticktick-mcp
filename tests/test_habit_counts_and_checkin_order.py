@@ -43,6 +43,7 @@ class FakeV2:
         return [dict(h) for h in self._habits]
 
     def get_habit_checkins(self, habit_ids, after_stamp):
+        self.asked_after_stamp = after_stamp
         return {habit_ids[0]: [dict(c) for c in self._checkins]}
 
 

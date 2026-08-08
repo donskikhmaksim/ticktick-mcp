@@ -38,7 +38,7 @@ class FakeV2:
         return {"inboxId": "inbox1", "syncTaskBean": {"update": []}}
 
     def get_trash(self, limit=50):
-        return []
+        return [][:limit]
 
 
 def _event(action):

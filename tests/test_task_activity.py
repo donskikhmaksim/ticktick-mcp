@@ -36,7 +36,7 @@ class FakeV2:
         }
 
     def get_trash(self, limit=50):
-        return self._trash
+        return self._trash[:limit]
 
 
 def _http_404():
