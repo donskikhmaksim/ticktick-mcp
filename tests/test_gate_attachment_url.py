@@ -374,3 +374,104 @@ async def test_unknown_public_domain_refused_before_the_gate(monkeypatch):
 
     assert "PUBLIC_BASE_URL" in result and "manifest_id" not in result
     assert spy.calls == [] and s._MANIFESTS == {}
+
+
+# ===========================================================================
+# 8. Карточка обязана НАЗЫВАТЬ задачу, а не показывать сырой id
+#
+# Живая приёмка 2026-08-07, дословно:
+#     Выдаю ссылку на загрузку «файл.txt» в задачу 6a7571238f0854e347f51407
+#
+# Файл — по имени, задача — голым идентификатором. Здесь это тяжелее, чем в
+# соседних тулах: это ЕДИНСТВЕННЫЙ метод, выдающий право ЗАПИСИ в аккаунт
+# (предъявительский пропуск на PUT /ul/{token}), и подтверждающий физически
+# не может глазами сверить, в какую задачу ляжет файл. 24 hex-символа не
+# сверяет никто.
+#
+# Тесты ниже фиксируют ОБА исхода резолвинга. Молчаливый показ id — и есть
+# дефект, поэтому при неудаче карточка обязана сказать об этом прямо, а не
+# делать вид, что цель названа. Предупреждение «по ней кто угодно сможет
+# положить файл в аккаунт» — единственное честное место старой карточки —
+# обязано сохраниться в обеих ветках (отдельный тест ниже).
+# ===========================================================================
+
+LIVE_TASK = {"id": TASK_ID, "title": "Купить молоко", "projectId": PROJECT_ID}
+
+
+def _wire_live_task(monkeypatch, task=LIVE_TASK):
+    """Живое состояние знает задачу — имя резолвится без сети."""
+    monkeypatch.setattr(s, "_open_by_id",
+                        lambda fresh=False: {task["id"]: dict(task)})
+
+
+async def test_preview_names_the_task_not_just_its_id(monkeypatch):
+    """Главный тест пункта: в карточке — НАЗВАНИЕ задачи."""
+    _wire(monkeypatch)
+    _wire_live_task(monkeypatch)
+
+    preview = await s.create_attachment_upload_url(**KWARGS)
+
+    assert "«Купить молоко»" in preview, (
+        f"карточка не называет задачу по имени:\n{preview}")
+    assert "scan.png" in preview
+
+
+async def test_preview_says_out_loud_when_the_task_name_is_unknown(monkeypatch):
+    """Резолвинг не удался (задачи нет в живом состоянии / оно недоступно) —
+    молчать нельзя: карточка обязана сказать, что имя установить не удалось,
+    и показать id, по которому человек хотя бы поймёт, что сверять нечего."""
+    _wire(monkeypatch)
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
+    monkeypatch.setattr(s, "_official_task_snapshot", lambda pid, tid: None)
+
+    preview = await s.create_attachment_upload_url(**KWARGS)
+
+    assert "название задачи установить не удалось" in preview.lower(), (
+        f"неудачный резолвинг остался молчаливым:\n{preview}")
+    assert TASK_ID in preview, "при неизвестном имени id обязан быть виден"
+
+
+async def test_bearer_warning_survives_in_both_branches(monkeypatch):
+    """Хорошее в старой карточке — честное предупреждение про пропуск —
+    обязано остаться и когда имя известно, и когда нет."""
+    _wire(monkeypatch)
+    _wire_live_task(monkeypatch)
+    named = await s.create_attachment_upload_url(**KWARGS)
+
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
+    monkeypatch.setattr(s, "_official_task_snapshot", lambda pid, tid: None)
+    unnamed = await s.create_attachment_upload_url(**KWARGS)
+
+    for preview in (named, unnamed):
+        assert "кто угодно сможет положить файл в аккаунт" in preview, preview
+        assert "15 мин" in preview
+
+
+async def test_task_name_lookup_falls_back_to_the_official_point_read(monkeypatch):
+    """Завершённой/не попавшей в v2-снапшот задачи нет в _open_by_id — но
+    точечное чтение официального API её знает. Полного скана аккаунта здесь
+    НЕ делаем намеренно: карточке нужно имя, а не обход всех проектов."""
+    _wire(monkeypatch)
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: {})
+    monkeypatch.setattr(s, "_official_task_snapshot",
+                        lambda pid, tid: dict(LIVE_TASK) if tid == TASK_ID else None)
+
+    preview = await s.create_attachment_upload_url(**KWARGS)
+
+    assert "«Купить молоко»" in preview, preview
+
+
+async def test_task_name_lookup_never_breaks_the_tool(monkeypatch):
+    """Резолвинг — украшение карточки, не право вето: любая его поломка не
+    должна мешать выдать план (и, после подтверждения, ссылку)."""
+    _wire(monkeypatch)
+
+    def _boom(fresh=False):
+        raise RuntimeError("v2 упал")
+    monkeypatch.setattr(s, "_open_by_id", _boom)
+    monkeypatch.setattr(s, "_official_task_snapshot", lambda pid, tid: None)
+
+    preview = await s.create_attachment_upload_url(**KWARGS)
+
+    assert "manifest_id" in preview and "🛑" not in preview
+    assert TASK_ID in preview

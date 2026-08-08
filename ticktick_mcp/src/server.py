@@ -893,6 +893,34 @@ def _official_task_scan(task_id: str) -> Optional[Dict]:
     return None
 
 
+def _live_task_title(task_id: str, project_id: str = "") -> Optional[str]:
+    """Живое НАЗВАНИЕ задачи по её id — для КАРТОЧКИ подтверждения, чтобы
+    человек читал «в задачу «Купить молоко»», а не 24 hex-символа, которые
+    глазами не сверяет никто.
+
+    Возвращает None, когда имя установить не удалось. Это НЕ отказ и не
+    identity-guard: вызывающий обязан сказать про неудачу вслух в тексте
+    карточки (молчаливый показ сырого id и был дефектом), но продолжить —
+    защиту от «не той задачи» здесь строить не на чем, вызывающему не
+    передают ожидаемое название, сверять нечего с чем.
+
+    Цена намеренно минимальная: сначала УЖЕ закэшированный v2-снапшот
+    открытых задач (fresh=False — карточке хватает состояния возрастом
+    ≤20 c, force-refetch ради отображаемого имени не оправдан), и лишь
+    если задачи там нет — одно точечное чтение официального API, и только
+    когда известен project_id. Полного скана аккаунта (_official_task_scan,
+    запрос на каждый проект) здесь НЕТ намеренно: он оправдан для guard'а,
+    решающего «трогать или нет», а не для строчки в превью."""
+    try:
+        by_id = _open_by_id(fresh=False)
+    except Exception:
+        by_id = None
+    live = (by_id or {}).get(task_id)
+    if not live and project_id:
+        live = _official_task_snapshot(project_id, task_id)
+    return ((live or {}).get("title") or "").strip() or None
+
+
 # Сколько раз и с какой паузой повторно перечитывать живое состояние ПОСЛЕ
 # identity-changing мутации (меняет проект/родителя/группу задачи —
 # move_tasks, set_task_parent, unset_task_parent, move_project_to_group,
@@ -11492,12 +11520,26 @@ async def get_attachment_download_url(task_id: str, project_id: str = None,
         return f"Error building download link: {str(e)}"
 
 
-def _describe_create_attachment_upload_url(p: Dict) -> str:
+def _describe_create_attachment_upload_url(p: Dict,
+                                           task_title: Optional[str] = None) -> str:
     # НИ ОДНОГО фрагмента будущей ссылки/токена здесь быть не может: токен
     # подписывается только в `_impl`, уже ПОСЛЕ подтверждения. Иначе пропуск
     # утёк бы в превью (и в сообщение Telegram) ещё до согласия человека.
+    #
+    # `task_title` — живое название задачи, добытое вызывающим до гейта
+    # (_live_task_title). Живая приёмка 2026-08-07 дала карточку «Выдаю
+    # ссылку на загрузку «файл.txt» в задачу 6a7571238f0854e347f51407»: файл
+    # назван по-человечески, задача — голым id. Это тот самый метод, который
+    # ВРУЧАЕТ право записи в аккаунт, и подтверждающий не мог глазами
+    # сверить, куда ляжет файл. None (имя не установлено) печатается ВСЛУХ
+    # как неизвестность — молчаливый показ id и был дефектом.
     name = p.get("filename") or "файл без имени"
-    return (f'Выдаю ссылку на загрузку «{name}» в задачу {p.get("task_id")} '
+    tid = p.get("task_id")
+    target = (f'в задачу «{task_title}» (id {tid})' if task_title else
+              f'в задачу id {tid} — ⚠️ НАЗВАНИЕ ЗАДАЧИ УСТАНОВИТЬ НЕ УДАЛОСЬ '
+              '(её нет в живом состоянии аккаунта или оно недоступно), '
+              'сверить глазами, в какую задачу ляжет файл, нельзя')
+    return (f'Выдаю ссылку на загрузку «{name}» {target} '
             f'(действует {_clamp_link_ttl(p.get("ttl_minutes"))} мин; по ней '
             'кто угодно сможет положить файл в аккаунт)')
 
@@ -11589,11 +11631,19 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
                 f"максимум {ATTACHMENT_MAX_BYTES // (1024*1024)} МБ. Ссылку не делаю.")
     params = {"task_id": task_id, "project_id": project_id,
               "filename": filename, "ttl_minutes": ttl_minutes}
+    # Имя задачи для карточки резолвится ДО гейта и уходит в describe
+    # замыканием, а НЕ ключом в `params`: `params` уезжают в манифест, в его
+    # object_hash и дословно в `_impl(**params)` — лишний ключ сломал бы и
+    # вызов исполнителя, и привязку одобренного плана к тому, что показали.
+    # На call #2 карточка не строится, поэтому и резолвить нечего.
+    task_title = (_live_task_title(task_id, project_id or "")
+                  if not manifest_id else None)
     outcome = await _gate_single("create_attachment_upload_url",
                                  "create_attachment_upload_url",
                                  params if not manifest_id else None,
                                  manifest_id, user_reply,
-                                 _describe_create_attachment_upload_url,
+                                 lambda p: _describe_create_attachment_upload_url(
+                                     p, task_title),
                                  automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
