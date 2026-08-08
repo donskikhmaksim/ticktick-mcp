@@ -1691,8 +1691,15 @@ def _split_tasks_by_state(
         exp_proj = t.get("projectName") or ""
         g = _guard_task(tid, exp_title, given_pid, exp_proj, by_id=by_id)
         if g.status == "missing":
+            # `reason` — СОБСТВЕННЫЕ слова guard'а о том, ПОЧЕМУ строка не
+            # прошла: «лежит В КОРЗИНЕ … верните через restore_tasks» против
+            # «не среди открытых (завершена/удалена/неверный id)». Вызывающие
+            # раньше выдумывали одну общую формулировку на оба случая, и
+            # человек у карточки не мог отличить удалённую задачу от опечатки
+            # в id — то есть не знал ни что случилось, ни как это починить.
             missing.append({"taskId": tid, "projectId": given_pid,
-                            "title": exp_title or f"[task {str(tid)[:8]}…]"})
+                            "title": exp_title or f"[task {str(tid)[:8]}…]",
+                            "reason": g.message})
         elif g.status == "mismatch":
             mismatch.append({"taskId": tid, "expected": exp_title or "(без названия)",
                              "actual": g.title or "(без названия)",
@@ -3112,12 +3119,9 @@ async def update_tasks(
         # обязана называть задачу, а не показывать её id (_plan_task_name).
         titles = _plan_task_titles(tasks)
         describe = functools.partial(_describe_update_item, titles=titles)
-        unapplicable = _unapplicable_update_rows(tasks)
-        if unapplicable:
-            describe = _describe_update_item_marking(unapplicable, titles)
-            notes = [f"⚠️ Не применится строк: {len(unapplicable)} из "
-                     f"{len(tasks)} — они помечены ⛔ выше. Подтверждение их "
-                     "не оживит; остальные будут выполнены."]
+        describe, notes, refusal = _plan_live_check(tasks, describe)
+        if refusal:
+            return refusal
     outcome = await _gate_batch("update", "update_tasks", tasks, summary,
                                 manifest_id, user_reply, describe,
                                 notes=notes, automation_key=automation_key)
@@ -3165,59 +3169,158 @@ def _describe_update_item(t: Dict[str, Any],
     return f"**{_plan_task_name(t, titles)}** — {_update_change_bits(t)}"
 
 
-def _unapplicable_update_rows(tasks: List[Dict[str, Any]]) -> Dict[str, str]:
-    """{taskId: причина} для строк плана, которые ЗАВЕДОМО не исполнятся —
-    сверка живого состояния на фазе ПЛАНА (2026-08-07).
+# ---------------------------------------------------------------------------
+# СВЕРКА СТРОК ПЛАНА С ЖИВЫМ СОСТОЯНИЕМ — одна на все батч-мутаторы
+# (update_tasks / complete_tasks / move_tasks / set_task_tags).
+#
+# Зачем она вообще (2026-08-07). Раньше батч сверял задачи с живым состоянием
+# ТОЛЬКО в исполнителе. Живой прогон: батч из пяти задач, одна из которых
+# лежала в корзине ещё до построения плана, — карточка перечислила все пять
+# одинаково, и человек подтверждал операцию, часть которой была обречена
+# заранее. Отчёт потом честно говорил «НЕ применилось 1», но постфактум:
+# согласие уже получено на то, чего не будет.
+#
+# ПОЧЕМУ ОДНА ФУНКЦИЯ НА ЧЕТЫРЕ ТУЛА (круг 8). Сверку сначала завели только у
+# `update_tasks`, и живой прогон по кнопкам тут же нашёл цену такого решения:
+# ТОТ ЖЕ корзинный вход у `complete_tasks`, `move_tasks` и `set_task_tags`
+# строил план как на живую задачу — без ⛔, без слова «корзина», в одном
+# экране рядом с честной карточкой `update_tasks`. Отличать «мне откажут» от
+# «всё применится» человек должен по состоянию объекта, а не по тому, какой
+# из четырёх похожих тулов позвала модель, поэтому решение принято ОДИН РАЗ
+# ДЛЯ ВСЕГО КЛАССА — здесь.
+#
+# ТРИ ИСХОДА, И ОНИ РАЗНЫЕ (это ядро круга 8):
+#   * все строки исполнимы          → план как был, ничего не дорисовано;
+#   * часть строк обречена          → ⛔ на этих строках + ⚠️-сводка под
+#                                     списком; остальные исполнимы, решает
+#                                     человек;
+#   * исполнимых строк не осталось  → плана НЕТ вовсе (🛑): подтверждать
+#                                     нечего, а карточка «согласны?» на ноль
+#                                     исполнимых строк — это просьба нажать
+#                                     «да» впустую. Одиночный корзинный вход
+#                                     (ровно то, что видел живой прогон)
+#                                     попадает сюда и получает тот же отказ
+#                                     со словом «корзина» и подсказкой
+#                                     restore_tasks, что и класс из пяти
+#                                     одиночных тулов, — политика круга 7
+#                                     наконец звучит одинаково у всех;
+#   * СВЕРКА НЕ УДАЛАСЬ             → см. `_PLAN_UNVERIFIED_NOTE` ниже.
+_PLAN_UNAPPLICABLE_NOTE = ("⚠️ Не применится строк: {n} из {total} — они "
+                           "помечены ⛔ выше. Подтверждение их не оживит; "
+                           "остальные будут выполнены.")
 
-    Зачем. До этой правки update_tasks сверял задачи с живым состоянием
-    ТОЛЬКО в исполнителе. Живой прогон: батч из пяти задач, одна из которых
-    лежала в корзине ещё до построения плана, — карточка перечислила все пять
-    одинаково, и человек подтверждал операцию, часть которой была обречена
-    заранее. Отчёт потом честно говорил «НЕ применилось 1», но постфактум:
-    согласие уже получено на то, чего не будет. У manual_triage такая сверка
-    (пометка ПРОПУЩЕНО) есть с самого начала — здесь закрывается тот же
-    пробел тем же способом.
+# СБОЙ САМОЙ СВЕРКИ — ГЛАВНАЯ ПРАВКА КРУГА 8.
+#
+# Дефект. Сверка молча возвращала «помечать нечего» в ДВУХ разных случаях:
+# когда все строки исполнимы и когда проверить их не удалось (живое состояние
+# недоступно, чтение упало, батчу не хватило запросов). Внешне это
+# неотличимо: план выглядел полностью исполнимым, а предупреждение уходило
+# только в серверный лог — человек у кнопки его не видит вообще. Живой прогон
+# поймал это дважды на ОДНОМ И ТОМ ЖЕ батче из 4 задач: первый раз карточка
+# пришла без ⛔, повтор — с ⛔ и сводкой «1 из 4». Это ровно тот класс, ради
+# которого шли семь кругов: «сомнение проверки неотличимо от факта», — и в
+# превью ДО операции он опаснее, чем в вердикте ПОСЛЕ неё.
+#
+# ПОЧЕМУ ПРЕДУПРЕЖДЕНИЕ, А НЕ ОТКАЗ СТРОИТЬ ПЛАН. Невозможность ПРОВЕРИТЬ —
+# это не то же самое, что невозможность ВЫПОЛНИТЬ: разовый сбой чтения
+# состояния превратился бы в отказ обслуживания по всем задачам подряд, в том
+# числе полностью исправным (тот же довод, по которому `_task_is_in_trash` не
+# fail-closed). Риск при этом закрыт с другой стороны и без отказа: исполнитель
+# перечитывает состояние сам и на недоступном отказывает по КАЖДОЙ строке
+# (`_guard_task` → status 'unavailable' → 🛑), то есть «подтвердил, а
+# применилось не то» здесь физически не выходит. Отбирать у человека рабочий
+# план ради риска, которого нет, — плохая сделка.
+#
+# ЗНАЧОК ⚠️, А НЕ ⛔ И НЕ ℹ️ — по каналам, разведённым в круге 7: ⛔/ℹ️ —
+# заявление о ФАКТЕ («эта строка не применится», «задача завершена»), а здесь
+# сервер как раз факта не знает. ⚠️ — сомнение В ПРОВЕРКЕ, ровно этот случай.
+_PLAN_UNVERIFIED_NOTE = (
+    "⚠️ ПРОВЕРИТЬ ИСПОЛНИМОСТЬ СТРОК НЕ УДАЛОСЬ ({why}). Отсутствие пометок "
+    "⛔ в списке выше НЕ означает, что применится всё: сверить план с живым "
+    "состоянием аккаунта сейчас не получилось. Часть строк может не "
+    "примениться — при исполнении состояние перечитывается заново, и по "
+    "непригодной строке будет отказ.")
 
-    Причины ровно те, по которым `_update_tasks_impl` откажет: задачи нет
-    среди открытых (закрыта/удалена/в корзине) или id указывает на ДРУГУЮ
-    задачу. Ничего не отсеивается: план строится целиком, строки только
-    помечаются — решает человек.
 
-    BEST-EFFORT: недоступное живое состояние не имеет права ронять фазу
-    плана (то же правило, что у превью «тег будет создан» в set_task_tags).
-    Тогда возвращается пустой словарь и не помечается ничего — сервер честно
-    не знает, а не выдаёт незнание за «всё в порядке». Настоящая защита
-    стоит там же, где стояла: fail-closed guard в исполнителе."""
+class _PlanCheck:
+    """Результат сверки строк плана: пометки и БЫЛА ЛИ СВЕРКА ВООБЩЕ.
+
+    `checked=False` (сверка не удалась) — не то же самое, что пустой `marks`
+    (сверка прошла, помечать нечего). Слить их в одно «пометок нет» и значит
+    выдать незнание за «всё в порядке»; ровно это и чинится."""
+
+    __slots__ = ("marks", "checked", "why")
+
+    def __init__(self, marks: Dict[str, str], checked: bool = True, why: str = ""):
+        self.marks = marks
+        self.checked = checked
+        self.why = why
+
+
+def _check_plan_rows(tasks: List[Dict[str, Any]]) -> _PlanCheck:
+    """Сверяет строки плана с живым состоянием. Причины ровно те, по которым
+    откажет исполнитель: задачи нет среди открытых (завершена / удалена / в
+    корзине) или id указывает на ДРУГУЮ задачу. Формулировку причины даёт сам
+    guard (`missing[...]["reason"]`), поэтому корзина называется корзиной и
+    несёт подсказку `restore_tasks`, а не растворяется в общем «нет среди
+    открытых»."""
     try:
         by_id = _open_by_id(fresh=True)
         if by_id is None:
-            return {}
+            return _PlanCheck({}, checked=False,
+                              why="живое состояние аккаунта недоступно")
         _found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
     except Exception as e:
-        logger.warning(f"update_tasks: сверка плана с живым состоянием не "
-                       f"удалась ({e}) — строки плана не помечаются")
-        return {}
+        logger.warning(f"сверка плана с живым состоянием не удалась ({e}) — "
+                       f"план скажет об этом вслух")
+        return _PlanCheck({}, checked=False,
+                          why=f"чтение живого состояния не удалось: {e}")
     out: Dict[str, str] = {}
     for m in missing:
-        out[str(m.get("taskId"))] = ("этой задачи нет среди открытых "
-                                     "(закрыта, удалена или в корзине)")
+        out[str(m.get("taskId"))] = (m.get("reason")
+                                     or "этой задачи нет среди открытых "
+                                        "(закрыта, удалена или в корзине)")
     for m in mismatch:
         out[str(m.get("taskId"))] = (f"id указывает на другую задачу — "
                                      f"живое название «{m.get('actual')}»")
-    return out
+    return _PlanCheck(out)
 
 
-def _describe_update_item_marking(unapplicable: Dict[str, str],
-                                  titles: Optional[Dict[str, str]] = None):
-    """`_describe_update_item` + пометка обречённой строки. Пометка живёт
-    ТОЛЬКО в тексте превью и не попадает в сами элементы манифеста: на
-    исполнении состояние перечитывается заново, и вчерашняя пометка не должна
-    ни отменять строку, ни выдавать себя за проверку."""
+def _mark_unapplicable_rows(describe_item, marks: Dict[str, str]):
+    """describe-функция тула + пометка обречённой строки. Пометка живёт ТОЛЬКО
+    в тексте превью и не попадает в сами элементы манифеста: на исполнении
+    состояние перечитывается заново, и вчерашняя пометка не должна ни отменять
+    строку, ни выдавать себя за проверку."""
     def describe(t: Dict[str, Any]) -> str:
-        line = _describe_update_item(t, titles)
-        why = unapplicable.get(str(t.get("taskId") or t.get("task_id") or ""))
+        line = describe_item(t)
+        why = marks.get(str(t.get("taskId") or t.get("task_id") or ""))
         return f"{line}\n   ⛔ НЕ БУДЕТ ПРИМЕНЕНО: {why}" if why else line
     return describe
+
+
+def _plan_live_check(tasks: List[Dict[str, Any]], describe_item):
+    """(describe, notes, refusal) для фазы ПЛАНА батч-мутатора.
+
+    `refusal` не None — вернуть его вызывающему как есть: план не строится,
+    манифест не создаётся, ничего не изменено."""
+    check = _check_plan_rows(tasks)
+    if not check.checked:
+        return describe_item, [_PLAN_UNVERIFIED_NOTE.format(why=check.why)], None
+    if not check.marks:
+        return describe_item, None, None
+    alive = [t for t in tasks
+             if str(t.get("taskId") or t.get("task_id") or "") not in check.marks]
+    if not alive:
+        reasons = "\n".join(
+            f"- «{(t.get('title') or '').strip() or str(t.get('taskId') or t.get('task_id') or '')}»: "
+            f"{check.marks.get(str(t.get('taskId') or t.get('task_id') or ''), '')}"
+            for t in tasks)
+        return describe_item, None, (
+            "🛑 План НЕ построен — исполнить нечего: ни одна строка не пройдёт "
+            f"проверку на исполнении.\n{reasons}\nНичего не изменено.")
+    return (_mark_unapplicable_rows(describe_item, check.marks),
+            [_PLAN_UNAPPLICABLE_NOTE.format(n=len(check.marks), total=len(tasks))],
+            None)
 
 
 async def _update_tasks_impl(
@@ -3522,10 +3625,22 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]] = None,
     # Живые названия для строк, которым вызывающий их не дал: карточка
     # обязана называть задачу, а не показывать её id (_plan_task_name).
     titles = _plan_task_titles(tasks) if not manifest_id else {}
+
+    def _describe(t: Dict[str, Any]) -> str:
+        return f"**{_plan_task_name(t, titles)}**"
+
+    # Сверка с живым состоянием на фазе ПЛАНА — та же, что у update_tasks
+    # (см. `_plan_live_check`). До круга 8 её здесь не было ВОВСЕ: корзинная
+    # задача попадала в карточку неотличимо от живой, хотя исполнитель её
+    # заведомо пропустит.
+    notes = None
+    if not manifest_id and tasks:
+        _describe, notes, refusal = _plan_live_check(tasks, _describe)
+        if refusal:
+            return refusal
     outcome = await _gate_batch(
         "complete", "complete_tasks", tasks, summary, manifest_id, user_reply,
-        lambda t: f"**{_plan_task_name(t, titles)}**",
-        automation_key=automation_key)
+        _describe, notes=notes, automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _complete_tasks_impl(outcome.summary, outcome.tasks)
@@ -9120,9 +9235,19 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]] = None,
     titles = _plan_task_titles(tasks) if not manifest_id else {}
     dest = (_plan_project_name(to_project_id, to_project_name)
             if not manifest_id else "")
+
+    def _describe(t: Dict[str, Any]) -> str:
+        return f"**{_plan_task_name(t, titles)}** → {dest}"
+
+    # Сверка с живым состоянием на фазе ПЛАНА — см. `_plan_live_check`.
+    notes = None
+    if not manifest_id and tasks:
+        _describe, notes, refusal = _plan_live_check(tasks, _describe)
+        if refusal:
+            return refusal
     outcome = await _gate_batch(
         "move", "move_tasks", tasks, summary, manifest_id, user_reply,
-        lambda t: f"**{_plan_task_name(t, titles)}** → {dest}",
+        _describe, notes=notes,
         extra={"to_project_id": to_project_id, "to_project_name": to_project_name},
         automation_key=automation_key)
     if not outcome.proceed:
@@ -10467,11 +10592,23 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
     # защита от тега-сироты стоит в _set_task_tags_impl, где отсутствующий
     # тег регистрируется в аккаунте ПЕРЕД записью на задачу — и там
     # недоступность состояния уже честно останавливает операцию.
+    #
+    # `tags_known` (круг 8) — тот же разбор фактa и сомнения, что у сверки
+    # строк. Пока флага не было, упавшее чтение оставляло `existing_tags`
+    # ПУСТЫМ, и правило «нет в списке → будет создан» печатало «тег не
+    # существует — будет создан» РОВНО ПРО ВСЕ теги, включая давно
+    # существующие: незнание выдавалось за факт, причём за противоположный
+    # действительности (комментарий выше обещал, что пометка «не
+    # показывается», — она показывалась на всех). Теперь при неудавшемся
+    # чтении не печатается ни одна пометка, а сомнение уходит отдельной ⚠️
+    # строкой плана.
     existing_tags: set = set()
+    tags_known = True
     if not manifest_id and tasks:
         try:
             existing_tags = set(await _live_tag_names(force=True))
         except Exception as e:
+            tags_known = False
             logger.warning(f"set_task_tags: не удалось прочитать список тегов "
                            f"для превью плана ({e}) — пометка «будет создан» "
                            "в этом плане не показывается")
@@ -10484,16 +10621,27 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
         parts = []
         for tag in wanted:
             bare = tag.lstrip("#").lower()
-            if bare and bare not in existing_tags:
+            if tags_known and bare and bare not in existing_tags:
                 parts.append(f"{tag} (тег не существует — будет создан)")
             else:
                 parts.append(tag)
         return (f"**{_plan_task_name(t, titles)}** → теги: "
                 + (", ".join(parts) or "(пусто)"))
 
+    # Сверка с живым состоянием на фазе ПЛАНА — см. `_plan_live_check`.
+    describe, notes = _describe_tags, None
+    if not manifest_id and tasks:
+        describe, notes, refusal = _plan_live_check(tasks, _describe_tags)
+        if refusal:
+            return refusal
+        if not tags_known:
+            notes = (notes or []) + [
+                "⚠️ ПРОВЕРИТЬ, СУЩЕСТВУЮТ ЛИ ЭТИ ТЕГИ, НЕ УДАЛОСЬ (список "
+                "тегов аккаунта не прочитался) — какой-то из них может быть "
+                "новым и будет заведён в аккаунте при исполнении."]
     outcome = await _gate_batch(
         "tags", "set_task_tags", tasks, summary, manifest_id, user_reply,
-        _describe_tags, automation_key=automation_key)
+        describe, notes=notes, automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
     return await _set_task_tags_impl(outcome.summary, outcome.tasks)
@@ -12651,6 +12799,17 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
     # На call #2 карточка не строится, поэтому и резолвить нечего.
     task_title = (_live_task_title(task_id, project_id or "")
                   if not manifest_id else None)
+    # ПОЛИТИКА КОРЗИНЫ ДЕЙСТВУЕТ И ЗДЕСЬ (круг 8, найдено сплошным прогоном
+    # одного корзинного входа по всем тулам — живой прогон по кнопкам этого
+    # не поймал). Иначе она обходится ссылкой: `attach_file_to_task` кладёт
+    # файл в удалённую задачу и отказывает, а этот тул на ТУ ЖЕ задачу выдавал
+    # РАБОЧУЮ ссылку-полномочие на запись — файл уезжал в корзину и исчезал
+    # вместе с ней при очистке. Проверяется ТОЛЬКО корзина: остальные
+    # состояния этот тул обслуживает намеренно (в том числе завершённую
+    # задачу — см. `_attachment_project_id` в исполнителе).
+    if not manifest_id and _task_is_in_trash(task_id):
+        return ("🛑 Ссылку НЕ выдаю — " + _TRASHED_TASK_NOTE.format(
+            title=task_title or str(task_id)[:8] + "…"))
     outcome = await _gate_single("create_attachment_upload_url",
                                  "create_attachment_upload_url",
                                  params if not manifest_id else None,
@@ -12672,6 +12831,12 @@ async def _create_attachment_upload_url_impl(task_id: str, project_id: str = Non
     base = _public_base_url()
     if not base:
         return _NO_PUBLIC_URL_MSG
+    # Вторая линия той же политики корзины: сюда приходят и по нажатию кнопки
+    # в Telegram (исполнитель зовётся напрямую, минуя код тула), и по
+    # манифесту, построенному ДО удаления задачи.
+    if _task_is_in_trash(task_id):
+        return ("🛑 Ссылку НЕ выдаю — " + _TRASHED_TASK_NOTE.format(
+            title=_lookup_task_title(task_id) or str(task_id)[:8] + "…"))
     try:
         # _attachment_project_id, а не _resolve_project_id: второй смотрит
         # ТОЛЬКО в открытые задачи (guard-политика — мутация не должна молча
