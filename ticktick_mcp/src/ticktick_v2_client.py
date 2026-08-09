@@ -279,7 +279,14 @@ class TickTickV2Client:
         from_str/to_str are 'YYYY-MM-DD HH:MM:SS' bounds (empty = unbounded)."""
         limit = max(1, min(limit, COMPLETED_MAX_LIMIT))
         if to_str is None:
-            to_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # 2026-08-09: было datetime.now() без tz — время ПРОЦЕССА
+            # (сервер на Railway обычно в UTC), а не владельца. Весь
+            # остальной код в этом файле аккуратно ходит через _USER_TZ
+            # (см. её докстринг выше), чтобы "сейчас" для фильтра/среза
+            # совпадало с тем, что владелец считает "сейчас" у себя. Эта
+            # верхняя граница "recently completed" была единственным
+            # местом, где это правило нарушалось.
+            to_str = datetime.now(_USER_TZ).strftime("%Y-%m-%d %H:%M:%S")
         params = {"from": from_str, "to": to_str, "limit": limit}
         data = self._request("GET", "/project/all/completed", params=params)
         return data if isinstance(data, list) else data.get("tasks", [])
