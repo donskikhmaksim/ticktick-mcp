@@ -495,7 +495,7 @@ def _files_word(n: int) -> str:
     return "файлов"
 
 
-def _task_attachment_count(task: Dict) -> int:
+def _task_attachment_count(task: Dict) -> Optional[int]:
     """Сколько файлов приложено к задаче, по ДВУМ источникам того же объекта:
     структурный массив `attachments` и inline-токены ![file](id/имя) в
     content/desc (те же два источника, что сводит `_merged_task_attachments`,
@@ -503,12 +503,32 @@ def _task_attachment_count(task: Dict) -> int:
     лишь когда его нет вовсе — у части аккаунтов он приходит пустым, и тогда
     ссылка в тексте единственное свидетельство файла. Складывать их нельзя:
     один и тот же файл присутствует обычно в обоих, и сумма соврала бы «2
-    файла» про один чек."""
-    structured = [a for a in (task.get("attachments") or []) if a]
-    if structured:
-        return len(structured)
-    text = str(task.get("content") or "") + "\n" + str(task.get("desc") or "")
-    return len({m.group(1) for m in _ATTACH_INLINE_RE.finditer(text)})
+    файла» про один чек.
+
+    None — «СКАЗАТЬ НЕ МОГУ», и это НЕ то же самое, что 0 (аудит 2026-08-09).
+    Источник, не перечисляющий вложения вовсе — официальный v1 API, чей ответ
+    попадает в `format_task`, — не даёт права утверждать «пусто»: карточка
+    задачи с фотографией чека Home Depot внутри сказала бы «(без названия ·
+    пусто)», то есть ровно то, из-за чего документ и попадает под удаление.
+    Ноль возвращается ТОЛЬКО когда список вложений реально был перечислен и
+    оказался пуст."""
+    try:
+        atts = task.get("attachments")
+        listed = atts is not None
+        if listed:
+            if not isinstance(atts, (list, tuple)):
+                return None           # источник ответил чем-то неожиданным
+            structured = [a for a in atts if a]
+            if structured:
+                return len(structured)
+        text = str(task.get("content") or "") + "\n" + str(task.get("desc") or "")
+        inline = len({m.group(1) for m in _ATTACH_INLINE_RE.finditer(text)})
+        if inline:
+            return inline
+        return 0 if listed else None
+    except Exception as e:                # pragma: no cover — форма ответа
+        logger.warning(f"вложения задачи посчитать не удалось: {e}")
+        return None
 
 
 def _task_has_text(task: Dict) -> bool:
@@ -524,24 +544,55 @@ def _task_has_text(task: Dict) -> bool:
 
 
 def _untitled_label(task: Optional[Dict] = None) -> str:
-    """Чем задача без названия называется в любом человеческом выводе."""
+    """Чем задача без названия называется в любом человеческом выводе.
+
+    ПОРЯДОК ВАЖЕН И ОБРАТНОМУ НЕ ПОДЛЕЖИТ: файл впереди текста. Задача, где
+    есть и файл, и подпись к нему, — это ДОКУМЕНТ; сказать про неё «есть
+    текст» значит спрятать вложение ровно там, где владелец решает, удалять
+    ли. «пусто» — самое сильное утверждение здесь, и оно делается только
+    когда источник действительно перечислил вложения (см.
+    `_task_attachment_count`); иначе строка просто не утверждает ничего."""
     task = task or {}
     n = _task_attachment_count(task)
     if n:
-        what = f"📎 {n} {_files_word(n)}"
-    elif _task_has_text(task):
-        what = "есть текст"
-    else:
-        what = "пусто"
-    return f"(без названия · {what})"
+        return f"(без названия · 📎 {n} {_files_word(n)})"
+    if _task_has_text(task):
+        return "(без названия · есть текст)"
+    if n == 0:
+        return "(без названия · пусто)"
+    return "(без названия)"           # содержимое источник не показал
 
 
 def _is_untitled(title: Optional[str]) -> bool:
-    """Пустое ли название. Одна точка на весь сервер: «нет имени» — это и
-    None, и "", и строка из одних пробелов, и их нельзя разводить по разным
-    веткам, иначе сверка в одном месте признаёт задачу безымянной, а в
-    соседнем — нет."""
+    """Пустое ли название — вопрос ПРЕДОХРАНИТЕЛЯ: «нечего ли сверять».
+    Одна точка на весь сервер: и None, и "", и строка из одних пробелов, их
+    нельзя разводить по разным веткам, иначе сверка в одном месте признаёт
+    задачу безымянной, а в соседнем — нет.
+
+    ЗДЕСЬ НАМЕРЕННО НЕ ВЫЧИЩАЮТСЯ НЕВИДИМЫЕ СИМВОЛЫ (аудит 2026-08-09).
+    Название из одного zero-width space — не пустота для сверки: оно
+    ОТЛИЧАЕТСЯ от пустого живого названия, и признать его пустым значило бы
+    пропустить в удаление объект, чьё имя разошлось с планом. Показу нужен
+    другой вопрос — «выглядит ли строка пустой глазами», — и на него отвечает
+    `_looks_untitled`. Обе ошибаются в безопасную сторону: показ щедрее (чаще
+    подставляет заменитель), предохранитель строже (реже считает имя
+    отсутствующим)."""
     return not str(title or "").strip()
+
+
+def _looks_untitled(title: Optional[str]) -> bool:
+    """Выглядит ли название пустым МЕСТОМ в списке — вопрос ПОКАЗА.
+
+    Всё, что `_is_untitled`, плюс строки из одних невидимых символов
+    (zero-width space и родня, `_INVISIBLE`): человек видит пустую строку
+    независимо от того, что там за кодовые точки, и решение об удалении
+    принимает по увиденному. Показ по truthiness («title or заменитель») этот
+    класс пропускал целиком — задача с названием из пробелов и фотографией
+    чека внутри печаталась пустотой (аудит 2026-08-09)."""
+    s = str(title or "")
+    for z in _INVISIBLE:
+        s = s.replace(z, "")
+    return not s.strip()
 
 
 # Format a task object from TickTick for better display
@@ -556,7 +607,9 @@ def format_task(task: Dict, trash_state: Optional[bool] = None) -> str:
     # списке (П15, 2026-08-09): карточка задачи с чеком Home Depot выглядела
     # так же, как карточка пустышки. Заглушка заменена на заменитель, который
     # говорит, ЧТО в задаче есть.
-    formatted = f"Title: {task.get('title') or _untitled_label(task)}\n"
+    formatted = ("Title: " + (_untitled_label(task)
+                              if _looks_untitled(task.get("title"))
+                              else task["title"]) + "\n")
 
     # Dates are printed in the OWNER's zone (_local_datetime_str), never as the
     # raw UTC instant TickTick stores. A deadline near local midnight otherwise
@@ -708,7 +761,8 @@ def format_task_line(task: Dict, project_name: str = None) -> str:
     # П15 (2026-08-09): «(no title)» не отличало документ от мусора — см.
     # _untitled_label. Три задачи владельца выглядели в списке одинаково, и
     # две из них были содержательными (чек Home Depot, скриншот дефекта).
-    bits.append(task.get("title") or _untitled_label(task))
+    bits.append(_untitled_label(task) if _looks_untitled(task.get("title"))
+                else task["title"])
     meta = []
     if task.get("dueDate"):
         # Owner's calendar day, not dueDate[:10] of the raw UTC instant — see
@@ -886,7 +940,8 @@ def _lookup_task_title(task_id: str) -> str:
             t = next((x for x in ticktick_v2.get_open_tasks()
                       if x.get("id") == task_id), None)
             if t:
-                return t.get("title") or _untitled_label(t)
+                return (_untitled_label(t) if _looks_untitled(t.get("title"))
+                        else t["title"])
         except Exception:
             pass
     return f"[task {task_id[:8]}…]"
@@ -1150,7 +1205,8 @@ def _live_task_title(task_id: str, project_id: str = "") -> Optional[str]:
             live = None
     if not live:
         return None
-    return (live.get("title") or "").strip() or _untitled_label(live)
+    return (_untitled_label(live) if _looks_untitled(live.get("title"))
+            else live["title"].strip())
 
 
 def _locate_task_any_state(task_id: str) -> Tuple[Optional[Dict], Optional[str], bool]:
@@ -1232,7 +1288,7 @@ def _plan_task_titles(tasks: Optional[List[Dict]], *,
     пустой словарь, и строка честно скажет, что имя неизвестно (см.
     `_plan_task_name`), а не выдаст незнание за имя."""
     need = {str(t.get("taskId") or t.get("task_id") or "")
-            for t in (tasks or []) if not (t.get("title") or "").strip()}
+            for t in (tasks or []) if _looks_untitled(t.get("title"))}
     need.discard("")
     if not need:
         return {}
@@ -1251,9 +1307,9 @@ def _plan_task_titles(tasks: Optional[List[Dict]], *,
         row = live.get(tid)
         if row is None:
             continue                      # задачи нет — это другой исход
-        name = (row.get("title") or "").strip()
-        out[tid] = ({"label": name, "untitled": False} if name else
-                    {"label": _untitled_label(row), "untitled": True})
+        out[tid] = ({"label": _untitled_label(row), "untitled": True}
+                    if _looks_untitled(row.get("title")) else
+                    {"label": row["title"].strip(), "untitled": False})
     return out
 
 
@@ -1273,9 +1329,10 @@ def _plan_task_name(t: Dict[str, Any],
     сверена по id; и только если про задачу не известно ничего — id вместе с
     прямым признанием, что имя неизвестно."""
     tid = str(t.get("taskId") or t.get("task_id") or "")
-    given = (t.get("title") or "").strip()
-    if given:
-        return f"«{given}»"
+    # `_looks_untitled`, а не truthiness: переданное имя из пробелов/невидимых
+    # символов напечаталось бы пустотой внутри кавычек (аудит 2026-08-09).
+    if not _looks_untitled(t.get("title")):
+        return f"«{t['title'].strip()}»"
     entry = (titles or {}).get(tid)
     if isinstance(entry, str):            # старый вид значения — только имя
         entry = {"label": entry, "untitled": False}
@@ -1857,9 +1914,11 @@ def _split_tasks_by_state(
             # то есть отказывала бы ровно в том случае, ради которого правка
             # и делалась.
             by_id_only = _is_untitled(exp_title) and _is_untitled(g.title)
+            shown = exp_title if not _looks_untitled(exp_title) else (
+                g.title if not _looks_untitled(g.title)
+                else _untitled_label(by_id.get(tid) or {}))
             found.append({"taskId": tid, "title": exp_title or g.title,
-                          "label": (exp_title or g.title
-                                    or _untitled_label(by_id.get(tid) or {})),
+                          "label": shown,
                           "projectId": g.project_id,
                           "armed": bool((exp_title or "").strip()),
                           "by_id": by_id_only})
@@ -5827,7 +5886,7 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
         # чек Home Depot вместе с настоящим мусором. Название в манифесте
         # при этом остаётся ПУСТЫМ: по нему сверяется исполнение, и подменять
         # его заменителем значило бы сверять выдуманное имя.
-        shown = (f"**«{it['title']}»**" if not _is_untitled(it["title"]) else
+        shown = (f"**«{it['title']}»**" if not _looks_untitled(it["title"]) else
                  f"**«{_untitled_label(by_id.get(it['taskId']) or {})}»** "
                  f"— {_BY_ID_NOTE}")
         lines.append(f"{i}. {mark}{shown} — {it['project']} (`{it['taskId']}`)")
@@ -5999,7 +6058,9 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
                           # `planned_title` печаталось бы как «» — строка, по
                           # которой нельзя понять, что именно исчезло (П15,
                           # 2026-08-09).
-                          "title": planned_title or _untitled_label(live),
+                          "title": (planned_title
+                                    if not _looks_untitled(planned_title)
+                                    else _untitled_label(live)),
                           "snapshot": it["snapshot"]})
         journal = _journal_write({
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -15610,8 +15671,9 @@ def _resolve_triage_ops(operations: List[Dict], by_id: Dict[str, Dict],
         # Задача найдена — значит «имени нет» здесь означает «у неё его нет»,
         # а не «мы её не нашли», и печатать про недоступное живое состояние
         # (как делал общий фолбэк) было бы прямой ложью.
-        e["_untitled"] = _is_untitled(live_title)
-        e["_label"] = live_title or _untitled_label(live)
+        e["_untitled"] = _looks_untitled(live_title)
+        e["_label"] = (_untitled_label(live) if _looks_untitled(live_title)
+                       else live_title)
         e["_snapshot"] = _snapshot_of(live)
         if e["op"] in ("delete", "complete", "merge"):
             e["_open_children"] = kids.get(e["task_id"], 0)
