@@ -135,3 +135,82 @@ def test_unregistered_and_unrecognized_tool_still_returns_none():
     тул», а «этот вид манифеста никогда не исполнялся кнопкой»)."""
     assert s._resolve_auto_executor("this_tool_never_existed", {}) is None
     assert s._resolve_auto_executor("", {}) is None
+
+
+# ─────────── независимый аудит (2026-08-09): сама проверка регистрации ────
+# может упасть — fail-closed, а не пробросить исключение наружу ────────────
+
+class _BrokenToolManager:
+    """Двойник `mcp._tool_manager`, чей `get_tool` падает — ровно то, что
+    случилось бы при несовместимом обновлении FastMCP: `_tool_manager` —
+    приватный, ничем не гарантированный атрибут библиотеки. Первая версия
+    этого фикса (376b3aa) звала `mcp._tool_manager.get_tool(...)` БЕЗ
+    try/except внутри `_resolve_auto_executor`, а тот в свою очередь вызывался
+    из `_auto_executable_tool` → `_tg_auto_execute_pending`, которая внутри
+    `_tg_auto_execute_tick` идёт БЕЗ обёртки — одно упавшее исключение на
+    ОДНОМ манифесте останавливало разбор ВСЕХ кандидатов в этом тике,
+    включая полностью рабочие, зарегистрированные тулы. Внешний
+    `_tg_auto_execute_poller_loop` процесс не ронял, но следующий тик через
+    10 секунд повторял тот же провал — автоисполнение вставало целиком,
+    хотя до этой правки такого дефекта не было вовсе (`_resolve_auto_executor`
+    состоял только из `dict.get`/`globals().get`, бросить не мог)."""
+
+    def get_tool(self, name):
+        raise RuntimeError("реестр инструментов недоступен (симуляция сбоя)")
+
+
+def test_registry_check_failure_refuses_instead_of_raising(monkeypatch):
+    """Главная регрессия из аудита: падение самой проверки регистрации не
+    должно вылетать из `_resolve_auto_executor` наружу — иначе именно тот
+    необёрнутый вызов из `_tg_auto_execute_pending` стопорит цикл поиска
+    кандидатов целиком. Вместо этого — исполнитель-отказник, как и для
+    честно отключённого тула."""
+    real_entry = s._AUTO_EXECUTORS["create_tasks"]
+    monkeypatch.setattr(s.mcp, "_tool_manager", _BrokenToolManager())
+
+    entry = s._resolve_auto_executor("create_tasks", {})  # не должно бросить
+
+    assert entry is not None
+    assert entry is not real_entry
+    assert entry.rehash is real_entry.rehash
+
+    out = asyncio.run(entry.execute("mid-broken-registry", {}))
+    assert out.startswith("🛑")
+    assert "create_tasks" in out
+
+
+def test_registry_check_failure_message_differs_from_plain_disabled(monkeypatch):
+    """Текст отказа обязан различать «тул отключён» (решение владельца) и
+    «проверка упала» (поломка сервера) — иначе владелец, увидев отказ,
+    решит, что сам когда-то выключил этот тул, хотя на деле сломался
+    внутренний вызов к приватному API FastMCP."""
+    monkeypatch.setattr(s.mcp, "_tool_manager", _BrokenToolManager())
+
+    entry = s._resolve_auto_executor("create_tasks", {})
+    out = asyncio.run(entry.execute("mid-broken-registry-2", {}))
+
+    assert "провер" in out.lower(), "текст должен называть причину — сбой проверки"
+    assert "отключён" not in out and "удалён" not in out, (
+        "формулировка «отключён/удалён» подразумевает решение владельца — "
+        "для сбоя самой проверки регистрации это вводящий в заблуждение текст")
+
+
+def test_registry_check_failure_is_logged_with_traceback(monkeypatch, caplog):
+    """`logger.exception` обязателен: без записи с трассировкой причина
+    («реестр внезапно недоступен») не видна нигде, кроме гадания по
+    симптомам («кнопка перестала работать»)."""
+    monkeypatch.setattr(s.mcp, "_tool_manager", _BrokenToolManager())
+
+    with caplog.at_level("ERROR"):
+        s._resolve_auto_executor("create_tasks", {})
+
+    assert "create_tasks" in caplog.text
+    assert any(rec.exc_info for rec in caplog.records), (
+        "ожидал запись с трассировкой (logger.exception), а не голый logger.error")
+
+
+def test_registered_tools_survive_a_broken_registry_check_for_other_tools():
+    """Регресс-страховка на будущее: пока реестр НЕ сломан, поведение теста
+    выше вообще не должно быть нужно — обычный живой тул как резолвился
+    напрямую (identity), так и резолвится."""
+    assert s._resolve_auto_executor("create_tasks", {}) is s._AUTO_EXECUTORS["create_tasks"]
