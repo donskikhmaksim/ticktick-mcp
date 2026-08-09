@@ -27,7 +27,7 @@ import time
 import urllib.parse
 import uuid
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -424,7 +424,11 @@ class TickTickV2Client:
     # ---- habits ----------------------------------------------------------
     @staticmethod
     def _now_iso() -> str:
-        return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000+0000")
+        # 2026-08-09: datetime.utcnow() — naive-время, помеченное Python как
+        # deprecated (будет удалено). Час тот же самый UTC, меняется только
+        # то, что объект теперь aware (несёт tzinfo=timezone.utc) — формат
+        # строки на выходе не менялся ни на символ.
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000+0000")
 
     def get_habits(self) -> List[Dict]:
         data = self._request("GET", "/habits")
