@@ -461,6 +461,34 @@ async def test_planned_title_but_live_is_untitled_is_refused(
     assert "Пропущены" in out
 
 
+async def test_planned_name_that_normalises_to_nothing_is_refused_on_untitled_live(
+        monkeypatch, tmp_path):
+    """ГРАНИЦА, сторона 2, СЛУЧАЙ, КОТОРЫЙ НЕ ЛОВИТ ОБЫЧНАЯ СВЕРКА (аудит
+    2026-08-09). `_names_agree` вычищает невидимые символы, поэтому имя из
+    одного zero-width space она считает СОВПАВШИМ с пустым живым названием —
+    и без отдельной ветки предохранителя такой план удалил бы безымянную
+    задачу (проверено: снятие ветки оставляло весь прогон зелёным).
+
+    Предохранитель обязан судить по СЫРОМУ значению: «в плане имя было, у
+    живой задачи его нет» — это другой объект, чем бы имя ни нормализовалось.
+    """
+    zero_width = "​"
+    # Предпосылка теста: обычная сверка здесь БЕССИЛЬНА — если это перестанет
+    # быть правдой, тест обязан сказать об этом, а не тихо стать тавтологией.
+    assert s._names_agree(zero_width, "") is True
+
+    live = {"t1": _receipt_task("t1")}
+    fake, _official = _wire(monkeypatch, live, tmp_path)
+    _delete_manifest("mid-zw", [
+        {"taskId": "t1", "projectId": "p_inbox", "title": zero_width,
+         "project": "Inbox", "snapshot": {"title": zero_width}}])
+
+    out = await s.execute_task_deletion("mid-zw", user_reply="да")
+
+    assert "t1" in live
+    assert [c for c in fake.calls if c[0] == "delete"] == []
+    assert "Пропущены" in out
+
 
 async def test_a_named_task_that_drifted_is_still_refused_after_the_relaxation(
         monkeypatch, tmp_path):
