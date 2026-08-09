@@ -119,9 +119,16 @@ def test_guard_ok_fallback_carries_through_split_tasks_by_state(monkeypatch):
     # `by_id` — признак «опознано по id, названия нет ни с одной стороны»
     # (П15, 2026-08-09). Здесь название есть и сверено, поэтому False, а
     # `label` (человекочитаемое имя для вывода) совпадает с самим названием.
+    # `live_title` — ЖИВОЕ имя, добытое guard'ом (здесь — через официальный
+    # фолбэк, ведь `by_id` пуст). Вызывающий, который полез бы за именем в сам
+    # `by_id`, получил бы пустоту по существующей задаче и принял бы её за
+    # «имени нет» — на этом и разоружалась сверка переименования (2026-08-09).
+    # `row` — номер исходной строки: id может повторяться в одном вызове.
     assert found == [{"taskId": "t1", "title": "__AUTOTEST__dup-src",
                       "label": "__AUTOTEST__dup-src",
-                      "projectId": "p_new", "armed": True, "by_id": False}]
+                      "projectId": "p_new",
+                      "live_title": "__AUTOTEST__dup-src", "row": 0,
+                      "armed": True, "by_id": False}]
 
 
 def test_guard_stays_missing_when_task_genuinely_does_not_exist(monkeypatch):
