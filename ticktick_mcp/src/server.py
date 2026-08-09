@@ -2099,6 +2099,95 @@ def _unarmed_note(found: List[Dict]) -> str:
     return "\n".join(notes)
 
 
+# ─── Н9 (2026-08-09): взведённость сверки как УСЛОВИЕ записи в поле названия ──
+#
+# Дыра, которую это закрывает. `_names_agree` первой строкой возвращает True на
+# пустое ожидаемое имя — и это её ЧЕСТНЫЙ контракт («претензии нет, сверять
+# нечего»), её зовут 24 места, половина законно передаёт пустоту. Менять её
+# нельзя. Но у одного вызывающего пустота означала другое: `update_tasks`
+# принимал строку {"taskId": X, "new_title": "ЗАТЁРТО"} БЕЗ поля title, guard
+# при этом был разоружён, имя живой задачи затиралось, а жалоба «выполнено БЕЗ
+# сверки названия» печаталась ПОСЛЕ записи. Восстановить затёртое нечем:
+# журнальная запись хранит НОВОЕ имя.
+#
+# Развести надо два внешне одинаковых случая:
+#   «имени нет, потому что менять его не собираемся» — законно и массово
+#       (срок, приоритет, теги, проект, завершение) — требовать имя там значит
+#       издеваться над вызывающим;
+#   «имени нет, но пишем В ПОЛЕ НАЗВАНИЯ» — единственный случай, когда
+#       отсутствие имени означает затирание старого без единой сверки.
+#
+# Поэтому правило записано ОДНОЙ функцией, а не рассуждением по месту, и один
+# текст отказа обслуживает все точки: подтверждающий обязан читать одно и то
+# же, откуда бы отказ ни пришёл.
+_RENAME_UNARMED_REFUSAL = (
+    "🛑 НЕ переименовал «{label}» — в строке есть new_title, но НЕТ текущего "
+    "названия задачи (поле title), то есть сверка личности не состоялась бы "
+    "вовсе: id из устаревшего списка затёр бы имя ЖИВОЙ задачи безвозвратно "
+    "(в журнал пишется НОВОЕ имя, восстанавливать не из чего). Добавь в эту "
+    "строку \"title\": \"<точное текущее название>\"; если названия у задачи "
+    "ДЕЙСТВИТЕЛЬНО нет — \"untitled\": true вместо него. Ничего не изменено.")
+
+
+def _title_check_armed(expected_title: str, untitled_claim: bool,
+                       live_title: str) -> bool:
+    """Взведена ли сверка названия для ОДНОЙ строки изменения (Н9).
+
+        сверка взведена := передано непустое title
+                        ИЛИ структурный маркер untitled=true, ПОДТВЕРЖДЁННЫЙ
+                            живым состоянием
+                        ИЛИ имени нет ни у вызывающего, ни у живой задачи
+                            (тот же признак, что `by_id` в
+                            `_split_tasks_by_state`)
+
+    Третья ветвь поглощает вторую по значению, и это НАМЕРЕННО не свёрнуто в
+    одну строку: маркер — ЗАЯВЛЕНИЕ вызывающего о живом состоянии, а признак
+    by_id — вывод сервера о нём же. Их совпадение здесь — свойство сегодняшнего
+    кода, а не тождество; свернув их, следующая правка потеряла бы разницу
+    между «вызывающий утверждает» и «сервер увидел».
+
+    Пустоту решает `_is_untitled` (строгий предохранитель), а НЕ
+    `_looks_untitled`: название из одного невидимого символа отличается от
+    пустого живого, и признать его отсутствующим значило бы разоружить сверку
+    ровно тем классом строк, ради которого она и стоит."""
+    if (expected_title or "").strip():
+        return True
+    if untitled_claim and _is_untitled(live_title):
+        return True
+    return _is_untitled(expected_title) and _is_untitled(live_title)
+
+
+def _rename_guard_refusal(t: Dict[str, Any], live_title: str,
+                          label: str) -> Optional[str]:
+    """Текст отказа для строки изменения — или None, если писать можно.
+
+    Зовётся ДО обращения к TickTick в обоих путях `_update_tasks_impl`.
+    Предупреждение после записи проверкой не считается: данные к этому моменту
+    уже испорчены.
+
+    Маркер `untitled` читается ЕДИНСТВЕННОЙ реализацией — `_triage_untitled_claim`
+    (строгий тип: "true" строкой и 1 числом НЕ проходят). Две его беды —
+    неверный тип и заявление, разошедшееся с живым состоянием, — отказывают
+    ВСЕГДА, а не только при переименовании: маркер это утверждение о ЛИЧНОСТИ
+    объекта, и ложное утверждение о личности не становится безобидным оттого,
+    что в этой же строке меняют всего лишь срок."""
+    untitled, bad_flag = _triage_untitled_claim(t, "untitled")
+    if bad_flag:
+        return (f"🛑 НЕ обновил «{label}» — {bad_flag} Ничего не изменено.")
+    if untitled and not _is_untitled(live_title):
+        return (f"🛑 НЕ обновил «{label}» — передан маркер untitled=true, но у "
+                f"живой задачи название ЕСТЬ: «{live_title}». Маркер — "
+                "утверждение «у этой задачи имени нет», и оно разошлось с "
+                "живым состоянием: значит id указывает не на ту задачу, "
+                "которую ты имеешь в виду. Передай точное текущее название в "
+                "поле title. Ничего не изменено.")
+    if t.get("new_title") is None:
+        return None                      # в поле названия не пишем — правило молчит
+    if _title_check_armed(t.get("title") or "", untitled, live_title):
+        return None
+    return _RENAME_UNARMED_REFUSAL.format(label=label)
+
+
 def _guard_project(project_id: str, expected_name: str = "", *,
                    fresh: bool = False, require_known: bool = False) -> Optional[str]:
     """Identity guard for a PROJECT mutation: if the caller supplied the project
@@ -3524,12 +3613,22 @@ async def update_tasks(
     one call via v2 batch (limited fields). For a single task with advanced fields
     (repeat_flag, reminders, column_id), the official API is used.
 
-    IMPORTANT: always include the task's current title in each item (as "title")
-    so the user knows which task is being changed.
+    RULE, ENFORCED IN CODE — not a wish: every item MUST carry the task's
+    CURRENT title as "title". An item that sets "new_title" WITHOUT "title" is
+    REFUSED before anything is sent to TickTick (the reply starts with 🛑 and
+    names the missing field). The price of the old behaviour is why: renaming
+    with no name to verify let one stale id overwrite a LIVE task's name, and
+    the journal keeps only the NEW name — the old one cannot be restored from
+    anywhere. If the task GENUINELY has no name (the list shows it as
+    «(без названия …)»), pass "untitled": true INSTEAD of "title"; it must be
+    boolean true — the string "true" and the number 1 are refused, and so is
+    the marker on a task that does have a name.
 
     Supported fields per item:
       taskId (required), projectId (required for single/advanced),
-      title (current title, for the dialog), new_title, content,
+      title (current title — required whenever new_title is set),
+      untitled (boolean true; use INSTEAD of title for a task with no name),
+      new_title, content,
       start_date ("YYYY-MM-DD" = all-day; full ISO only if time given; or the
         literal word "today"/"tomorrow"/"yesterday"/a weekday name — RU too —
         resolved by the server off its own clock, immune to your own date
@@ -3838,6 +3937,14 @@ async def _update_tasks_impl(
                 # an update with a stale projectId — refuse instead of lying.
                 results.append(f"🛑 НЕ обновил «{shown_title}» — {g.message}")
                 continue
+            # Н9 (2026-08-09): запись В ПОЛЕ НАЗВАНИЯ при невзведённой сверке —
+            # отказ ЗДЕСЬ, до единого обращения к TickTick. Живое имя берётся у
+            # guard'а (`g.title`), который его только что прочитал, — второго
+            # чтения не нужно.
+            refusal = _rename_guard_refusal(t, g.title or "", shown_title)
+            if refusal:
+                results.append(refusal)
+                continue
             # Fix for the "changing one date turns the task into a range" bug:
             # sync the untouched start/due field when the caller only supplied
             # one of them and the task was previously a single fixed date.
@@ -3931,8 +4038,12 @@ async def _update_tasks_impl(
                                 f"живом состоянии: {verdict.lstrip('- ')}")
                 if date_warn:
                     line += f"\n  ⚠️ {date_warn}"
-                if not (t.get("title") or "").strip():
-                    line += " ⚠️ выполнено БЕЗ сверки названия (title не передан)"
+                # Н9 (2026-08-09): жалоба «выполнено БЕЗ сверки названия» здесь
+                # УБРАНА. Опасный случай — запись в поле названия без сверки —
+                # теперь не доходит до записи вовсе (отказ выше), а на
+                # безымянной задаче эта строка пугала владельца там, где всё в
+                # порядке: имени нет ни у вызывающего, ни у задачи, и объект
+                # опознан идентификатором (тот же разбор, что в `_unarmed_note`).
                 if sub_fails:
                     line += "\n  ⚠️ " + "; ".join(sub_fails)
                 results.append(line)
@@ -3958,11 +4069,22 @@ async def _update_tasks_impl(
         label_of = {}
         changes = []
         date_warns = {}
+        # Н9 (2026-08-09): ЧЕТВЁРТАЯ корзина. Строка с записью в поле названия
+        # при невзведённой сверке не попадает в `changes` вообще — то есть
+        # отказ случается ДО `batch_update_tasks`, а не после. Корзина печатается
+        # рядом с `_mismatch_report`, иначе «Обновлено N» перестало бы сходиться
+        # с длиной запроса — ровно тот класс ошибок, который здесь и чинится.
+        refused = []
         for t in tasks:
             tid = t.get("taskId") or t.get("task_id")
             if tid not in ok_ids:
                 continue
             label_of[tid] = t.get("title") or _lookup_task_title(tid)
+            refusal = _rename_guard_refusal(
+                t, (by_id.get(tid) or {}).get("title") or "", label_of[tid])
+            if refusal:
+                refused.append((tid, refusal))
+                continue
             ch = {"taskId": tid}
             if t.get("new_title") is not None:
                 ch["title"] = t["new_title"]
@@ -4033,9 +4155,16 @@ async def _update_tasks_impl(
         if not_applied:
             lines.append(f"❌ НЕ применилось {len(not_applied)}:\n  - "
                          + "\n  - ".join(not_applied))
-        note = _unarmed_note(found)
+        # Отказанные строки из жалобы «выполнено БЕЗ сверки» вынуты: они НЕ
+        # выполнены. Сама ветка `loose` в `_unarmed_note` остаётся — она нужна
+        # тем вызывающим, где имя не пишется вовсе (завершение, перемещение).
+        refused_ids = {tid for tid, _ in refused}
+        note = _unarmed_note([f for f in found
+                              if f["taskId"] not in refused_ids])
         if note:
             lines.append(note)
+        for _tid, refusal in refused:
+            lines.append(refusal)
         if mismatch:
             lines.append(_mismatch_report(mismatch, "обновил"))
         if missing:
@@ -16759,6 +16888,10 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
     a wrong title would be (the id points at something else than you meant).
     Never set `untitled` for a task that shows a real name in the list, and
     never send both `untitled` and `title` — that is refused outright.
+    `untitled: true` does NOT block renaming: an `update` whose `changes`
+    carry `new_title` still goes through for a task that really has no name —
+    the marker is what keeps that legitimate case open now that renaming with
+    no name to verify is refused everywhere (see update_tasks).
 
     `changes` accepts ONLY these keys: new_title, content, due_date,
     start_date, priority (0|1|3|5), tags (list of strings), reminders,
