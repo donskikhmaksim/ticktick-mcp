@@ -626,7 +626,12 @@ def _is_untitled(title: Optional[str]) -> bool:
     нельзя разводить по разным веткам, иначе сверка в одном месте признаёт
     задачу безымянной, а в соседнем — нет.
 
-    ЗДЕСЬ НАМЕРЕННО НЕ ВЫЧИЩАЮТСЯ НЕВИДИМЫЕ СИМВОЛЫ (аудит 2026-08-09).
+    ЗДЕСЬ НАМЕРЕННО НЕ ВЫЧИЩАЮТСЯ НУЛЕВОЙ ШИРИНЫ СИМВОЛЫ (аудит 2026-08-09).
+    ТОЧНАЯ ГРАНИЦА, иначе докстринг обещает больше, чем делает `strip()`
+    (уточнено 2026-08-09): пробельные по Unicode невидимки — неразрывный
+    пробел U+00A0 и родня — `strip()`-ом СНИМАЮТСЯ, и имя из одного NBSP
+    считается здесь отсутствующим. Не снимаются только символы нулевой ширины
+    (U+200B и соседи, `_INVISIBLE`) — они не пробельные.
     Название из одного zero-width space — не пустота для сверки: оно
     ОТЛИЧАЕТСЯ от пустого живого названия, и признать его пустым значило бы
     пропустить в удаление объект, чьё имя разошлось с планом. Показу нужен
@@ -1727,13 +1732,21 @@ class _Guard:
     ONLY `_guard_task_incl_completed` ever returns (the task exists and its
     title checks out, it is simply no longer open). `ok` stays strictly
     "open and verified", so nothing that switches on `.ok` is affected."""
-    __slots__ = ("status", "project_id", "title", "message")
+    __slots__ = ("status", "project_id", "title", "message", "title_known")
 
-    def __init__(self, status, project_id="", title="", message=""):
+    def __init__(self, status, project_id="", title="", message="",
+                 title_known=False):
         self.status = status
         self.project_id = project_id   # the task's CURRENT projectId (corrected)
         self.title = title             # the live title
         self.message = message
+        # ПРОЧИТАНО ЛИ живое название вообще (2026-08-09). Пустая строка в
+        # `title` отвечает сразу на два разных вопроса — «у задачи нет имени» и
+        # «объект до нас не доехал / в ответе нет такого поля», — и вызывающий,
+        # строящий на ней проверку, разоружается на втором случае, думая, что
+        # видит первый. Кто различать не обязан, тот просто не читает это поле:
+        # добавление ничего не ломает.
+        self.title_known = title_known
 
     @property
     def ok(self) -> bool:
@@ -1813,6 +1826,9 @@ def _guard_task(
                       "(завершена/удалена/неверный id)")
     real_pid = live.get("projectId") or project_id
     real_title = live.get("title") or ""
+    # Ключа `title` в ответе может не быть вовсе (урезанный снимок) — это НЕ
+    # «задача без названия», и склеивать их нельзя: см. `_Guard.title_known`.
+    title_known = "title" in live
     names = _v2_project_names()
     # Д2 (2026-08-09): переданное название — это заменитель, который сервер
     # сам напечатал для ЭТОЙ ЖЕ безымянной задачи (см.
@@ -1822,11 +1838,13 @@ def _guard_task(
     if (not _names_agree(expected_title, real_title)
             and not _is_untitled_placeholder(expected_title, live)):
         return _Guard("mismatch", real_pid, real_title,
-                      f"id указывает на «{real_title}», а НЕ «{expected_title}»")
+                      f"id указывает на «{real_title}», а НЕ «{expected_title}»",
+                      title_known)
     if expected_project and not _names_agree(expected_project, names.get(real_pid, "")):
         return _Guard("mismatch", real_pid, real_title,
-                      f"id в проекте «{names.get(real_pid, '')}», а НЕ «{expected_project}»")
-    return _Guard("ok", real_pid, real_title)
+                      f"id в проекте «{names.get(real_pid, '')}», а НЕ «{expected_project}»",
+                      title_known)
+    return _Guard("ok", real_pid, real_title, title_known=title_known)
 
 
 # Единая пометка класса «операции над завершённой задачей» — один текст на
@@ -1973,7 +1991,7 @@ def _split_tasks_by_state(
         raise RuntimeError(_STATE_UNAVAILABLE_MSG)
     names = _v2_project_names()
     found, mismatch, missing = [], [], []
-    for t in tasks:
+    for row, t in enumerate(tasks):
         tid = t.get("taskId") or t.get("task_id")
         given_pid = t.get("projectId") or t.get("project_id") or ""
         exp_title = t.get("title") or ""
@@ -2010,9 +2028,25 @@ def _split_tasks_by_state(
             shown = exp_title if not _looks_untitled(exp_title) else (
                 g.title if not _looks_untitled(g.title)
                 else _untitled_label(by_id.get(tid) or {}))
+            # `live_title` и `row` — 2026-08-09, по следам живой поломки.
+            # ЖИВОЕ ИМЯ БЕРЁТСЯ У GUARD'А, а не из `by_id`: снимок открытых
+            # задач отстаёт (см. `_official_task_snapshot` — инцидент
+            # 2026-08-07, задача выпадала из v2-выборки на 25 минут), и guard
+            # ради этого ходит в официальный запасной канал. Вызывающий,
+            # который потом сам полезет в `by_id`, получит пустоту по живой
+            # задаче — а пустота в поле имени читается как «имени нет» и
+            # разоружает любую проверку, построенную на ней. Отдаём то, на чём
+            # guard ПРИНИМАЛ РЕШЕНИЕ, чтобы второго источника правды не было.
+            #
+            # `row` — номер ИСХОДНОЙ строки запроса: id может повторяться в
+            # одном вызове, и сопоставление по taskId склеивает разные строки
+            # в одну (жалоба по законной строке пропадала вместе с отказом по
+            # соседней).
             found.append({"taskId": tid, "title": exp_title or g.title,
                           "label": shown,
                           "projectId": g.project_id,
+                          "live_title": g.title if g.title_known else None,
+                          "row": row,
                           "armed": bool((exp_title or "").strip()),
                           "by_id": by_id_only})
     return found, mismatch, missing
@@ -2097,6 +2131,155 @@ def _unarmed_note(found: List[Dict]) -> str:
                      + ", ".join(f"«{f.get('label') or f['title']}»"
                                  for f in by_id_rows))
     return "\n".join(notes)
+
+
+# ─── Н9 (2026-08-09): взведённость сверки как УСЛОВИЕ записи в поле названия ──
+#
+# Дыра, которую это закрывает. `_names_agree` первой строкой возвращает True на
+# пустое ожидаемое имя — и это её ЧЕСТНЫЙ контракт («претензии нет, сверять
+# нечего»), её зовут 24 места, половина законно передаёт пустоту. Менять её
+# нельзя. Но у одного вызывающего пустота означала другое: `update_tasks`
+# принимал строку {"taskId": X, "new_title": "ЗАТЁРТО"} БЕЗ поля title, guard
+# при этом был разоружён, имя живой задачи затиралось, а жалоба «выполнено БЕЗ
+# сверки названия» печаталась ПОСЛЕ записи. Восстановить затёртое нечем:
+# журнальная запись хранит НОВОЕ имя.
+#
+# Развести надо два внешне одинаковых случая:
+#   «имени нет, потому что менять его не собираемся» — законно и массово
+#       (срок, приоритет, теги, проект, завершение) — требовать имя там значит
+#       издеваться над вызывающим;
+#   «имени нет, но пишем В ПОЛЕ НАЗВАНИЯ» — единственный случай, когда
+#       отсутствие имени означает затирание старого без единой сверки.
+#
+# Поэтому правило записано ОДНОЙ функцией, а не рассуждением по месту, и один
+# текст отказа обслуживает все точки: подтверждающий обязан читать одно и то
+# же, откуда бы отказ ни пришёл.
+_RENAME_UNARMED_REFUSAL = (
+    "🛑 НЕ переименовал «{label}» — в строке есть new_title, но НЕТ текущего "
+    "названия задачи (поле title), то есть сверка личности не состоялась бы "
+    "вовсе: id из устаревшего списка затёр бы имя ЖИВОЙ задачи безвозвратно "
+    "(в журнал пишется НОВОЕ имя, восстанавливать не из чего). Добавь в эту "
+    "строку \"title\": \"<точное текущее название>\"; если названия у задачи "
+    "ДЕЙСТВИТЕЛЬНО нет — \"untitled\": true вместо него. Эта строка НЕ "
+    "применена, название не тронуто.")
+
+# Живое имя ПРОЧИТАТЬ НЕ УДАЛОСЬ — это не то же самое, что «имени нет»
+# (2026-08-09, найдено скептиком на пакетном пути). Разница наблюдаемая:
+# «прочитали, там пусто» разрешает переименование по признаку «объект опознан
+# идентификатором»; «не читали» не разрешает НИЧЕГО, потому что незнание — не
+# основание разоружаться.
+_RENAME_UNKNOWN_LIVE_REFUSAL = (
+    "🛑 НЕ переименовал «{label}» — прочитать текущее название живой задачи не "
+    "удалось, а в строке нет поля title, с которым его можно было бы сверить. "
+    "Незнание не разрешает запись в поле названия: именно так одно "
+    "переименование по устаревшему id и стирает имя живой задачи. Передай "
+    "\"title\": \"<точное текущее название>\" и повтори. Эта строка НЕ "
+    "применена, название не тронуто.")
+
+# Переименование В ПУСТОТУ. Сверка при этом может быть честно взведена (имя
+# передано и совпало) — предикат ниже судит о том, ЧТО ПЕРЕДАНО для сверки, а
+# это отдельный вопрос: что ПИШЕТСЯ в поле названия. Пути расходились:
+# официальный клиент фильтрует `if title:` (ticktick_client.py:560) и пустое
+# имя не отправлял, а пакетный канал отправлял и стирал название, после чего
+# отчёт рапортовал успех именем, которого уже нет.
+_RENAME_TO_NOTHING_REFUSAL = (
+    "🛑 НЕ переименовал «{label}» — new_title пустой, а это стёрло бы название "
+    "задачи в пустоту (в журнал ушло бы пустое значение, восстанавливать было "
+    "бы не из чего). Если название надо изменить — передай новое; если "
+    "трогать его не нужно — убери поле new_title из строки. Эта строка НЕ "
+    "применена, название не тронуто.")
+
+
+def _title_check_armed(expected_title: str, untitled_claim: bool,
+                       live_title: Optional[str]) -> bool:
+    """Взведена ли сверка названия для ОДНОЙ строки изменения (Н9).
+
+        сверка взведена := передано ВИДИМОЕ title
+                        ИЛИ структурный маркер untitled=true, ПОДТВЕРЖДЁННЫЙ
+                            прочитанным живым состоянием
+                        ИЛИ имени нет ни у вызывающего, ни у ПРОЧИТАННОЙ живой
+                            задачи (тот же признак, что `by_id` в
+                            `_split_tasks_by_state`)
+
+    `live_title is None` означает «живое имя НЕ ПРОЧИТАНО» и не разрешает
+    ничего. Пустая строка означает «прочитали, там пусто» — это разные вещи, и
+    различать их обязан код, а не вызывающий: на пакетном пути живое имя
+    добывалось из снимка открытых задач, которого у живой задачи могло не
+    оказаться (её находил официальный запасной канал), и пустота «я не смотрел»
+    читалась предикатом как «имени нет» — сверка разоружалась ровно на том
+    классе задач, ради которого фолбэк и появился.
+
+    Пустоту РЕШАЕТ `_looks_untitled` (вопрос показа: «выглядит ли пустым
+    местом»), а не `_is_untitled`. Причина конкретная: название из одного
+    невидимого символа фаза плана уже признаёт безымянным, и строгий ответ
+    здесь означал бы два разных ответа на вопрос «пусто ли это» в одной
+    цепочке — план принимает, исполнение отказывает, и переименовать такую
+    задачу становится нельзя вообще. Заявленное имя из одних невидимых
+    символов именем тоже не считается: сверять по нему нечего, а сходство с
+    живым уже проверил `_names_agree` (иначе строка сюда не дошла бы)."""
+    if live_title is None:
+        return False
+    # Нестроковый вход не роняет предикат: сюда доходят словари, собранные
+    # моделью, и `{"title": 123}` обязан получить отказ, а не AttributeError
+    # изнутри проверки безопасности.
+    expected_title = "" if expected_title is None else str(expected_title)
+    live_title = str(live_title)
+    if not _looks_untitled(expected_title):
+        return True
+    if untitled_claim and _looks_untitled(live_title):
+        return True
+    return _looks_untitled(expected_title) and _looks_untitled(live_title)
+
+
+def _rename_guard_refusal(t: Dict[str, Any], live_title: Optional[str],
+                          label: str) -> Optional[str]:
+    """Текст отказа для строки изменения — или None, если писать можно.
+
+    Зовётся ДО обращения к TickTick в обоих путях `_update_tasks_impl`.
+    Предупреждение после записи проверкой не считается: данные к этому моменту
+    уже испорчены.
+
+    `live_title` обязан приходить ОТ GUARD'А (`_Guard.title` / поле
+    `live_title` строки `found`), а не из снимка открытых задач: снимок
+    отстаёт, и живая задача выпадает из него на минуты. `None` — «не
+    прочитали», и это отказ, а не поблажка.
+
+    Ни один отказ здесь не говорит «ничего не изменено»: в одном вызове строк
+    несколько, соседние могли примениться законно, и обещание про ВЕСЬ объект
+    было бы ложью. Речь всегда про ЭТУ строку.
+
+    Маркер `untitled` читается ЕДИНСТВЕННОЙ реализацией — `_triage_untitled_claim`
+    (строгий тип: "true" строкой и 1 числом НЕ проходят). Две его беды —
+    неверный тип и заявление, разошедшееся с живым состоянием, — отказывают
+    ВСЕГДА, а не только при переименовании: маркер это утверждение о ЛИЧНОСТИ
+    объекта, и ложное утверждение о личности не становится безобидным оттого,
+    что в этой же строке меняют всего лишь срок."""
+    untitled, bad_flag = _triage_untitled_claim(t, "untitled")
+    if bad_flag:
+        return f"🛑 НЕ обновил «{label}» — {bad_flag} Эта строка НЕ применена."
+    if untitled and live_title is None:
+        return (f"🛑 НЕ обновил «{label}» — передан маркер untitled=true, но "
+                "прочитать живое название задачи не удалось, значит проверить "
+                "это утверждение нечем. Маркер, который никто не сверил, — то "
+                "же самое, что отсутствие сверки. Передай \"title\": "
+                "\"<точное текущее название>\". Эта строка НЕ применена.")
+    if untitled and not _looks_untitled(live_title):
+        return (f"🛑 НЕ обновил «{label}» — передан маркер untitled=true, но у "
+                f"живой задачи название ЕСТЬ: «{live_title}». Маркер — "
+                "утверждение «у этой задачи имени нет», и оно разошлось с "
+                "живым состоянием: значит id указывает не на ту задачу, "
+                "которую ты имеешь в виду. Передай точное текущее название в "
+                "поле title. Эта строка НЕ применена.")
+    new_title = t.get("new_title")
+    if new_title is None:
+        return None                      # в поле названия не пишем — правило молчит
+    if not str(new_title).strip():
+        return _RENAME_TO_NOTHING_REFUSAL.format(label=label)
+    if live_title is None:
+        return _RENAME_UNKNOWN_LIVE_REFUSAL.format(label=label)
+    if _title_check_armed(t.get("title") or "", untitled, live_title):
+        return None
+    return _RENAME_UNARMED_REFUSAL.format(label=label)
 
 
 def _guard_project(project_id: str, expected_name: str = "", *,
@@ -3524,12 +3707,22 @@ async def update_tasks(
     one call via v2 batch (limited fields). For a single task with advanced fields
     (repeat_flag, reminders, column_id), the official API is used.
 
-    IMPORTANT: always include the task's current title in each item (as "title")
-    so the user knows which task is being changed.
+    RULE, ENFORCED IN CODE — not a wish: every item MUST carry the task's
+    CURRENT title as "title". An item that sets "new_title" WITHOUT "title" is
+    REFUSED before anything is sent to TickTick (the reply starts with 🛑 and
+    names the missing field). The price of the old behaviour is why: renaming
+    with no name to verify let one stale id overwrite a LIVE task's name, and
+    the journal keeps only the NEW name — the old one cannot be restored from
+    anywhere. If the task GENUINELY has no name (the list shows it as
+    «(без названия …)»), pass "untitled": true INSTEAD of "title"; it must be
+    boolean true — the string "true" and the number 1 are refused, and so is
+    the marker on a task that does have a name.
 
     Supported fields per item:
       taskId (required), projectId (required for single/advanced),
-      title (current title, for the dialog), new_title, content,
+      title (current title — required whenever new_title is set),
+      untitled (boolean true; use INSTEAD of title for a task with no name),
+      new_title, content,
       start_date ("YYYY-MM-DD" = all-day; full ISO only if time given; or the
         literal word "today"/"tomorrow"/"yesterday"/a weekday name — RU too —
         resolved by the server off its own clock, immune to your own date
@@ -3838,6 +4031,15 @@ async def _update_tasks_impl(
                 # an update with a stale projectId — refuse instead of lying.
                 results.append(f"🛑 НЕ обновил «{shown_title}» — {g.message}")
                 continue
+            # Н9 (2026-08-09): запись В ПОЛЕ НАЗВАНИЯ при невзведённой сверке —
+            # отказ ЗДЕСЬ, до единого обращения к TickTick. Живое имя берётся у
+            # guard'а (`g.title`), который его только что прочитал, — второго
+            # чтения не нужно.
+            refusal = _rename_guard_refusal(
+                t, g.title if g.title_known else None, shown_title)
+            if refusal:
+                results.append(refusal)
+                continue
             # Fix for the "changing one date turns the task into a range" bug:
             # sync the untouched start/due field when the caller only supplied
             # one of them and the task was previously a single fixed date.
@@ -3931,8 +4133,12 @@ async def _update_tasks_impl(
                                 f"живом состоянии: {verdict.lstrip('- ')}")
                 if date_warn:
                     line += f"\n  ⚠️ {date_warn}"
-                if not (t.get("title") or "").strip():
-                    line += " ⚠️ выполнено БЕЗ сверки названия (title не передан)"
+                # Н9 (2026-08-09): жалоба «выполнено БЕЗ сверки названия» здесь
+                # УБРАНА. Опасный случай — запись в поле названия без сверки —
+                # теперь не доходит до записи вовсе (отказ выше), а на
+                # безымянной задаче эта строка пугала владельца там, где всё в
+                # порядке: имени нет ни у вызывающего, ни у задачи, и объект
+                # опознан идентификатором (тот же разбор, что в `_unarmed_note`).
                 if sub_fails:
                     line += "\n  ⚠️ " + "; ".join(sub_fails)
                 results.append(line)
@@ -3954,15 +4160,40 @@ async def _update_tasks_impl(
         if by_id is None:
             return _STATE_UNAVAILABLE_MSG
         found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
-        ok_ids = {f["taskId"] for f in found}
         label_of = {}
         changes = []
         date_warns = {}
-        for t in tasks:
-            tid = t.get("taskId") or t.get("task_id")
-            if tid not in ok_ids:
+        # Н9 (2026-08-09): ЧЕТВЁРТАЯ корзина. Строка с записью в поле названия
+        # при невзведённой сверке не попадает в `changes` вообще — то есть
+        # отказ случается ДО `batch_update_tasks`, а не после. Корзина печатается
+        # рядом с `_mismatch_report`, иначе «Обновлено N» перестало бы сходиться
+        # с длиной запроса — ровно тот класс ошибок, который здесь и чинится.
+        refused = []
+        kept = []
+        # Идём по СТРОКАМ, прошедшим guard (`found`), а не по исходному списку:
+        # живое имя обязано прийти оттуда же, откуда его взял guard, — он его
+        # уже прочитал, при необходимости через официальный запасной канал, и
+        # положил рядом. Прежний код доставал имя из `by_id`, то есть из
+        # снимка открытых задач, которого у живой задачи могло не оказаться
+        # (инцидент 2026-08-07: выпадала на 25 минут). Тогда «имени нет»
+        # означало на самом деле «я не смотрел», предикат разоружался, и
+        # переименование без сверки проходило в канал — ровно та дыра, которую
+        # правка закрывает в одиночном пути.
+        for f in found:
+            t = tasks[f["row"]]
+            tid = f["taskId"]
+            # Ярлык берётся и из строки guard'а (`label`) тоже: у задачи вне
+            # v2-снимка `_lookup_task_title` имени не найдёт, и отказ назвал бы
+            # её «[task X…]» — то есть человек прочитал бы отказ, не поняв, о
+            # какой задаче речь.
+            label_of[tid] = (t.get("title") or f.get("label")
+                             or _lookup_task_title(tid))
+            refusal = _rename_guard_refusal(t, f.get("live_title"),
+                                            label_of[tid])
+            if refusal:
+                refused.append((f, refusal))
                 continue
-            label_of[tid] = t.get("title") or _lookup_task_title(tid)
+            kept.append(f)
             ch = {"taskId": tid}
             if t.get("new_title") is not None:
                 ch["title"] = t["new_title"]
@@ -4033,9 +4264,17 @@ async def _update_tasks_impl(
         if not_applied:
             lines.append(f"❌ НЕ применилось {len(not_applied)}:\n  - "
                          + "\n  - ".join(not_applied))
-        note = _unarmed_note(found)
+        # Отказанные строки из жалобы «выполнено БЕЗ сверки» вынуты: они НЕ
+        # выполнены. Сама ветка `loose` в `_unarmed_note` остаётся — она нужна
+        # тем вызывающим, где имя не пишется вовсе (завершение, перемещение).
+        # Вычитаются именно СТРОКИ (`kept`), а не идентификаторы: один и тот же
+        # id может стоять в вызове дважды, и вычитание по id глушило честное
+        # предупреждение по законной строке заодно с отказом по соседней.
+        note = _unarmed_note(kept)
         if note:
             lines.append(note)
+        for _f, refusal in refused:
+            lines.append(refusal)
         if mismatch:
             lines.append(_mismatch_report(mismatch, "обновил"))
         if missing:
@@ -16759,6 +16998,10 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
     a wrong title would be (the id points at something else than you meant).
     Never set `untitled` for a task that shows a real name in the list, and
     never send both `untitled` and `title` — that is refused outright.
+    `untitled: true` does NOT block renaming: an `update` whose `changes`
+    carry `new_title` still goes through for a task that really has no name —
+    the marker is what keeps that legitimate case open now that renaming with
+    no name to verify is refused everywhere (see update_tasks).
 
     `changes` accepts ONLY these keys: new_title, content, due_date,
     start_date, priority (0|1|3|5), tags (list of strings), reminders,

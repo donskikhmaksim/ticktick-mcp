@@ -132,6 +132,13 @@ class _FakeV2:
                 t["tags"] = c["tags"]
             if "assignee" in c:
                 t["assignee"] = c["assignee"]
+            # Двойник обязан быть ЧЕСТНЫМ: настоящий канал применяет и эти
+            # поля, а молчаливый двойник заставлял бы пост-проверку кричать
+            # «не применилось» на исправном коде (2026-08-09).
+            for k in ("title", "content", "priority", "dueDate", "startDate",
+                      "isAllDay"):
+                if k in c:
+                    t[k] = c[k]
         return {"id2error": errs} if errs else {}
 
     def create_tag(self, name, color=None):
@@ -151,6 +158,11 @@ class _FakeOfficial:
     def __init__(self, live):
         self.live = live
         self.create_calls = []
+        # Н9 (2026-08-09): список вызовов ЗАПИСИ. Без него утверждение «отказ
+        # случился ДО обращения к TickTick» писать нечем: по живому состоянию
+        # видно только результат, а не то, дёргали ли канал вообще — а именно
+        # это и отличает настоящий запрет от предупреждения после факта.
+        self.update_calls = []
         self._n = 0
 
     def create_task(self, title, project_id, content=None, start_date=None,
@@ -166,9 +178,22 @@ class _FakeOfficial:
     def update_task(self, task_id, project_id, title=None, content=None,
                     start_date=None, due_date=None, priority=None,
                     repeat_flag=None, reminders=None):
+        self.update_calls.append({"task_id": task_id, "project_id": project_id,
+                                  "title": title})
         t = self.live.setdefault(task_id, {"id": task_id})
         if title is not None:
             t["title"] = title
+        if content is not None:
+            t["content"] = content
+        if priority is not None:
+            t["priority"] = priority
+        # Официальный клиент нормализует даты сам; двойнику достаточно
+        # положить то, что ему передали, — иначе живая пере-проверка объявит
+        # исправное изменение непримененным.
+        for key, val in (("dueDate", due_date), ("startDate", start_date)):
+            if val is not None:
+                t[key] = val
+                t["isAllDay"] = len(str(val)) == 10
         return dict(t)
 
 
