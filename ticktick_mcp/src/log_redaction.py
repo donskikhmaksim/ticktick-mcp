@@ -27,6 +27,16 @@
 ЧЕГО ЭТО НЕ ДЕЛАЕТ. Секреты, уже попавшие в старые логи, остаются там —
 их надо считать скомпрометированными и ротировать отдельно. И это не
 замена переносу секрета из пути в заголовок (ломающее изменение, отдельно).
+
+ВТОРОЙ ПОТРЕБИТЕЛЬ (2026-08-09, П7 follow-up). `redact()` больше не только
+для логов: `server.py` зовёт её же (через `_redact_for_user`) для текста
+исключений, который возвращается МОДЕЛИ в чат — второй канал утечки того
+же класса, только без хендлера-фильтра. Отсюда и маски, которых логам
+самим по себе не требовалось: токен Telegram-бота (`/bot<token>/` в URL
+Telegram API), `Authorization: Bearer …`, логин:пароль в Postgres DSN,
+PEM-блок приватного ключа (Google service account). Список не закрыт —
+это набор известных форматов секретов в этом проекте, а не гарантия про
+любой будущий.
 """
 
 from __future__ import annotations
@@ -44,14 +54,64 @@ LINK_TOKEN_PLACEHOLDER = "<link-token>"
 # Ниже этой длины подстроку НЕ вырезаем по всему тексту: короткая строка
 # («ok», «id») может встретиться где угодно в осмысленном сообщении, и
 # слепая замена сделает логи бесполезными. Секрет короче 8 символов и так
-# не секрет; позиционное правило (регэкспы ниже) его всё равно накроет.
+# не секрет; позиционное правило (регэкспы ниже) его всё равно накроет —
+# оно не смотрит на длину значения вообще.
 _MIN_INLINE_SECRET_LEN = 8
 
 # Позиционные правила: сегмент пути СРАЗУ после /mcp, /dl, /ul — это и есть
 # пропуск. Работают даже если значение секрета фильтру неизвестно (например
 # ссылка выдана другим процессом) и независимо от его длины.
-_MCP_PATH_RE = re.compile(r"(?<![\w/])(/mcp/)([^/?\s\"']+)")
-_LINK_PATH_RE = re.compile(r"(?<![\w/])(/(?:dl|ul)/)([^/?\s\"']+)")
+#
+# ИСПРАВЛЕНО (аудит 2026-08-09, П7 follow-up). До этой правки регэксп нёс
+# `(?<![\w/])` перед слэшем — «символ прямо перед /mcp(/dl,/ul)/ не должен
+# быть буквой/цифрой/ещё одним слэшем». Замысел был не пересекать чужой
+# путь, но на практике это условие рвётся на ЛЮБОМ полном URL:
+# "https://host.up.railway.app/dl/<токен>" — перед слэшем стоит "p" из
+# ".app", буква, лукбехайнд не пускает совпадение, и маскировка НЕ
+# СРАБАТЫВАЕТ НИКОГДА для полных ссылок — только для голого пути в
+# access-логе ("GET /dl/<токен> HTTP/1.1", где перед слэшем пробел).
+# Живой пример: исключение HTTP-клиента, в тексте которого лежит URL
+# ретрая, — именно так секрет и уезжает модели, ровно та дыра, которую
+# П7 должен был закрыть. Ложных срабатываний от снятия лукбехайнда не
+# прибавляется: сам паттерн требует буквальный "/mcp/"/"/dl/"/"/ul/" —
+# слэш перед именем уже задаёт границу сегмента пути, отдельно проверять
+# предыдущий символ незачем.
+_MCP_PATH_RE = re.compile(r"(/mcp/)([^/?\s\"'<>]+)")
+_LINK_PATH_RE = re.compile(r"(/(?:dl|ul)/)([^/?\s\"'<>]+)")
+
+#: Чем заменяем токен Telegram-бота в сегменте `/bot<token>/` URL Telegram API.
+BOT_TOKEN_PLACEHOLDER = "<tg-bot-token>"
+#: Чем заменяем значение заголовка `Authorization: Bearer <...>`.
+BEARER_PLACEHOLDER = "<bearer-token>"
+#: Чем заменяем учётные данные в Postgres DSN (`user:password@`).
+DSN_CREDENTIALS_PLACEHOLDER = "<db-credentials>"
+#: Чем заменяем PEM-блок приватного ключа (например, Google service account).
+PRIVATE_KEY_PLACEHOLDER = "<private-key>"
+
+# Добавлено аудитом 2026-08-09 (П7 follow-up): список масок писался для
+# СЕГМЕНТОВ НАШЕГО ЖЕ пути (/mcp,/dl,/ul) и ничего не знал про секреты
+# ДРУГИХ систем, которые тоже оказываются в тексте исключений —
+# `str(e)` от `requests` внутри URL Telegram API содержит токен бота
+# буквально (`_tg_call` в tg_approval.py собирает
+# `f"{TELEGRAM_API}/bot{cfg.bot_token}/{method}"`); токен бота — это
+# полный контроль над вторым фактором подтверждения удалений.
+#
+# Формат токена Telegram-бота: `<numeric id>:<~35 base64url-ish символов>`
+# (например "123456789:AAHxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx") — не
+# привязываемся к точной длине хвоста, маскируем по форме.
+_BOT_TOKEN_RE = re.compile(r"(/bot)(\d+:[A-Za-z0-9_-]+)")
+# `Authorization: Bearer <token>` — стандартный HTTP-заголовок, может
+# попасть в текст исключения при логировании запроса целиком.
+_BEARER_RE = re.compile(r"(?i)(Authorization:\s*Bearer\s+)(\S+)")
+# `postgres://user:password@host/db` (и `postgresql://`) — DSN с логином и
+# паролем в открытом виде; так возвращает ошибку psycopg при сбое подключения.
+_PG_DSN_RE = re.compile(r"(postgres(?:ql)?://)([^:/?#\s]+):([^/?#\s]+)@")
+# PEM-блок приватного ключа (Google service account и любой другой RSA/EC
+# ключ в том же формате) — самая распознаваемая по форме секретная строка.
+_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----.*?-----END (?:RSA |EC )?PRIVATE KEY-----",
+    re.DOTALL,
+)
 
 
 def redact(text: str, secret: Optional[str] = None) -> str:
@@ -73,6 +133,10 @@ def redact(text: str, secret: Optional[str] = None) -> str:
             text = text.replace(quoted, SECRET_PLACEHOLDER)
     text = _MCP_PATH_RE.sub(lambda m: m.group(1) + SECRET_PLACEHOLDER, text)
     text = _LINK_PATH_RE.sub(lambda m: m.group(1) + LINK_TOKEN_PLACEHOLDER, text)
+    text = _BOT_TOKEN_RE.sub(lambda m: m.group(1) + BOT_TOKEN_PLACEHOLDER, text)
+    text = _BEARER_RE.sub(lambda m: m.group(1) + BEARER_PLACEHOLDER, text)
+    text = _PG_DSN_RE.sub(lambda m: m.group(1) + DSN_CREDENTIALS_PLACEHOLDER + "@", text)
+    text = _PRIVATE_KEY_RE.sub(PRIVATE_KEY_PLACEHOLDER, text)
     return text
 
 

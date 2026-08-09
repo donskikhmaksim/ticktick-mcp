@@ -37,7 +37,14 @@ from . import manifest_store
 from . import tg_approval
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+# П8 (2026-08-09): без формата logging.basicConfig печатал ГОЛОЕ сообщение —
+# ни времени, ни уровня, ни модуля. Вперемешку с logger.exception (см. ниже)
+# это делало логи Railway практически бесполезными при разборе инцидента:
+# нельзя было понять, КОГДА упало и в каком модуле, только текст сообщения.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 # Опциональный внеполосный Telegram-фактор (см. tg_approval.py doc-comment).
@@ -56,6 +63,45 @@ PORT = int(os.getenv("PORT", os.getenv("MCP_PORT", "8000")))
 # public Railway endpoint. Without it the path is the default "/mcp".
 SECRET = os.getenv("MCP_SECRET", "").strip()
 STREAMABLE_PATH = f"/mcp/{SECRET}" if SECRET else "/mcp"
+
+
+def _redact_for_user(text: Any) -> str:
+    """Прогнать текст, который уйдёт МОДЕЛИ (не только логам), через тот же
+    редактор секретов пути, что и `log_redaction.install()` для логов
+    (П7, 2026-08-09).
+
+    ПОЧЕМУ. До этой правки `except Exception as e: return f"...: {str(e)}"`
+    отдавал текст исключения HTTP-клиента как есть. Такое исключение вполне
+    может содержать URL с нашим же секретом (`/mcp/<secret>`) или подписанную
+    ссылку вложения (`/dl/<token>`, `/ul/<token>`) — например если клиент
+    ретраит запрос к самому себе или логирует полный запрос внутри текста
+    ошибки. `log_redaction.redact()` для логов такое уже чистит; для строк,
+    возвращаемых из тула модели, чистки не было — секрет уезжал в переписку
+    навсегда. Здесь та же функция, тот же список масок, просто применяется
+    ко второму каналу вывода.
+    """
+    return log_redaction.redact(str(text), secret=SECRET or None)
+
+
+def _tool_error(context: str, exc: Any) -> str:
+    """Build the standard failure string returned to the model by a tool.
+
+    Every read/write tool below funnels its `except Exception as e` (or an
+    inline `{"error": ...}` payload from the low-level client) through this
+    single function instead of hand-writing `f"Error ...: {str(e)}"` at each
+    of the ~80 call sites. Two reasons: exception text is redacted the same
+    way log lines are (see `_redact_for_user` above — no secret URL leaks
+    into the chat), and the wording is uniform instead of a mix of
+    "fetching"/"retrieving"/etc. for the same kind of failure.
+
+    Args:
+        context: short present-participle phrase naming the failed
+            operation, e.g. "fetching projects" — becomes "Error fetching
+            projects: ...".
+        exc: the caught exception, or an already-stringified error payload
+            (e.g. a dict's `['error']` value coming from the client).
+    """
+    return f"Error {context}: {_redact_for_user(exc)}"
 
 
 def _automation_key_matches(provided: str) -> bool:
@@ -159,8 +205,8 @@ def initialize_client():
             ticktick_v2.invalidate_cache() if ticktick_v2 else None)
 
         return True
-    except Exception as e:
-        logger.error(f"Failed to initialize TickTick client: {e}")
+    except Exception:
+        logger.exception("Failed to initialize TickTick client")
         return False
 
 
@@ -222,10 +268,10 @@ async def tg_own_bot_webhook(request: Request) -> Response:
         body = {}
     try:
         await _run_blocking(tg_approval.handle_webhook, _TG_CFG, body)
-    except Exception as e:  # noqa: BLE001 — вебхук обязан ответить Telegram'у,
+    except Exception:  # noqa: BLE001 — вебхук обязан ответить Telegram'у,
         # что бы ни случилось внутри обработки; Telegram ретраит не-2xx, а
         # повторная доставка того же апдейта на сломанном коде ничего не чинит
-        logger.error(f"TG own_bot webhook: handle_webhook упал: {e!r}")
+        logger.exception("TG own_bot webhook: handle_webhook упал")
     return PlainTextResponse("", status_code=200)
 
 
@@ -379,15 +425,15 @@ async def attachment_download_link(request: Request) -> Response:
         upstream = await _run_blocking(
             lambda: ticktick_v2.open_attachment_stream(
                 payload["p"], payload["t"], payload["a"]))
-    except TickTickAuthError as e:
-        logger.error(f"/dl auth error: {e}")
+    except TickTickAuthError:
+        logger.exception("/dl auth error")
         return PlainTextResponse("Сервер не может обратиться к TickTick "
                                  "(сессия истекла).\n", status_code=502)
     except ValueError:
         # Attachment genuinely gone upstream — same 404 wording as a bad link.
         return PlainTextResponse(_BAD_LINK_MSG, status_code=404)
-    except Exception as e:
-        logger.error(f"/dl upstream error: {e}")
+    except Exception:
+        logger.exception("/dl upstream error")
         return PlainTextResponse("Не удалось получить файл из TickTick.\n",
                                  status_code=502)
 
@@ -437,14 +483,15 @@ async def attachment_upload_link(request: Request) -> Response:
     try:
         await _run_blocking(lambda: ticktick_v2.upload_attachment_bytes(
             payload["p"], payload["t"], payload["a"], bytes(buf), filename=name))
-    except TickTickAuthError as e:
-        logger.error(f"/ul auth error: {e}")
+    except TickTickAuthError:
+        logger.exception("/ul auth error")
         return PlainTextResponse("Сервер не может обратиться к TickTick "
                                  "(сессия истекла).\n", status_code=502)
     except Exception as e:
-        logger.error(f"/ul upstream error: {e}")
-        return PlainTextResponse(f"TickTick не принял файл: {e}\n",
-                                 status_code=502)
+        logger.exception("/ul upstream error")
+        return PlainTextResponse(
+            f"TickTick не принял файл: {_redact_for_user(e)}\n",
+            status_code=502)
     return JSONResponse({"status": "ok", "fileName": name,
                          "size_bytes": len(buf), "task_id": payload["t"],
                          "attachment_id": payload["a"]})
@@ -2165,7 +2212,7 @@ async def get_projects() -> str:
     try:
         projects = await _run_blocking(lambda: ticktick.get_projects())
         if 'error' in projects:
-            return f"Error fetching projects: {projects['error']}"
+            return _tool_error("fetching projects", projects['error'])
 
         # One v2 state read for the whole listing: the folder map (resolved
         # once, not per project) and the built-in Inbox.
@@ -2187,8 +2234,8 @@ async def get_projects() -> str:
 
         return result
     except Exception as e:
-        logger.error(f"Error in get_projects: {e}")
-        return f"Error retrieving projects: {str(e)}"
+        logger.exception("Error in get_projects")
+        return _tool_error("fetching projects", e)
 
 @mcp.tool(annotations=READONLY)
 async def get_project(project_id: str) -> str:
@@ -2213,7 +2260,7 @@ async def get_project(project_id: str) -> str:
     try:
         project = await _run_blocking(lambda: ticktick.get_project(project_id))
         if isinstance(project, dict) and 'error' in project:
-            return f"Error fetching project: {project['error']}"
+            return _tool_error("fetching project", project['error'])
 
         # Тот же отказ, что и в get_task: пустой ответ печатался как проект
         # «No name / (id: ?)», то есть как существующий.
@@ -2228,8 +2275,8 @@ async def get_project(project_id: str) -> str:
         group_names = await _run_blocking(_v2_group_names)
         return format_project(project, group_names)
     except Exception as e:
-        logger.error(f"Error in get_project: {e}")
-        return f"Error retrieving project: {str(e)}"
+        logger.exception("Error in get_project")
+        return _tool_error("fetching project", e)
 
 @mcp.tool(annotations=READONLY)
 async def get_project_tasks(project_id: str, limit: int = _PROJECT_TASKS_PAGE,
@@ -2271,7 +2318,7 @@ async def get_project_tasks(project_id: str, limit: int = _PROJECT_TASKS_PAGE,
     try:
         project_data = await _run_blocking(lambda: ticktick.get_project_with_data(project_id))
         if 'error' in project_data:
-            return f"Error fetching project data: {project_data['error']}"
+            return _tool_error("fetching project data", project_data['error'])
         
         tasks = project_data.get('tasks', [])
         pname = project_data.get('project', {}).get('name', project_id)
@@ -2306,8 +2353,8 @@ async def get_project_tasks(project_id: str, limit: int = _PROJECT_TASKS_PAGE,
 
         return result
     except Exception as e:
-        logger.error(f"Error in get_project_tasks: {e}")
-        return f"Error retrieving project tasks: {str(e)}"
+        logger.exception("Error in get_project_tasks")
+        return _tool_error("fetching project tasks", e)
 
 # v2's trash endpoint caps a page at 500; ask for the whole page so "not in the
 # trash" is as close to a full answer as one request can be.
@@ -2369,7 +2416,7 @@ async def get_task(project_id: str, task_id: str) -> str:
     try:
         task = await _run_blocking(lambda: ticktick.get_task(project_id, task_id))
         if isinstance(task, dict) and 'error' in task:
-            return f"Error fetching task: {task['error']}"
+            return _tool_error("fetching task", task['error'])
 
         # Пустой/чужой ответ — это ОТКАЗ, а не карточка «No title / Active».
         refusal = _identity_or_refusal(
@@ -2383,8 +2430,8 @@ async def get_task(project_id: str, task_id: str) -> str:
         in_trash, note = await _trash_state(task_id)
         return format_task(task, trash_state=in_trash) + note
     except Exception as e:
-        logger.error(f"Error in get_task: {e}")
-        return f"Error retrieving task: {str(e)}"
+        logger.exception("Error in get_task")
+        return _tool_error("fetching task", e)
 
 def _build_v2_task_obj(node: Dict, project_id: str, task_id: str,
                        parent_id: str = None) -> Dict:
@@ -2696,7 +2743,7 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                         await _run_blocking(lambda: ticktick_v2.set_task_column(root_id, t["column_id"]))
                     except Exception as e:
                         logger.warning(f"Column failed: {e}")
-                        sub_notes.append(f"⚠️ раздел (column) не применился: {e}")
+                        sub_notes.append(f"⚠️ раздел (column) не применился: {_redact_for_user(e)}")
                 total = len(tasks_flat)
                 line = f"✓ «{title}» + {total - 1} подзадач (дерево, {total} всего)"
                 if root_id:
@@ -2724,7 +2771,7 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                 reminders=t.get("reminders"),
             )
             if 'error' in task:
-                failed.append(f"#{i+1} «{title}»: {task['error']}")
+                failed.append(f"#{i+1} «{title}»: {_redact_for_user(task['error'])}")
                 continue
             task_id = task.get("id")
 
@@ -2735,27 +2782,27 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                         await _run_blocking(lambda: ticktick_v2.set_task_tags(task_id, t["tags"]))
                     except Exception as e:
                         logger.warning(f"Tagging failed: {e}")
-                        sub_notes.append(f"⚠️ теги не применились: {e}")
+                        sub_notes.append(f"⚠️ теги не применились: {_redact_for_user(e)}")
                 if t.get("assignee") is not None:
                     try:
                         await _run_blocking(lambda: ticktick_v2.batch_update_tasks(
                             [{"taskId": task_id, "assignee": t["assignee"]}]))
                     except Exception as e:
                         logger.warning(f"Assignee failed: {e}")
-                        sub_notes.append(f"⚠️ исполнитель не назначен: {e}")
+                        sub_notes.append(f"⚠️ исполнитель не назначен: {_redact_for_user(e)}")
                 if t.get("column_id"):
                     try:
                         await _run_blocking(lambda: ticktick_v2.set_task_column(task_id, t["column_id"]))
                     except Exception as e:
                         logger.warning(f"Column failed: {e}")
-                        sub_notes.append(f"⚠️ раздел (column) не применился: {e}")
+                        sub_notes.append(f"⚠️ раздел (column) не применился: {_redact_for_user(e)}")
                 if t.get("parent_id"):
                     try:
                         await _run_blocking(lambda: ticktick_v2.batch_set_task_parent(
                             [task_id], t["parent_id"], project_id))
                     except Exception as e:
                         logger.warning(f"Parent link failed: {e}")
-                        sub_notes.append(f"⚠️ привязка к родителю не применилась: {e}")
+                        sub_notes.append(f"⚠️ привязка к родителю не применилась: {_redact_for_user(e)}")
             elif task_id and not ticktick_v2 and (
                     t.get("tags") or t.get("assignee") is not None
                     or t.get("parent_id")):
@@ -2795,7 +2842,7 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                 except Exception as e:
                     logger.warning(f"Batch subtasks failed: {e}")
                     sub_notes.append(
-                        f"⚠️ подзадачи НЕ созданы ({len(all_sub_tasks)} шт.): {e}")
+                        f"⚠️ подзадачи НЕ созданы ({len(all_sub_tasks)} шт.): {_redact_for_user(e)}")
             elif sub_items and task_id and not ticktick_v2:
                 sub_notes.append(
                     f"⚠️ запрошено {len(sub_items)} подзадач, но они требуют "
@@ -2812,7 +2859,7 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
             created.append(line)
 
         except Exception as e:
-            failed.append(f"#{i+1} «{title}»: {e}")
+            failed.append(f"#{i+1} «{title}»: {_redact_for_user(e)}")
 
     # Post-verify DESTINATION against fresh state: each created task must
     # actually sit in the requested project (and column, when one was asked).
@@ -3445,7 +3492,7 @@ def _check_plan_rows(tasks: List[Dict[str, Any]]) -> _PlanCheck:
         logger.warning(f"сверка плана с живым состоянием не удалась ({e}) — "
                        f"план скажет об этом вслух")
         return _PlanCheck({}, checked=False,
-                          why=f"чтение живого состояния не удалось: {e}")
+                          why=f"чтение живого состояния не удалось: {_redact_for_user(e)}")
     out: Dict[str, str] = {}
     for m in missing:
         out[str(m.get("taskId"))] = (m.get("reason")
@@ -3559,7 +3606,7 @@ async def _update_tasks_impl(
                     reminders=t.get("reminders"),
                 )
                 if 'error' in task:
-                    results.append(f"✗ «{shown_title}»: {task['error']}")
+                    results.append(f"✗ «{shown_title}»: {_redact_for_user(task['error'])}")
                     continue
                 # Sub-steps (tags/column/assignee) — failures go into the RESULT
                 # text, not only the log: «обновлено» must not hide a lost tag.
@@ -3569,19 +3616,19 @@ async def _update_tasks_impl(
                         await _run_blocking(lambda: ticktick_v2.set_task_tags(tid, t["tags"]))
                     except Exception as e:
                         logger.warning(f"Updated but tagging failed: {e}")
-                        sub_fails.append(f"теги не применились ({e})")
+                        sub_fails.append(f"теги не применились ({_redact_for_user(e)})")
                 if t.get("column_id") and ticktick_v2:
                     try:
                         await _run_blocking(lambda: ticktick_v2.set_task_column(tid, t["column_id"]))
                     except Exception as e:
                         logger.warning(f"Updated but column assignment failed: {e}")
-                        sub_fails.append(f"раздел (column) не применился ({e})")
+                        sub_fails.append(f"раздел (column) не применился ({_redact_for_user(e)})")
                 if t.get("assignee") is not None and ticktick_v2:
                     try:
                         await _run_blocking(lambda: ticktick_v2.batch_update_tasks([{"taskId": tid, "assignee": t["assignee"]}]))
                     except Exception as e:
                         logger.warning(f"Updated but assignee failed: {e}")
-                        sub_fails.append(f"исполнитель не назначен ({e})")
+                        sub_fails.append(f"исполнитель не назначен ({_redact_for_user(e)})")
                 if (t.get("tags") is not None or t.get("assignee") is not None) \
                         and not ticktick_v2:
                     sub_fails.append("теги/исполнитель требуют v2 API — v2 "
@@ -3630,7 +3677,7 @@ async def _update_tasks_impl(
                 results.append(line)
                 _single_updates.append(item)
             except Exception as e:
-                results.append(f"✗ «{shown_title}»: {e}")
+                results.append(f"✗ «{shown_title}»: {_redact_for_user(e)}")
         if _single_updates:
             rid = _op_journal("update", _single_updates, summary)
             results.append(_report_line(rid))
@@ -3739,8 +3786,8 @@ async def _update_tasks_impl(
             lines.append(_report_line(rid))
         return "\n".join(lines) if lines else "Ничего не обновлено."
     except Exception as e:
-        logger.error(f"Error in update_tasks: {e}")
-        return f"Error updating tasks: {str(e)}"
+        logger.exception("Error in update_tasks")
+        return _tool_error("updating tasks", e)
 @mcp.tool()
 async def complete_tasks(summary: str, tasks: List[Dict[str, str]] = None,
                          manifest_id: str = "", user_reply: str = "",
@@ -3903,7 +3950,7 @@ async def _complete_tasks_impl(summary: str, tasks: List[Dict[str, str]]) -> str
                 pname = t.get("projectName") or _v2_project_names().get(pid, "")
                 res = await _run_blocking(lambda: ticktick.complete_task(pid, tid))
                 if 'error' in res:
-                    results.append(f"✗ «{title}»: {res['error']}")
+                    results.append(f"✗ «{title}»: {_redact_for_user(res['error'])}")
                     continue
                 # Post-verify: the official API can silently no-op a complete
                 # with a mismatched projectId — «✓» only after the task is
@@ -3929,8 +3976,8 @@ async def _complete_tasks_impl(summary: str, tasks: List[Dict[str, str]]) -> str
                 results.append(_report_line(rid))
             return "\n".join(results)
     except Exception as e:
-        logger.error(f"Error in complete_tasks: {e}")
-        return f"Error completing tasks: {str(e)}"
+        logger.exception("Error in complete_tasks")
+        return _tool_error("completing tasks", e)
 @mcp.tool()
 async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = None,
                        manifest_id: str = "", user_reply: str = "",
@@ -4127,8 +4174,8 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
         return await _maybe_tg_notify_plan("delete_tasks", mid,
                                            "\n".join(preview), agent_tail)
     except Exception as e:
-        logger.error(f"Error in delete_tasks: {e}")
-        return f"Error deleting tasks: {str(e)}"
+        logger.exception("Error in delete_tasks")
+        return _tool_error("deleting tasks", e)
 
 
 # ---------------------------------------------------------------------------
@@ -4939,7 +4986,8 @@ async def _maybe_tg_notify_plan(tool: str, manifest_id: str,
             m.pop("tg_notified", None)
             m.pop("_tg_tool", None)
             m.pop("_tg_manifest_id", None)
-        return (f"🛑 Не смог отправить запрос подтверждения в Telegram ({err}). "
+        return (f"🛑 Не смог отправить запрос подтверждения в Telegram "
+                f"({_redact_for_user(err)}). "
                 "Действие НЕ запланировано, ничего не изменено. Проверьте "
                 "бота/настройки Telegram-подтверждения и попробуйте снова.")
     # УСПЕШНО отправлено → манифест ПОМЕЧЕН (2026-08-06, фикс
@@ -6046,8 +6094,8 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
             lines.append("\n" + _build_operation_report(manifest_id))
         return "\n".join(lines) if lines else "Ничего не удалено."
     except Exception as e:
-        logger.error(f"Error in execute_task_deletion: {e}")
-        return f"Error executing deletion manifest: {str(e)}"
+        logger.exception("Error in execute_task_deletion")
+        return _tool_error("executing deletion manifest", e)
 
 
 def _fmt_tag_set(tags) -> str:
@@ -6417,8 +6465,8 @@ def _build_operation_report(record_id: str) -> str:
                      "это серверная проверка, не заменяй её своим пересказом]")
         return "\n".join(lines)
     except Exception as e:
-        logger.error(f"Error in operation_report: {e}")
-        return f"Error building operation report: {str(e)}"
+        logger.exception("Error in operation_report")
+        return _tool_error("building operation report", e)
 
 
 # ---------------------------------------------------------------------------
@@ -7218,7 +7266,7 @@ async def _execute_declutter_from_sheet(manifest_id: str) -> str:
     try:
         rows = declutter_sheet.read_manifest_rows(manifest_id)
     except declutter_sheet.DeclutterSheetError as e:
-        return f"🛑 Не могу прочитать таблицу разбора: {e}"
+        return f"🛑 Не могу прочитать таблицу разбора: {_redact_for_user(e)}"
     if not rows:
         try:
             url = declutter_sheet.sheet_url()
@@ -7260,7 +7308,7 @@ async def _execute_declutter_from_sheet(manifest_id: str) -> str:
         try:
             declutter_sheet.batch_update_rows(resolved_updates)
         except declutter_sheet.DeclutterSheetError as e:
-            return f"🛑 Не могу разрешить зависший лок applying в таблице: {e}"
+            return f"🛑 Не могу разрешить зависший лок applying в таблице: {_redact_for_user(e)}"
 
     apply_rows = [r for r in rows if r.get("action") in _DC_MUTATING_ROW_ACTIONS
                   and r.get("decision") == "approved"
@@ -7278,7 +7326,7 @@ async def _execute_declutter_from_sheet(manifest_id: str) -> str:
     try:
         declutter_sheet.batch_update_rows(lock_updates)
     except declutter_sheet.DeclutterSheetError as e:
-        return f"🛑 Не могу поставить лок applying в таблице: {e}"
+        return f"🛑 Не могу поставить лок applying в таблице: {_redact_for_user(e)}"
 
     summary = f"Разбор помойки (таблица) — манифест {manifest_id}"
     out_blocks: List[str] = []
@@ -7379,7 +7427,7 @@ async def _execute_declutter_from_sheet(manifest_id: str) -> str:
         except declutter_sheet.DeclutterSheetError as e:
             out_blocks.append(
                 f"⚠️ Правки применены, но не смог записать статусы обратно в "
-                f"таблицу: {e} — сверь фактический результат вручную "
+                f"таблицу: {_redact_for_user(e)} — сверь фактический результат вручную "
                 "(operation_report ниже) и поправь `status` в таблице.")
 
         if not out_blocks:
@@ -7407,7 +7455,7 @@ async def _execute_declutter_from_sheet(manifest_id: str) -> str:
             pass
         return combined
     except Exception as e:
-        logger.error(f"Error in _execute_declutter_from_sheet: {e}")
+        logger.exception("Error in _execute_declutter_from_sheet")
         # Best-effort: release the applying lock back to failed so a retry is
         # possible instead of a permanently stuck row (mirrors the RAM
         # branch's "graceful error, manifest state already changed" contract
@@ -7415,10 +7463,10 @@ async def _execute_declutter_from_sheet(manifest_id: str) -> str:
         try:
             declutter_sheet.batch_update_rows(
                 [{"row_id": r["row_id"], "status": "failed",
-                  "error": f"внутренняя ошибка: {e}"} for r in apply_rows])
+                  "error": f"внутренняя ошибка: {_redact_for_user(e)}"} for r in apply_rows])
         except Exception:
             pass
-        return f"Error executing declutter manifest (sheet): {str(e)}"
+        return _tool_error("executing declutter manifest (sheet)", e)
 
 
 # DISABLED 2026-08-04 по прямому указанию Максима ("Деклатер закоменть пока") —
@@ -7549,7 +7597,7 @@ async def plan_declutter(scope: str = "", dry_run: bool = True,
             url = declutter_sheet.sheet_url()
         except declutter_sheet.DeclutterSheetError as e:
             return (f"🛑 Отказ: не могу сохранить план durable в Google Sheet "
-                    f"(persist=\"sheet\") — {e} Ничего не записано в TickTick "
+                    f"(persist=\"sheet\") — {_redact_for_user(e)} Ничего не записано в TickTick "
                     "и ничего не записано в таблицу — план НЕ построен. "
                     "Проверь DECLUTTER_SHEET_ID/GSHEETS_SA_JSON и доступ к "
                     "сети, либо вызови без persist (RAM-режим, как раньше).")
@@ -7796,8 +7844,8 @@ async def _execute_declutter_ram_impl(manifest_id: str, m: Dict) -> str:
             combined += "\n\n---\n### 🧾 Независимые отчёты\n\n" + "\n\n".join(reports)
         return combined
     except Exception as e:
-        logger.error(f"Error in execute_declutter: {e}")
-        return f"Error executing declutter manifest: {str(e)}"
+        logger.exception("Error in execute_declutter")
+        return _tool_error("executing declutter manifest", e)
 
 
 # DISABLED 2026-08-04 — см. пометку у plan_declutter выше.
@@ -7892,7 +7940,7 @@ async def set_declutter_decision(manifest_id: str, row_ids: List[int],
     try:
         rows = declutter_sheet.read_manifest_rows(manifest_id)
     except declutter_sheet.DeclutterSheetError as e:
-        return f"🛑 Не могу прочитать таблицу разбора: {e}"
+        return f"🛑 Не могу прочитать таблицу разбора: {_redact_for_user(e)}"
     if not rows:
         return f"🛑 Манифест разбора {manifest_id} не найден в таблице."
     valid_ids = {int(r["row_id"]) for r in rows
@@ -7906,7 +7954,7 @@ async def set_declutter_decision(manifest_id: str, row_ids: List[int],
         declutter_sheet.batch_update_rows(
             [{"row_id": rid, "decision": decision} for rid in apply_ids])
     except declutter_sheet.DeclutterSheetError as e:
-        return f"🛑 Не удалось записать decision в таблицу: {e}"
+        return f"🛑 Не удалось записать decision в таблицу: {_redact_for_user(e)}"
     msg = f"✅ decision=\"{decision}\" проставлен для {len(apply_ids)} строк: {apply_ids}"
     if unknown:
         msg += f"\n⚠️ Не найдены в манифесте {manifest_id} (пропущены): {unknown}"
@@ -8036,11 +8084,12 @@ async def _create_project_impl(name: str, color: str = "#F18181",
         )
 
         if 'error' in project:
-            return f"### ❌ Проект «{name}» НЕ создан\n\nTickTick отклонил: {project['error']}"
+            return (f"### ❌ Проект «{name}» НЕ создан\n\nTickTick отклонил: "
+                    f"{_redact_for_user(project['error'])}")
         pid = project.get('id')
     except Exception as e:
-        logger.error(f"Error in create_project: {e}")
-        return f"### ❌ Проект «{name}» НЕ создан\n\nОшибка: {str(e)}"
+        logger.exception("Error in create_project")
+        return f"### ❌ Проект «{name}» НЕ создан\n\nОшибка: {_redact_for_user(e)}"
 
     # Post-verify: independent fresh re-read (separate GET, not the create
     # response) so a false-positive "success" from the API doesn't slip through.
@@ -8057,7 +8106,7 @@ async def _create_project_impl(name: str, color: str = "#F18181",
     except Exception as e:
         return (f"### ⚠️ Проект «{name}» создан, но НЕ подтверждён\n\n"
                 f"{format_project(project)}\n\n"
-                f"⚠️ {_UNVERIFIED_MSG} ({e})")
+                f"⚠️ {_UNVERIFIED_MSG} ({_redact_for_user(e)})")
 
 _PROJECT_DELETE_SAMPLE_CAP = 20  # preview lines shown before the confirm echo
 
@@ -8134,12 +8183,12 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
     try:
         data = await _run_blocking(lambda: ticktick.get_project_with_data(project_id))
     except Exception as e:
-        logger.error(f"Error in delete_project (fetching contents): {e}")
+        logger.exception("Error in delete_project (fetching contents)")
         return (f"🛑 Не смог прочитать содержимое проекта «{live_name}» — отказ "
-                f"(не удаляю вслепую): {str(e)}")
+                f"(не удаляю вслепую): {_redact_for_user(e)}")
     if 'error' in data:
         return (f"🛑 Не смог прочитать содержимое проекта «{live_name}» — отказ "
-                f"(не удаляю вслепую): {data['error']}")
+                f"(не удаляю вслепую): {_redact_for_user(data['error'])}")
     tasks = data.get('tasks') or []
     count = len(tasks)
 
@@ -8285,7 +8334,7 @@ async def _delete_project_impl(project_id: str, project_name: str,
         result = await _run_blocking(lambda: ticktick.delete_project(project_id))
         if 'error' in result:
             return (f"❌ TickTick отклонил удаление проекта «{live_name}»: "
-                    f"{result['error']}\n{_report_line(record_id)}")
+                    f"{_redact_for_user(result['error'])}\n{_report_line(record_id)}")
 
         # Post-verify against FRESH state: the project must no longer resolve.
         if ticktick_v2:
@@ -8312,8 +8361,8 @@ async def _delete_project_impl(project_id: str, project_name: str,
         lines.append(_report_line(record_id))
         return "\n".join(lines)
     except Exception as e:
-        logger.error(f"Error in delete_project: {e}")
-        return f"Error deleting project: {str(e)}"
+        logger.exception("Error in delete_project")
+        return _tool_error("deleting project", e)
     
 
 ### Improved Task MCP Tools
@@ -8651,7 +8700,7 @@ def _get_project_tasks_by_filter(filter_func, filter_name: str,
     # Official-API fallback: fetch the project list only now that we need it.
     projects = ticktick.get_projects()
     if 'error' in projects:
-        return f"Error fetching projects: {projects['error']}"
+        return _tool_error("fetching projects", projects['error'])
     if not projects:
         return "No projects found."
 
@@ -8770,8 +8819,8 @@ async def get_all_tasks(limit: int = _ALL_TASKS_PAGE, offset: int = 0) -> str:
         return out
 
     except Exception as e:
-        logger.error(f"Error in get_all_tasks: {e}")
-        return f"Error retrieving tasks: {str(e)}"
+        logger.exception("Error in get_all_tasks")
+        return _tool_error("fetching tasks", e)
 
 @mcp.tool(annotations=READONLY)
 async def get_tasks_by_priority(priority_id: int, limit: int = 200, offset: int = 0) -> str:
@@ -8803,8 +8852,8 @@ async def get_tasks_by_priority(priority_id: int, limit: int = 200, offset: int 
                                             limit=limit, offset=offset)
 
     except Exception as e:
-        logger.error(f"Error in get_tasks_by_priority: {e}")
-        return f"Error retrieving tasks by priority: {str(e)}"
+        logger.exception("Error in get_tasks_by_priority")
+        return _tool_error("fetching tasks by priority", e)
 
 @mcp.tool(annotations=READONLY)
 async def get_tasks_due_today() -> str:
@@ -8820,8 +8869,8 @@ async def get_tasks_due_today() -> str:
         return _get_project_tasks_by_filter(today_filter, "due today")
 
     except Exception as e:
-        logger.error(f"Error in get_tasks_due_today: {e}")
-        return f"Error retrieving tasks due today: {str(e)}"
+        logger.exception("Error in get_tasks_due_today")
+        return _tool_error("fetching tasks due today", e)
 
 @mcp.tool(annotations=READONLY)
 async def get_overdue_tasks() -> str:
@@ -8837,8 +8886,8 @@ async def get_overdue_tasks() -> str:
         return _get_project_tasks_by_filter(overdue_filter, "overdue")
 
     except Exception as e:
-        logger.error(f"Error in get_overdue_tasks: {e}")
-        return f"Error retrieving overdue tasks: {str(e)}"
+        logger.exception("Error in get_overdue_tasks")
+        return _tool_error("fetching overdue tasks", e)
 
 @mcp.tool(annotations=READONLY)
 async def get_tasks_due_tomorrow() -> str:
@@ -8854,8 +8903,8 @@ async def get_tasks_due_tomorrow() -> str:
         return _get_project_tasks_by_filter(tomorrow_filter, "due tomorrow")
 
     except Exception as e:
-        logger.error(f"Error in get_tasks_due_tomorrow: {e}")
-        return f"Error retrieving tasks due tomorrow: {str(e)}"
+        logger.exception("Error in get_tasks_due_tomorrow")
+        return _tool_error("fetching tasks due tomorrow", e)
     
 @mcp.tool(annotations=READONLY)
 async def get_tasks_due_in_days(days: int) -> str:
@@ -8880,8 +8929,8 @@ async def get_tasks_due_in_days(days: int) -> str:
         return _get_project_tasks_by_filter(days_filter, f"due {day_description}")
 
     except Exception as e:
-        logger.error(f"Error in get_tasks_due_in_days: {e}")
-        return f"Error retrieving tasks due in days: {str(e)}"
+        logger.exception("Error in get_tasks_due_in_days")
+        return _tool_error("fetching tasks due in days", e)
 
 @mcp.tool(annotations=READONLY)
 async def get_tasks_due_this_week() -> str:
@@ -8903,8 +8952,8 @@ async def get_tasks_due_this_week() -> str:
         return _get_project_tasks_by_filter(week_filter, "due this week")
 
     except Exception as e:
-        logger.error(f"Error in get_tasks_due_this_week: {e}")
-        return f"Error retrieving tasks due this week: {str(e)}"
+        logger.exception("Error in get_tasks_due_this_week")
+        return _tool_error("fetching tasks due this week", e)
 
 @mcp.tool(annotations=READONLY)
 async def search_tasks(search_term: str) -> str:
@@ -8940,8 +8989,8 @@ async def search_tasks(search_term: str) -> str:
         return _get_project_tasks_by_filter(search_filter, f"matching '{search_term}'")
 
     except Exception as e:
-        logger.error(f"Error in search_tasks: {e}")
-        return f"Error searching tasks: {str(e)}"
+        logger.exception("Error in search_tasks")
+        return _tool_error("searching tasks", e)
 
 @mcp.tool(annotations=READONLY)
 async def get_recurring_tasks(search_term: str = "") -> str:
@@ -8965,7 +9014,7 @@ async def get_recurring_tasks(search_term: str = "") -> str:
         else:
             projects = await _run_blocking(lambda: ticktick.get_projects())
             if 'error' in projects:
-                return f"Error fetching projects: {projects['error']}"
+                return _tool_error("fetching projects", projects['error'])
             all_open = []
             for p in projects:
                 pid = p.get("id")
@@ -8986,8 +9035,8 @@ async def get_recurring_tasks(search_term: str = "") -> str:
         return label + "\n" + format_task_tree(tasks, 200)
 
     except Exception as e:
-        logger.error(f"Error in get_recurring_tasks: {e}")
-        return f"Error retrieving recurring tasks: {str(e)}"
+        logger.exception("Error in get_recurring_tasks")
+        return _tool_error("fetching recurring tasks", e)
 
 # New MCP Tools for Getting things done framework (Priority / Due Dates)
 
@@ -9011,8 +9060,8 @@ async def get_engaged_tasks() -> str:
         return _get_project_tasks_by_filter(engaged_filter, "engaged")
 
     except Exception as e:
-        logger.error(f"Error in get_engaged_tasks: {e}")
-        return f"Error retrieving engaged tasks: {str(e)}"
+        logger.exception("Error in get_engaged_tasks")
+        return _tool_error("fetching engaged tasks", e)
 
 @mcp.tool(annotations=READONLY)
 async def get_next_tasks() -> str:
@@ -9033,8 +9082,8 @@ async def get_next_tasks() -> str:
         return _get_project_tasks_by_filter(next_filter, "next")
 
     except Exception as e:
-        logger.error(f"Error in get_next_tasks: {e}")
-        return f"Error retrieving next tasks: {str(e)}"
+        logger.exception("Error in get_next_tasks")
+        return _tool_error("fetching next tasks", e)
 
 def _describe_create_subtask(p: Dict) -> str:
     return (f'Создаю подзадачу «{p.get("subtask_title")}» под «'
@@ -9206,7 +9255,7 @@ async def _create_subtask_impl(parent_task_title: str, subtask_title: str,
         )
 
         if 'error' in subtask:
-            return f"Error creating subtask: {subtask['error']}"
+            return _tool_error("creating subtask", subtask['error'])
 
         # Post-verify: the created task must exist AND point at the parent.
         sid = subtask.get("id")
@@ -9229,8 +9278,8 @@ async def _create_subtask_impl(parent_task_title: str, subtask_title: str,
                            f"«{g.title or parent_task_title}» (проверено).")
         return (verdict + "\n\n" + format_task(subtask) + "\n" + _report_line(rid))
     except Exception as e:
-        logger.error(f"Error in create_subtask: {e}")
-        return f"Error creating subtask: {str(e)}"
+        logger.exception("Error in create_subtask")
+        return _tool_error("creating subtask", e)
 
 # ---------------------------------------------------------------------------
 # v2 API tools (unofficial). Available when TICKTICK_V2_TOKEN (the `t` cookie
@@ -9282,8 +9331,8 @@ async def get_completed_tasks(limit: int = 100) -> str:
                     f"{COMPLETED_MAX_LIMIT} most recent, not everything.)")
         return out
     except Exception as e:
-        logger.error(f"Error in get_completed_tasks: {e}")
-        return f"Error fetching completed tasks: {str(e)}"
+        logger.exception("Error in get_completed_tasks")
+        return _tool_error("fetching completed tasks", e)
 
 
 @mcp.tool(annotations=READONLY)
@@ -9299,8 +9348,8 @@ async def list_tags() -> str:
         lines = [f"- {t.get('label', t.get('name', '?'))}" for t in tags]
         return f"Tags ({len(tags)}):\n\n" + "\n".join(lines)
     except Exception as e:
-        logger.error(f"Error in list_tags: {e}")
-        return f"Error fetching tags: {str(e)}"
+        logger.exception("Error in list_tags")
+        return _tool_error("fetching tags", e)
 
 
 @mcp.tool(annotations=READONLY)
@@ -9321,8 +9370,8 @@ async def get_tasks_by_tag(tag: str) -> str:
         out = f"Tasks tagged '{tag}' ({len(tasks)}):\n\n"
         return out + format_task_tree(tasks)
     except Exception as e:
-        logger.error(f"Error in get_tasks_by_tag: {e}")
-        return f"Error fetching tasks by tag: {str(e)}"
+        logger.exception("Error in get_tasks_by_tag")
+        return _tool_error("fetching tasks by tag", e)
 
 
 @mcp.tool(annotations=READONLY)
@@ -9371,8 +9420,8 @@ async def get_inbox_tasks(limit: int = _TREE_PAGE, offset: int = 0) -> str:
                     f"call again with offset={shown_to}.\n")
         return out
     except Exception as e:
-        logger.error(f"Error in get_inbox_tasks: {e}")
-        return f"Error fetching inbox tasks: {str(e)}"
+        logger.exception("Error in get_inbox_tasks")
+        return _tool_error("fetching inbox tasks", e)
 
 
 @mcp.tool()
@@ -9550,8 +9599,8 @@ async def _move_tasks_impl(summary: str, tasks: List[Dict[str, str]],
             lines.append(_report_line(rid))
         return "\n".join(lines) if lines else "Ничего не перемещено."
     except Exception as e:
-        logger.error(f"Error in move_tasks: {e}")
-        return f"Error moving tasks: {str(e)}"
+        logger.exception("Error in move_tasks")
+        return _tool_error("moving tasks", e)
 
 
 # ---------------------------------------------------------------------------
@@ -9595,8 +9644,8 @@ async def get_habits() -> str:
                     f"    repeat: {h.get('repeatRule','')}\n")
         return out
     except Exception as e:
-        logger.error(f"Error in get_habits: {e}")
-        return f"Error fetching habits: {str(e)}"
+        logger.exception("Error in get_habits")
+        return _tool_error("fetching habits", e)
 
 
 _HABIT_STATUS_LABELS = {2: "выполнено", 1: "провалено", 0: "не выполнено"}
@@ -9762,7 +9811,7 @@ async def _checkin_habit_impl(habit_name: str, habit_id: str, date: str = None,
             return (f"### ⚠️ Чек-ин «{real_name}» отправлен, проверка не выполнена\n\n"
                     f"- дата: {when_fmt}\n"
                     f"- запрос на статус **{labels[status]}** ({val}/{goal}) отправлен\n"
-                    f"- ⚠️ независимое перечитывание (`get_habit_checkins`) упало с ошибкой: {e} — "
+                    f"- ⚠️ независимое перечитывание (`get_habit_checkins`) упало с ошибкой: {_redact_for_user(e)} — "
                     "исход НЕ подтверждён")
 
         if written is None:
@@ -9788,8 +9837,8 @@ async def _checkin_habit_impl(habit_name: str, habit_id: str, date: str = None,
                 f"- при независимом перечитывании: **{w_label}** ({w_value}/{w_goal})\n"
                 "- ⚠️ запись есть, но не совпадает с тем, что отправляли — проверь вручную")
     except Exception as e:
-        logger.error(f"Error in checkin_habit: {e}")
-        return f"Error checking in habit: {str(e)}"
+        logger.exception("Error in checkin_habit")
+        return _tool_error("checking in habit", e)
 
 
 def _describe_create_habit(p: Dict) -> str:
@@ -9915,10 +9964,10 @@ async def _create_habit_impl(name: str, goal: float = 1.0, unit: str = "Count",
             repeat_rule=repeat_rule, section=section, color=color, icon=icon,
             encouragement=encouragement))
     except RuntimeError as e:
-        return f"### ❌ Привычка «{name}» НЕ создана — TickTick отклонил: {e}"
+        return f"### ❌ Привычка «{name}» НЕ создана — TickTick отклонил: {_redact_for_user(e)}"
     except Exception as e:
-        logger.error(f"Error in create_habit: {e}")
-        return f"Error creating habit: {str(e)}"
+        logger.exception("Error in create_habit")
+        return _tool_error("creating habit", e)
 
     # Post-verify: a SEPARATE fresh read of the live habit list — never the
     # write response — must show the habit, under the requested name.
@@ -9926,7 +9975,7 @@ async def _create_habit_impl(name: str, goal: float = 1.0, unit: str = "Count",
         after = await _run_blocking(lambda: ticktick_v2.get_habits())
     except Exception as e:
         return (f"### ⚠️ Привычка «{name}» отправлена (id: {hid}), проверка не выполнена\n\n"
-                f"- ⚠️ независимое перечитывание (`get_habits`) упало с ошибкой: {e}\n"
+                f"- ⚠️ независимое перечитывание (`get_habits`) упало с ошибкой: {_redact_for_user(e)}\n"
                 f"- {_UNVERIFIED_MSG}")
     live = next((h for h in after if h.get("id") == hid), None)
     if live is None:
@@ -10112,7 +10161,7 @@ async def _delete_habit_impl(habit_name: str, habit_id: str) -> str:
             after = await _run_blocking(lambda: ticktick_v2.get_habits())
         except Exception as e:
             return (f"### ⚠️ Привычка «{real_name}» отправлена на удаление, проверка не выполнена\n\n"
-                    f"- ⚠️ независимое перечитывание (`get_habits`) упало с ошибкой: {e}\n"
+                    f"- ⚠️ независимое перечитывание (`get_habits`) упало с ошибкой: {_redact_for_user(e)}\n"
                     f"- {_UNVERIFIED_MSG}")
         if any(h.get("id") == habit_id for h in after):
             return (f"### ❌ Привычка «{real_name}» ВСЁ ЕЩЁ в списке\n\n"
@@ -10130,8 +10179,8 @@ async def _delete_habit_impl(habit_name: str, habit_id: str) -> str:
                 "- 🧾 подтверждено отдельным живым чтением списка привычек "
                 "(`get_habits`) сразу после удаления")
     except Exception as e:
-        logger.error(f"Error in delete_habit: {e}")
-        return f"Error deleting habit: {str(e)}"
+        logger.exception("Error in delete_habit")
+        return _tool_error("deleting habit", e)
 
 
 @mcp.tool(annotations=READONLY)
@@ -10173,8 +10222,8 @@ async def get_habit_checkins(habit_name: str, habit_id: str, after_date: str) ->
                 f"{done} done, {failed} failed, {skipped} not done "
                 f"(oldest first):\n" + "\n".join(lines))
     except Exception as e:
-        logger.error(f"Error in get_habit_checkins: {e}")
-        return f"Error fetching habit check-ins: {str(e)}"
+        logger.exception("Error in get_habit_checkins")
+        return _tool_error("fetching habit check-ins", e)
 
 
 # ---------------------------------------------------------------------------
@@ -10196,8 +10245,8 @@ async def list_filters() -> str:
             out += f"- {f.get('name','?')}  (id: {f.get('id')})\n    rule: {f.get('rule','')}\n"
         return out
     except Exception as e:
-        logger.error(f"Error in list_filters: {e}")
-        return f"Error fetching filters: {str(e)}"
+        logger.exception("Error in list_filters")
+        return _tool_error("fetching filters", e)
 
 
 # ---------------------------------------------------------------------------
@@ -10490,8 +10539,8 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
             lines.append(_report_line(rid))
         return "\n".join(lines) if lines else "Ничего не вложено."
     except Exception as e:
-        logger.error(f"Error in set_task_parent: {e}")
-        return f"Error nesting tasks: {str(e)}"
+        logger.exception("Error in set_task_parent")
+        return _tool_error("nesting tasks", e)
 
 def _describe_unset_task_parent(p: Dict) -> str:
     return (f'Отцепляю «{p.get("task_title")}» от родителя '
@@ -10733,8 +10782,8 @@ async def _unset_task_parent_impl(task_title: str, parent_task_title: str,
         return (f"✅ «{task_title}» отцеплена от «{parent_task_title}» (проверено).\n"
                 + _report_line(rid))
     except Exception as e:
-        logger.error(f"Error in unset_task_parent: {e}")
-        return f"Error detaching subtask: {str(e)}"
+        logger.exception("Error in unset_task_parent")
+        return _tool_error("detaching subtask", e)
 
 
 @mcp.tool()
@@ -10916,10 +10965,10 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
             try:
                 shown = display_by_key.get(tag_name, tag_name)
                 await _run_blocking(lambda tn=shown: ticktick_v2.create_tag(tn))
-            except Exception as e:
-                logger.error(
+            except Exception:
+                logger.exception(
                     f"set_task_tags: auto-registration of tag '{tag_name}' "
-                    f"raised: {e}")
+                    "raised")
         after_create = (set(await _live_tag_names(force=True))
                         if to_register else existing_tags)
         registered = [t for t in to_register if t in after_create]
@@ -11010,8 +11059,8 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
             lines.append(_report_line(rid))
         return "\n".join(lines) if lines else "Ничего не изменено."
     except Exception as e:
-        logger.error(f"Error in set_task_tags: {e}")
-        return f"Error setting tags: {str(e)}"# ---------------------------------------------------------------------------
+        logger.exception("Error in set_task_tags")
+        return _tool_error("setting tags", e)# ---------------------------------------------------------------------------
 # Batch operations (v2)
 # ---------------------------------------------------------------------------
 
@@ -11238,8 +11287,8 @@ async def run_filter(filter: str, limit: int = _TREE_PAGE, offset: int = 0) -> s
                     f"call again with offset={shown_to}.\n")
         return out
     except Exception as e:
-        logger.error(f"Error in run_filter: {e}")
-        return f"Error running filter: {str(e)}"
+        logger.exception("Error in run_filter")
+        return _tool_error("running filter", e)
 
 
 # ---------------------------------------------------------------------------
@@ -11310,8 +11359,8 @@ async def list_project_groups() -> str:
                         "longer exists.")
         return out
     except Exception as e:
-        logger.error(f"Error in list_project_groups: {e}")
-        return f"Error fetching project groups: {str(e)}"
+        logger.exception("Error in list_project_groups")
+        return _tool_error("fetching project groups", e)
 
 
 async def _live_groups(fresh: bool = True) -> List[Dict]:
@@ -11384,10 +11433,10 @@ async def _create_project_group_impl(name: str) -> str:
     try:
         gid = await _run_blocking(lambda: ticktick_v2.create_project_group(name))
     except RuntimeError as e:
-        return f"❌ Группа «{name}» НЕ создана — TickTick отклонил: {e}"
+        return f"❌ Группа «{name}» НЕ создана — TickTick отклонил: {_redact_for_user(e)}"
     except Exception as e:
-        logger.error(f"Error in create_project_group: {e}")
-        return f"Error creating project group: {str(e)}"
+        logger.exception("Error in create_project_group")
+        return _tool_error("creating project group", e)
     # Post-verify: the new group must appear in the force-refreshed list.
     try:
         groups = await _live_groups()
@@ -11395,7 +11444,7 @@ async def _create_project_group_impl(name: str) -> str:
             return (f"❌ Группа «{name}» НЕ подтвердилась — её нет в списке "
                     "групп после создания, проверь вручную.")
     except Exception as e:
-        return f"Группа «{name}» отправлена (id: {gid}), но {_UNVERIFIED_MSG} ({e})"
+        return f"Группа «{name}» отправлена (id: {gid}), но {_UNVERIFIED_MSG} ({_redact_for_user(e)})"
     return f"✅ Группа проектов «{name}» создана (проверено). (id: {gid})"
 
 
@@ -11582,8 +11631,8 @@ async def _delete_project_group_impl(group_name: str, group_id: str) -> str:
         return (f"✅ Группа проектов «{real}» удалена (проверено; проекты "
                 "остались, просто без папки).")
     except Exception as e:
-        logger.error(f"Error in delete_project_group: {e}")
-        return f"Error deleting project group: {str(e)}"
+        logger.exception("Error in delete_project_group")
+        return _tool_error("deleting project group", e)
 
 
 def _describe_move_project_to_group(p: Dict, dest_name: Optional[str] = None,
@@ -11766,8 +11815,8 @@ async def _move_project_to_group_impl(project_name: str, project_id: str,
                     f"{got!r}, ожидался {want!r}.")
         return f"✅ Проект «{live_pname}» перемещён в {dest} (проверено)."
     except Exception as e:
-        logger.error(f"Error in move_project_to_group: {e}")
-        return f"Error moving project: {str(e)}"
+        logger.exception("Error in move_project_to_group")
+        return _tool_error("moving project", e)
 
 
 # ---------------------------------------------------------------------------
@@ -11801,8 +11850,8 @@ async def get_task_comments(task_title: str, project_id: str, task_id: str) -> s
             out += f"- (id:{c.get('id')}) [{who}] {c.get('title','')}\n"
         return out
     except Exception as e:
-        logger.error(f"Error in get_task_comments: {e}")
-        return f"Error fetching comments: {str(e)}"
+        logger.exception("Error in get_task_comments")
+        return _tool_error("fetching comments", e)
 
 
 def _describe_add_task_comment(p: Dict) -> str:
@@ -11967,7 +12016,7 @@ async def _add_task_comment_impl(task_title: str, text: str, project_id: str,
         except Exception as e:
             logger.warning(f"add_task_comment: post-verify чтение не удалось: {e}")
             return (f"⚠️ Комментарий отправлен в «{name}», но исход НЕ "
-                    f"ПОДТВЕРЖДЁН (перечитать комментарии не удалось: {e}) — "
+                    f"ПОДТВЕРЖДЁН (перечитать комментарии не удалось: {_redact_for_user(e)}) — "
                     f"проверь вручную.{note}")
         found = next((c for c in (cms or [])
                       if (new_id and c.get("id") == new_id)
@@ -11978,8 +12027,8 @@ async def _add_task_comment_impl(task_title: str, text: str, project_id: str,
                     f"вручную.{note}")
         return f"✅ Комментарий добавлен к «{name}» (проверено).{note}"
     except Exception as e:
-        logger.error(f"Error in add_task_comment: {e}")
-        return f"Error adding comment: {str(e)}"
+        logger.exception("Error in add_task_comment")
+        return _tool_error("adding comment", e)
 
 
 # ---------------------------------------------------------------------------
@@ -12044,8 +12093,8 @@ async def get_statistics() -> str:
             "не значит, что одна из сторон врёт."
         )
     except Exception as e:
-        logger.error(f"Error in get_statistics: {e}")
-        return f"Error fetching statistics: {str(e)}"
+        logger.exception("Error in get_statistics")
+        return _tool_error("fetching statistics", e)
 
 
 @mcp.tool(annotations=READONLY)
@@ -12099,8 +12148,8 @@ async def get_trash(limit: int = 50) -> str:
                     "to see them.")
         return out
     except Exception as e:
-        logger.error(f"Error in get_trash: {e}")
-        return f"Error fetching trash: {str(e)}"
+        logger.exception("Error in get_trash")
+        return _tool_error("fetching trash", e)
 
 
 @mcp.tool()
@@ -12335,8 +12384,8 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
                                          "toProjectId": pid} for i in items]))
                             fix_api_fail.update(id2error_failures(mresp, ids))
                         except Exception as e:
-                            logger.error("restore_tasks: corrective move to "
-                                        f"{pid} failed: {e}")
+                            logger.exception(
+                                f"restore_tasks: corrective move to {pid} failed")
                             for tid2 in ids:
                                 fix_api_fail.setdefault(tid2, str(e))
                     # Same retried re-read, now checking the STRICT
@@ -12405,8 +12454,8 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
             lines.append(_report_line(rid))
         return "\n".join(lines) if lines else "Ничего не восстановлено."
     except Exception as e:
-        logger.error(f"Error in restore_tasks: {e}")
-        return f"Error restoring tasks: {str(e)}"
+        logger.exception("Error in restore_tasks")
+        return _tool_error("restoring tasks", e)
 
 
 def _describe_attach_file_to_task(p: Dict) -> str:
@@ -12612,8 +12661,8 @@ async def _attach_file_to_task_impl(task_title: str, task_id: str, project_id: s
                     " вложение НЕ видно на задаче — проверь вручную")
         return f"{marker} Прикреплён файл «{shown_name}» ({size_str}) к «{title}»{verify}{note}"
     except Exception as e:
-        logger.error(f"Error in attach_file_to_task: {e}")
-        return f"Error attaching file: {str(e)}"
+        logger.exception("Error in attach_file_to_task")
+        return _tool_error("attaching file", e)
 
 
 # 2026-08-09 (П9 пакет ТЗ, пункт 4): было 15 МБ — теоретический потолок,
@@ -12711,8 +12760,8 @@ async def list_task_attachments(task_id: str, project_id: str = None) -> str:
             out += f"  {i}. {name}  (id:{att_id}{size_str})\n"
         return out
     except Exception as e:
-        logger.error(f"Error in list_task_attachments: {e}")
-        return f"Error listing attachments: {str(e)}"
+        logger.exception("Error in list_task_attachments")
+        return _tool_error("listing attachments", e)
 
 
 def _attachment_project_id(task_id: str, given: str = None) -> Optional[str]:
@@ -12837,8 +12886,8 @@ async def download_task_attachment(task_id: str, project_id: str = None,
                 f"size_bytes: {len(data)}\n"
                 f"content_base64: {b64}")
     except Exception as e:
-        logger.error(f"Error in download_task_attachment: {e}")
-        return f"Error downloading attachment: {str(e)}"
+        logger.exception("Error in download_task_attachment")
+        return _tool_error("downloading attachment", e)
 
 
 def _clamp_link_ttl(ttl_minutes: Optional[int]) -> int:
@@ -12904,8 +12953,8 @@ async def get_attachment_download_url(task_id: str, project_id: str = None,
                 "Открой её в браузере или на телефоне — файл скачается напрямую, "
                 "минуя этот чат. После истечения срока ссылка перестанет работать.")
     except Exception as e:
-        logger.error(f"Error in get_attachment_download_url: {e}")
-        return f"Error building download link: {str(e)}"
+        logger.exception("Error in get_attachment_download_url")
+        return _tool_error("building download link", e)
 
 
 def _describe_create_attachment_upload_url(p: Dict,
@@ -13092,8 +13141,8 @@ async def _create_attachment_upload_url_impl(task_id: str, project_id: str = Non
                 "Файл появится на задаче сразу после успешной загрузки; "
                 "проверить — list_task_attachments.")
     except Exception as e:
-        logger.error(f"Error in create_attachment_upload_url: {e}")
-        return f"Error building upload link: {str(e)}"
+        logger.exception("Error in create_attachment_upload_url")
+        return _tool_error("building upload link", e)
 
 
 # ---------------------------------------------------------------------------
@@ -13169,8 +13218,8 @@ async def _create_tag_impl(name: str, color: str = None) -> str:
         return (f"⚠️ Тег «{name}» отправлен на создание, но не виден в "
                 "свежем списке тегов — проверь вручную.")
     except Exception as e:
-        logger.error(f"Error in create_tag: {e}")
-        return f"Error creating tag: {str(e)}"
+        logger.exception("Error in create_tag")
+        return _tool_error("creating tag", e)
 
 
 async def _live_tag_names(force: bool = True) -> List[str]:
@@ -13306,8 +13355,8 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
         return await _rename_tag_impl(old_name, new_name,
                                       merged=bool(allow_merge and will_merge))
     except Exception as e:
-        logger.error(f"Error in rename_tag: {e}")
-        return f"Error renaming tag: {str(e)}"
+        logger.exception("Error in rename_tag")
+        return _tool_error("renaming tag", e)
 
 
 async def _rename_tag_impl(old_name: str, new_name: str,
@@ -13402,8 +13451,8 @@ async def _delete_tag_impl(name: str) -> str:
         return (f"✅ Тег «{name}» удалён (проверено). Снят с "
                 f"**{len(carriers)}** открытых задач(и); сами задачи не тронуты.")
     except Exception as e:
-        logger.error(f"Error in delete_tag: {e}")
-        return f"Error deleting tag: {str(e)}"
+        logger.exception("Error in delete_tag")
+        return _tool_error("deleting tag", e)
 
 
 
@@ -13567,8 +13616,8 @@ async def _abandon_task_impl(summary: str, task_id: str,
                     + _report_line(rid))
         return f"✅ Не буду делать: «{title}» (проверено)\n" + _report_line(rid)
     except Exception as e:
-        logger.error(f"Error in abandon_task: {e}")
-        return f"Error abandoning task: {str(e)}"
+        logger.exception("Error in abandon_task")
+        return _tool_error("abandoning task", e)
 
 
 def _describe_duplicate_task(p: Dict, live_title: Optional[str] = None) -> str:
@@ -13749,8 +13798,8 @@ async def _duplicate_task_impl(summary: str, task_id: str, task_title: str = Non
                 "kanban-раздел (column) и привязка к родителю.\n"
                 + _report_line(rid))
     except Exception as e:
-        logger.error(f"Error in duplicate_task: {e}")
-        return f"Error duplicating task: {str(e)}"
+        logger.exception("Error in duplicate_task")
+        return _tool_error("duplicating task", e)
 
 
 # ---------------------------------------------------------------------------
@@ -13899,8 +13948,8 @@ async def _update_task_comment_impl(task_title: str, text: str, project_id: str,
         warn = f"\nℹ️ {_COMPLETED_TASK_NOTE}." if g.status == "completed" else ""
         return f"✅ Комментарий на «{task_title}» обновлён (проверено).{warn}"
     except Exception as e:
-        logger.error(f"Error in update_task_comment: {e}")
-        return f"Error updating comment: {str(e)}"
+        logger.exception("Error in update_task_comment")
+        return _tool_error("updating comment", e)
 
 
 def _describe_delete_task_comment(p: Dict) -> str:
@@ -14029,8 +14078,8 @@ async def _delete_task_comment_impl(task_title: str, project_id: str,
         warn = f"\nℹ️ {_COMPLETED_TASK_NOTE}." if g.status == "completed" else ""
         return f"✅ Комментарий на «{task_title}» удалён (проверено).{warn}"
     except Exception as e:
-        logger.error(f"Error in delete_task_comment: {e}")
-        return f"Error deleting comment: {str(e)}"
+        logger.exception("Error in delete_task_comment")
+        return _tool_error("deleting comment", e)
 
 
 # ---------------------------------------------------------------------------
@@ -14154,10 +14203,11 @@ async def _update_project_impl(project_name: str, project_id: str,
         proj = await _run_blocking(lambda: ticktick.update_project(
             project_id, name=name, color=color, view_mode=view_mode))
         if 'error' in proj:
-            return f"### ❌ Проект «{project_name}» НЕ обновлён\n\nTickTick отклонил: {proj['error']}"
+            return (f"### ❌ Проект «{project_name}» НЕ обновлён\n\nTickTick отклонил: "
+                    f"{_redact_for_user(proj['error'])}")
     except Exception as e:
-        logger.error(f"Error in update_project: {e}")
-        return f"### ❌ Проект «{project_name}» НЕ обновлён\n\nОшибка: {str(e)}"
+        logger.exception("Error in update_project")
+        return f"### ❌ Проект «{project_name}» НЕ обновлён\n\nОшибка: {_redact_for_user(e)}"
 
     # Post-verify: independent fresh re-read, compare each field that was
     # actually requested against what TickTick shows live — the write
@@ -14189,7 +14239,7 @@ async def _update_project_impl(project_name: str, project_id: str,
     except Exception as e:
         return (f"### ⚠️ Проект «{project_name}» обновлён, но НЕ подтверждён\n\n"
                 f"{format_project(proj)}\n\n"
-                f"⚠️ {_UNVERIFIED_MSG} ({e})")
+                f"⚠️ {_UNVERIFIED_MSG} ({_redact_for_user(e)})")
 
 
 def _describe_archive_project(p: Dict) -> str:
@@ -14300,10 +14350,10 @@ async def _archive_project_impl(project_name: str, project_id: str,
     try:
         await _run_blocking(lambda: ticktick_v2.archive_project(project_id, closed=archived))
     except RuntimeError as e:
-        return f"### ❌ Проект «{live_name}» НЕ {verb}\n\nTickTick отклонил: {e}"
+        return f"### ❌ Проект «{live_name}» НЕ {verb}\n\nTickTick отклонил: {_redact_for_user(e)}"
     except Exception as e:
-        logger.error(f"Error in archive_project: {e}")
-        return f"Error archiving project: {str(e)}"
+        logger.exception("Error in archive_project")
+        return _tool_error("archiving project", e)
 
     # Post-verify: independent fresh re-read of the project's own `closed`
     # flag (not the write response) — force the v2 cache first.
@@ -14322,7 +14372,7 @@ async def _archive_project_impl(project_name: str, project_id: str,
                 f"🧾 closed={got_closed} — подтверждено отдельным живым чтением TickTick.")
     except Exception as e:
         return (f"### ⚠️ Проект «{live_name}» {verb}, но НЕ подтверждён\n\n"
-                f"⚠️ {_UNVERIFIED_MSG} ({e})")
+                f"⚠️ {_UNVERIFIED_MSG} ({_redact_for_user(e)})")
 
 
 # ---------------------------------------------------------------------------
@@ -14500,8 +14550,8 @@ async def search_all_tasks(
             )
         return out
     except Exception as e:
-        logger.error(f"Error in search_all_tasks: {e}")
-        return f"Error searching tasks: {str(e)}"
+        logger.exception("Error in search_all_tasks")
+        return _tool_error("searching tasks", e)
 
 
 @mcp.tool(annotations=READONLY)
@@ -14643,8 +14693,8 @@ async def get_task_info(task_id: str) -> str:
             out += "\n(no checklist items, subtasks, or attachments)\n"
         return out
     except Exception as e:
-        logger.error(f"Error in get_task_info: {e}")
-        return f"Error fetching task info: {str(e)}"
+        logger.exception("Error in get_task_info")
+        return _tool_error("fetching task info", e)
 
 
 def _task_activity_fallback(task_id: str) -> Optional[str]:
@@ -14840,8 +14890,8 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
             out += line + "\n"
         return out
     except Exception as e:
-        logger.error(f"Error in get_task_activity: {e}")
-        msg = f"Error fetching task activity: {str(e)}"
+        logger.exception("Error in get_task_activity")
+        msg = _tool_error("fetching task activity", e)
         if "404" in str(e):
             fallback = await _run_blocking(lambda: _task_activity_fallback(task_id))
             if fallback:
@@ -14982,8 +15032,8 @@ async def get_changes(since: str, until: str = None,
                  "что переименовал) используй get_task_activity.")
         return header + body + note
     except Exception as e:
-        logger.error(f"Error in get_changes: {e}")
-        return f"Error fetching changes: {str(e)}"
+        logger.exception("Error in get_changes")
+        return _tool_error("fetching changes", e)
 
 
 @mcp.tool(annotations=READONLY)
@@ -15014,8 +15064,8 @@ async def get_project_members(project_id: str) -> str:
             out += f"- {name}{role} — userId: {uid}{status}\n"
         return out
     except Exception as e:
-        logger.error(f"Error in get_project_members: {e}")
-        return f"Error fetching project members: {str(e)}"
+        logger.exception("Error in get_project_members")
+        return _tool_error("fetching project members", e)
 
 
 def _build_assignee_index(tasks: List[Dict]) -> Dict[str, str]:
@@ -15093,8 +15143,8 @@ async def get_tasks_by_assignee(assignee: str, include_completed: bool = False) 
                   f"({'все' if include_completed else 'незавершённые'}) — {len(matched)}:")
         return header + "\n" + format_task_tree(matched, 200)
     except Exception as e:
-        logger.error(f"Error in get_tasks_by_assignee: {e}")
-        return f"Error fetching tasks by assignee: {str(e)}"
+        logger.exception("Error in get_tasks_by_assignee")
+        return _tool_error("fetching tasks by assignee", e)
 
 
 @mcp.tool(annotations=READONLY)
@@ -15112,7 +15162,7 @@ async def list_project_columns(project_id: str) -> str:
     try:
         data = await _run_blocking(lambda: ticktick.get_project_with_data(project_id))
         if 'error' in data:
-            return f"Error fetching project: {data['error']}"
+            return _tool_error("fetching project", data['error'])
         cols = data.get("columns", []) or []
         if not cols:
             return ("This project has no kanban columns (it may be a list-view "
@@ -15121,8 +15171,8 @@ async def list_project_columns(project_id: str) -> str:
         return f"Columns of project {project_id} ({len(cols)}):\n" + "\n".join(
             f"- {col.get('name', '?')}  (id: {col.get('id')})" for col in cols)
     except Exception as e:
-        logger.error(f"Error in list_project_columns: {e}")
-        return f"Error fetching columns: {str(e)}"
+        logger.exception("Error in list_project_columns")
+        return _tool_error("fetching columns", e)
 
 
 def _describe_create_project_column(p: Dict, live_name: Optional[str] = None) -> str:
@@ -15260,10 +15310,10 @@ async def _create_project_column_impl(project_id: str, name: str,
     try:
         cid = await _run_blocking(lambda: ticktick_v2.create_column(project_id, name))
     except RuntimeError as e:
-        return f"### ❌ Раздел «{name}» НЕ создан\n\nTickTick отклонил: {e}"
+        return f"### ❌ Раздел «{name}» НЕ создан\n\nTickTick отклонил: {_redact_for_user(e)}"
     except Exception as e:
-        logger.error(f"Error in create_project_column: {e}")
-        return f"Error creating column: {str(e)}"
+        logger.exception("Error in create_project_column")
+        return _tool_error("creating column", e)
 
     # Post-verify: independent fresh re-read of the project's columns (via the
     # official API, not the v2 write response) — the new column must be there.
@@ -15280,7 +15330,7 @@ async def _create_project_column_impl(project_id: str, name: str,
                 f"🧾 Подтверждено отдельным живым чтением TickTick (id: {cid}).")
     except Exception as e:
         return (f"### ⚠️ Раздел «{name}» создан (id: {cid}), но НЕ подтверждён\n\n"
-                f"⚠️ {_UNVERIFIED_MSG} ({e})")
+                f"⚠️ {_UNVERIFIED_MSG} ({_redact_for_user(e)})")
 
 
 # ---------------------------------------------------------------------------
@@ -16342,11 +16392,11 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict],
                 tail += f" · ⚠️ не проверяется автоматически: {n_unchecked}"
             lines.append(tail)
     except Exception as e:
-        logger.error(f"manual_triage: независимая сверка упала: {e}")
+        logger.exception("manual_triage: независимая сверка упала")
         verdicts = []
         lines.append(
             f"⚠️ МУТАЦИИ УЖЕ ОТПРАВЛЕНЫ ({len(ready)} операций из {len(ops)}), "
-            f"но независимая сверка НЕ УДАЛАСЬ ({e}). Это НЕ значит, что "
+            f"но независимая сверка НЕ УДАЛАСЬ ({_redact_for_user(e)}). Это НЕ значит, что "
             "ничего не сделано — часть операций (в том числе необратимых) "
             "могла примениться. Проверьте результат в TickTick вручную; ниже "
             "— сырые ответы исполнителей.")
@@ -16452,12 +16502,12 @@ async def _auto_execute_delete_project(manifest_id: str, m: Dict) -> str:
         data = await _run_blocking(lambda: ticktick.get_project_with_data(project_id))
     except Exception as e:
         return (f"🛑 Автоисполнение отменено: не смог прочитать содержимое "
-                f"проекта «{name}» ({e}) — не удаляю вслепую. Ничего не "
-                "изменено, построй план заново.")
+                f"проекта «{name}» ({_redact_for_user(e)}) — не удаляю вслепую. "
+                "Ничего не изменено, построй план заново.")
     if isinstance(data, dict) and data.get("error"):
         return (f"🛑 Автоисполнение отменено: не смог прочитать содержимое "
-                f"проекта «{name}» ({data['error']}) — не удаляю вслепую. "
-                "Ничего не изменено, построй план заново.")
+                f"проекта «{name}» ({_redact_for_user(data['error'])}) — не "
+                "удаляю вслепую. Ничего не изменено, построй план заново.")
     return await _delete_project_impl(project_id, name,
                                       (data or {}).get("tasks") or [])
 
@@ -17097,8 +17147,8 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
     try:
         independent = _build_operation_report(manifest_id)
     except Exception as e:
-        independent_err = str(e)
-        logger.error(f"TG auto-execute: независимая перепроверка "
+        independent_err = _redact_for_user(e)
+        logger.exception(f"TG auto-execute: независимая перепроверка "
                      f"{manifest_id} упала: {e}")
 
     report_usable = bool(independent) and not any(
@@ -17442,9 +17492,9 @@ def _publish_auto_execute_outcome(candidate: Dict, tool: str, full_md: str,
         delivery = tg_approval.post_report_to_group(
             _TG_CFG, candidate["manifest_id"], full_md,
             tool=tool, verdict=verdict)
-    except Exception as e:
-        logger.error(f"TG auto-execute: публикация отчёта в группу упала "
-                     f"({tool}/{candidate['manifest_id']}): {e}")
+    except Exception:
+        logger.exception(f"TG auto-execute: публикация отчёта в группу упала "
+                         f"({tool}/{candidate['manifest_id']})")
 
     # Фолбэк на ЛИЧКУ, если в группу не ушло НИЧЕГО. Самый вероятный прод-
     # сценарий: TG_REPORTS_CHAT_ID вписали руками с опечаткой или бота не
@@ -17472,9 +17522,9 @@ def _publish_auto_execute_outcome(candidate: Dict, tool: str, full_md: str,
                 logger.error(f"TG auto-execute: отчёт не удалось доставить ни в "
                              f"группу, ни в личку ({tool}/"
                              f"{candidate['manifest_id']}): {fb.error}")
-        except Exception as e:
-            logger.error(f"TG auto-execute: фолбэк-отправка отчёта в личку "
-                         f"упала ({tool}/{candidate['manifest_id']}): {e}")
+        except Exception:
+            logger.exception(f"TG auto-execute: фолбэк-отправка отчёта в личку "
+                             f"упала ({tool}/{candidate['manifest_id']})")
 
     # Частичная доставка — отдельный исход, а не «успех» и не «ничего не
     # дошло»: часть отчёта в группе ЕСТЬ, поэтому дублировать его целиком в
@@ -17500,9 +17550,9 @@ def _publish_auto_execute_outcome(candidate: Dict, tool: str, full_md: str,
     try:
         summary_ok = bool(tg_approval.summarize_in_owner_chat(
             _TG_CFG, candidate["chat_id"], candidate["message_id"], short_md))
-    except Exception as e:
-        logger.error(f"TG auto-execute: сводка в личку не отправилась "
-                     f"({tool}/{candidate['manifest_id']}): {e}")
+    except Exception:
+        logger.exception(f"TG auto-execute: сводка в личку не отправилась "
+                         f"({tool}/{candidate['manifest_id']})")
 
     # Уборка «сирот» плана в ЛИЧКЕ (2026-08-06). Длинный план уходит
     # несколькими сообщениями: последнее (с кнопками) лежит в message_id и
@@ -17787,8 +17837,8 @@ def _publish_lost_manifest_outcome(candidate: Dict) -> None:
                 # обязан быть громким в логе, а не тихим.
                 logger.error(f"TG lost-plan: сообщение владельцу о потерянном "
                              f"плане {mid} НЕ доставлено: {res.error}")
-        except Exception as e:
-            logger.error(f"TG lost-plan: отправка владельцу упала ({mid}): {e}")
+        except Exception:
+            logger.exception(f"TG lost-plan: отправка владельцу упала ({mid})")
     else:
         logger.error(f"TG lost-plan: в строке {mid} нет chat_id — сказать "
                      f"владельцу некуда")
@@ -17839,9 +17889,8 @@ def _announce_lost_manifests(candidates: List[Dict]) -> int:
         try:
             _publish_lost_manifest_outcome(c)
             told += 1
-        except Exception as e:  # noqa: BLE001 — один сбой не глушит остальных
-            logger.error(f"TG lost-plan: уведомление по {c['manifest_id']} "
-                         f"упало: {e}")
+        except Exception:  # noqa: BLE001 — один сбой не глушит остальных
+            logger.exception(f"TG lost-plan: уведомление по {c['manifest_id']} упало")
     if told:
         logger.warning(f"TG lost-plan: подтверждено кнопкой, но исполнять было "
                        f"нечего — сообщено владельцу по {told} плану(ам)")
@@ -18045,14 +18094,13 @@ async def _tg_auto_execute_tick() -> None:
                        "прервано. План уже погашен — проверьте состояние в "
                        "TickTick: часть операции могла успеть примениться.")
             else:
-                msg = f"🛑 Ошибка при автоисполнении «{tool}»: {e}"
+                msg = f"🛑 Ошибка при автоисполнении «{tool}»: {_redact_for_user(e)}"
             # Падение ПОСЛЕ нажатия кнопки: состояние «нажато, но НЕ
             # выполнено». Раньше здесь не менялось ничего, и надгробие,
             # поставленное при захвате, продолжало утверждать «исполнено» —
             # тихий отказ в чистом виде.
             _tombstone_manifest(mid, _TOMBSTONE_FAILED, _first_line(msg))
-            logger.error(f"TG auto-execute: ошибка при исполнении "
-                        f"{tool}/{mid}: {e!r}")
+            logger.exception(f"TG auto-execute: ошибка при исполнении {tool}/{mid}")
             if c.get(_OUTCOME_PUBLISHED_KEY):
                 # СТРУКТУРНАЯ защита от второго отчёта (2026-08-06). Исключение
                 # прилетело уже ПОСЛЕ того, как итог по этому кандидату начал
@@ -18062,9 +18110,9 @@ async def _tg_auto_execute_tick() -> None:
                 # Раньше от этого удерживали только внутренние try/except
                 # внутри `_publish_auto_execute_outcome`, то есть дисциплина;
                 # теперь удерживает признак, который нельзя забыть.
-                logger.error(f"TG auto-execute: сбой ПОСЛЕ публикации итога "
-                             f"({tool}/{mid}) — второй отчёт не публикую, "
-                             f"чтобы не отменять уже доложенный результат")
+                logger.exception(f"TG auto-execute: сбой ПОСЛЕ публикации итога "
+                                 f"({tool}/{mid}) — второй отчёт не публикую, "
+                                 "чтобы не отменять уже доложенный результат")
                 continue
             try:
                 # Ошибка исполнения идёт по ТОМУ ЖЕ пути: полный текст (с
@@ -18082,7 +18130,7 @@ async def _tg_auto_execute_tick() -> None:
                     # таймаут в архиве был бы неотличим от обычной ошибки.
                     msg,
                     "",
-                    f"Исключение: `{type(e).__name__}: {e}`",
+                    f"Исключение: `{type(e).__name__}: {_redact_for_user(e)}`",
                     "",
                     "Мутация могла быть выполнена ЧАСТИЧНО — исход не "
                     "подтверждён; проверь `operation_report` по этому "
@@ -18103,9 +18151,9 @@ async def _tg_auto_execute_tick() -> None:
         lost = _tg_lost_manifest_rows(rows, now_ms=now_ms)
         if lost:
             await _run_blocking(_announce_lost_manifests, lost)
-    except Exception as e:  # noqa: BLE001
-        logger.error(f"TG lost-plan: разбор потерянных планов упал "
-                     f"(поллер продолжает работать): {e}")
+    except Exception:  # noqa: BLE001
+        logger.exception("TG lost-plan: разбор потерянных планов упал "
+                         "(поллер продолжает работать)")
 
 
 def _consume_manifest_for_auto_execute(manifest_id: str) -> Optional[Dict]:
@@ -18215,8 +18263,8 @@ async def _tg_auto_execute_poller_loop() -> None:
         started = time.monotonic()
         try:
             await _tg_auto_execute_tick()
-        except Exception as e:
-            logger.error(f"TG auto-execute poller: unhandled error: {e}")
+        except Exception:
+            logger.exception("TG auto-execute poller: unhandled error")
         # Уборка — отдельным таймером по монотонным часам (не по системным:
         # перевод времени/NTP-скачок не должен ни заморозить уборку на час,
         # ни устроить её на каждом тике). Падение уборки НИКОГДА не убивает
@@ -18254,9 +18302,9 @@ async def _tg_auto_execute_poller_loop() -> None:
                         int(_TG_LOST_LOOKBACK_S * 1000))
                     if gone:
                         logger.info(f"Манифесты: убрано просроченных планов: {gone}")
-                except Exception as e:
-                    logger.error(f"TG reaper: уборка упала (поллер продолжает "
-                                 f"работать): {e}")
+                except Exception:
+                    logger.exception("TG reaper: уборка упала (поллер продолжает "
+                                     "работать)")
         elapsed = time.monotonic() - started
         if elapsed > _TG_AUTO_EXECUTE_INTERVAL_S:
             logger.warning(

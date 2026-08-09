@@ -167,10 +167,16 @@ class TickTickV2Client:
             timeout=REQUEST_TIMEOUT,
         )
         if resp.status_code != 200:
+            # Аудит 2026-08-09 (П7 follow-up): тело ответа НЕ печатаем — это
+            # ответ signon-эндпоинта, он может нести куки/сессионные данные,
+            # а исключение отсюда доезжает до модели через _tool_error()
+            # (общий except в вызывающих тулах). Длина — достаточный сигнал
+            # для диагностики «пусто/капча/HTML», не раскрывая содержимое.
             raise TickTickAuthError(
-                f"v2 password login failed ({resp.status_code}): {resp.text[:200]}. "
-                "TickTick now gates this behind a captcha — use TICKTICK_V2_TOKEN "
-                "(the `t` cookie from a logged-in browser) instead."
+                f"v2 password login failed ({resp.status_code}, "
+                f"{len(resp.text)} bytes body — not echoed). TickTick now "
+                "gates this behind a captcha — use TICKTICK_V2_TOKEN (the "
+                "`t` cookie from a logged-in browser) instead."
             )
         try:
             body = resp.json()
@@ -181,7 +187,11 @@ class TickTickV2Client:
             )
         token = body.get("token")
         if not token:
-            raise TickTickAuthError(f"v2 login returned no token: {body}")
+            # Та же осторожность: имена полей — можно, значения — нет (могут
+            # быть сессионные данные из signon-ответа TickTick).
+            raise TickTickAuthError(
+                f"v2 login returned no token (response had keys: "
+                f"{sorted(body.keys()) if isinstance(body, dict) else type(body).__name__})")
         self.token = token
         self.session.cookies.set("t", token)
         logger.info("TickTick v2 authenticated via password (deprecated path)")

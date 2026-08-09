@@ -209,3 +209,101 @@ def test_percent_encoded_secret_is_redacted():
     printed = log_redaction.redact("/mcp/fake%20secret/with%2Bchars", tricky)
     assert "fake%20secret" not in printed
     assert "<mcp-secret>" in printed
+
+
+# ─────────────────── Аудит 2026-08-09 (П7 follow-up) ───────────────────
+
+def test_link_token_is_redacted_inside_a_full_url():
+    """Живой дефект, найденный независимым аудитом: `/dl/<токен>` внутри
+    ПОЛНОЙ ссылки (`https://хост/dl/<токен>`) — ровно так строится сама
+    ссылка (server.py: `f"{base}/dl/{token}"`), и ровно так текст исключения
+    HTTP-клиента доносит её до `_redact_for_user`. Старый регэксп с
+    `(?<![\\w/])` перед слэшем никогда не срабатывал здесь: перед "/dl/"
+    стоит буква домена ("...app" -> "p"), лукбехайнд блокировал совпадение
+    на КАЖДОЙ настоящей ссылке — маскировка работала только для голого пути
+    в access-логе ("GET /dl/<токен> HTTP/1.1", там перед слэшем пробел)."""
+    url = f"https://foo.up.railway.app/dl/{FAKE_LINK_TOKEN}"
+    out = log_redaction.redact(url)
+    assert FAKE_LINK_TOKEN not in out
+    assert "https://foo.up.railway.app/dl/<link-token>" == out
+
+
+def test_upload_link_token_is_redacted_inside_a_full_url():
+    url = f"https://foo.up.railway.app/ul/{FAKE_LINK_TOKEN}"
+    out = log_redaction.redact(url)
+    assert FAKE_LINK_TOKEN not in out
+    assert "<link-token>" in out
+
+
+def test_mcp_secret_positional_rule_works_inside_a_full_url_too():
+    """Тот же класс дефекта, что и для /dl,/ul — для /mcp/ значение обычно
+    маскируется по значению SECRET, но позиционное правило (второй, не
+    зависящий от значения слой защиты) обязано срабатывать и без него."""
+    out = log_redaction.redact(f"https://host.example/mcp/{FAKE_SECRET}",
+                               secret=None)
+    assert FAKE_SECRET not in out
+    assert "https://host.example/mcp/<mcp-secret>" == out
+
+
+def test_multiline_text_is_still_redacted():
+    """Угроза-мутация: `if '\\n' in text: return text` (пропустить
+    многострочный вход как «слишком сложный») прошла бы мимо тестов, если
+    бы все примеры были однострочными — а вложенные исключения
+    (traceback-подобные тексты, тела HTTP-ошибок) многострочны почти
+    всегда."""
+    multiline = (
+        "Traceback (most recent call last):\n"
+        f"  requests.exceptions.ConnectionError: /mcp/{FAKE_SECRET}\n"
+        f"  see also /dl/{FAKE_LINK_TOKEN} for the retried attachment\n"
+        "ConnectionError: [Errno 61] Connection refused"
+    )
+    out = log_redaction.redact(multiline, FAKE_SECRET)
+    assert FAKE_SECRET not in out
+    assert FAKE_LINK_TOKEN not in out
+    assert "<mcp-secret>" in out
+    assert "<link-token>" in out
+    assert "Traceback (most recent call last):" in out
+    assert "ConnectionError: [Errno 61] Connection refused" in out
+
+
+def test_telegram_bot_token_is_redacted():
+    """Живой дефект, найденный независимым аудитом: `tg_approval._tg_call`
+    строит `f"{TELEGRAM_API}/bot{cfg.bot_token}/{method}"`; при сетевом
+    сбое `str(e)` от requests несёт этот URL целиком, токен бота уезжает
+    модели как есть — токен даёт полный контроль над вторым фактором
+    подтверждения удалений."""
+    exc_text = ("HTTPSConnectionPool(host='api.telegram.org', port=443): "
+                "Max retries exceeded with url: "
+                "/bot123456789:AAHfake0bot0token0DO0NOT0USE/sendMessage")
+    out = log_redaction.redact(exc_text)
+    assert "AAHfake0bot0token0DO0NOT0USE" not in out
+    assert "/bot<tg-bot-token>" in out
+    assert "api.telegram.org" in out  # диагностика не должна пострадать
+
+
+def test_bearer_header_is_redacted():
+    out = log_redaction.redact("failed request, header: Authorization: Bearer sekrit.jwt.value")
+    assert "sekrit.jwt.value" not in out
+    assert "Authorization: Bearer <bearer-token>" in out
+
+
+def test_postgres_dsn_credentials_are_redacted():
+    """tg_approval.py возвращает `f'...в Postgres: {e}'` при сбое подключения
+    — сообщение psycopg может содержать DSN целиком, включая логин:пароль."""
+    out = log_redaction.redact(
+        "could not connect to server: postgres://ttuser:hunter2@10.0.0.5:5432/tg")
+    assert "hunter2" not in out
+    assert "ttuser" not in out
+    assert "postgres://<db-credentials>@10.0.0.5:5432/tg" in out
+
+
+def test_google_private_key_pem_block_is_redacted():
+    """Ключ service-account (declutter_sheet.py) — PEM-блок, самый
+    узнаваемый по форме секрет, который в принципе может оказаться в тексте
+    исключения (например, если ключ повреждён)."""
+    body = ("-----BEGIN PRIVATE KEY-----\n"
+            "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC\n"
+            "-----END PRIVATE KEY-----")
+    out = log_redaction.redact(f"GSHEETS_SA_JSON нечитаем: {body}")
+    assert "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC" not in out
+    assert "<private-key>" in out
