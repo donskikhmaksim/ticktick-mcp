@@ -20,8 +20,10 @@ set_declutter_decision в server.py) — сама функция и её `_impl`
 tests/test_tool_registry.py, — а не выдуманным двойником.
 """
 import asyncio
+import time
 
 import ticktick_mcp.src.server as s
+import ticktick_mcp.src.tg_approval as tg
 
 
 def _undeclare_tool(monkeypatch, name: str) -> None:
@@ -214,3 +216,92 @@ def test_registered_tools_survive_a_broken_registry_check_for_other_tools():
     выше вообще не должно быть нужно — обычный живой тул как резолвился
     напрямую (identity), так и резолвится."""
     assert s._resolve_auto_executor("create_tasks", {}) is s._AUTO_EXECUTORS["create_tasks"]
+
+
+# ───── СТРУКТУРНАЯ ЛОВУШКА (независимый аудит, 2026-08-09): call site, не функция ─────
+
+class _FakeV2DeleteForTick:
+    """Двойник тех же методов ticktick_v2, которыми пользуется исполнитель
+    delete_tasks и candidate-discovery поллера (get_open_tasks/invalidate_cache
+    зовутся по пути, даже когда до реального удаления не доходит)."""
+
+    def __init__(self, live):
+        self.live = live
+
+    def get_state(self, force=False):
+        pass
+
+    def get_open_tasks(self):
+        return list(self.live.values())
+
+    def batch_delete_tasks(self, items):
+        for it in items:
+            self.live.pop(it["taskId"], None)
+        return {}
+
+    def invalidate_cache(self):
+        pass
+
+
+def test_disabled_tool_refuses_through_the_real_poller_tick_not_only_the_resolver(
+        monkeypatch):
+    """Все восемь тестов выше дёргают `_resolve_auto_executor` НАПРЯМУЮ — они
+    убедительно доказывают, что сама функция честная, но ничего не говорят о
+    месте, где её реально вызывают в бою: `_tg_auto_execute_tick` (нажатие
+    кнопки ✅ в Telegram). Замена ТОЛЬКО этого call site на прямой поиск в
+    `_AUTO_EXECUTORS`/generic-словаре в обход `_resolve_auto_executor` не
+    трогает саму функцию — весь набор из восьми тестов выше остался бы
+    зелёным (проверено: с такой подменой на call site'е они все проходят), а
+    кнопка в проде исполнила бы операцию, которую владелец считает
+    выключенной — ровно тот сценарий, который вся эта проверка существует
+    предотвратить.
+
+    Гоняем НАСТОЯЩИЙ `_tg_auto_execute_tick()` целиком (как в
+    tests/test_tg_auto_execute.py), не переигрываем его шаги вручную —
+    Postgres и Telegram подменены, реестр FastMCP настоящий."""
+    _undeclare_tool(monkeypatch, "delete_tasks")
+
+    monkeypatch.setattr(s, "_TG_CFG", tg.TgApprovalConfig(
+        enabled=True, bot_token="x", owner_chat_id="1", server="ticktick",
+        tools_allowlist=None, ttl_s=3600))
+
+    live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
+    monkeypatch.setattr(s, "ticktick_v2", _FakeV2DeleteForTick(live))
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Покупки"})
+
+    mid = "mid-undeclared-real-tick"
+    s._MANIFESTS[mid] = {
+        "kind": "delete", "consumed": False, "created": time.monotonic(),
+        "object_hash": s._manifest_object_hash("delete", ["t1"]),
+        "summary": "test", "items": [{
+            "taskId": "t1", "projectId": "p1", "title": "Купить молоко",
+            "project": "Покупки", "snapshot": {},
+        }],
+    }
+
+    def _fake_approvals(mids, lost_scan_since_ms=None):
+        return {m: {"status": "APPROVED", "expires_at": tg._now_ms() + 3_600_000,
+                    "chat_id": "c1", "message_id": 7, "extra_message_ids": [],
+                    "created_at": tg._now_ms(), "decided_at": None,
+                    "report_message_ids": [], "lost_notified_at": None}
+                for m in mids if m == mid}
+    monkeypatch.setattr(tg, "get_tg_approvals", _fake_approvals)
+
+    group = []
+    monkeypatch.setattr(
+        tg, "post_report_to_group",
+        lambda cfg, manifest_id, report_md, *, tool, verdict:
+            group.append((manifest_id, tool, verdict, report_md))
+            or tg.ReportDelivery([1001], 1, 1, True))
+    monkeypatch.setattr(tg, "summarize_in_owner_chat",
+                        lambda cfg, chat_id, message_id, short_md: True)
+
+    asyncio.run(s._tg_auto_execute_tick())
+
+    assert "t1" in live, (
+        "боевой путь исполнил удаление тулом, снятым из реестра FastMCP — "
+        "_resolve_auto_executor обойдён на call site в _tg_auto_execute_tick")
+    assert group, "об исходе не опубликовано ни одного отчёта"
+    _pub_mid, _tool, verdict, report_md = group[0]
+    assert verdict != "ok"
+    assert "🛑" in report_md and "отсутств" in report_md.lower()

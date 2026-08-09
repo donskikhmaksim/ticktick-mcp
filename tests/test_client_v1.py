@@ -144,6 +144,27 @@ def test_create_task_504_is_NOT_retried_and_surfaces_error(client, monkeypatch):
     assert result.get("id") != "second-task-would-be-a-duplicate"
 
 
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+def test_get_retries_on_every_documented_transient_status(client, monkeypatch, status):
+    """2026-08-09 (независимый аудит): test_retries_on_502_and_504_before_succeeding
+    выше проверяет ТОЛЬКО добавленную пару (502, 504) — сужение всего набора
+    ретраев до РОВНО этих двух кодов (`response.status_code not in (502,
+    504)` вместо `(429, 500, 502, 503, 504)`) оставило бы тот тест зелёным
+    (502 и 504 по-прежнему в множестве), а 429/500/503 молча ушли бы в
+    жёсткие ошибки без единой попытки повтора. Здесь — весь документированный
+    набор, один код за один прогон, чтобы прогонка любого из них поодиночке
+    не могла спрятаться за успехом соседних."""
+    monkeypatch.setattr("ticktick_mcp.src.ticktick_client.time.sleep", lambda *_: None)
+    responses = iter([FakeResp(status, text="transient"), FakeResp(200, {"ok": 1})])
+    sess = types.SimpleNamespace()
+    sess.get = lambda *a, **k: next(responses)
+    sess.post = lambda *a, **k: next(responses)
+    sess.delete = lambda *a, **k: next(responses)
+    client.session = sess
+
+    assert client._make_request("GET", "/project") == {"ok": 1}
+
+
 def test_get_project_still_retries_on_504_like_before(client, monkeypatch):
     """Mirror of the above: reads have no side effect, so the pre-existing
     retry-on-504 behaviour (test_retries_on_502_and_504_before_succeeding)

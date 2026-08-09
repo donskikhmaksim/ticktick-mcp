@@ -149,6 +149,22 @@ def test_untitled_task_with_text_is_told_apart_from_an_empty_one():
     assert with_text.split("(id:")[0] != empty.split("(id:")[0]
 
 
+def test_desc_field_note_is_recognised_as_text_not_empty():
+    """2026-08-09 (независимый аудит). `_task_has_text` заглядывает и в
+    `content`, и в `desc` — часть ответов v2-API кладёт заметку задачи именно
+    в `desc`, а не в `content`. Ни один тест выше ничего не кладёт в `desc` —
+    выкинуть это поле из проверки (`for field in ("content",):` вместо
+    `("content", "desc")`) оставило бы ВЕСЬ файл зелёным, а задача с реальной
+    заметкой в `desc` получила бы приговор «(без названия: пусто)» — ровно та
+    ошибка опознания, ради починки которой П15 и затевался."""
+    task = {"id": "t1", "title": "", "attachments": [],
+            "desc": "проверить возврат"}
+    assert s._task_has_text(task) is True
+    line = s.format_task_line(task, "Inbox")
+    assert "(без названия: есть текст)" in line
+    assert "(без названия: пусто)" not in line
+
+
 def test_a_file_is_never_hidden_behind_the_text_label():
     """M4. Задача, где есть И файл, И подпись к нему, — это ДОКУМЕНТ. Если
     порядок в заменителе перевернуть (сначала текст), файл исчезнет из строки

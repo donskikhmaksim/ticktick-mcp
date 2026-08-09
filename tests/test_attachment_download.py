@@ -134,6 +134,56 @@ async def test_unknown_filename_refuses_and_points_at_list_tool(fake_v2):
     assert "list_task_attachments" in out
 
 
+# ===========================================================================
+# Аудит 2026-08-09: и образец, и ожидание в тестах выше вычисляются ИЗ САМОЙ
+# константы (fixture строит BIG_ATT_ID из DOWNLOAD_ATTACHMENT_MAX_BYTES + 1024,
+# а test_oversized_attachment_reports_the_actual_and_max_size печатает
+# max_kb = DOWNLOAD_ATTACHMENT_MAX_BYTES // 1024). Откат константы к прежнему
+# значению (15 МБ) сдвинул бы ОБЕ стороны сравнения одновременно — тест
+# остался бы зелёным, а фотография чека на живых данных снова давала бы ответ,
+# который транспорт MCP отбрасывает целиком. Ниже — число, зашитое буквально.
+# ===========================================================================
+
+def test_download_attachment_limit_is_pinned_at_256kb():
+    assert s.DOWNLOAD_ATTACHMENT_MAX_BYTES == 256 * 1024
+
+
+async def test_a_file_exactly_at_the_hardcoded_256kb_limit_downloads(monkeypatch):
+    """Граница снизу, литералом: ровно 262144 байта — предел включительно
+    (`if len(data) > MAX`), и это должно оставаться так независимо от того,
+    во что превратится сама константа."""
+    fake = FakeV2Attachments({
+        "boundary-ok": ("boundary.bin", b"x" * (256 * 1024), "application/octet-stream"),
+    })
+    monkeypatch.setattr(s, "ticktick_v2", fake)
+
+    out = await s.download_task_attachment(
+        task_id=TASK_ID, project_id=PROJECT_ID, attachment_id="boundary-ok")
+
+    assert "content_base64:" in out
+    assert "size_bytes: 262144" in out
+
+
+async def test_a_file_one_byte_over_the_hardcoded_256kb_limit_is_refused(
+        monkeypatch):
+    """Тот же литерал плюс один байт — обязан отказать. Если константу
+    вернуть к 15 МБ, этот файл (262145 байт) свободно пройдёт лимит, и тест
+    покраснеет, хотя оба теста выше (вычисляющие свои числа из константы)
+    остались бы зелёными."""
+    fake = FakeV2Attachments({
+        "boundary-over": ("boundary.bin", b"x" * (256 * 1024 + 1),
+                          "application/octet-stream"),
+    })
+    monkeypatch.setattr(s, "ticktick_v2", fake)
+
+    out = await s.download_task_attachment(
+        task_id=TASK_ID, project_id=PROJECT_ID, attachment_id="boundary-over")
+
+    assert "Not downloaded" in out
+    assert "content_base64" not in out
+    assert "256 KB" in out
+
+
 async def test_task_with_no_attachments_refuses_clearly(monkeypatch):
     empty = FakeV2Attachments({})
     monkeypatch.setattr(s, "ticktick_v2", empty)
