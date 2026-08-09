@@ -29,14 +29,20 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
     
     # Class variable to store the authorization code
     auth_code = None
-    
+    # 2026-08-09: значение state, которое МЫ сами сгенерировали и отправили в
+    # authorization URL (start_auth_flow). Раньше оно нигде не сверялось при
+    # возврате — код авторизации принимался с любым (или вовсе без) state,
+    # то есть защиты от CSRF не было, хотя сам параметр честно генерировался.
+    expected_state = None
+
     def do_GET(self):
         """Handle GET requests to the callback URL."""
         # Parse query parameters
         query = urllib.parse.urlparse(self.path).query
         params = urllib.parse.parse_qs(query)
-        
-        if 'code' in params:
+        got_state = params.get('state', [None])[0]
+
+        if 'code' in params and got_state == OAuthCallbackHandler.expected_state:
             # Store the authorization code
             OAuthCallbackHandler.auth_code = params['code'][0]
             
@@ -223,6 +229,9 @@ class TickTickAuth:
         try:
             # Use a socket server to handle the callback
             OAuthCallbackHandler.auth_code = None
+            # 2026-08-09: сверяется в do_GET — без этого CSRF-защита была
+            # только на бумаге (state генерировался, но никогда не читался).
+            OAuthCallbackHandler.expected_state = state
             httpd = socketserver.TCPServer(("", self.port), OAuthCallbackHandler)
             
             print(f"Waiting for authentication callback on port {self.port}...")
