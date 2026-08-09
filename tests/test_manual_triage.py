@@ -2373,3 +2373,91 @@ async def test_a_clean_overflow_refusal_has_no_empty_reference_block(
     out = await _assert_refused_outright(monkeypatch, live, ops, "больше капа")
 
     assert "Не вошло" not in out, out
+
+
+# ═══════ 26. Ранний выход исполнителя не теряет справку (Д8) ═══════════════
+
+
+_NOT_PLANNED_ONE = [{"task_id": "a1", "op": "delete", "title": "Купить хлеб",
+                     "why": "название не совпало — по этому id сейчас "
+                            "«Купить молоко», а в плане «Купить хлеб»"}]
+
+
+async def test_the_state_unavailable_exit_still_names_what_did_not_make_it(
+        monkeypatch, tmp_path):
+    """Д8 (2026-08-09). Манифест погашен, исполнитель стартовал, живое
+    состояние недоступно. Про операции, не прошедшие сверку, сказать больше
+    негде и некогда: план одноразовый, справка жила только в нём, превью в
+    личке уже затёрто сводкой."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
+
+    out = await s._manual_triage_impl(
+        "Разбираю",
+        [{"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+          "said": "сделал", "_project_id": "p_in",
+          "_live_title": "Оплатить интернет"}],
+        not_planned=list(_NOT_PLANNED_ONE))
+
+    assert "состояние TickTick недоступно" in out, out
+    assert "#### ❌ Не вошло в план" in out, f"справка потеряна:\n{out}"
+    assert "id a1" in out and "название не совпало" in out
+
+
+async def test_the_not_ready_exit_still_names_what_did_not_make_it(
+        monkeypatch, tmp_path):
+    """Тот же ранний выход этажом выше: сервер вообще не готов. Справка
+    одноразовая ровно так же."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    monkeypatch.setattr(s, "_ensure_ready", lambda: "🛑 Сервер не настроен.")
+
+    out = await s._manual_triage_impl(
+        "Разбираю",
+        [{"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+          "said": "сделал", "_project_id": "p_in",
+          "_live_title": "Оплатить интернет"}],
+        not_planned=list(_NOT_PLANNED_ONE))
+
+    assert "Сервер не настроен" in out
+    assert "#### ❌ Не вошло в план" in out, f"справка потеряна:\n{out}"
+
+
+async def test_an_early_exit_without_a_reference_is_byte_for_byte_the_old_text(
+        monkeypatch, tmp_path):
+    """Зеркало: когда справки нет, ранний выход не обрастает ни пустой
+    рубрикой, ни лишним переводом строки."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
+
+    out = await s._manual_triage_impl(
+        "Разбираю",
+        [{"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+          "said": "сделал", "_project_id": "p_in",
+          "_live_title": "Оплатить интернет"}])
+
+    assert out == s._STATE_UNAVAILABLE_MSG
+
+
+async def test_the_reference_survives_the_button_path_into_a_dead_state(
+        monkeypatch, tmp_path):
+    """Полный кнопочный путь: план построен, справка уехала в манифест, а к
+    моменту исполнения живое состояние отвалилось. Отчёт — единственный текст,
+    который увидит человек, и он обязан назвать невошедшее."""
+    live, _calls = _plan_with_one_rename(monkeypatch, tmp_path)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "delete", "task_id": "a1", "title": "Купить хлеб",
+         "said": "не нужно"},
+        {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "сделал"}])
+    m = s._MANIFESTS[_mid(preview)]
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
+
+    out = await s._generic_gate_auto_execute(_mid(preview), m)
+
+    assert "состояние TickTick недоступно" in out, out
+    assert "#### ❌ Не вошло в план" in out, f"справка потеряна:\n{out}"
+    assert "«Купить молоко»" in out

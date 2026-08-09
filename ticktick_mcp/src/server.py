@@ -16779,13 +16779,21 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict],
     Нужны потому, что отчёт — единственный текст, который переживает нажатие
     кнопки: превью в личке затирается сводкой, а отчёт уходит в группу-архив
     навсегда."""
+    # Д8 (2026-08-09). КАЖДЫЙ ранний выход отсюда печатает справку о
+    # невошедшем — иначе она пропадает навсегда: манифест к этому моменту уже
+    # погашен (план одноразовый), превью в личке затёрто сводкой, а сама
+    # справка жила только внутри плана. Ровно та потеря, ради предотвращения
+    # которой она и писалась. Раньше её печатал только выход «ничего не
+    # пережило сверку»; выходы «сервер не готов» и «живое состояние
+    # недоступно» о ней молчали.
     err = _ensure_ready()
     if err:
-        return err
+        return "\n".join([err] + _triage_not_planned_report_lines(not_planned))
     ops = list(tasks or [])
     by_id = _open_by_id(fresh=True)
     if by_id is None:
-        return _STATE_UNAVAILABLE_MSG
+        return "\n".join([_STATE_UNAVAILABLE_MSG]
+                         + _triage_not_planned_report_lines(not_planned))
     names = _v2_project_names()
 
     ready: List[Dict] = []
