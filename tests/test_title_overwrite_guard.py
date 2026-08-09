@@ -60,14 +60,18 @@ async def test_rename_without_title_is_refused_before_the_write(monkeypatch):
     out = await s._update_tasks_impl("переименую", [
         {"taskId": "t_lease", "projectId": "pA", "new_title": "ЗАТЁРТО"}])
 
-    # (1) отказ виден и НАЗЫВАЕТ недостающее поле
-    assert out.startswith("🛑"), out
-    assert "new_title" in out and "title" in out, out
-    # (2) главное: записи не было вообще
+    # ПОРЯДОК УТВЕРЖДЕНИЙ НАМЕРЕННЫЙ. Главное — не текст ответа, а то, что
+    # канала не касались: старое поведение печатало предупреждение и прошло бы
+    # проверку «в ответе есть 🛑», затерев при этом имя. Поэтому при откате
+    # правки первым падает именно это утверждение.
+    # (2) записи не было вообще
     assert _no_writes(v2, official), \
         f"канал всё-таки дёрнули: official={official.update_calls}, v2={v2.calls}"
     # (3) живое имя цело
     assert live["t_lease"]["title"] == _LEASE
+    # (1) отказ виден и НАЗЫВАЕТ недостающее поле
+    assert out.startswith("🛑"), out
+    assert "new_title" in out and "title" in out, out
 
 
 async def test_rename_without_title_is_refused_in_the_batch_path_too(monkeypatch):
