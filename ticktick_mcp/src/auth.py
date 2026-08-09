@@ -10,6 +10,8 @@ import os
 import webbrowser
 import time
 import base64
+import hashlib
+import hmac
 import http.server
 import socketserver
 import urllib.parse
@@ -35,6 +37,39 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
     # то есть защиты от CSRF не было, хотя сам параметр честно генерировался.
     expected_state = None
 
+    @staticmethod
+    def _state_matches(got_state) -> bool:
+        """Сверка `state` из колбэка с тем, что сервер сам сгенерировал.
+
+        2026-08-09 (доработка по замечанию ревью): пустой/неустановленный
+        `expected_state` — ЯВНО невалидное состояние, а не «сверка выключена»:
+        раньше `got_state == OAuthCallbackHandler.expected_state` при
+        `expected_state is None` И отсутствующем параметре `state` в query
+        давало `None == None` → `True` — код авторизации принимался ровно в
+        том состоянии, которое выглядит как «защита на месте», а на деле
+        полностью отключена. Важное не должно держаться на добросовестности
+        вызывающего (сегодня путь один и `expected_state` всегда ставится
+        перед стартом сервера — но защита обязана быть невозможной для
+        обхода, а не просто «в бою так не бывает»).
+
+        Сравнение — как `_automation_key_matches` в server.py:61 (тот же
+        приём, тот же комментарий про причину): `hmac.compare_digest` по
+        sha256-дайджестам, а не по сырым строкам через `==`, — константное
+        время, не течёт даже длина значения."""
+        expected = OAuthCallbackHandler.expected_state
+        if not expected:
+            logger.warning("OAuth callback: сверка CSRF state не "
+                           "инициализирована (expected_state пуст) — "
+                           "отказываю безусловно, независимо от того, что "
+                           "пришло в запросе.")
+            return False
+        if not got_state:
+            return False
+        return hmac.compare_digest(
+            hashlib.sha256(str(got_state).encode("utf-8")).digest(),
+            hashlib.sha256(str(expected).encode("utf-8")).digest(),
+        )
+
     def do_GET(self):
         """Handle GET requests to the callback URL."""
         # Parse query parameters
@@ -42,7 +77,7 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(query)
         got_state = params.get('state', [None])[0]
 
-        if 'code' in params and got_state == OAuthCallbackHandler.expected_state:
+        if 'code' in params and OAuthCallbackHandler._state_matches(got_state):
             # Store the authorization code
             OAuthCallbackHandler.auth_code = params['code'][0]
             
