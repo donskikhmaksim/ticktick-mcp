@@ -211,6 +211,29 @@ def test_percent_encoded_secret_is_redacted():
     assert "<mcp-secret>" in printed
 
 
+def test_percent_encoded_secret_tail_past_a_literal_slash_is_also_redacted():
+    """2026-08-09 (независимый аудит): тест выше проверяет ОТСУТСТВИЕ ТОЛЬКО
+    ПЕРВОГО куска секрета ("fake%20secret") — а его ловит уже отдельный,
+    независимый от quote()-блока механизм: позиционный regex `_MCP_PATH_RE`
+    (см. redact()), который стопорится на первом литеральном "/" и один
+    маскирует "/mcp/fake%20secret" целиком, что бы ни было дальше. Секрет
+    здесь ("fake secret/with+chars") сам содержит "/", а `quote()` по
+    умолчанию его НЕ кодирует (safe="/") — значит закодированное значение
+    после этого "/" ("with%2Bchars") остаётся ВТОРЫМ сегментом пути, и его
+    маскирует ИСКЛЮЧИТЕЛЬНО блок `quoted = urllib.parse.quote(secret); ...
+    text.replace(quoted, ...)`. Удаление этого блока оставляет "with%2Bchars"
+    в логе нетронутым, а прежний тест этого не видит — он не заглядывает за
+    первый "/" секрета вообще. Здесь — смотрим за оба."""
+    tricky = "fake secret/with+chars"
+    printed = log_redaction.redact("/mcp/fake%20secret/with%2Bchars", tricky)
+    assert "with%2Bchars" not in printed, (
+        "хвост секрета после встроенного '/' остался в логе в процентной "
+        "кодировке — блок квотирования секрета в redact() снят")
+    assert tricky not in printed
+    # Ровно одна маска на весь секрет — не два обрубка вокруг его "/".
+    assert printed == "/mcp/<mcp-secret>"
+
+
 # ─────────────────── Аудит 2026-08-09 (П7 follow-up) ───────────────────
 
 def test_link_token_is_redacted_inside_a_full_url():

@@ -34,7 +34,8 @@ expected_state явно невалидным (безусловный отказ)
 `_automation_key_matches` в server.py:61."""
 import io
 
-from ticktick_mcp.src.auth import OAuthCallbackHandler
+from ticktick_mcp.src.auth import OAuthCallbackHandler, TickTickAuth
+from ticktick_mcp.src import auth as auth_module
 
 
 class _FakeHandler:
@@ -150,3 +151,61 @@ def test_uninitialized_expected_state_refuses_any_state_too():
 
     assert OAuthCallbackHandler.auth_code is None
     assert fake.status_code == 400
+
+
+# ═══════════ ВЫДАЮЩАЯ половина (2026-08-09, независимый аудит) ═══════════
+#
+# Все тесты выше проверяют только do_GET — ПРОВЕРЯЮЩУЮ половину. Обман,
+# которым мутация прошла бы этот файл насквозь: заменить честную генерацию
+# в `start_auth_flow` (`state = base64.urlsafe_b64encode(os.urandom(30))...`)
+# на константу (`state = "fixed-value"`). do_GET по-прежнему честно сравнивает
+# пришедшее значение с `expected_state` — сверка формально жива, и все шесть
+# тестов выше остаются зелёными. Дефект содержательный: state всегда один и
+# тот же, атакующий узнаёт его один раз (например, из собственной прошлой
+# попытки входа) и дальше подставляет в CSRF-ссылку для ЛЮБОЙ следующей
+# жертвы — ровно то, для защиты от чего state вообще существует.
+class _FakeOAuthTCPServer:
+    """Двойник `socketserver.TCPServer`: одно `handle_request()` сразу
+    «доставляет» колбэк (выставляет `auth_code`), поэтому цикл ожидания в
+    `start_auth_flow` заканчивается за одну итерацию без открытия реального
+    сокета. Не упрощает то, что проверяется, — `start_auth_flow` вообще не
+    читает у сервера ничего, кроме факта, что `handle_request()` вернулся."""
+
+    def __init__(self, address, handler_cls):
+        self.timeout = None
+
+    def handle_request(self):
+        OAuthCallbackHandler.auth_code = "code-from-fake-callback"
+
+    def server_close(self):
+        pass
+
+
+def test_start_auth_flow_generates_a_fresh_state_every_call(monkeypatch):
+    """Ловит замену генерации state на константу. Два независимых вызова
+    `start_auth_flow` обязаны положить в `OAuthCallbackHandler.expected_state`
+    РАЗНЫЕ значения. Подменяются только три вызова, к CSRF не относящиеся, —
+    открытие браузера, реальный TCP-сокет и обмен кода на токен (сетевой
+    HTTP-запрос); ни генерации, ни сверки state тест не трогает."""
+    monkeypatch.setattr(auth_module.webbrowser, "open", lambda *a, **k: None)
+    monkeypatch.setattr(auth_module.socketserver, "TCPServer", _FakeOAuthTCPServer)
+
+    a = TickTickAuth(client_id="cid", client_secret="sec", port=0)
+    monkeypatch.setattr(a, "exchange_code_for_token", lambda: "ok")
+
+    _reset()
+    a.start_auth_flow()
+    state1 = OAuthCallbackHandler.expected_state
+
+    _reset()
+    a.start_auth_flow()
+    state2 = OAuthCallbackHandler.expected_state
+
+    assert state1 is not None and state2 is not None
+    assert state1 != state2, (
+        "start_auth_flow сгенерировал ОДИНАКОВЫЙ state дважды подряд — если "
+        "это не подмена генерации на константу, то катастрофически слабая "
+        "энтропия источника случайности")
+    # Отсекает и другую дешёвую подмену — константу, которая просто чуть
+    # длиннее счётчика вызовов ("state-1", "state-2" и т.п.).
+    assert len(state1) >= 20 and len(state2) >= 20
