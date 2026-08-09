@@ -131,7 +131,7 @@ def test_untitled_task_with_attachment_shows_the_file_in_a_list():
     """Приёмка: «задача без названия, но с вложением, показывается в списке
     так, что видно: там файл»."""
     line = s.format_task_line(_receipt_task(), "Inbox")
-    assert "(без названия · 📎 1 файл)" in line
+    assert "(без названия: 📎 1 файл)" in line
     assert "(no title)" not in line
 
 
@@ -144,8 +144,8 @@ def test_untitled_task_with_text_is_told_apart_from_an_empty_one():
          "content": "проверить возврат"}, "Inbox")
     empty = s.format_task_line({"id": "t2", "title": "", "attachments": []},
                                "Inbox")
-    assert "(без названия · есть текст)" in with_text
-    assert "(без названия · пусто)" in empty
+    assert "(без названия: есть текст)" in with_text
+    assert "(без названия: пусто)" in empty
     assert with_text.split("(id:")[0] != empty.split("(id:")[0]
 
 
@@ -157,7 +157,7 @@ def test_a_file_is_never_hidden_behind_the_text_label():
             "attachments": [{"fileName": "receipt.jpg", "id": "d" * 24}],
             "content": "вернуть до конца месяца"}
     line = s.format_task_line(task, "Inbox")
-    assert "(без названия · 📎 1 файл)" in line
+    assert "(без названия: 📎 1 файл)" in line
     assert "есть текст" not in line
 
 
@@ -189,15 +189,15 @@ def test_whitespace_only_title_is_shown_as_untitled_everywhere():
     одинаково."""
     task = dict(_receipt_task(), title="   ")
 
-    assert "(без названия · 📎 1 файл)" in s.format_task_line(task, "Inbox")
-    assert "(без названия · 📎 1 файл)" in s.format_task(task)
+    assert "(без названия: 📎 1 файл)" in s.format_task_line(task, "Inbox")
+    assert "(без названия: 📎 1 файл)" in s.format_task(task)
 
     import ticktick_mcp.src.server as srv
     old = srv.ticktick_v2
     srv.ticktick_v2 = _FakeV2({"t_receipt": task})
     try:
-        assert s._lookup_task_title("t_receipt") == "(без названия · 📎 1 файл)"
-        assert s._live_task_title("t_receipt") == "(без названия · 📎 1 файл)"
+        assert s._lookup_task_title("t_receipt") == "(без названия: 📎 1 файл)"
+        assert s._live_task_title("t_receipt") == "(без названия: 📎 1 файл)"
     finally:
         srv.ticktick_v2 = old
 
@@ -206,7 +206,7 @@ def test_invisible_only_title_is_shown_as_untitled():
     """Название из одного zero-width space человек видит как пустое место —
     значит и показ обязан видеть его так же."""
     task = dict(_receipt_task(), title="​")
-    assert "(без названия · 📎 1 файл)" in s.format_task_line(task, "Inbox")
+    assert "(без названия: 📎 1 файл)" in s.format_task_line(task, "Inbox")
 
 
 async def test_one_object_is_named_the_same_way_in_a_list_and_in_a_plan(
@@ -221,8 +221,8 @@ async def test_one_object_is_named_the_same_way_in_a_list_and_in_a_plan(
     line = s.format_task_line(task, "Inbox")
     plan = await s.plan_task_deletion("уборка", [{"taskId": "t_receipt"}])
 
-    assert "(без названия · 📎 1 файл)" in line
-    assert "(без названия · 📎 1 файл)" in plan
+    assert "(без названия: 📎 1 файл)" in line
+    assert "(без названия: 📎 1 файл)" in plan
 
 
 def test_attachment_known_only_from_inline_content_ref_still_counts():
@@ -231,7 +231,7 @@ def test_attachment_known_only_from_inline_content_ref_still_counts():
     как файл, а не как «есть текст»."""
     task = {"id": "t1", "title": "",
             "content": "![file](" + "b" * 24 + "/receipt.jpg)"}
-    assert "(без названия · 📎 1 файл)" in s.format_task_line(task)
+    assert "(без названия: 📎 1 файл)" in s.format_task_line(task)
 
 
 def test_two_attachments_are_not_double_counted_across_both_sources():
@@ -240,7 +240,7 @@ def test_two_attachments_are_not_double_counted_across_both_sources():
     task = {"id": "t1", "title": "",
             "attachments": [{"fileName": "receipt.jpg", "id": "c" * 24}],
             "content": "![file](" + "c" * 24 + "/receipt.jpg)"}
-    assert "(без названия · 📎 1 файл)" in s.format_task_line(task)
+    assert "(без названия: 📎 1 файл)" in s.format_task_line(task)
 
 
 def test_untitled_card_does_not_print_the_no_title_placeholder():
@@ -248,7 +248,7 @@ def test_untitled_card_does_not_print_the_no_title_placeholder():
     выглядел и у чека, и у пустышки."""
     out = s.format_task(_receipt_task())
     assert "No title" not in out
-    assert "(без названия · 📎 1 файл)" in out
+    assert "(без названия: 📎 1 файл)" in out
 
 
 def test_untitled_task_found_alive_is_never_named_by_its_bare_id():
@@ -261,7 +261,7 @@ def test_untitled_task_found_alive_is_never_named_by_its_bare_id():
     old = srv.ticktick_v2
     srv.ticktick_v2 = fake
     try:
-        assert s._lookup_task_title("t_receipt") == "(без названия · 📎 1 файл)"
+        assert s._lookup_task_title("t_receipt") == "(без названия: 📎 1 файл)"
         assert s._lookup_task_title("t_ghost") == "[task t_ghost…]"
     finally:
         srv.ticktick_v2 = old
@@ -276,7 +276,7 @@ def test_live_task_title_of_an_untitled_task_is_its_content_not_none(
     live = {"t_receipt": _receipt_task()}
     _wire(monkeypatch, live)
 
-    assert s._live_task_title("t_receipt") == "(без названия · 📎 1 файл)"
+    assert s._live_task_title("t_receipt") == "(без названия: 📎 1 файл)"
     assert s._live_task_title("t_ghost") is None
 
 
@@ -291,7 +291,7 @@ async def test_deletion_plan_shows_the_content_and_says_identified_by_id(
 
     plan = await s.plan_task_deletion("уборка", [{"taskId": "t_receipt"}])
 
-    assert "(без названия · 📎 1 файл)" in plan
+    assert "(без названия: 📎 1 файл)" in plan
     assert "опознана ПО id" in plan
     assert "стоит сначала её назвать" in plan
     # Прежний текст — прямая ложь про существующий объект.
@@ -309,7 +309,7 @@ async def test_update_preview_of_an_untitled_task_says_identified_by_id(
         {"taskId": "t_receipt", "projectId": "p_inbox",
          "new_title": "Чек Home Depot — возврат $374.92"}])
 
-    assert "(без названия · 📎 1 файл)" in preview
+    assert "(без названия: 📎 1 файл)" in preview
     assert "опознана ПО id" in preview
     assert "нет в живом состоянии аккаунта" not in preview
 
@@ -328,7 +328,7 @@ def test_triage_line_names_an_untitled_task_by_its_content(monkeypatch):
     line = s._describe_triage_op(ops[0])
 
     assert ops[0].get("_skip") is None
-    assert "(без названия · 📎 1 файл)" in line
+    assert "(без названия: 📎 1 файл)" in line
     assert "опознана ПО id" in line
     assert "нет в живом состоянии аккаунта" not in line
 
@@ -360,13 +360,13 @@ def test_unarmed_note_calls_an_untitled_row_identified_by_id_not_unchecked(
     «опознано по id»: ⚠️ здесь пугало бы владельца там, где всё в порядке, и
     прятало бы настоящие непроверенные строки среди ложных."""
     note = s._unarmed_note([
-        {"taskId": "t_receipt", "title": "(без названия · 📎 1 файл)",
+        {"taskId": "t_receipt", "title": "(без названия: 📎 1 файл)",
          "armed": False, "by_id": True},
         {"taskId": "t2", "title": "Обычная", "armed": False, "by_id": False},
     ])
     assert "ℹ️ 1 опознано ПО id" in note
     assert "⚠️ 1 выполнено БЕЗ сверки названия" in note
-    assert "(без названия · 📎 1 файл)" in note
+    assert "(без названия: 📎 1 файл)" in note
 
 
 def test_split_marks_untitled_row_as_identified_by_id(monkeypatch):
@@ -393,15 +393,15 @@ def test_split_marks_untitled_row_as_identified_by_id(monkeypatch):
     # уехал бы в манифест как настоящее имя и сломал сверку на исполнении;
     # человекочитаемое имя живёт отдельно, в `label`.
     assert by_task["t_receipt"]["title"] == ""
-    assert by_task["t_receipt"]["label"] == "(без названия · 📎 1 файл)"
+    assert by_task["t_receipt"]["label"] == "(без названия: 📎 1 файл)"
     assert by_task["t_spaces"]["by_id"] is True
-    assert by_task["t_spaces"]["label"] == "(без названия · 📎 1 файл)"
+    assert by_task["t_spaces"]["label"] == "(без названия: 📎 1 файл)"
     assert by_task["t_named"]["by_id"] is False
     assert by_task["t_named"]["label"] == "Купить молоко"
 
     # …и то же имя доезжает до сводки, которую читает владелец.
     note = s._unarmed_note(found)
-    assert note.count("(без названия · 📎 1 файл)") == 2
+    assert note.count("(без названия: 📎 1 файл)") == 2
 
 
 # ═════════════ 4. УДАЛЕНИЕ и ГРАНИЦА ПОСЛАБЛЕНИЯ ═════════════
@@ -423,7 +423,7 @@ async def test_untitled_task_is_deleted_when_both_sides_are_untitled(
     assert ("delete", ["t_receipt"]) in fake.calls
     assert "Удалено 1" in out
     # Отчёт обязан НАЗЫВАТЬ удалённое, а не печатать «»
-    assert "«(без названия · 📎 1 файл)»" in out
+    assert "«(без названия: 📎 1 файл)»" in out
 
 
 async def test_planned_untitled_but_live_has_a_title_is_still_refused(
@@ -548,7 +548,7 @@ async def test_report_names_the_deleted_task_instead_of_its_id(
     report = await s.operation_report("mid-report")
 
     for text in (out, report):
-        assert "(без названия · 📎 1 файл)" in text
+        assert "(без названия: 📎 1 файл)" in text
         assert "[task t_receip" not in text
 
 
@@ -563,7 +563,7 @@ async def test_untitled_task_with_attachment_goes_through_show_rename_delete(
 
     # показ
     shown = s.format_task_list([live["t_receipt"]])
-    assert "(без названия · 📎 1 файл)" in shown
+    assert "(без названия: 📎 1 файл)" in shown
 
     # переименование
     preview = await s.update_tasks("назвать", [
