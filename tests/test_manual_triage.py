@@ -1288,7 +1288,7 @@ async def test_changes_invisible_in_the_open_list_are_reported_as_unchecked(
 # убрала — план доставляется ЦЕЛИКОМ, разбитый на несколько сообщений
 # (split_for_telegram / send_message_chunked). Отказ вместе с его причиной
 # снят, а тесты ниже держат новое: длинный план строится и доезжает полностью.
-# Предел разового ущерба по-прежнему на _TRIAGE_HARD_CAP (50 операций).
+# Предел разового ущерба по-прежнему на _TRIAGE_PLAN_DAMAGE_CAP (50 операций).
 
 def _tg_on(monkeypatch, allowlist=None):
     monkeypatch.setattr(s, "_TG_CFG", tg.TgApprovalConfig(
@@ -1671,13 +1671,13 @@ async def test_max_items_cannot_be_raised_above_the_hard_cap(monkeypatch, tmp_pa
     """Кап, который волен поднять сам вызывающий, — не кап. `max_items=10000`
     строил план на 200 удалений; для фичи, родившейся из «слишком большой
     готовый к исполнению план», это существенно."""
-    live, ops = _long_plan(s._TRIAGE_HARD_CAP + 1)
+    live, ops = _long_plan(s._TRIAGE_PLAN_DAMAGE_CAP + 1)
     _wire(monkeypatch, live, tmp_path)
 
     out = await _assert_refused_outright(monkeypatch, live, ops, "больше капа",
                                          max_items=10000)
 
-    assert f"больше капа {s._TRIAGE_HARD_CAP}" in out
+    assert f"больше капа {s._TRIAGE_PLAN_DAMAGE_CAP}" in out
     assert "max_items=10000" in out and "НЕ поднимает" in out
 
 
@@ -1693,7 +1693,7 @@ async def test_max_items_can_still_be_lowered(monkeypatch, tmp_path):
 
 
 async def test_the_hard_cap_is_fifty():
-    assert s._TRIAGE_HARD_CAP == 50
+    assert s._TRIAGE_PLAN_DAMAGE_CAP == 50
 
 
 # ═══════ 20. Повторяющееся обоснование — заметное предупреждение ════════════
@@ -2219,7 +2219,7 @@ async def test_the_cap_counts_the_plan_not_the_rejected_input(
     """50 валидных + 1 непрошедшая = 50 исполнимых, то есть ровно кап.
     Отказывать здесь — значит отказывать из-за мусора, который и так выброшен
     (кап ограничивает разовый УЩЕРБ, а ущерб наносит только исполнимое)."""
-    live, ops = _long_plan(s._TRIAGE_HARD_CAP)
+    live, ops = _long_plan(s._TRIAGE_PLAN_DAMAGE_CAP)
     live["gone"] = {"id": "gone", "title": "Уже удалена", "projectId": "p_in"}
     ops.append({"op": "delete", "task_id": "gone", "title": "Уже удалена",
                 "said": "неактуально"})
@@ -2229,7 +2229,7 @@ async def test_the_cap_counts_the_plan_not_the_rejected_input(
     preview = await s.manual_triage("Разбираю входящие", ops)
 
     assert "больше капа" not in preview
-    assert len(s._MANIFESTS[_mid(preview)]["tasks"]) == s._TRIAGE_HARD_CAP
+    assert len(s._MANIFESTS[_mid(preview)]["tasks"]) == s._TRIAGE_PLAN_DAMAGE_CAP
     assert "❌ Не вошло: 1" in preview
 
 
@@ -2237,7 +2237,7 @@ async def test_the_cap_still_refuses_when_the_plan_itself_is_too_big(
         monkeypatch, tmp_path):
     """Зеркало: считать по исполнимым — не значит ослабить. 51 исполнимая по
     прежнему отвергается целиком."""
-    live, ops = _long_plan(s._TRIAGE_HARD_CAP + 1)
+    live, ops = _long_plan(s._TRIAGE_PLAN_DAMAGE_CAP + 1)
     _wire(monkeypatch, live, tmp_path)
 
     await _assert_refused_outright(monkeypatch, live, ops, "больше капа")
@@ -2348,7 +2348,7 @@ async def test_the_cap_refusal_still_names_what_did_not_pass_the_check(
     непрошедших сверку уже посчитана, и жить ей больше негде: манифеста нет,
     превью нет, второго шанса рассказать про эти операции не будет. Без неё
     модель делит список пополам и строит новый план на те же непрошедшие."""
-    live, ops = _long_plan(s._TRIAGE_HARD_CAP + 1)
+    live, ops = _long_plan(s._TRIAGE_PLAN_DAMAGE_CAP + 1)
     live["ghost"] = {"id": "ghost", "title": "Уже удалена", "projectId": "p_in"}
     ops.append({"op": "delete", "task_id": "ghost", "title": "Уже удалена",
                 "said": "неактуально"})
@@ -2367,7 +2367,7 @@ async def test_a_clean_overflow_refusal_has_no_empty_reference_block(
         monkeypatch, tmp_path):
     """Зеркало: когда непрошедших нет, отказ по капу не обрастает пустой
     рубрикой «❌ Не вошло: 0»."""
-    live, ops = _long_plan(s._TRIAGE_HARD_CAP + 1)
+    live, ops = _long_plan(s._TRIAGE_PLAN_DAMAGE_CAP + 1)
     _wire(monkeypatch, live, tmp_path)
 
     out = await _assert_refused_outright(monkeypatch, live, ops, "больше капа")
@@ -2461,3 +2461,86 @@ async def test_the_reference_survives_the_button_path_into_a_dead_state(
     assert "состояние TickTick недоступно" in out, out
     assert "#### ❌ Не вошло в план" in out, f"справка потеряна:\n{out}"
     assert "«Купить молоко»" in out
+
+
+# ═══════ 27. Два предела: объём входа и ущерб плана (Д12) ══════════════════
+
+
+async def test_a_huge_input_is_refused_before_live_state_is_even_read(
+        monkeypatch, tmp_path):
+    """Д12 (2026-08-09). Предел ущерба считается по прошедшим сверку — и это
+    правильно, но верхней границы на ДЛИНУ ВХОДА после той правки не осталось
+    ни одной. Вызов, где сверку переживает горстка строк, а остальные тысячи
+    едут в превью, в манифест и в архивный отчёт, обязан отвергаться ДО
+    чтения живого состояния."""
+    live, ops = _long_plan(s._TRIAGE_INPUT_VOLUME_CAP + 1)
+    _wire(monkeypatch, live, tmp_path)
+    reads = []
+    monkeypatch.setattr(s, "_open_by_id",
+                        lambda fresh=False: reads.append(1) or dict(live))
+
+    out = await _assert_refused_outright(
+        monkeypatch, live, ops, "больше предела на объём одного вызова")
+
+    assert reads == [], "живое состояние читалось, хотя вход отвергнут"
+    assert str(s._TRIAGE_INPUT_VOLUME_CAP) in out
+
+
+async def test_the_volume_limit_does_not_care_how_many_survive_the_check(
+        monkeypatch, tmp_path):
+    """Тот самый сценарий: почти всё не проходит сверку, план получается
+    крошечный. Предел УЩЕРБА такой вызов честно пропускает — держать его
+    обязан отдельный предел объёма."""
+    live, ops = _long_plan(s._TRIAGE_INPUT_VOLUME_CAP + 40)
+    _wire(monkeypatch, live, tmp_path)
+    # Всё, кроме десяти, исчезло из живого состояния — в план ушло бы 10.
+    for tid in list(live)[10:]:
+        live.pop(tid)
+
+    out = await _assert_refused_outright(
+        monkeypatch, live, ops, "больше предела на объём одного вызова")
+
+    assert "больше капа" not in out, "перепутаны два разных предела"
+
+
+async def test_the_two_limits_are_different_numbers_and_different_checks(
+        monkeypatch, tmp_path):
+    """Зеркало к обоим: 60 операций — больше предела УЩЕРБА (50), но меньше
+    предела ОБЪЁМА (200). Отказ должен быть по ущербу, а не по объёму, иначе
+    пределы снова сведены в один."""
+    assert s._TRIAGE_PLAN_DAMAGE_CAP == 50
+    assert s._TRIAGE_INPUT_VOLUME_CAP == 200
+    assert s._TRIAGE_INPUT_VOLUME_CAP > s._TRIAGE_PLAN_DAMAGE_CAP
+
+    live, ops = _long_plan(s._TRIAGE_PLAN_DAMAGE_CAP + 10)
+    _wire(monkeypatch, live, tmp_path)
+
+    out = await _assert_refused_outright(monkeypatch, live, ops, "больше капа")
+
+    assert "объём одного вызова" not in out
+
+
+async def test_the_volume_limit_is_not_a_lever_the_caller_can_pull(
+        monkeypatch, tmp_path):
+    """`max_items` — рычаг вызывающего на УЩЕРБ («сделай план поменьше»).
+    Объём собственного ввода вызывающий регулировать не вправе: и щедрый, и
+    скупой max_items одинаково не спасают вызов на 201 операцию."""
+    live, ops = _long_plan(s._TRIAGE_INPUT_VOLUME_CAP + 1)
+    _wire(monkeypatch, live, tmp_path)
+
+    for lever in (10_000, 5):
+        await _assert_refused_outright(
+            monkeypatch, live, ops, "больше предела на объём одного вызова",
+            max_items=lever)
+
+
+async def test_a_plan_at_the_damage_cap_still_builds(monkeypatch, tmp_path):
+    """И главное: ни один из двух пределов не съел законный разбор — ровно
+    кап ущерба по-прежнему проходит."""
+    live, ops = _long_plan(s._TRIAGE_PLAN_DAMAGE_CAP)
+    _wire(monkeypatch, live, tmp_path)
+
+    preview = await s.manual_triage("Разбираю входящие", ops)
+
+    assert "🛑" not in preview
+    assert len(s._MANIFESTS[_mid(preview)]["tasks"]) == s._TRIAGE_PLAN_DAMAGE_CAP

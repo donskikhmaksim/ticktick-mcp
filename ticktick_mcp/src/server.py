@@ -15756,13 +15756,36 @@ _TRIAGE_VERB = {"update": "изменить", "move": "перенести", "com
 # название» на желаемое, и сверка id↔задача сравнила бы значение сама с собой).
 _TRIAGE_FORBIDDEN_CHANGE_KEYS = ("title", "taskId", "task_id", "projectId",
                                  "project_id")
-# Жёсткий потолок числа операций в одном плане. Кап, который волен поднять
-# сам вызывающий (`max_items=10000` строил план на 200 удалений), — это не
-# кап: ограничивать нужно того, КТО зовёт, а он же и передаёт аргумент.
-# Поэтому потолок живёт КОНСТАНТОЙ в коде, а `max_items` может его только
-# опустить. Фича родилась из инцидента «слишком большой готовый к исполнению
-# план» — предел разового ущерба здесь не украшение.
-_TRIAGE_HARD_CAP = 50
+# ДВА РАЗНЫХ ПРЕДЕЛА, И СВОДИТЬ ИХ В ОДИН НЕЛЬЗЯ (Д12, 2026-08-09).
+#
+# `_TRIAGE_PLAN_DAMAGE_CAP` — предел разового УЩЕРБА: сколько операций может
+# оказаться в манифесте, то есть сколько объектов человек способен изменить
+# одним нажатием. Считается по тому, что ПРОШЛО сверку и реально уходит в
+# план (правка Д9 прошлого раунда: отказывать из-за мусора, который и так
+# выброшен, — это отказ ни за что). Кап, который волен поднять сам
+# вызывающий (`max_items=10000` строил план на 200 удалений), — не кап,
+# поэтому потолок живёт КОНСТАНТОЙ в коде, а `max_items` может его только
+# опустить.
+#
+# `_TRIAGE_INPUT_VOLUME_CAP` — предел разового ОБЪЁМА ВХОДА: сколько операций
+# вообще можно передать за один вызов. Проверяется ДО чтения живого состояния
+# и ДО сверки, и `max_items` его не касается вовсе.
+#
+# Почему одного мало. После переезда капа на «прошедшие сверку» верхней
+# границы на длину входа не осталось ни одной: 5000 операций, 4960 не прошли
+# — в план идут 40, отказа нет, а 4960 справочных записей уезжают в превью (в
+# Telegram, где обрезка снята, это сотни сообщений), в манифест и в Postgres
+# вместе с планом, и ещё раз в архивный отчёт. Ущерб при этом нулевой —
+# ограничение на ущерб такой вызов честно пропускает. Ограничивать объём
+# обязан ОТДЕЛЬНЫЙ предел, иначе «предел один» означает «объём не ограничен».
+#
+# Почему входной заметно выше плана, а не равен ему: разбор, где половина
+# строк отвалилась по дрейфу, — законный сценарий (ради него Д9 и делался), и
+# сводить два числа к одному значило бы вернуть отказ по капу из-за
+# выброшенного мусора. 200 — «человек надиктовал разбор», 5000 — «модель
+# высыпала весь аккаунт».
+_TRIAGE_PLAN_DAMAGE_CAP = 50
+_TRIAGE_INPUT_VOLUME_CAP = 200
 # Ключи `changes`, которые сервер РЕАЛЬНО применяет (_update_tasks_impl) и
 # показывает в предпросмотре (_update_change_bits). Всё, чего здесь нет,
 # молча не сделалось бы, а отчёт при этом отрапортовал бы «обновлено».
@@ -15892,9 +15915,35 @@ def _triage_change_refusal(i: int, title: str, changes: Dict) -> Optional[str]:
     return None
 
 
-def _triage_cap_refusal(planned: int, max_items: int) -> Optional[str]:
-    """Потолок числа операций В ПЛАНЕ. Считается по тому, что РЕАЛЬНО уходит в
-    манифест, а не по длине входного списка (2026-08-09).
+def _triage_input_volume_refusal(received: int) -> Optional[str]:
+    """Предел разового ОБЪЁМА ВХОДА — ДЛИНА переданного списка, проверяется ДО
+    чтения живого состояния и ДО сверки (Д12, 2026-08-09).
+
+    Это НЕ второй экземпляр предела ущерба и не его дубль: ущерб меряется
+    исполнимым (`_triage_plan_damage_refusal` ниже), объём — всем, что вообще
+    приехало в вызов. Разошлись они не на бумаге: 5000 операций, из которых
+    сверку не прошли 4960, дают план на 40 — предел ущерба такой вызов
+    пропускает честно, а 4960 справочных записей всё равно уезжают в превью
+    (в Telegram — сотнями сообщений), в манифест, в Postgres и в архивный
+    отчёт. Сведёшь два предела в один — исчезнет либо ограничение объёма
+    (как и случилось), либо законный разбор, где половина строк отвалилась.
+
+    `max_items` сюда не передаётся НАМЕРЕННО: он — рычаг вызывающего на
+    ущерб («сделай мне план поменьше»), а объём собственного ввода вызывающий
+    регулировать не вправе."""
+    if received <= _TRIAGE_INPUT_VOLUME_CAP:
+        return None
+    return (f"🛑 Отказ: передано {received} операций — больше предела на объём "
+            f"одного вызова ({_TRIAGE_INPUT_VOLUME_CAP}). Это ОТДЕЛЬНЫЙ предел, "
+            "не тот, что ограничивает размер плана: столько строк не поместится "
+            "ни в предпросмотр, ни в отчёт, даже если сверку из них переживёт "
+            "десяток. Разбери список частями. Ничего не сделано, живое "
+            "состояние даже не читалось.")
+
+
+def _triage_plan_damage_refusal(planned: int, max_items: int) -> Optional[str]:
+    """Предел разового УЩЕРБА — число операций В ПЛАНЕ. Считается по тому, что
+    РЕАЛЬНО уходит в манифест, а не по длине входного списка (2026-08-09).
 
     Кап — это предел разового ущерба, а ущерб наносит только исполнимое. С
     тех пор как не прошедшее сверку в план не попадает вовсе (П19), «50
@@ -15902,16 +15951,19 @@ def _triage_cap_refusal(planned: int, max_items: int) -> Optional[str]:
     больше капа 50», хотя исполнить предлагалось ровно 50. Отказ по мусору,
     который и так выброшен, — это отказ ни за что.
 
+    Длину входа этот предел не сторожит и сторожить не должен — для неё есть
+    `_triage_input_volume_refusal` выше (Д12).
+
     `max_items` может потолок только ОПУСТИТЬ: кап, который волен поднять сам
     вызывающий, — не кап (он же и передаёт аргумент)."""
     cap = max_items if isinstance(max_items, int) and not isinstance(max_items, bool) \
-        else _TRIAGE_HARD_CAP
-    cap = max(1, min(cap, _TRIAGE_HARD_CAP))
+        else _TRIAGE_PLAN_DAMAGE_CAP
+    cap = max(1, min(cap, _TRIAGE_PLAN_DAMAGE_CAP))
     if planned <= cap:
         return None
     raised = (f" Переданный max_items={max_items} потолок НЕ поднимает: "
-              f"{_TRIAGE_HARD_CAP} задан константой в коде."
-              if isinstance(max_items, int) and max_items > _TRIAGE_HARD_CAP
+              f"{_TRIAGE_PLAN_DAMAGE_CAP} задан константой в коде."
+              if isinstance(max_items, int) and max_items > _TRIAGE_PLAN_DAMAGE_CAP
               else "")
     return (f"🛑 Отказ: операций {planned} — больше капа "
             f"{cap}.{raised} Разбей разбор на части и подтверди каждую "
@@ -15953,6 +16005,14 @@ def _validate_triage_ops(operations: List[Dict], max_items: int) -> Optional[str
         return ("🛑 Пустой список операций — разбирать нечего. Этот инструмент "
                 "НЕ выбирает задачи сам: передай явный список того, что "
                 "человек сказал сделать.")
+    # Предел ОБЪЁМА — первым делом, до построчной валидации и задолго до
+    # чтения живого состояния (Д12, 2026-08-09): смысл верхней границы на
+    # длину входа в том, чтобы вызов на 5000 строк не доехал ни до сети, ни
+    # до превью, ни до базы. Предел УЩЕРБА живёт отдельно и считается позже,
+    # по прошедшим сверку, — см. `_triage_plan_damage_refusal`.
+    refusal = _triage_input_volume_refusal(len(operations))
+    if refusal:
+        return refusal
     kind_of: Dict[str, str] = {}
     for i, op in enumerate(operations, 1):
         if not isinstance(op, dict):
@@ -16387,7 +16447,7 @@ def _triage_plan_notes(ops: List[Dict]) -> List[str]:
 # `split_for_telegram`/`send_message_chunked`. Обрезки больше нет, значит нет
 # и того, от чего защищались, — а сама защита стала вредной: она запрещала бы
 # законные длинные планы, которые теперь доезжают до владельца полностью.
-# Предел разового ущерба при этом никуда не делся — его держит `_TRIAGE_HARD_CAP`
+# Предел разового ущерба при этом никуда не делся — его держит `_TRIAGE_PLAN_DAMAGE_CAP`
 # (50 операций, константой в коде, `max_items` может только опустить).
 
 
@@ -16642,9 +16702,17 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
          "keep_task_id":"e6","keep_title":"Позвонить в банк",
          "said":"это одно и то же, оставь одну"}]
 
+    TWO SEPARATE LIMITS, do not confuse them: (1) VOLUME — more than 200
+    operations in one call is refused before live state is even read (the
+    list would not fit a preview or a report no matter how many rows survive
+    the check, and `max_items` does not affect it); (2) BLAST — more than 50
+    operations in the resulting PLAN, counted after the live check, so rows
+    that were dropped never cost you the plan; `max_items` can only LOWER
+    that 50, never raise it.
+
     Refused OUTRIGHT (nothing is mutated, no manifest is created): an empty
-    list, more operations than the cap (50 hard-coded server-side, `max_items`
-    can only LOWER it), an unknown `op`, a missing task_id/said, a missing
+    list, more operations than either limit above, an unknown `op`, a missing
+    task_id/said, a missing
     title that carries no `untitled: true` either, `title` and `untitled`
     together, an `untitled` that is not a real boolean, the same
     task_id in two operations, update without `changes`, an unknown or
@@ -16665,7 +16733,7 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
     Args:
         summary: one-line human sentence in the user's language, e.g. «Разбираю входящие после созвона» — the server appends the per-type counts to it
         operations: the explicit list described above — required on call #1, IGNORED on call #2 (may be repeated verbatim)
-        max_items: refuse to plan more operations than this (blast cap); the server's own hard cap is 50 and this argument can only lower it
+        max_items: refuse to plan more operations than this (BLAST limit, counted on what passed the live check); the server's own hard cap is 50 and this argument can only lower it — it does NOT touch the separate 200-operation limit on how much you may send in one call
         manifest_id: from call #1's response — pass on call #2 to actually apply
         user_reply: the user's literal reply approving the plan — required on call #2
         automation_key: headless-automation only — a VALID key executes on the FIRST call (no plan, no button, no user_reply); interactive assistants leave this empty
@@ -16713,8 +16781,9 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
                     "план НЕ построен, ничего не изменено:\n"
                     + "\n".join(_triage_not_planned_lines(not_planned)))
         # Кап считается по тому, что РЕАЛЬНО уходит в манифест, — см.
-        # `_triage_cap_refusal`.
-        refusal = _triage_cap_refusal(len(enriched), max_items)
+        # `_triage_plan_damage_refusal`; ДЛИНУ ВХОДА сторожит отдельный
+        # предел объёма, проверенный ещё до чтения живого состояния (Д12).
+        refusal = _triage_plan_damage_refusal(len(enriched), max_items)
         if refusal:
             # Д9 (2026-08-09): справка о непрошедших едет ВМЕСТЕ с отказом.
             # Она к этому моменту уже посчитана, а жить ей больше негде: плана
