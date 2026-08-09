@@ -137,13 +137,92 @@ def test_untitled_task_with_attachment_shows_the_file_in_a_list():
 
 def test_untitled_task_with_text_is_told_apart_from_an_empty_one():
     """Разница между «есть текст» и «пусто» — это разница между документом и
-    мусором; ради неё вся правка и делалась."""
+    мусором; ради неё вся правка и делалась. «Пусто» законно только когда
+    источник ДЕЙСТВИТЕЛЬНО перечислил вложения (здесь — пустым списком)."""
     with_text = s.format_task_line(
-        {"id": "t1", "title": "", "content": "проверить возврат"}, "Inbox")
-    empty = s.format_task_line({"id": "t2", "title": ""}, "Inbox")
+        {"id": "t1", "title": "", "attachments": [],
+         "content": "проверить возврат"}, "Inbox")
+    empty = s.format_task_line({"id": "t2", "title": "", "attachments": []},
+                               "Inbox")
     assert "(без названия · есть текст)" in with_text
     assert "(без названия · пусто)" in empty
     assert with_text.split("(id:")[0] != empty.split("(id:")[0]
+
+
+def test_a_file_is_never_hidden_behind_the_text_label():
+    """M4. Задача, где есть И файл, И подпись к нему, — это ДОКУМЕНТ. Если
+    порядок в заменителе перевернуть (сначала текст), файл исчезнет из строки
+    списка — ровно то, из-за чего чек Home Depot попал в план на удаление."""
+    task = {"id": "t1", "title": "",
+            "attachments": [{"fileName": "receipt.jpg", "id": "d" * 24}],
+            "content": "вернуть до конца месяца"}
+    line = s.format_task_line(task, "Inbox")
+    assert "(без названия · 📎 1 файл)" in line
+    assert "есть текст" not in line
+
+
+def test_unreadable_attachment_field_never_claims_the_task_is_empty():
+    """M6. Сбой или неожиданная форма ответа про вложения — это «не знаю», а
+    не «пусто». «Пусто» — приговор документу, и выносить его по незнанию
+    нельзя."""
+    broken = s.format_task_line({"id": "t1", "title": "",
+                                 "attachments": "внезапно строка"}, "Inbox")
+    assert "(без названия)" in broken
+    assert "пусто" not in broken
+
+
+def test_official_api_task_without_attachment_field_says_nothing_about_files():
+    """`format_task` печатает и ответ ОФИЦИАЛЬНОГО v1 API (get_task,
+    get_project_tasks), который поля `attachments` не отдаёт вовсе. Утверждать
+    по такому ответу «пусто» — значит объявить пустой карточку задачи, в
+    которой лежит файл."""
+    v1_task = {"id": "t1", "projectId": "p_inbox", "title": "", "status": 0}
+    out = s.format_task(v1_task)
+    assert "Title: (без названия)\n" in out
+    assert "пусто" not in out
+
+
+def test_whitespace_only_title_is_shown_as_untitled_everywhere():
+    """M1 — ГЛАВНОЕ. Название из одних пробелов truthy, поэтому показ по
+    `title or заменитель` пропускал его целиком: задача с фотографией чека
+    внутри печаталась пустой строкой. Все точки показа обязаны отвечать
+    одинаково."""
+    task = dict(_receipt_task(), title="   ")
+
+    assert "(без названия · 📎 1 файл)" in s.format_task_line(task, "Inbox")
+    assert "(без названия · 📎 1 файл)" in s.format_task(task)
+
+    import ticktick_mcp.src.server as srv
+    old = srv.ticktick_v2
+    srv.ticktick_v2 = _FakeV2({"t_receipt": task})
+    try:
+        assert s._lookup_task_title("t_receipt") == "(без названия · 📎 1 файл)"
+        assert s._live_task_title("t_receipt") == "(без названия · 📎 1 файл)"
+    finally:
+        srv.ticktick_v2 = old
+
+
+def test_invisible_only_title_is_shown_as_untitled():
+    """Название из одного zero-width space человек видит как пустое место —
+    значит и показ обязан видеть его так же."""
+    task = dict(_receipt_task(), title="​")
+    assert "(без названия · 📎 1 файл)" in s.format_task_line(task, "Inbox")
+
+
+async def test_one_object_is_named_the_same_way_in_a_list_and_in_a_plan(
+        monkeypatch, tmp_path):
+    """Согласованность точек показа: строка списка и строка плана про ОДИН
+    объект обязаны называть его одинаково. Расхождение здесь и было признаком
+    того, что показ живёт по двум разным правилам."""
+    task = dict(_receipt_task(), title="  ")
+    live = {"t_receipt": task}
+    _wire(monkeypatch, live, tmp_path)
+
+    line = s.format_task_line(task, "Inbox")
+    plan = await s.plan_task_deletion("уборка", [{"taskId": "t_receipt"}])
+
+    assert "(без названия · 📎 1 файл)" in line
+    assert "(без названия · 📎 1 файл)" in plan
 
 
 def test_attachment_known_only_from_inline_content_ref_still_counts():
@@ -293,12 +372,17 @@ def test_unarmed_note_calls_an_untitled_row_identified_by_id_not_unchecked(
 def test_split_marks_untitled_row_as_identified_by_id(monkeypatch):
     """Признак `by_id` ставится ТОЛЬКО когда пусто с обеих сторон."""
     live = {"t_receipt": _receipt_task(),
+            # Пробельное название — тот же класс, что пустое: строка,
+            # выглядящая пустым местом, обязана получить заменитель, иначе
+            # ⚠️/ℹ️-сводка операции напечатает ««   »» (аудит 2026-08-09).
+            "t_spaces": dict(_receipt_task("t_spaces"), title="   "),
             "t_named": {"id": "t_named", "projectId": "p_inbox",
                         "title": "Купить молоко"}}
     _wire(monkeypatch, live)
 
     found, mismatch, missing = s._split_tasks_by_state(
         [{"taskId": "t_receipt"},
+         {"taskId": "t_spaces", "title": "   "},
          {"taskId": "t_named", "title": "Купить молоко"}],
         by_id=dict(live))
 
@@ -310,7 +394,14 @@ def test_split_marks_untitled_row_as_identified_by_id(monkeypatch):
     # человекочитаемое имя живёт отдельно, в `label`.
     assert by_task["t_receipt"]["title"] == ""
     assert by_task["t_receipt"]["label"] == "(без названия · 📎 1 файл)"
+    assert by_task["t_spaces"]["by_id"] is True
+    assert by_task["t_spaces"]["label"] == "(без названия · 📎 1 файл)"
     assert by_task["t_named"]["by_id"] is False
+    assert by_task["t_named"]["label"] == "Купить молоко"
+
+    # …и то же имя доезжает до сводки, которую читает владелец.
+    note = s._unarmed_note(found)
+    assert note.count("(без названия · 📎 1 файл)") == 2
 
 
 # ═════════════ 4. УДАЛЕНИЕ и ГРАНИЦА ПОСЛАБЛЕНИЯ ═════════════
@@ -370,6 +461,35 @@ async def test_planned_title_but_live_is_untitled_is_refused(
     assert "Пропущены" in out
 
 
+async def test_planned_name_that_normalises_to_nothing_is_refused_on_untitled_live(
+        monkeypatch, tmp_path):
+    """ГРАНИЦА, сторона 2, СЛУЧАЙ, КОТОРЫЙ НЕ ЛОВИТ ОБЫЧНАЯ СВЕРКА (аудит
+    2026-08-09). `_names_agree` вычищает невидимые символы, поэтому имя из
+    одного zero-width space она считает СОВПАВШИМ с пустым живым названием —
+    и без отдельной ветки предохранителя такой план удалил бы безымянную
+    задачу (проверено: снятие ветки оставляло весь прогон зелёным).
+
+    Предохранитель обязан судить по СЫРОМУ значению: «в плане имя было, у
+    живой задачи его нет» — это другой объект, чем бы имя ни нормализовалось.
+    """
+    zero_width = "​"
+    # Предпосылка теста: обычная сверка здесь БЕССИЛЬНА — если это перестанет
+    # быть правдой, тест обязан сказать об этом, а не тихо стать тавтологией.
+    assert s._names_agree(zero_width, "") is True
+
+    live = {"t1": _receipt_task("t1")}
+    fake, _official = _wire(monkeypatch, live, tmp_path)
+    _delete_manifest("mid-zw", [
+        {"taskId": "t1", "projectId": "p_inbox", "title": zero_width,
+         "project": "Inbox", "snapshot": {"title": zero_width}}])
+
+    out = await s.execute_task_deletion("mid-zw", user_reply="да")
+
+    assert "t1" in live
+    assert [c for c in fake.calls if c[0] == "delete"] == []
+    assert "Пропущены" in out
+
+
 async def test_a_named_task_that_drifted_is_still_refused_after_the_relaxation(
         monkeypatch, tmp_path):
     """Контроль: обычное расхождение имён продолжает ловиться — послабление
@@ -410,6 +530,26 @@ async def test_untitled_relaxation_does_not_delete_a_neighbouring_task(
     assert "t_drift" in live and "t_bystander" in live
     assert ("delete", ["t_receipt"]) in fake.calls
     assert "Удалено 1" in out and "Пропущены 1" in out
+
+
+async def test_report_names_the_deleted_task_instead_of_its_id(
+        monkeypatch, tmp_path):
+    """Отчёт печатал про безымянную задачу «- ✅ **«[task tB…]»** — удалена»:
+    идентификатор в кавычках, в позиции имени — та самая форма, которую
+    сервер осуждает везде ещё. Причём абзацем выше тот же объект уже назван
+    по-человечески. Один объект — одно имя (аудит 2026-08-09)."""
+    live = {"t_receipt": _receipt_task()}
+    _wire(monkeypatch, live, tmp_path)
+    _delete_manifest("mid-report", [
+        {"taskId": "t_receipt", "projectId": "p_inbox", "title": "",
+         "project": "Inbox", "snapshot": s._snapshot_of(live["t_receipt"])}])
+
+    out = await s.execute_task_deletion("mid-report", user_reply="да")
+    report = await s.operation_report("mid-report")
+
+    for text in (out, report):
+        assert "(без названия · 📎 1 файл)" in text
+        assert "[task t_receip" not in text
 
 
 # ═════════════ 5. ПОЛНЫЙ ЦИКЛ ═════════════
