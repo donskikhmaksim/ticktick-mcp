@@ -15918,6 +15918,31 @@ def _triage_cap_refusal(planned: int, max_items: int) -> Optional[str]:
             "отдельно. Ничего не сделано.")
 
 
+def _triage_untitled_claim(op: Dict, field: str) -> Tuple[bool, str]:
+    """Читает СТРУКТУРНЫЙ маркер «у этого объекта нет названия» (Д1,
+    2026-08-09) → (заявлен ли маркер, текст претензии к его типу).
+
+    Почему отдельное булево поле, а не пустая строка в `title` и не текст
+    заменителя. Пустая строка в поле названия неотличима от «модель забыла
+    название» — а именно на это требование и опиралась вся сверка id↔задача.
+    Текст заменителя («(без названия · 📎 1 файл)») печатает САМ сервер для
+    человека; принимать его обратно как имя значит объявить именем свою же
+    подпись — и тогда любой объект, чью подпись видно в списке, «называется»
+    ею. Маркер поэтому — признак, а не строка: его нельзя ни угадать по
+    выводу, ни подставить случайно.
+
+    Тип проверяется строго (`is True` / `is False`): "true" строкой или 1
+    молча читались бы как «маркера нет», и вызывающий получил бы отказ про
+    пустой title, не поняв, что его поле просто выброшено."""
+    raw = op.get(field)
+    if raw is None or raw is False:
+        return False, ""
+    if raw is True:
+        return True, ""
+    return False, (f"поле {field} должно быть булевым true (или отсутствовать), "
+                   f"а не {raw!r} — маркер «названия нет» не строка и не число.")
+
+
 def _validate_triage_ops(operations: List[Dict], max_items: int) -> Optional[str]:
     """Fail-closed валидация ВСЕГО плана до единой мутации. Любое нарушение —
     отказ ЦЕЛИКОМ (не «выкинем плохую строку и сделаем остальное»): человек
@@ -15942,13 +15967,35 @@ def _validate_triage_ops(operations: List[Dict], max_items: int) -> Optional[str
             return (f"🛑 Отказ: операция #{i} ({kind}) — пустой task_id. "
                     "Ничего не сделано.")
         title = str(op.get("title") or "").strip()
-        if not title:
+        untitled, bad_flag = _triage_untitled_claim(op, "untitled")
+        if bad_flag:
+            return (f"🛑 Отказ: операция #{i} ({kind}) — {bad_flag} "
+                    "Ничего не сделано.")
+        if untitled and title:
+            return (f"🛑 Отказ: операция #{i} ({kind}) — одновременно "
+                    f"untitled=true и title=«{title}»: это два разных "
+                    "утверждения о ТОМ ЖЕ объекте («названия нет» и «название "
+                    "такое»), и сервер не выбирает за тебя, какое из них "
+                    "проверять. Ничего не сделано.")
+        if not title and not untitled:
+            # Д1 (2026-08-09). Пока здесь стояло голое «название обязательно»,
+            # безымянная задача была через агрегатор НЕДОСТИЖИМА: любое имя,
+            # присланное за неё, дальше не проходило сверку с пустым живым.
+            # Речь про реальные объекты владельца — фотография чека Home Depot
+            # на возврат $374.92 и скриншот дефекта, обе выглядели в списке
+            # пустой строкой. Дверь открыта СТРУКТУРНЫМ маркером, а не
+            # послаблением на строку: см. `_triage_untitled_claim`.
             return (f"🛑 Отказ: операция #{i} ({kind}) — пустой title. Точное "
                     "текущее название обязательно: по нему сервер проверяет, "
-                    "что id указывает на ТУ задачу. Ничего не сделано.")
+                    "что id указывает на ТУ задачу. Если у задачи "
+                    "ДЕЙСТВИТЕЛЬНО нет названия (в списке она показана "
+                    "заменителем «(без названия …)») — передай untitled=true "
+                    "ВМЕСТО названия; сам заменитель как title слать нельзя, "
+                    "это подпись сервера, а не имя объекта. Ничего не сделано.")
+        shown = title or "без названия"
         said = str(op.get("said") or "").strip()
         if not said:
-            return (f"🛑 Отказ: операция #{i} («{title}») — пустое поле said. "
+            return (f"🛑 Отказ: операция #{i} («{shown}») — пустое поле said. "
                     "В нём должны быть СЛОВА ЧЕЛОВЕКА про ЭТУ задачу "
                     "(дословно или сжато), иначе в предпросмотре не видно, "
                     "откуда взялась строка плана. Ничего не сделано.")
@@ -15960,29 +16007,40 @@ def _validate_triage_ops(operations: List[Dict], max_items: int) -> Optional[str
         if kind == "update":
             changes = op.get("changes")
             if not isinstance(changes, dict) or not changes:
-                return (f"🛑 Отказ: операция #{i} («{title}») — update без "
+                return (f"🛑 Отказ: операция #{i} («{shown}») — update без "
                         "непустого changes. Ничего не сделано.")
             bad = [k for k in _TRIAGE_FORBIDDEN_CHANGE_KEYS if k in changes]
             if bad:
-                return (f"🛑 Отказ: операция #{i} («{title}») — в changes "
+                return (f"🛑 Отказ: операция #{i} («{shown}») — в changes "
                         f"запрещённые ключи {bad}: они разоружили бы сверку "
                         "id↔задача. Переименование — это changes={\"new_title\": "
                         "\"...\"}, а перенос — отдельная операция op=\"move\". "
                         "Ничего не сделано.")
-            refusal = _triage_change_refusal(i, title, changes)
+            refusal = _triage_change_refusal(i, shown, changes)
             if refusal:
                 return refusal
         if kind == "move" and not (str(op.get("to_project_id") or "").strip()
                                    or str(op.get("to_project") or "").strip()):
-            return (f"🛑 Отказ: операция #{i} («{title}») — move без "
+            return (f"🛑 Отказ: операция #{i} («{shown}») — move без "
                     "to_project_id и без to_project. Ничего не сделано.")
         if kind == "merge":
+            keep_untitled, bad_keep = _triage_untitled_claim(op, "keep_untitled")
+            if bad_keep:
+                return (f"🛑 Отказ: операция #{i} ({kind}) — {bad_keep} "
+                        "Ничего не сделано.")
             if not str(op.get("keep_task_id") or "").strip():
-                return (f"🛑 Отказ: операция #{i} («{title}») — merge без "
+                return (f"🛑 Отказ: операция #{i} («{shown}») — merge без "
                         "keep_task_id (какую копию оставляем). Ничего не сделано.")
-            if not str(op.get("keep_title") or "").strip():
-                return (f"🛑 Отказ: операция #{i} («{title}») — merge без "
-                        "keep_title. Ничего не сделано.")
+            if keep_untitled and str(op.get("keep_title") or "").strip():
+                return (f"🛑 Отказ: операция #{i} («{shown}») — одновременно "
+                        "keep_untitled=true и непустой keep_title. Ничего не "
+                        "сделано.")
+            if not str(op.get("keep_title") or "").strip() and not keep_untitled:
+                # Та же дверь, что и у `untitled`, — для ОСТАВЛЯЕМОЙ копии:
+                # два безымянных дубля иначе объединить нечем (Д1, 2026-08-09).
+                return (f"🛑 Отказ: операция #{i} («{shown}») — merge без "
+                        "keep_title. Если у оставляемой копии названия нет — "
+                        "keep_untitled=true. Ничего не сделано.")
     # Отдельным проходом: «оставляемая» копия не должна сама исчезнуть в этом
     # же плане — иначе объединение снесёт ОБЕ копии и данные пропадут совсем.
     doomed = {tid for tid, k in kind_of.items()
@@ -16069,7 +16127,33 @@ def _resolve_triage_ops(operations: List[Dict], by_id: Dict[str, Dict],
             resolved.append(e)
             continue
         live_title = live.get("title") or ""
-        if not _names_agree(e.get("title") or "", live_title):
+        # Маркер «названия нет» (Д1, 2026-08-09) — ОТДЕЛЬНАЯ ветка сверки, а
+        # не поблажка на пустую строку: он утверждает про живую задачу ровно
+        # то же, что и обычное название, и потому обязан проверяться так же
+        # строго. Стоит маркер, а имя у задачи ЕСТЬ → id ведёт не туда, куда
+        # думал вызывающий (её могли переименовать, могли перепутать) — это
+        # расхождение, и операция из плана выбрасывается.
+        #
+        # Судим `_looks_untitled`, а не `_is_untitled`: маркер — это ответ на
+        # то, ЧТО СЕРВЕР НАПЕЧАТАЛ, а печатает он заменитель именно по
+        # `_looks_untitled` (название из одних невидимых символов человек
+        # видит пустым местом). Разойдись показ со сверкой — и задача,
+        # показанная безымянной, снова стала бы недостижимой: настоящее её
+        # «имя» вызывающий напечатать не может, он его не видел.
+        if e.get("untitled") is True:
+            if not _looks_untitled(live_title):
+                # Живое имя кладётся В ОПЕРАЦИЮ, а не только в текст причины:
+                # у маркерной операции своего `title` нет вовсе, и без этого
+                # справка «❌ Не вошло» печатала про НАЙДЕННУЮ задачу «её нет
+                # в живом состоянии аккаунта» — та самая ложь, ради которой
+                # П15 и делался, только с другой стороны.
+                e["_live_title"] = live_title
+                e["_skip"] = ("в плане стоит untitled=true («названия нет»), а "
+                              f"по этому id сейчас «{live_title}» — это другой "
+                              "объект, чем имели в виду")
+                resolved.append(e)
+                continue
+        elif not _names_agree(e.get("title") or "", live_title):
             e["_skip"] = (f"название не совпало — по этому id сейчас "
                           f"«{live_title}», а в плане «{e.get('title')}»")
             resolved.append(e)
@@ -16105,8 +16189,15 @@ def _resolve_triage_ops(operations: List[Dict], by_id: Dict[str, Dict],
                               "не осталось бы ни одной копии")
                 resolved.append(e)
                 continue
-            if not _names_agree(e.get("keep_title") or "",
-                                keep_live.get("title") or ""):
+            keep_live_title = keep_live.get("title") or ""
+            if e.get("keep_untitled") is True:
+                if not _looks_untitled(keep_live_title):
+                    e["_skip"] = ("для основной копии стоит keep_untitled=true "
+                                  f"(«названия нет»), а она называется "
+                                  f"«{keep_live_title}» — дубль НЕ удаляю")
+                    resolved.append(e)
+                    continue
+            elif not _names_agree(e.get("keep_title") or "", keep_live_title):
                 e["_skip"] = ("основная задача по keep_task_id называется "
                               f"«{keep_live.get('title')}», а не "
                               f"«{e.get('keep_title')}» — дубль НЕ удаляю")
@@ -16314,7 +16405,17 @@ def _triage_drift_reason(op: Dict, by_id: Dict[str, Dict],
     live = by_id.get(op.get("task_id"))
     if not live:
         return "исчезла из открытых задач между планом и исполнением"
-    if not _names_agree(op.get("title") or "", live.get("title") or ""):
+    # Маркер «названия нет» обязан пере-проверяться ЗДЕСЬ отдельной веткой
+    # (Д1, 2026-08-09). Через `_names_agree` он не проверяется вообще: у такой
+    # операции `title` пуст, а пустое ожидание — «претензии нет, пропускай».
+    # То есть без этой ветки задача, которой между планом и нажатием кнопки
+    # ДАЛИ название, была бы удалена как безымянная — ровно та подмена
+    # объекта, от которой сверка и стоит.
+    if op.get("untitled") is True:
+        if not _looks_untitled(live.get("title") or ""):
+            return ("в плане стояло «названия нет», а после плана задаче дали "
+                    f"название («{live.get('title')}»)")
+    elif not _names_agree(op.get("title") or "", live.get("title") or ""):
         return (f"название изменилось после плана (сейчас «{live.get('title')}»)")
     if op["op"] == "move":
         to_id = op.get("_to_project_id") or ""
@@ -16455,6 +16556,8 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         "op":      "delete" | "complete" | "update" | "move" | "merge",
         "task_id": "<task id>",                      # required, non-empty
         "title":   "<the task's exact CURRENT title>",  # required — identity guard
+        "untitled": true,   # INSTEAD of "title", ONLY for a task that really
+                            # has NO title — see below
         "said":    "<what the HUMAN said about THIS task>",  # required
         # op="update" only — same field names update_tasks itself takes:
         "changes": {"new_title": "...", "due_date": "YYYY-MM-DD",
@@ -16468,8 +16571,22 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         # tags are LOST with it (real field-merging is a separate feature that
         # does not exist yet). The preview says so out loud.
         "keep_task_id": "<id of the copy that STAYS>",
-        "keep_title":   "<its exact current title>"
+        "keep_title":   "<its exact current title>",
+        "keep_untitled": true   # INSTEAD of "keep_title", same rule as
+                                # "untitled" but for the copy that STAYS
       }
+
+    `untitled` — the ONLY way to name a task that has no name. Some tasks
+    genuinely carry an EMPTY title (a photo of a receipt, a screenshot of a
+    bug) and the server prints them with a stand-in like
+    «(без названия · 📎 1 файл)». That stand-in is the SERVER's caption for a
+    human, NOT the task's name: sending it back as `title` is a mismatch and
+    the operation gets dropped. Set `untitled: true` and OMIT `title`
+    instead — then the identity guard checks that the live task really has no
+    title. If it turns out to HAVE one, the operation is dropped exactly like
+    a wrong title would be (the id points at something else than you meant).
+    Never set `untitled` for a task that shows a real name in the list, and
+    never send both `untitled` and `title` — that is refused outright.
 
     `changes` accepts ONLY these keys: new_title, content, due_date,
     start_date, priority (0|1|3|5), tags (list of strings), reminders,
@@ -16497,10 +16614,13 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
 
     Refused OUTRIGHT (nothing is mutated, no manifest is created): an empty
     list, more operations than the cap (50 hard-coded server-side, `max_items`
-    can only LOWER it), an unknown `op`, a missing task_id/title/said, the same
+    can only LOWER it), an unknown `op`, a missing task_id/said, a missing
+    title that carries no `untitled: true` either, `title` and `untitled`
+    together, an `untitled` that is not a real boolean, the same
     task_id in two operations, update without `changes`, an unknown or
     wrongly-typed key inside `changes`, move without a destination, merge
-    without keep_task_id/keep_title, a merge whose kept task is itself
+    without keep_task_id, merge without keep_title and without
+    `keep_untitled: true`, a merge whose kept task is itself
     deleted/closed elsewhere in the same plan, or (when the Telegram approval
     layer is on) a plan too long to fit one Telegram message.
 
