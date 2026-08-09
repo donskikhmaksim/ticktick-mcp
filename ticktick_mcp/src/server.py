@@ -2869,8 +2869,28 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                     except Exception as e:
                         logger.warning(f"Column failed: {e}")
                         sub_notes.append(f"⚠️ раздел (column) не применился: {_redact_for_user(e)}")
+                # Д11 (2026-08-09): число в ГЛАВНОЙ строке считается по
+                # СОЗДАННОМУ, а не по запрошенному. Раньше здесь стояло
+                # `len(tasks_flat)` целиком — то есть строка «✓ «Ремонт» + 7
+                # подзадач» печаталась и тогда, когда канал только что
+                # отклонил половину дерева, прямо противореча собственному
+                # предупреждению двумя строками выше. Соседняя ветка того же
+                # метода (PATH B, `sub_count = len(all_sub_tasks) -
+                # len(sub_fail)`) вычитала отказы всегда — правило берётся
+                # оттуда. Корень считается отдельно: когда отклонён он сам,
+                # «✓ «title»» было бы ложью про саму задачу, а не про счёт.
                 total = len(tasks_flat)
-                line = f"✓ «{title}» + {total - 1} подзадач (дерево, {total} всего)"
+                made = total - len(tree_fail)
+                root_ok = tasks_flat[0]["id"] not in tree_fail
+                kids_made = made - (1 if root_ok else 0)
+                if root_ok:
+                    line = f"✓ «{title}» + {kids_made} подзадач (дерево, "
+                    line += (f"{made} из {total})" if tree_fail
+                             else f"{total} всего)")
+                else:
+                    line = (f"⚠️ «{title}» — САМА задача НЕ создана, TickTick "
+                            f"отклонил её (из дерева создано {made} из "
+                            f"{total})")
                 # Родитель КОРНЯ дерева (когда всё дерево вешают под уже
                 # существующую задачу) — такое же ожидание, как у подзадач:
                 # ожидается только если канал не сообщил об отказе по этой
