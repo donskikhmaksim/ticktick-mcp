@@ -249,6 +249,40 @@ async def test_automation_key_path_refuses_the_blind_rename(monkeypatch,
     assert "manifest_id" not in out, out
 
 
+async def test_automation_key_path_is_refused_by_the_core_after_the_plan_check(
+        monkeypatch, tmp_path):
+    """Тот же путь, но случай, о котором фаза плана знать НЕ МОГЛА: на момент
+    сверки задача была безымянной (маркер верен, план молчит), а к моменту
+    записи её назвали в приложении. Ключ исполняет с первого вызова, второго
+    подтверждения нет — значит здесь работает только ядро, и этот тест краснеет
+    ровно при его откате."""
+    live = {"t_receipt": {"id": "t_receipt", "title": "", "projectId": "pA"}}
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+    monkeypatch.setattr(s, "SECRET", "s3cret-key-for-the-robot")
+    _v2, official = _wire(monkeypatch, live)
+
+    # Часы гонки: имя появляется РОВНО между сверкой плана и обращением к
+    # каналу записи.
+    _check = s._plan_live_check
+
+    def _named_right_after_the_plan(tasks, describe, row_refusal=None):
+        res = _check(tasks, describe, row_refusal=row_refusal)
+        live["t_receipt"]["title"] = "Чек Home Depot — возврат $374.92"
+        return res
+
+    monkeypatch.setattr(s, "_plan_live_check", _named_right_after_the_plan)
+
+    out = await s.update_tasks(
+        "робот называет пустышку",
+        [{"taskId": "t_receipt", "projectId": "pA", "untitled": True,
+          "new_title": "Робот назвал"}],
+        automation_key="s3cret-key-for-the-robot")
+
+    assert official.update_calls == [], official.update_calls
+    assert live["t_receipt"]["title"] == "Чек Home Depot — возврат $374.92"
+    assert "🛑" in out and "untitled" in out, out
+
+
 async def test_automation_key_path_still_renames_with_the_current_title(
         monkeypatch, tmp_path):
     """Ключ не превращается в запрет на работу: законное переименование
