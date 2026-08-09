@@ -325,15 +325,22 @@ class TickTickClient:
         
         logger.debug("Tokens saved to .env file")
     
-    def _make_request(self, method: str, endpoint: str, data=None) -> Dict:
+    def _make_request(self, method: str, endpoint: str, data=None, *,
+                       idempotent: bool = False) -> Dict:
         """
         Makes a request to the TickTick API.
-        
+
         Args:
             method: HTTP method (GET, POST, PUT, DELETE)
             endpoint: API endpoint (without base URL)
             data: Request data (for POST, PUT)
-        
+            idempotent: whether a 429/5xx retry is safe to fire WITHOUT
+                knowing if the first attempt's write already landed
+                server-side. Ignored for GET (always safe). For POST/DELETE
+                the default is False — see the comment above the retry loop
+                for why callers must opt in explicitly rather than this
+                defaulting to "retry everything".
+
         Returns:
             API response as a dictionary
         """
@@ -354,13 +361,53 @@ class TickTickClient:
             response = _issue()
 
             # Retry on 429/5xx with exponential backoff (1s, 2s) — rate limits
-            # on bursts usually clear after a short wait. 2026-08-09: added
-            # 502/504 — Cloudflare-proxy transients — to match the v2 client's
-            # set (ticktick_v2_client.py's _request), which already retries
-            # them; the two channels had silently drifted apart, and this one
-            # was the narrower of the two.
+            # on bursts usually clear after a short wait. 2026-08-09 (packet
+            # П9): added 502/504 — Cloudflare-proxy transients — to match the
+            # v2 client's set (ticktick_v2_client.py's _request), which
+            # already retries them.
+            #
+            # 2026-08-09 (Д4 fix, follow-up to П9): unifying the STATUS-CODE
+            # list across both clients was fine — 502/504 genuinely are
+            # transient proxy blips on both channels. But П9 ALSO made the
+            # retry unconditional on this (v1/official) channel, and that
+            # part does not carry over: a 5xx/429 here means the CLIENT never
+            # saw a response, not that the server never processed the
+            # request — a 504 in particular is a gateway giving up waiting,
+            # which is exactly the shape of "the write landed but the ack got
+            # lost". Whether a blind retry is then safe depends on what kind
+            # of write it is:
+            #   - update-by-id / complete-by-id / delete-by-id: retrying
+            #     re-applies the SAME change to the SAME id — a no-op on the
+            #     second try, not a duplicate.
+            #   - create (POST /project, POST /task with no id yet): on THIS
+            #     channel the SERVER mints the new id — there is no
+            #     idempotency key. Retrying a lost-ack create resends "make a
+            #     new task" and TickTick has no way to recognise it as a
+            #     repeat: a second, orphaned task is created. The command
+            #     that issued it sees the id from the SECOND response, a
+            #     post-write verify finds that id and reports success, and
+            #     the first copy never appears in any log — it surfaces only
+            #     when someone finds it by hand later.
+            #   - This is exactly the case where ticktick_v2_client.py's
+            #     retry is NOT a template to copy: v2's /batch/task takes an
+            #     "id" the CLIENT already generated (uuid4 — see
+            #     server.py's `task_id = _uuid.uuid4().hex[:24]` minted
+            #     BEFORE calling batch_create_tasks). Resubmitting that
+            #     object on v2 is an upsert on the SAME id, so a retry there
+            #     can never fork into two tasks. The two channels are not
+            #     interchangeable on this point, even though they now share
+            #     one status-code list.
+            #
+            # So: GET is always retried (reading twice changes nothing). A
+            # write is retried ONLY when the caller explicitly marks the
+            # call idempotent=True. The default is False, so a new
+            # POST/DELETE call site that forgets to think about this simply
+            # fails fast on a 5xx instead of silently duplicating — fail-fast
+            # is the safe direction for the default to fall in.
             for _attempt in range(2):
                 if response.status_code not in (429, 500, 502, 503, 504):
+                    break
+                if method != "GET" and not idempotent:
                     break
                 time.sleep(2 ** _attempt)
                 response = _issue()
@@ -428,6 +475,10 @@ class TickTickClient:
             "viewMode": view_mode,
             "kind": kind
         }
+        # Create: the server mints the new id, no idempotency key exists on
+        # this channel. NOT retried (idempotent left at its default False) —
+        # a lost-ack retry here would create a second project. See the retry
+        # comment in _make_request for the full explanation.
         return self._make_request("POST", "/project", data)
     
     def update_project(self, project_id: str, name: str = None, color: str = None, 
@@ -443,11 +494,15 @@ class TickTickClient:
         if kind:
             data["kind"] = kind
             
-        return self._make_request("POST", f"/project/{project_id}", data)
-    
+        # Update-by-known-id: reapplying the same change on retry is a no-op,
+        # not a duplicate. Safe to retry (see _make_request's retry comment).
+        return self._make_request("POST", f"/project/{project_id}", data, idempotent=True)
+
     def delete_project(self, project_id: str) -> Dict:
         """Deletes a project."""
-        return self._make_request("DELETE", f"/project/{project_id}")
+        # Delete-by-known-id: retrying a lost-ack delete just deletes the
+        # same (now already-gone) project again. Safe to retry.
+        return self._make_request("DELETE", f"/project/{project_id}", idempotent=True)
     
     # Task methods
     def get_task(self, project_id: str, task_id: str) -> Dict:
@@ -487,8 +542,11 @@ class TickTickClient:
         if reminders:
             data["reminders"] = reminders
 
+        # Create: same reasoning as create_project — NOT retried. This is
+        # the exact call the Д4 defect was about (a lost-ack 504 retry here
+        # created a ghost duplicate task).
         return self._make_request("POST", "/task", data)
-    
+
     def update_task(self, task_id: str, project_id: str, title: str = None,
                    content: str = None, priority: int = None,
                    start_date: str = None, due_date: str = None,
@@ -521,15 +579,20 @@ class TickTickClient:
         if reminders:
             data["reminders"] = reminders
 
-        return self._make_request("POST", f"/task/{task_id}", data)
-    
+        # Update-by-known-id: safe to retry, see delete_project's comment.
+        return self._make_request("POST", f"/task/{task_id}", data, idempotent=True)
+
     def complete_task(self, project_id: str, task_id: str) -> Dict:
         """Marks a task as complete."""
-        return self._make_request("POST", f"/project/{project_id}/task/{task_id}/complete")
-    
+        # State transition on a known id: retrying re-marks the same task
+        # complete — a no-op the second time, not a duplicate. Safe to retry.
+        return self._make_request("POST", f"/project/{project_id}/task/{task_id}/complete",
+                                   idempotent=True)
+
     def delete_task(self, project_id: str, task_id: str) -> Dict:
         """Deletes a task."""
-        return self._make_request("DELETE", f"/project/{project_id}/task/{task_id}")
+        # Delete-by-known-id: safe to retry, see delete_project's comment.
+        return self._make_request("DELETE", f"/project/{project_id}/task/{task_id}", idempotent=True)
     
     def create_subtask(self, subtask_title: str, parent_task_id: str, project_id: str, 
                       content: str = None, priority: int = 0) -> Dict:
@@ -556,5 +619,7 @@ class TickTickClient:
             data["content"] = content
         if priority is not None:
             data["priority"] = priority
-            
+
+        # Create (same /task endpoint as create_task): NOT retried, same
+        # reasoning as create_project/create_task above.
         return self._make_request("POST", "/task", data)
