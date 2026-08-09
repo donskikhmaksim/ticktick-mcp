@@ -16134,6 +16134,39 @@ _GENERIC_GATE_ENTRY = _AutoExecutorEntry(_generic_gate_rehash,
                                          _generic_gate_auto_execute)
 
 
+def _tool_is_registered(tool: str) -> bool:
+    """Единственный источник истины о том, жив ли инструмент `tool` СЕЙЧАС
+    (2026-08-09): реестр самого FastMCP (`mcp._tool_manager`), а не globals().
+    Отключение тула здесь делается комментированием ОДНОГО декоратора
+    `@mcp.tool()` (см. плашки «DISABLED» у plan_declutter/execute_declutter/
+    resume_declutter/set_declutter_decision выше) — сама функция и её `_impl`
+    остаются в модуле нетронутыми, поэтому проверка `globals().get(...)` их
+    по-прежнему находит и НИЧЕГО не говорит о том, отключён ли тул. Прямой
+    `mcp._tool_manager.get_tool(...)` — синхронный (в отличие от публичного
+    async `mcp.list_tools()`, которым пользуется tests/test_tool_registry.py)
+    и не требует await из этой синхронной функции."""
+    if not tool:
+        return False
+    return mcp._tool_manager.get_tool(tool) is not None
+
+
+def _auto_execute_tool_disabled_refusal(tool: str):
+    """Фабрика исполнителя-отказника для `_resolve_auto_executor`: вместо
+    того чтобы молча вернуть None (кандидат просто выпал бы из очереди без
+    единого слова владельцу — см. `continue` в `_tg_auto_execute_tick`),
+    исполняет по ТОЙ ЖЕ схеме, что и обычный отказ (`_auto_execute_rename_tag`
+    выше, начинается с 🛑) — а значит проходит весь штатный конвейер:
+    `_auto_execute_report_is_failure` увидит 🛑, надгробие ляжет как
+    «нажато, но не выполнено», и текст уйдёт владельцу в Telegram, а не в
+    лог, который никто не читает в моменте."""
+    async def _refuse(manifest_id: str, m: Dict) -> str:
+        return (f"🛑 Автоисполнение отменено: инструмент «{tool}» в сервере "
+                "отсутствует (отключён или удалён) — план исполнен не "
+                "будет. Если функция должна быть доступна, инструмент нужно "
+                "сперва вернуть в реестр (раскомментировать @mcp.tool()).")
+    return _refuse
+
+
 def _resolve_auto_executor(tool: str, m: Dict) -> Optional[_AutoExecutorEntry]:
     """Which executor runs this manifest: an explicitly registered one wins
     (delete_tasks today — its manifest shape predates the shared gates), the
@@ -16141,16 +16174,32 @@ def _resolve_auto_executor(tool: str, m: Dict) -> Optional[_AutoExecutorEntry]:
     and everything else returns None (candidate skipped, nothing happens).
     Deliberately does NOT resolve declutter: its registration stays commented
     out above, and a declutter manifest has no `_gate` key, so it falls
-    through to None here too — both layers stay disabled together."""
+    through to None here too — both layers stay disabled together.
+
+    2026-08-09: раньше отсюда не проверялось НИЧЕГО, кроме факта, что где-то
+    в модуле есть подходящая функция (`_AUTO_EXECUTORS` — регистрация в
+    отдельном словаре; generic-путь — просто `globals()`). Ни то, ни другое
+    не связано с тем, зарегистрирован ли тул в MCP-сервере СЕЙЧАС: отключение
+    комментированием ОДНОГО декоратора `@mcp.tool()` не трогает ни функцию,
+    ни (для generic-пути) `_<tool>_impl`, ни (для explicit-пути) саму запись
+    в `_AUTO_EXECUTORS`, если её кто-то забыл закомментировать вместе с
+    декоратором — ровно тот класс бага, который здесь и произошёл с
+    declutter (см. плашку у `_register_auto_executor` выше). Раз нашёлся
+    исполнитель-кандидат (explicit или generic), но `tool` не зарегистрирован
+    — не отдаём его как есть: подменяем на явный отказ
+    (`_auto_execute_tool_disabled_refusal`), который объясняет причину
+    владельцу, а не просто исчезает молча."""
     if not tool:
         return None
     entry = _AUTO_EXECUTORS.get(tool)
-    if entry is not None:
-        return entry
-    if m.get("_gate") in ("batch", "single") and callable(
+    if entry is None and m.get("_gate") in ("batch", "single") and callable(
             globals().get(f"_{tool}_impl")):
-        return _GENERIC_GATE_ENTRY
-    return None
+        entry = _GENERIC_GATE_ENTRY
+    if entry is None:
+        return None
+    if _tool_is_registered(tool):
+        return entry
+    return _AutoExecutorEntry(entry.rehash, _auto_execute_tool_disabled_refusal(tool))
 
 
 def _auto_execute_tool_of(m: Dict) -> str:
