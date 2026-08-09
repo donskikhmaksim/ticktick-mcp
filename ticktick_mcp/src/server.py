@@ -3783,7 +3783,13 @@ async def update_tasks(
         # обязана называть задачу, а не показывать её id (_plan_task_name).
         titles = _plan_task_titles(tasks)
         describe = functools.partial(_describe_update_item, titles=titles)
-        describe, notes, refusal = _plan_live_check(tasks, describe)
+        # Н9 (2026-08-09): фаза плана обязана знать то же правило, что и ядро.
+        # До этого она печатала «название → «Затёрто»» без пометки, человек
+        # соглашался, и всё согласие уходило в 🛑 на исполнении. Правило не
+        # копируется сюда второй реализацией: план зовёт ТУ ЖЕ функцию отказа,
+        # что и мутатор, на уже прочитанном живом состоянии.
+        describe, notes, refusal = _plan_live_check(
+            tasks, describe, row_refusal=_rename_guard_refusal)
         if refusal:
             return refusal
     outcome = await _gate_batch("update", "update_tasks", tasks, summary,
@@ -3913,27 +3919,70 @@ class _PlanCheck:
     (сверка прошла, помечать нечего). Слить их в одно «пометок нет» и значит
     выдать незнание за «всё в порядке»; ровно это и чинится."""
 
-    __slots__ = ("marks", "checked", "why")
+    __slots__ = ("marks", "checked", "why", "row_marks")
 
-    def __init__(self, marks: Dict[str, str], checked: bool = True, why: str = ""):
+    def __init__(self, marks: Dict[str, str], checked: bool = True, why: str = "",
+                 row_marks: Optional[Dict[int, str]] = None):
         self.marks = marks
         self.checked = checked
         self.why = why
+        # Пометки, привязанные к НОМЕРУ СТРОКИ, а не к taskId (2026-08-09).
+        # `marks` по id верны для своих причин: «задачи нет среди открытых» и
+        # «id указывает на другую задачу» — свойства САМОГО id, и все строки с
+        # этим id обречены одинаково. Причина «в этой строке пишут в поле
+        # названия без сверки» — свойство ПОЛЕЙ СТРОКИ: один и тот же id
+        # может стоять в законной строке (срок) и в обречённой
+        # (переименование), и пометка по id либо приписала бы ⛔ законной
+        # строке, либо (что хуже) отменила бы весь план из-за соседней.
+        self.row_marks: Dict[int, str] = row_marks or {}
 
 
-def _check_plan_rows(tasks: List[Dict[str, Any]]) -> _PlanCheck:
+def _row_refusal_reason(refusal: str, label: str) -> str:
+    """Текст отказа исполнения → причина для пометки ⛔ в плане.
+
+    Снимает ведущее «🛑 НЕ <глагол> «label» — », и только его: тело причины
+    остаётся ДОСЛОВНО тем же, что человек прочитает на исполнении, — иначе у
+    плана и у исполнителя завелись бы два расходящихся объяснения одного
+    отказа.
+
+    Сравнение идёт по ПОЛНОМУ префиксу с подставленным label, а не по первому
+    « — » в строке: у настоящих задач разделитель встречается прямо в имени
+    («Договор аренды — подписать до 15-го»), и резать по нему значило бы
+    показывать человеку обрубок его же названия вместо причины."""
+    for verb in ("переименовал", "обновил"):
+        head = f"🛑 НЕ {verb} «{label}» — "
+        if refusal.startswith(head):
+            return refusal[len(head):]
+    return refusal
+
+
+def _check_plan_rows(tasks: List[Dict[str, Any]], row_refusal=None) -> _PlanCheck:
     """Сверяет строки плана с живым состоянием. Причины ровно те, по которым
     откажет исполнитель: задачи нет среди открытых (завершена / удалена / в
     корзине) или id указывает на ДРУГУЮ задачу. Формулировку причины даёт сам
     guard (`missing[...]["reason"]`), поэтому корзина называется корзиной и
     несёт подсказку `restore_tasks`, а не растворяется в общем «нет среди
-    открытых»."""
+    открытых».
+
+    `row_refusal(t, live_title, label) -> Optional[str]` — ПОСТРОЧНАЯ проверка
+    ядра того тула, чей план сейчас строится (2026-08-09). Её передаёт сам
+    тул, и это не украшение сигнатуры: правило «пишешь в поле названия —
+    предъяви текущее» живёт в ядре `update_tasks`, а `complete_tasks`,
+    `move_tasks` и `set_task_tags` про него ничего не знают. Позвать её
+    безусловно значило бы напечатать ⛔ у тула, который эту строку исполнит
+    как ни в чём не бывало, — то есть соврать в другую сторону.
+
+    Причина при этом НЕ ДОСПРАШИВАЕТ состояние: живое имя берётся из строки
+    `found`, которую `_split_tasks_by_state` уже вернул (поле `live_title` —
+    то самое, на котором guard принимал решение, при необходимости прочитанное
+    официальным запасным каналом). `None` там значит «не читали» и разрешением
+    не является ни здесь, ни на исполнении."""
     try:
         by_id = _open_by_id(fresh=True)
         if by_id is None:
             return _PlanCheck({}, checked=False,
                               why="живое состояние аккаунта недоступно")
-        _found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
+        found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
     except Exception as e:
         logger.warning(f"сверка плана с живым состоянием не удалась ({e}) — "
                        f"план скажет об этом вслух")
@@ -3947,43 +3996,78 @@ def _check_plan_rows(tasks: List[Dict[str, Any]]) -> _PlanCheck:
     for m in mismatch:
         out[str(m.get("taskId"))] = (f"id указывает на другую задачу — "
                                      f"живое название «{m.get('actual')}»")
-    return _PlanCheck(out)
+    rows: Dict[int, str] = {}
+    if row_refusal is not None:
+        for f in found:
+            row = f.get("row")
+            if row is None or not (0 <= row < len(tasks)):
+                continue
+            label = f.get("label") or f.get("title") or ""
+            refusal = row_refusal(tasks[row], f.get("live_title"), label)
+            if refusal:
+                rows[row] = _row_refusal_reason(refusal, label)
+    return _PlanCheck(out, row_marks=rows)
 
 
-def _mark_unapplicable_rows(describe_item, marks: Dict[str, str]):
+def _plan_row_why(i: int, t: Dict[str, Any], check: _PlanCheck) -> str:
+    """Почему ЭТА строка плана обречена — по обоим видам пометок, или ""."""
+    return (check.marks.get(str(t.get("taskId") or t.get("task_id") or ""))
+            or check.row_marks.get(i, ""))
+
+
+def _mark_unapplicable_rows(describe_item, marks: Dict[str, str],
+                            tasks: Optional[List[Dict[str, Any]]] = None,
+                            row_marks: Optional[Dict[int, str]] = None):
     """describe-функция тула + пометка обречённой строки. Пометка живёт ТОЛЬКО
     в тексте превью и не попадает в сами элементы манифеста: на исполнении
     состояние перечитывается заново, и вчерашняя пометка не должна ни отменять
-    строку, ни выдавать себя за проверку."""
+    строку, ни выдавать себя за проверку.
+
+    Построчные пометки (`row_marks`) находятся по ТОМУ ЖЕ объекту строки
+    (`x is t`), а не по taskId и не по счётчику вызовов: describe зовут по
+    элементам того же списка `tasks`, который сверялся, а id в этом списке
+    может повторяться."""
     def describe(t: Dict[str, Any]) -> str:
         line = describe_item(t)
         why = marks.get(str(t.get("taskId") or t.get("task_id") or ""))
+        if not why and row_marks:
+            for i, x in enumerate(tasks or ()):
+                if x is t:
+                    why = row_marks.get(i)
+                    break
         return f"{line}\n   ⛔ НЕ БУДЕТ ПРИМЕНЕНО: {why}" if why else line
     return describe
 
 
-def _plan_live_check(tasks: List[Dict[str, Any]], describe_item):
+def _plan_live_check(tasks: List[Dict[str, Any]], describe_item, row_refusal=None):
     """(describe, notes, refusal) для фазы ПЛАНА батч-мутатора.
 
     `refusal` не None — вернуть его вызывающему как есть: план не строится,
-    манифест не создаётся, ничего не изменено."""
-    check = _check_plan_rows(tasks)
+    манифест не создаётся, ничего не изменено.
+
+    `row_refusal` — построчная проверка ядра ЭТОГО тула, см. `_check_plan_rows`.
+    Без неё план молчал про строки, которые исполнитель заведомо отвергнет по
+    их собственным полям: карточка печатала «название → «Затёрто»» без единой
+    пометки, человек жал «да», и всё согласие уходило в отказ. Правда о СВОЕЙ
+    осведомлённости — обязанность фазы плана: причина известна из уже
+    прочитанного состояния, доспрашивать для неё нечего."""
+    check = _check_plan_rows(tasks, row_refusal=row_refusal)
     if not check.checked:
         return describe_item, [_PLAN_UNVERIFIED_NOTE.format(why=check.why)], None
-    if not check.marks:
+    if not check.marks and not check.row_marks:
         return describe_item, None, None
-    alive = [t for t in tasks
-             if str(t.get("taskId") or t.get("task_id") or "") not in check.marks]
-    if not alive:
+    doomed = [i for i, t in enumerate(tasks) if _plan_row_why(i, t, check)]
+    if len(doomed) == len(tasks):
         reasons = "\n".join(
             f"- «{(t.get('title') or '').strip() or str(t.get('taskId') or t.get('task_id') or '')}»: "
-            f"{check.marks.get(str(t.get('taskId') or t.get('task_id') or ''), '')}"
-            for t in tasks)
+            f"{_plan_row_why(i, t, check)}"
+            for i, t in enumerate(tasks))
         return describe_item, None, (
             "🛑 План НЕ построен — исполнить нечего: ни одна строка не пройдёт "
             f"проверку на исполнении.\n{reasons}\nНичего не изменено.")
-    return (_mark_unapplicable_rows(describe_item, check.marks),
-            [_PLAN_UNAPPLICABLE_NOTE.format(n=len(check.marks), total=len(tasks))],
+    return (_mark_unapplicable_rows(describe_item, check.marks, tasks,
+                                    check.row_marks),
+            [_PLAN_UNAPPLICABLE_NOTE.format(n=len(doomed), total=len(tasks))],
             None)
 
 
@@ -17229,10 +17313,23 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict],
 
     upd = [o for o in ready if o["op"] == "update"]
     if upd:
+        # Маркер «названия нет» ПРОБРАСЫВАЕТСЯ В ЯДРО (2026-08-09). У операции
+        # с `untitled: true` поле `title` пусто по определению, и без маркера
+        # ядро видело ровно то, что запрещено: запись в поле названия при
+        # пустом переданном имени. Проходило оно там по другому основанию —
+        # «имени нет ни у вызывающего, ни у живой задачи», — то есть обещание
+        # докстринга «законный случай держит открытым маркер» выполнял не
+        # маркер. Разница не косметическая: утверждение «у этой задачи имени
+        # нет» ядро СВЕРЯЕТ с живым состоянием, которое оно читает само,
+        # непосредственно перед записью. Между сверкой разбора и этим чтением
+        # задачу могли назвать в приложении — тогда id указывает уже не на тот
+        # объект, о котором человек принимал решение, и строка обязана
+        # получить отказ, а не тихо примениться.
         items = [{"taskId": o["task_id"],
                   "projectId": (by_id.get(o["task_id"]) or {}).get("projectId")
                   or o.get("_project_id", ""),
                   "title": o.get("title") or "",
+                  **({"untitled": True} if o.get("untitled") is True else {}),
                   **(o.get("changes") or {})} for o in upd]
         sections.append(("✏️ Изменения", await _update_tasks_impl(summary, items)))
 

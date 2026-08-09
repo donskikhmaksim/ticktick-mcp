@@ -111,21 +111,26 @@ async def test_rename_without_title_is_refused_in_the_batch_path_too(monkeypatch
     assert live["t2"]["title"] == "Вторая"
 
 
-async def test_the_public_tool_refuses_it_too_after_a_real_yes(monkeypatch,
-                                                               tmp_path):
-    """Через ПУБЛИЧНЫЙ интерфейс — тот, который видит модель: план, живое
-    согласие, исполнение. Тест на одну лишь внутреннюю функцию не доказал бы,
-    что запрет вообще достижим снаружи."""
+async def test_the_public_tool_refuses_it_at_the_plan_phase(monkeypatch,
+                                                            tmp_path):
+    """Через ПУБЛИЧНЫЙ интерфейс — тот, который видит модель. Тест на одну лишь
+    внутреннюю функцию не доказал бы, что запрет вообще достижим снаружи.
+
+    2026-08-09: отказ теперь приходит РАНЬШЕ — на фазе плана, единственной
+    строке отказано, исполнимых не осталось, и манифеста не создаётся вовсе.
+    Раньше здесь строился план, человек говорил «да», и только тогда получал
+    🛑: согласие спрашивали на то, чего не будет. Ядро при этом остаётся
+    сторожем и достижимо снаружи — см. `test_the_approved_plan_is_still_refused_by_the_core`
+    и путь `automation_key` в tests/test_plan_knows_the_rename_rule.py."""
     live = _lease_live()
     monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
     v2, official = _wire(monkeypatch, live)
 
-    preview = await s.update_tasks("переименую", [
+    out = await s.update_tasks("переименую", [
         {"taskId": "t_lease", "projectId": "pA", "new_title": "ЗАТЁРТО"}])
-    mid = _extract_manifest_id(preview)
-    out = await s.update_tasks("переименую", manifest_id=mid, user_reply="да")
 
     assert "🛑" in out and "new_title" in out, out
+    assert "manifest_id" not in out, out
     assert _no_writes(v2, official), \
         f"канал всё-таки дёрнули: official={official.update_calls}, v2={v2.calls}"
     assert live["t_lease"]["title"] == _LEASE
