@@ -181,10 +181,18 @@ def test_describe_triage_op_never_puts_an_id_in_the_name_slot():
     assert f"«{GHOST}»" not in line, line
 
 
-async def test_manual_triage_skipped_row_is_named_not_numbered():
-    """Строка ПРОПУЩЕНО (задачи нет среди открытых) тоже обязана называть
-    задачу. Пустой title сюда не доходит вовсе — manual_triage отказывает
-    раньше, целым планом, — поэтому проверяется достижимый случай."""
+async def test_manual_triage_mismatch_block_names_the_task_not_its_number():
+    """Справочный блок «❌ Не вошло» (задачи нет среди открытых) тоже обязан
+    НАЗЫВАТЬ задачу, а не показывать один номер. Пустой title сюда не доходит
+    вовсе — manual_triage отказывает раньше, целым планом, — поэтому
+    проверяется достижимый случай.
+
+    2026-08-09 (П19): раньше это была строка ТОГО ЖЕ плана с пометкой
+    ⚠️ ПРОПУЩЕНО; теперь операция из плана выброшена и живёт в справке под ним
+    — требование «называй объект по имени» от переезда не изменилось.
+    Обрезанный id (первые 8 символов) в справке ЕСТЬ и это намеренно: он якорь
+    для следующего вызова. Запрет ровно один и прежний — сырой id ВМЕСТО
+    имени, и `_assert_named` проверяет отсутствие ПОЛНОГО id."""
     text = await stand.call(
         "manual_triage", summary="Разбираю",
         operations=[
@@ -194,7 +202,8 @@ async def test_manual_triage_skipped_row_is_named_not_numbered():
              "title": "Записаться к врачу", "said": "к врачу сходил"},
         ])
 
-    assert "ПРОПУЩЕНО" in text, text
+    assert "❌ Не вошло: 1" in text, text
+    assert "ПРОПУЩЕНО" not in text, text
     _assert_named(text, "Призрак", GHOST)
 
 

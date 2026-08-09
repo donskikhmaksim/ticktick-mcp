@@ -591,8 +591,13 @@ async def test_drifted_task_is_skipped_not_applied(monkeypatch, tmp_path):
     assert "Пропущено" in out and "название изменилось" in out
 
 
-async def test_operation_on_a_vanished_task_is_marked_skipped_at_plan_time(
+async def test_operation_on_a_vanished_task_is_dropped_from_the_plan(
         monkeypatch, tmp_path):
+    """2026-08-09 (П19): не прошедшая сверку операция В ПЛАН НЕ ПОПАДАЕТ.
+    Раньше она оставалась строкой того же плана с пометкой ⚠️ ПРОПУЩЕНО и
+    лежала в манифесте — здесь закреплено обратное: в манифесте её нет, а
+    человек читает про неё в справочном блоке ПОД планом, к которому кнопка
+    подтверждения не относится."""
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
 
@@ -602,10 +607,13 @@ async def test_operation_on_a_vanished_task_is_marked_skipped_at_plan_time(
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
          "said": "сделал"}])
 
-    assert "ПРОПУЩЕНО" in preview and "не найдена среди открытых" in preview
-    assert "пропущено 1" in preview
+    assert "ПРОПУЩЕНО" not in preview, "строки-пометки в плане больше нет"
+    assert "❌ Не вошло: 1" in preview
+    assert "не найдена среди открытых" in preview
+    assert "id ghost…" in preview, "справка обязана называть идентификатор"
+    assert "не вошло в план 1" in preview
     m = s._MANIFESTS[_mid(preview)]
-    assert [o["task_id"] for o in m["tasks"]] == ["d4", "ghost"]
+    assert [o["task_id"] for o in m["tasks"]] == ["d4"]
 
 
 async def test_plan_where_everything_is_skipped_is_not_built(monkeypatch, tmp_path):
@@ -641,8 +649,11 @@ async def test_move_to_a_name_that_matches_nothing_is_skipped(monkeypatch, tmp_p
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
          "said": "сделал"}])
 
-    assert "ПРОПУЩЕНО" in preview
     assert "не найден среди живых проектов" in preview
+    # 2026-08-09 (П19): нерезолвнутый перенос не строка плана, а справка под ним
+    assert "ПРОПУЩЕНО" not in preview
+    assert "❌ Не вошло: 1" in preview
+    assert [o["task_id"] for o in s._MANIFESTS[_mid(preview)]["tasks"]] == ["d4"]
 
 
 # ═══════ 6. Анти-declutter: в план не попадает ничего, чего не назвали ══════
@@ -833,8 +844,10 @@ async def test_rehash_changes_when_the_stored_operations_are_swapped(
 # Требование владельца: никогда не выдавать частичный успех за полный.
 
 async def test_title_mismatch_is_skipped_and_never_executed(monkeypatch, tmp_path):
-    """id указывает на живую задачу, но названо не то — операция помечена
-    ПРОПУЩЕНО с причиной и до исполнителя не доходит."""
+    """id указывает на живую задачу, но названо не то — операция В ПЛАН НЕ
+    ВОШЛА (2026-08-09, П19: не строка с пометкой, а справка под планом) и до
+    исполнителя не доходит. Поэтому итог и считается «1 из 1»: план состоял
+    из ОДНОЙ операции — подтверждали ровно её."""
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
@@ -846,15 +859,17 @@ async def test_title_mismatch_is_skipped_and_never_executed(monkeypatch, tmp_pat
          "said": "сделал"}])
     mid = _mid(preview)
 
-    assert "ПРОПУЩЕНО" in preview and "название не совпало" in preview
+    assert "ПРОПУЩЕНО" not in preview
+    assert "❌ Не вошло: 1" in preview and "название не совпало" in preview
     assert "«Купить молоко»" in preview   # видно, как задача называется НА САМОМ ДЕЛЕ
+    assert [o["task_id"] for o in s._MANIFESTS[mid]["tasks"]] == ["d4"]
 
     out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
 
     assert [c[0] for c in calls] == ["complete"]
     assert calls[0][1] == ["d4"]
     assert "a1" in live
-    assert "✅ Выполнено 1 из 2" in out and "пропущено 1" in out
+    assert "✅ Выполнено 1 из 1" in out
 
 
 async def test_vanished_task_never_reaches_an_executor(monkeypatch, tmp_path):
@@ -872,7 +887,8 @@ async def test_vanished_task_never_reaches_an_executor(monkeypatch, tmp_path):
 
     assert [c[0] for c in calls] == ["complete"]
     assert "ghost" not in [tid for c in calls for tid in c[1]]
-    assert "✅ Выполнено 1 из 2" in out
+    # «из 1», а не «из 2»: исчезнувшая задача в план не вошла (2026-08-09, П19)
+    assert "✅ Выполнено 1 из 1" in out
 
 
 async def test_merge_is_refused_when_the_kept_copy_is_missing_at_plan_time(
@@ -892,13 +908,14 @@ async def test_merge_is_refused_when_the_kept_copy_is_missing_at_plan_time(
          "said": "сделал"}])
     mid = _mid(preview)
 
-    assert "ПРОПУЩЕНО" in preview and "дубль НЕ удаляю" in preview
+    assert "ПРОПУЩЕНО" not in preview
+    assert "❌ Не вошло: 1" in preview and "дубль НЕ удаляю" in preview
 
     out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
 
     assert "e5" in live, "снесли единственную оставшуюся копию"
     assert "e5" not in [tid for c in calls for tid in c[1]]
-    assert "✅ Выполнено 1 из 2" in out
+    assert "✅ Выполнено 1 из 1" in out
 
 
 async def test_merge_is_refused_when_the_kept_copy_vanishes_after_the_plan(
@@ -1810,3 +1827,149 @@ def test_docstring_matches_the_runtime_instruction_about_call2():
     assert "IGNORED on call #2" in doc
     assert "Do NOT re-send" not in doc
     assert "may be repeated verbatim" in doc
+
+
+# ═══════ 20. П19: непрошедшее сверку В ПЛАН НЕ ПОПАДАЕТ ВОВСЕ ═══════════════
+# (2026-08-09) Раньше такая операция оставалась строкой ТОГО ЖЕ плана с
+# пометкой ⚠️ ПРОПУЩЕНО. Человеку показывали двадцать строк, три из них
+# помеченные, он жал ОДНУ кнопку — и пометки проходили мимо внимания:
+# решение принималось по большинству. Кнопка обязана подтверждать только то,
+# что реально выполнимо; всё остальное — справка, к которой она не относится.
+
+
+def _twenty_ops(live):
+    """Двадцать удалений по живым задачам — размер разбора из приёмки ТЗ."""
+    ops = []
+    for i in range(20):
+        tid = f"P{i:03d}"
+        live[tid] = {"id": tid, "title": f"Позвонить по объявлению №{i}",
+                     "projectId": "p_in"}
+        ops.append({"op": "delete", "task_id": tid,
+                    "title": f"Позвонить по объявлению №{i}",
+                    "said": f"объявление №{i} уже неактуально"})
+    return ops
+
+
+async def test_one_renamed_task_out_of_twenty_leaves_the_plan_but_is_reported(
+        monkeypatch, tmp_path):
+    """Приёмка ТЗ: девятнадцать в манифест, двадцатая — только в справку.
+
+    Проверяется ровно то, что было сломано: состав МАНИФЕСТА (кнопка ✅
+    исполняет его, а не текст), а не только текст превью."""
+    live = {}
+    ops = _twenty_ops(live)
+    _wire(monkeypatch, live, tmp_path)
+    live["P007"]["title"] = "Позвонить по объявлению №7 (уже созвонились)"
+
+    preview = await s.manual_triage("Разбираю входящие", ops)
+
+    m = s._MANIFESTS[_mid(preview)]
+    assert len(m["tasks"]) == 19
+    assert "P007" not in [o["task_id"] for o in m["tasks"]]
+    assert "✅ В план вошло: 19 операций" in preview
+    assert "❌ Не вошло: 1" in preview
+    assert "id P007…" in preview
+    # Что ожидалось и что на самом деле — обе стороны названы, а не «пропущено».
+    assert "Позвонить по объявлению №7 (уже созвонились)" in preview
+    assert "ПРОПУЩЕНО" not in preview
+
+
+async def test_the_only_dead_task_creates_no_manifest_and_no_telegram_message(
+        monkeypatch, tmp_path):
+    """Приёмка ТЗ: план из одной удалённой задачи — манифеста нет вовсе, в
+    Telegram не уходит ничего. Просить «да» на план, где исполнять нечего, —
+    это выпрашивать согласие на пустоту."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    _tg_on(monkeypatch)
+    seen = _notify_recorder(monkeypatch)
+    before = dict(s._MANIFESTS)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "delete", "task_id": "ghost", "title": "Старая задача",
+         "said": "неактуально"}])
+
+    assert seen == [], f"в Telegram что-то ушло: {seen}"
+    assert s._MANIFESTS == before, "манифест создан на пустом плане"
+    assert "🛑" in out and "план НЕ построен" in out
+    assert "id ghost…" in out and "не найдена среди открытых" in out
+
+
+async def test_a_plan_where_everything_matches_shows_no_reference_block(
+        monkeypatch, tmp_path):
+    """Приёмка ТЗ: когда расхождений нет, справочного блока нет тоже —
+    обычный план не должен обрастать пустой рубрикой «не вошло: 0»."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+
+    preview = await s.manual_triage("Разбираю", _mixed_ops())
+
+    assert "Не вошло" not in preview
+    assert "В план вошло" not in preview
+    assert "не вошло в план" not in preview
+    assert len(s._MANIFESTS[_mid(preview)]["tasks"]) == 5
+
+
+async def test_the_reference_block_reaches_telegram_below_the_plan(
+        monkeypatch, tmp_path):
+    """Справка обязана дойти и до владельца — ниже черты, тем же сообщением,
+    но БЕЗ собственных кнопок: кнопка у сообщения одна и относится к плану."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    _tg_on(monkeypatch)
+    seen = _notify_recorder(monkeypatch)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "delete", "task_id": "ghost", "title": "Старая задача",
+         "said": "неактуально"},
+        {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "сделал"}])
+
+    assert len(seen) == 1
+    sent = seen[0]["preview"]
+    assert "❌ Не вошло: 1" in sent
+    assert "id ghost…" in sent
+    # Справка стоит ПОСЛЕ списка операций, а не вместо/выше него.
+    assert sent.index("1. ✅ Закрыть") < sent.index("❌ Не вошло")
+    assert sent in preview
+
+
+async def test_no_argument_of_the_tool_can_switch_the_precheck_off():
+    """Тест на отсутствие обходного пути (требование ТЗ).
+
+    Сверка — первый шаг внутри инструмента, и другого способа создать манифест
+    не существует. Тест сторожит СИГНАТУРУ: если однажды появится параметр
+    вроде `skip_precheck`/`force`/`trust_titles`, он упадёт и потребует
+    объяснить, почему обязательное правило снова стало необязательным.
+    `automation_key` в списке разрешённых не потому, что он что-то пропускает,
+    — он обходит ПОДТВЕРЖДЕНИЕ, а не сверку (см. тест ниже)."""
+    import inspect
+
+    got = set(inspect.signature(s.manual_triage).parameters)
+
+    assert got == {"summary", "operations", "max_items", "manifest_id",
+                   "user_reply", "automation_key"}, got
+
+
+async def test_automation_key_executes_without_a_button_but_never_without_the_check(
+        monkeypatch, tmp_path):
+    """Единственный аргумент, который вообще меняет маршрут, — ключ headless-
+    автоматики. Он снимает подтверждение, но НЕ сверку: непрошедшая операция
+    не исполняется и здесь, и автоматика узнаёт о ней из ответа."""
+    monkeypatch.setattr(s, "SECRET", "test-secret")
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    calls = _stub_sub_impls(monkeypatch, live)
+    _tg_on(monkeypatch)
+    seen = _notify_recorder(monkeypatch)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "delete", "task_id": "a1", "title": "Купить хлеб",
+         "said": "не нужно"},
+        {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "сделал"}], automation_key="test-secret")
+
+    assert seen == [], "автоматика не должна слать кнопки"
+    assert [c[0] for c in calls] == ["complete"]
+    assert "a1" in live, "операция, не прошедшая сверку, всё-таки выполнилась"
+    assert "❌ Не вошло: 1" in out and "название не совпало" in out
