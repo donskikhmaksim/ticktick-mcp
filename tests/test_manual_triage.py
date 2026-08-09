@@ -1972,4 +1972,240 @@ async def test_automation_key_executes_without_a_button_but_never_without_the_ch
     assert seen == [], "автоматика не должна слать кнопки"
     assert [c[0] for c in calls] == ["complete"]
     assert "a1" in live, "операция, не прошедшая сверку, всё-таки выполнилась"
-    assert "❌ Не вошло: 1" in out and "название не совпало" in out
+    assert "❌ не вошло в план 1" in out, "шапка отчёта молчит о невошедшем"
+    assert "#### ❌ Не вошло в план" in out and "название не совпало" in out
+    assert "«Купить хлеб»" in out
+
+
+# ═══════ 21. Справка про невошедшее ПЕРЕЖИВАЕТ нажатие кнопки ══════════════
+# (2026-08-09, найдено независимым аудитом.) Превью живёт до нажатия:
+# `summarize_in_owner_chat` перезаписывает сообщение с планом короткой сводкой
+# («Объектов в плане: 19 · Подтверждено перепроверкой: 19»), а
+# `_cleanup_plan_leftovers` стирает остальные куски. Единственный текст,
+# который остаётся навсегда, — отчёт об исполнении, уходящий в группу-архив.
+# До П19 невошедшее попадало туда САМО: оно лежало в манифесте помеченными
+# строками, и отчёт печатал блок «⏭ Пропущено». Выбросив эти строки из плана,
+# справку надо донести до отчёта явно — иначе улучшение превью оплачено
+# потерей архива, а компенсирует потерю только внимательность модели.
+
+
+def _plan_with_one_rename(monkeypatch, tmp_path):
+    """План из двух операций, одна из которых не проходит сверку (задачу
+    переименовали руками). Возвращает (live, calls, preview)."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    calls = _stub_sub_impls(monkeypatch, live)
+    return live, calls
+
+
+async def test_the_execution_report_names_what_did_not_make_the_plan(
+        monkeypatch, tmp_path):
+    """Чат-«да»: отчёт (он же уходит в постоянный архив) обязан назвать
+    невошедшее — id, задачу и причину, а не только посчитать его в шапке."""
+    live, calls = _plan_with_one_rename(monkeypatch, tmp_path)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "delete", "task_id": "a1", "title": "Купить хлеб",
+         "said": "не нужно"},
+        {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "сделал"}])
+    mid = _mid(preview)
+
+    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+
+    assert "❌ не вошло в план 1" in out, "шапка отчёта молчит о невошедшем"
+    assert "#### ❌ Не вошло в план" in out
+    assert "id a1…" in out
+    assert "«Купить молоко»" in out, "отчёт не назвал задачу"
+    assert "название не совпало" in out, "отчёт не назвал причину"
+    # Рубрика отдельная от «⏭ Пропущено»: то был дрейф ПОСЛЕ подтверждения,
+    # а это — то, что не подтверждалось вообще.
+    assert "подтверждения по ним не было" in out
+    assert [c[0] for c in calls] == ["complete"]
+
+
+async def test_the_reference_survives_the_button_path_through_the_manifest(
+        monkeypatch, tmp_path):
+    """Кнопочный путь: сервер исполняет план САМ, через
+    `_generic_gate_auto_execute(mid, m)` — тул вторым вызовом не зовётся. Всё,
+    что доедет до отчёта, обязано лежать В МАНИФЕСТЕ, а не в памяти вызова."""
+    live, calls = _plan_with_one_rename(monkeypatch, tmp_path)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "delete", "task_id": "a1", "title": "Купить хлеб",
+         "said": "не нужно"},
+        {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "сделал"}])
+    m = s._MANIFESTS[_mid(preview)]
+
+    # `title` — название ИЗ ПЛАНА (живого у исчезнувшей задачи может не быть
+    # вовсе), а как объект называется НА САМОМ ДЕЛЕ, говорит причина.
+    assert m["extra"]["not_planned"] == [
+        {"task_id": "a1", "op": "delete", "title": "Купить хлеб",
+         "why": "название не совпало — по этому id сейчас «Купить молоко», "
+                "а в плане «Купить хлеб»"}]
+    # Справка — НЕ исполняемые строки: в ней нет ни одного ключа, по которому
+    # её можно было бы принять за операцию (вернуть их в `tasks` значило бы
+    # вернуть ровно ту проблему, ради которой П19 и делался).
+    assert set(m["extra"]["not_planned"][0]) == {"task_id", "op", "title", "why"}
+
+    out = await s._generic_gate_auto_execute(_mid(preview), m)
+
+    assert "#### ❌ Не вошло в план" in out and "«Купить молоко»" in out
+    assert [c[0] for c in calls] == ["complete"]
+
+
+async def test_the_reference_survives_a_server_restart(monkeypatch, tmp_path):
+    """Манифест переживает перезапуск через Postgres (`_durable_payload` →
+    json → `_manifest_from_payload`). Справка обязана пережить его вместе с
+    планом: сериализуемость здесь не деталь, а условие того, что после
+    рестарта отчёт всё ещё знает, о чём умолчать нельзя."""
+    import json
+
+    live, _calls = _plan_with_one_rename(monkeypatch, tmp_path)
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "delete", "task_id": "a1", "title": "Купить хлеб",
+         "said": "не нужно"},
+        {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "сделал"}])
+    m = s._MANIFESTS[_mid(preview)]
+
+    # Ровно то, что уезжает в базу и приезжает обратно в другом процессе.
+    revived = s._manifest_from_payload(
+        json.loads(json.dumps(s._durable_payload(m), ensure_ascii=False)))
+
+    assert revived["extra"]["not_planned"] == m["extra"]["not_planned"]
+
+
+async def test_a_clean_plan_stores_no_reference_field_at_all(monkeypatch, tmp_path):
+    """Зеркало: когда расхождений нет, в манифесте не заводится и поле —
+    отчёт не должен обрастать пустой рубрикой."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+
+    preview = await s.manual_triage("Разбираю", _mixed_ops())
+
+    assert s._MANIFESTS[_mid(preview)]["extra"] == {}
+
+
+# ═══════ 22. Порчи, которые проходили мимо тестов ══════════════════════════
+# Все четыре внесены независимым аудитом 2026-08-09 и дали полный зелёный
+# прогон. Каждая — отдельный способ «человек не узнал про часть».
+
+
+def _three_bad_ops():
+    """Три операции, каждая непрошедшая по СВОЕЙ причине и своего типа —
+    иначе фильтр по одному типу (порча №2) остался бы невидимым."""
+    return [
+        {"op": "delete", "task_id": "a1", "title": "Купить хлеб",
+         "said": "не нужно"},                       # название не совпало
+        {"op": "update", "task_id": "ghost1", "title": "Призрак",
+         "changes": {"new_title": "Призрак-2"}, "said": "переименуй"},
+        {"op": "move", "task_id": "c3", "title": "Позвонить Ивану",
+         "to_project": "Такого-нет", "said": "это рабочее"},
+        {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "сделал"},                         # единственная исполнимая
+    ]
+
+
+async def test_every_single_mismatch_is_printed_not_just_the_first(
+        monkeypatch, tmp_path):
+    """Порча №1: `records[:1]` — счётчик «❌ Не вошло: 3» остаётся верным, а
+    печатается одна строка из трёх. Число и количество строк обязаны сходиться,
+    поэтому тест считает СТРОКИ, а не верит заголовку."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+
+    preview = await s.manual_triage("Разбираю", _three_bad_ops())
+
+    assert "❌ Не вошло: 3" in preview
+    printed = [ln for ln in preview.splitlines() if ln.startswith("• id ")]
+    assert len(printed) == 3, f"напечатано {len(printed)} строк из 3:\n{preview}"
+    # И каждая из трёх названа поимённо, а не «и ещё две».
+    for needle in ("id a1…", "id ghost1…", "id c3…"):
+        assert needle in preview, needle
+
+
+async def test_a_failed_update_is_reported_like_any_other_kind(
+        monkeypatch, tmp_path):
+    """Порча №2: `... and o.get("op") != "update"` — непрошедший update
+    исчезает молча, а в заголовке остаётся «не вошло в план 1» без единого
+    объяснения. Тест проверяет КАЖДЫЙ из пяти типов по отдельности."""
+    for kind, op in (
+            ("update", {"op": "update", "task_id": "ghost1", "title": "Призрак",
+                        "changes": {"new_title": "Иначе"}, "said": "переименуй"}),
+            ("delete", {"op": "delete", "task_id": "ghost1", "title": "Призрак",
+                        "said": "не нужно"}),
+            ("complete", {"op": "complete", "task_id": "ghost1",
+                          "title": "Призрак", "said": "сделал"}),
+            ("move", {"op": "move", "task_id": "ghost1", "title": "Призрак",
+                      "to_project_id": "p_work", "said": "рабочее"}),
+            ("merge", {"op": "merge", "task_id": "ghost1", "title": "Призрак",
+                       "keep_task_id": "e6", "keep_title": "Позвонить в банк",
+                       "said": "дубль"})):
+        live = _live_inbox()
+        _wire(monkeypatch, live, tmp_path)
+        s._MANIFESTS.clear()
+
+        preview = await s.manual_triage("Разбираю", [
+            op, {"op": "complete", "task_id": "d4",
+                 "title": "Оплатить интернет", "said": "сделал"}])
+
+        assert "❌ Не вошло: 1" in preview, f"{kind}: нет блока\n{preview}"
+        assert "id ghost1…" in preview, f"{kind}: расхождение не названо"
+        assert "«Призрак»" in preview, f"{kind}: задача не названа"
+
+
+async def test_a_skip_mark_vetoes_execution_even_without_a_drift_reason(
+        monkeypatch, tmp_path):
+    """Порча №3: `if False and op.get("_skip")` в `_manual_triage_impl`.
+
+    Сейчас её прячет то, что `_triage_drift_reason` дублирует все пять причин
+    `_skip`, — но это совпадение, а не гарантия: появится причина без
+    зеркальной drift-проверки, и старый манифест (их поднимает из базы
+    `_rehydrate_manifest` после перезапуска) исполнит помеченное.
+
+    Поэтому здесь операция ЖИВАЯ и по всем drift-проверкам чистая, а помечена
+    причиной, которой в `_triage_drift_reason` нет вовсе. Единственное, что
+    может её остановить, — сама пометка."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    calls = _stub_sub_impls(monkeypatch, live)
+    old_manifest_task = {
+        "op": "delete", "task_id": "a1", "title": "Купить молоко",
+        "said": "не нужно", "_project_id": "p_in", "_live_title": "Купить молоко",
+        "_skip": "причина из будущей версии сверки, зеркала в drift у неё нет"}
+
+    assert s._triage_drift_reason(old_manifest_task, live, _NAMES) == "", \
+        "фикстура сломана: drift сам её ловит, порча снова невидима"
+
+    out = await s._manual_triage_impl("Старый план", [
+        old_manifest_task,
+        {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "сделал", "_project_id": "p_in",
+         "_live_title": "Оплатить интернет"}])
+
+    assert [c[0] for c in calls] == ["complete"], "помеченная операция исполнена"
+    assert "a1" in live
+    assert "Пропущено" in out and "причина из будущей версии" in out
+
+
+async def test_the_report_quotes_the_summary_with_its_counts(
+        monkeypatch, tmp_path):
+    """Порча №4: подзаголовок отчёта `_{summary}_` заменён константой — и
+    отчёт после исполнения перестал повторять, ЧТО именно разбирали и сколько
+    в план не вошло. Ничем не сторожилось: прежняя проверка «"пропущено 1" in
+    out» исчезла вместе со старым поведением, а замены не появилось."""
+    live, _calls = _plan_with_one_rename(monkeypatch, tmp_path)
+
+    preview = await s.manual_triage("Разбираю входящие после созвона", [
+        {"op": "delete", "task_id": "a1", "title": "Купить хлеб",
+         "said": "не нужно"},
+        {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "сделал"}])
+
+    out = await s.manual_triage("Разбираю", manifest_id=_mid(preview),
+                                user_reply="да")
+
+    assert "_Разбираю входящие после созвона — закрыть 1; " \
+           "не вошло в план 1_" in out, out

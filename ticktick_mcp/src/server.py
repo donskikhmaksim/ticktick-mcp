@@ -15465,25 +15465,51 @@ def _ops_plural(n: int) -> str:
     return f"{n} операций"
 
 
-def _triage_mismatch_line(op: Dict) -> str:
-    """Одна строка справочного блока про операцию, НЕ вошедшую в план:
-    что за операция, какая задача (название из плана — живого может не быть
-    вовсе), её id и ПОЧЕМУ она не прошла — дословной причиной сверки, где уже
-    сказано «сейчас такое-то, а в плане такое-то».
+def _triage_not_planned_records(blocked: List[Dict]) -> List[Dict]:
+    """Не прошедшие сверку операции → ПЛОСКИЕ справочные записи (2026-08-09).
 
-    Id печатается ОБРЕЗАННЫМ (8 символов + …), как везде в отчётах: он нужен
-    как якорь для следующего вызова, а не для чтения глазами."""
-    tid = str(op.get("task_id") or "")
-    shown = _plan_task_name({"task_id": tid,
-                             "title": op.get("_live_title") or op.get("title")})
-    emoji = _TRIAGE_EMOJI.get(op.get("op"), "•")
-    verb = _TRIAGE_VERB.get(op.get("op"), op.get("op"))
+    Зачем отдельная форма, а не сами операции. Эти записи едут в манифест —
+    то есть в Postgres и через перезапуск сервера, — чтобы отчёт ПОСЛЕ
+    нажатия кнопки мог назвать невошедшее поимённо. Класть туда операции как
+    есть нельзя: рядом с `tasks` они читались бы как «ещё немного работы», а
+    вся суть П19 в том, что исполнять их нельзя. Здесь остаются четыре
+    строковых поля, ни одного служебного ключа исполнения — такую запись
+    просто не во что превратить обратно в операцию."""
+    return [{"task_id": str(o.get("task_id") or ""),
+             "op": str(o.get("op") or ""),
+             "title": str(o.get("_live_title") or o.get("title") or ""),
+             "why": str(o.get("_skip") or "")} for o in blocked]
+
+
+def _triage_not_planned_line(rec: Dict) -> str:
+    """Одна строка справки: id, что за операция, какая задача и ПОЧЕМУ она не
+    прошла — дословной причиной сверки, где уже сказано «сейчас такое-то, а в
+    плане такое-то»."""
+    shown = _plan_task_name({"task_id": rec.get("task_id"),
+                             "title": rec.get("title")})
+    emoji = _TRIAGE_EMOJI.get(rec.get("op"), "•")
+    verb = _TRIAGE_VERB.get(rec.get("op"), rec.get("op"))
+    tid = str(rec.get("task_id") or "")
     head = f"id {tid[:8]}…" if tid else "id не указан"
-    return f"• {head} — {emoji} {verb} {shown}: {op.get('_skip')}"
+    return f"• {head} — {emoji} {verb} {shown}: {rec.get('why')}"
 
 
-def _triage_mismatch_block(doable: List[Dict], blocked: List[Dict]) -> List[str]:
-    """Справочный блок «что НЕ вошло в план» (2026-08-09, П19).
+def _triage_not_planned_lines(records: List[Dict]) -> List[str]:
+    """Заголовок «❌ Не вошло: N» плюс строка на КАЖДУЮ запись.
+
+    Число в заголовке и количество строк берутся из одного списка намеренно:
+    аудит 2026-08-09 внёс порчу `records[:1]` — счётчик оставался верным, а
+    печаталась одна строка из трёх. Расхождение между «сколько сказано» и
+    «сколько показано» — ровно тот класс «человек не узнал про часть», ради
+    которого пакет и делался, поэтому тест сверяет их друг с другом."""
+    if not records:
+        return []
+    return [f"❌ Не вошло: {len(records)} — разберите с человеком в чате"] \
+        + [_triage_not_planned_line(r) for r in records]
+
+
+def _triage_mismatch_block(doable: List[Dict], records: List[Dict]) -> List[str]:
+    """Справочный блок «что НЕ вошло в план» для ПРЕВЬЮ (2026-08-09, П19).
 
     Раньше не прошедшие сверку операции оставались строками ТОГО ЖЕ плана с
     пометкой ⚠️ ПРОПУЩЕНО. Человек видел двадцать строк, три из них помеченные,
@@ -15491,13 +15517,13 @@ def _triage_mismatch_block(doable: List[Dict], blocked: List[Dict]) -> List[str]
     по большинству. Теперь их в плане нет, а сюда выносится справка: она
     печатается ПОД списком операций (в чат и в Telegram одним и тем же
     текстом, через `notes`), и кнопки к ней не относятся."""
-    if not blocked:
+    if not records:
         return []
-    return [f"✅ В план вошло: {_ops_plural(len(doable))} → отправлено на "
-            "подтверждение\n"
-            f"❌ Не вошло: {len(blocked)} — разберите с человеком в чате "
-            "(подтверждение относится ТОЛЬКО к списку выше)\n"
-            + "\n".join(_triage_mismatch_line(o) for o in blocked)]
+    head = (f"✅ В план вошло: {_ops_plural(len(doable))} → отправлено на "
+            "подтверждение")
+    lines = _triage_not_planned_lines(records)
+    lines[0] += " (подтверждение относится ТОЛЬКО к списку выше)"
+    return ["\n".join([head] + lines)]
 
 
 def _triage_plan_notes(ops: List[Dict]) -> List[str]:
@@ -15643,6 +15669,25 @@ def _triage_blocked_lines(blocked: List[Tuple[Dict, str]]) -> List[str]:
     return out
 
 
+def _triage_not_planned_report_lines(records: Optional[List[Dict]]) -> List[str]:
+    """Тот же перечень невошедшего, но для ОТЧЁТА после исполнения.
+
+    Отдельная рубрика, а не хвост к «⏭ Пропущено», потому что случаи разные и
+    человек обязан их различать: «пропущено» — было в плане, подтверждено
+    кнопкой, но сдрейфовало между «да» и мутацией; «не вошло в план» — не
+    подтверждалось ВООБЩЕ, кнопка к нему никогда не относилась.
+
+    Почему это обязано быть в отчёте, а не только в превью: превью живёт до
+    нажатия (сообщение с планом перезаписывается сводкой, лишние куски
+    удаляются), а отчёт уходит в группу-архив навсегда. До П19 невошедшее
+    попадало в архив само — оно лежало в манифесте помеченными строками."""
+    if not records:
+        return []
+    return ["", "#### ❌ Не вошло в план — сверка НА ЭТАПЕ ПЛАНА, "
+            "подтверждения по ним не было"] \
+        + [_triage_not_planned_line(r) for r in records]
+
+
 @mcp.tool()
 async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
                         max_items: int = 50, manifest_id: str = "",
@@ -15780,7 +15825,7 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
 
     enriched: Optional[List[Dict]] = None
     notes: Optional[List[str]] = None
-    mismatch: List[str] = []
+    extra: Optional[Dict] = None
     if not manifest_id:
         refusal = _validate_triage_ops(list(operations or []), max_items)
         if refusal:
@@ -15801,39 +15846,51 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         enriched = [o for o in checked if not o.get("_skip")]
         # list.sort устойчива: внутри одного типа исходный порядок сохраняется.
         enriched.sort(key=lambda o: _TRIAGE_ORDER[o["op"]])
+        not_planned = _triage_not_planned_records(blocked)
         if not enriched:
             # Просить «да» на план, где исполнять нечего, — это выпрашивать
             # согласие на пустоту. Манифест не создаётся вовсе, в Telegram
             # ничего не уходит.
             return ("🛑 Ни одна операция не прошла сверку с живым состоянием — "
                     "план НЕ построен, ничего не изменено:\n"
-                    + "\n".join(_triage_mismatch_line(o) for o in blocked))
+                    + "\n".join(_triage_not_planned_lines(not_planned)))
         summary = _triage_summary_with_counts(summary, checked)
-        mismatch = _triage_mismatch_block(enriched, blocked)
         # Справка едет через тот же `notes`, что и прочие предупреждения про
         # весь план: он печатается ПОД списком операций и попадает разом и в
         # чат, и в Telegram — своей копии сборки текста здесь не заводим.
-        notes = _triage_plan_notes(enriched) + mismatch
+        notes = _triage_plan_notes(enriched) \
+            + _triage_mismatch_block(enriched, not_planned)
+        # …и ОТДЕЛЬНО едет в манифест, чтобы пережить нажатие кнопки
+        # (2026-08-09, найдено независимым аудитом). Превью живёт до нажатия:
+        # `summarize_in_owner_chat` перезаписывает сообщение с планом короткой
+        # сводкой, `_cleanup_plan_leftovers` стирает остальные куски. Единственный
+        # текст, который остаётся навсегда, — отчёт об исполнении, уходящий в
+        # группу-архив. До П19 невошедшее попадало туда само (оно лежало в
+        # манифесте помеченными строками); выбросив их из плана, справку надо
+        # донести до отчёта явно — иначе улучшение превью оплачено потерей
+        # архива. `extra` манифеста для этого и есть: он сохраняется вместе с
+        # планом в Postgres и возвращается исполнителю и после перезапуска.
+        extra = {"not_planned": not_planned} if not_planned else None
 
     outcome = await _gate_batch("manual_triage", "manual_triage", enriched, summary,
                                 manifest_id, user_reply, _describe_triage_op,
-                                items_arg="operations", notes=notes,
+                                extra=extra, items_arg="operations", notes=notes,
                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
-    report = await _manual_triage_impl(outcome.summary, outcome.tasks)
-    # Единственный путь, доходящий сюда с непустым `mismatch`, — headless-
-    # автоматика с верным ключом (она исполняет с первого вызова, минуя
-    # кнопку). Отчёт `_manual_triage_impl` знает только про то, что вошло в
-    # план, поэтому расхождения приклеиваются здесь: молчание о них было бы
-    # ровно тем же обманом, только в другом канале.
-    return report + ("\n\n" + "\n".join(mismatch) if mismatch else "")
+    # `**extra` — тот же путь, которым план доезжает до исполнителя после
+    # кнопки (`_generic_gate_auto_execute` зовёт impl(summary, tasks, **extra)):
+    # чат-«да», кнопка и headless-ключ обязаны давать ОДИН отчёт, а не три.
+    return await _manual_triage_impl(outcome.summary, outcome.tasks,
+                                     **(outcome.extra or {}))
 
 
-async def _manual_triage_impl(summary: str, tasks: List[Dict]) -> str:
+async def _manual_triage_impl(summary: str, tasks: List[Dict],
+                              not_planned: Optional[List[Dict]] = None) -> str:
     """Pure mutation logic for manual_triage — NO consent gate (the gate lives
     in the public manual_triage() above; this is also what the Telegram button
-    replays via _generic_gate_auto_execute, which calls impl(summary, tasks)).
+    replays via _generic_gate_auto_execute, which calls impl(summary, tasks,
+    **extra)).
 
     Two hard rules here:
       1. Every operation is re-checked against LIVE state immediately before
@@ -15842,7 +15899,15 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict]) -> str:
       2. The final verdict is NOT parsed out of the sub-executors' texts: after
          all of them run, this reads fresh live state ONE more time and judges
          each operation independently (_verify_item). Unreadable state ⇒
-         «исход НЕ ПОДТВЕРЖДЁН», not «успех»."""
+         «исход НЕ ПОДТВЕРЖДЁН», not «успех».
+
+    `not_planned` (2026-08-09) — СПРАВОЧНЫЕ записи про операции, которые не
+    прошли сверку на этапе плана и в `tasks` не попали. Здесь они ТОЛЬКО
+    печатаются: ни одна ветка исполнения их не читает, и превратить запись
+    обратно в операцию нечем (у неё нет ни `changes`, ни `keep_task_id`).
+    Нужны потому, что отчёт — единственный текст, который переживает нажатие
+    кнопки: превью в личке затирается сводкой, а отчёт уходит в группу-архив
+    навсегда."""
     err = _ensure_ready()
     if err:
         return err
@@ -15884,7 +15949,8 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict]) -> str:
              "погашен (план одноразовый): повторное «да» по нему ничего не "
              "сделает — если разбор всё ещё нужен, построй его заново новым "
              "вызовом manual_triage без manifest_id.", ""]
-            + _triage_blocked_lines(blocked))
+            + _triage_blocked_lines(blocked)
+            + _triage_not_planned_report_lines(not_planned))
 
     sections: List[Tuple[str, str]] = []
 
@@ -15989,6 +16055,8 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict]) -> str:
             head = f"✅ Выполнено {n_ok} из {len(ops)}"
             if blocked:
                 head += f" · ⏭ пропущено {len(blocked)} (см. ниже)"
+            if not_planned:
+                head += f" · ❌ не вошло в план {len(not_planned)} (см. ниже)"
             lines.append(head)
             lines.append(
                 f"✏️ Изменено {per_kind.get('update', 0)} · "
@@ -16015,6 +16083,7 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict]) -> str:
         lines += ["", f"#### {title}", text]
     if blocked:
         lines += [""] + _triage_blocked_lines(blocked)
+    lines += _triage_not_planned_report_lines(not_planned)
     return "\n".join(lines)
 
 
