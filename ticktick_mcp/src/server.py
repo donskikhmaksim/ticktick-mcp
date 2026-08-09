@@ -462,6 +462,88 @@ PRIORITY_MAP = {0: "None", 1: "Low", 3: "Medium", 5: "High"}
 STATUS_MAP = {0: "Active", 2: "Completed", -1: "Won't do (abandoned)"}
 
 
+# ---------------------------------------------------------------------------
+# ЗАДАЧА БЕЗ НАЗВАНИЯ — НЕ ПУСТОЕ МЕСТО В СПИСКЕ (П15, 2026-08-09).
+#
+# Случай: из плана на удаление в 14 задач исполнилось 11, а три не прошли — и
+# все три были с ПУСТЫМ названием. В списках они выглядели одинаково: пустой
+# строкой, неотличимо от мусора. При этом две из трёх были содержательными —
+# в Inbox лежала ФОТОГРАФИЯ ЧЕКА HOME DEPOT на возврат $374.92, в Vibe Coding
+# Notes скриншот с описанием дефекта. Владелец включил их в удаление именно
+# потому, что по строке списка нельзя было отличить документ от мусора;
+# спасло только то, что удаление не прошло по другой причине.
+#
+# ПРАВИЛО: там, где у задачи нет имени, печатается не «(no title)» и не
+# пустота, а то, ЧТО В НЕЙ ЕСТЬ: «(без названия · 📎 1 файл)» ≠ «(без
+# названия · пусто)». Разница между этими двумя строками — разница между
+# документом и мусором, и решение об удалении принимается по ней.
+#
+# Считается ТОЛЬКО по уже прочитанному объекту задачи, без единого
+# дополнительного запроса: эта функция зовётся на каждую строку каждого
+# списка (сотни задач за вызов).
+_ATTACH_INLINE_RE = re.compile(r"!\[file\]\(([0-9a-fA-F]{24})/([^)]*)\)")
+
+
+def _files_word(n: int) -> str:
+    """«файл» / «файла» / «файлов» — по-русски число обязано согласоваться."""
+    if n % 100 in (11, 12, 13, 14):
+        return "файлов"
+    if n % 10 == 1:
+        return "файл"
+    if n % 10 in (2, 3, 4):
+        return "файла"
+    return "файлов"
+
+
+def _task_attachment_count(task: Dict) -> int:
+    """Сколько файлов приложено к задаче, по ДВУМ источникам того же объекта:
+    структурный массив `attachments` и inline-токены ![file](id/имя) в
+    content/desc (те же два источника, что сводит `_merged_task_attachments`,
+    только без сетевого чтения). Структурный массив главный; токены считаются
+    лишь когда его нет вовсе — у части аккаунтов он приходит пустым, и тогда
+    ссылка в тексте единственное свидетельство файла. Складывать их нельзя:
+    один и тот же файл присутствует обычно в обоих, и сумма соврала бы «2
+    файла» про один чек."""
+    structured = [a for a in (task.get("attachments") or []) if a]
+    if structured:
+        return len(structured)
+    text = str(task.get("content") or "") + "\n" + str(task.get("desc") or "")
+    return len({m.group(1) for m in _ATTACH_INLINE_RE.finditer(text)})
+
+
+def _task_has_text(task: Dict) -> bool:
+    """Есть ли в задаче собственный текст — заметка, описание или пункты
+    чеклиста. Inline-ссылки на вложения из текста вычитаются: задача, у
+    которой в content ровно `![file](…)` и больше ничего, содержит ФАЙЛ, а не
+    текст, и называть её «есть текст» значит прятать файл."""
+    for field in ("content", "desc"):
+        text = _ATTACH_INLINE_RE.sub("", str(task.get(field) or ""))
+        if text.strip():
+            return True
+    return any((i or {}).get("title") for i in (task.get("items") or []))
+
+
+def _untitled_label(task: Optional[Dict] = None) -> str:
+    """Чем задача без названия называется в любом человеческом выводе."""
+    task = task or {}
+    n = _task_attachment_count(task)
+    if n:
+        what = f"📎 {n} {_files_word(n)}"
+    elif _task_has_text(task):
+        what = "есть текст"
+    else:
+        what = "пусто"
+    return f"(без названия · {what})"
+
+
+def _is_untitled(title: Optional[str]) -> bool:
+    """Пустое ли название. Одна точка на весь сервер: «нет имени» — это и
+    None, и "", и строка из одних пробелов, и их нельзя разводить по разным
+    веткам, иначе сверка в одном месте признаёт задачу безымянной, а в
+    соседнем — нет."""
+    return not str(title or "").strip()
+
+
 # Format a task object from TickTick for better display
 def format_task(task: Dict, trash_state: Optional[bool] = None) -> str:
     """Format a task into a human-readable string (title first, ids at the end).
@@ -470,7 +552,11 @@ def format_task(task: Dict, trash_state: Optional[bool] = None) -> str:
     verified it does not, None = not checked (the default — the official v1
     API carries no deletion flag at all, so most callers simply cannot know).
     """
-    formatted = f"Title: {task.get('title', 'No title')}\n"
+    # «No title» здесь было ровно тем слепым пятном, что и пустая строка в
+    # списке (П15, 2026-08-09): карточка задачи с чеком Home Depot выглядела
+    # так же, как карточка пустышки. Заглушка заменена на заменитель, который
+    # говорит, ЧТО в задаче есть.
+    formatted = f"Title: {task.get('title') or _untitled_label(task)}\n"
 
     # Dates are printed in the OWNER's zone (_local_datetime_str), never as the
     # raw UTC instant TickTick stores. A deadline near local midnight otherwise
@@ -619,7 +705,10 @@ def format_task_line(task: Dict, project_name: str = None) -> str:
     bits = []
     if project_name:
         bits.append(f"[{project_name}]")
-    bits.append(task.get("title") or "(no title)")
+    # П15 (2026-08-09): «(no title)» не отличало документ от мусора — см.
+    # _untitled_label. Три задачи владельца выглядели в списке одинаково, и
+    # две из них были содержательными (чек Home Depot, скриншот дефекта).
+    bits.append(task.get("title") or _untitled_label(task))
     meta = []
     if task.get("dueDate"):
         # Owner's calendar day, not dueDate[:10] of the raw UTC instant — see
@@ -784,13 +873,20 @@ def _v2_groups_and_inbox() -> tuple:
 
 
 def _lookup_task_title(task_id: str) -> str:
-    """Return the task's title from the v2 cache, or a fallback string."""
+    """Return the task's title from the v2 cache, or a fallback string.
+
+    ЗАДАЧА НАЙДЕНА, А ИМЕНИ У НЕЁ НЕТ — это НЕ «не нашли» (П15, 2026-08-09):
+    раньше обе ветки давали `[task 6a757123…]`, то есть в позицию имени
+    попадал идентификатор, и безымянная задача с фотографией чека Home Depot
+    выглядела в каждом сообщении так же, как задача, которой вообще нет.
+    Найденная безымянная называется тем, ЧТО в ней лежит (_untitled_label);
+    `[task …]` остаётся только для по-настоящему ненайденной."""
     if ticktick_v2:
         try:
             t = next((x for x in ticktick_v2.get_open_tasks()
                       if x.get("id") == task_id), None)
-            if t and t.get("title"):
-                return t["title"]
+            if t:
+                return t.get("title") or _untitled_label(t)
         except Exception:
             pass
     return f"[task {task_id[:8]}…]"
@@ -1033,7 +1129,13 @@ def _live_task_title(task_id: str, project_id: str = "") -> Optional[str]:
     для завершённой. Имя завершённой задачи известно, и отказ его печатать
     не защищал ничего — он лишь прятал от подтверждающего, КУДА ляжет файл.
     Ветка «имя не установить» осталась на месте для настоящих случаев:
-    задачи нет вовсе, или чтение недоступно."""
+    задачи нет вовсе, или чтение недоступно.
+
+    ЗАДАЧА НАЙДЕНА, А ИМЕНИ У НЕЁ НЕТ — это НЕ «не установили» (П15,
+    2026-08-09): такая задача возвращает заменитель по содержимому («(без
+    названия · 📎 1 файл)»), а None остаётся ровно за двумя настоящими
+    случаями выше. Иначе карточка, ВРУЧАЮЩАЯ право записи в аккаунт, говорила
+    про существующую задачу «её нет в живом состоянии аккаунта»."""
     try:
         by_id = _open_by_id(fresh=False)
     except Exception:
@@ -1046,7 +1148,9 @@ def _live_task_title(task_id: str, project_id: str = "") -> Optional[str]:
             live, _where = ticktick_v2.find_task_any_state(task_id)
         except Exception:
             live = None
-    return ((live or {}).get("title") or "").strip() or None
+    if not live:
+        return None
+    return (live.get("title") or "").strip() or _untitled_label(live)
 
 
 def _locate_task_any_state(task_id: str) -> Tuple[Optional[Dict], Optional[str], bool]:
@@ -1099,8 +1203,20 @@ _NO_NAME_PERSON = ("⚠️ ИМЯ УЧАСТНИКА УСТАНОВИТЬ НЕ �
 
 
 def _plan_task_titles(tasks: Optional[List[Dict]], *,
-                      source: str = "open") -> Dict[str, str]:
-    """{taskId: живое название} для строк карточки плана.
+                      source: str = "open") -> Dict[str, Dict[str, Any]]:
+    """{taskId: {"label": как назвать, "untitled": имени у задачи НЕТ}} для
+    строк карточки плана.
+
+    ДВА РАЗНЫХ ИСХОДА, КОТОРЫЕ РАНЬШЕ БЫЛИ ОДНИМ (П15, 2026-08-09). Функция
+    возвращала только непустые имена, поэтому «задачи не нашли» и «задачу
+    нашли, но названия у неё нет» приходили к `_plan_task_name` одинаково —
+    отсутствием ключа, — и карточка плана в обоих случаях писала «⚠️ НАЗВАНИЕ
+    ЗАДАЧИ УСТАНОВИТЬ НЕ УДАЛОСЬ (её нет в живом состоянии аккаунта или оно
+    недоступно)». Про безымянную задачу это неправда: она есть, её карточка
+    читается, из неё скачивается вложение (случай трёх задач владельца, среди
+    них фотография чека Home Depot на возврат $374.92). Теперь второй исход
+    называет себя сам — заменителем из `_untitled_label` и признаком
+    `untitled`, по которому строка плана говорит про опознание по id.
 
     Платит ТОЛЬКО за то, чего не хватает: если вызывающий дал название
     каждому элементу (обычный случай — этого требуют докстринги тулов),
@@ -1130,21 +1246,44 @@ def _plan_task_titles(tasks: Optional[List[Dict]], *,
         logger.warning(f"карточка плана: живые названия ({source}) прочитать "
                        f"не удалось ({e}) — строки скажут об этом вслух")
         return {}
-    out = {}
+    out: Dict[str, Dict[str, Any]] = {}
     for tid in need:
-        name = ((live.get(tid) or {}).get("title") or "").strip()
-        if name:
-            out[tid] = name
+        row = live.get(tid)
+        if row is None:
+            continue                      # задачи нет — это другой исход
+        name = (row.get("title") or "").strip()
+        out[tid] = ({"label": name, "untitled": False} if name else
+                    {"label": _untitled_label(row), "untitled": True})
     return out
 
 
+# Пометка для строки плана, объекту которой имени НЕ ПОЛОЖЕНО (П15,
+# 2026-08-09). Опознание по id — законный случай, но молчать о нём нельзя:
+# человек, читающий план, обязан видеть, ЧЕМ сверялась личность объекта, и
+# ⚠️ здесь не годится (это не сомнение в проверке, а факт о состоянии
+# объекта — см. правило ⚠️/ℹ️ у _COMPLETED_TASK_NOTE).
+_BY_ID_NOTE = ("ℹ️ опознана ПО id: названия у задачи нет, сверять нечего — "
+               "возможно, стоит сначала её назвать")
+
+
 def _plan_task_name(t: Dict[str, Any],
-                    titles: Optional[Dict[str, str]] = None) -> str:
-    """Кусок строки карточки, НАЗЫВАЮЩИЙ задачу: «Купить молоко» — либо, если
-    имени нет ниоткуда, id вместе с прямым признанием, что имя неизвестно."""
+                    titles: Optional[Dict[str, Any]] = None) -> str:
+    """Кусок строки карточки, НАЗЫВАЮЩИЙ задачу: «Купить молоко»; для задачи
+    БЕЗ названия — заменитель по её содержимому плюс признание, что личность
+    сверена по id; и только если про задачу не известно ничего — id вместе с
+    прямым признанием, что имя неизвестно."""
     tid = str(t.get("taskId") or t.get("task_id") or "")
-    name = (t.get("title") or "").strip() or (titles or {}).get(tid, "")
-    return f"«{name}»" if name else f"id {tid} — {_NO_NAME_TASK}"
+    given = (t.get("title") or "").strip()
+    if given:
+        return f"«{given}»"
+    entry = (titles or {}).get(tid)
+    if isinstance(entry, str):            # старый вид значения — только имя
+        entry = {"label": entry, "untitled": False}
+    if not entry:
+        return f"id {tid} — {_NO_NAME_TASK}"
+    if entry.get("untitled"):
+        return f"«{entry['label']}» — {_BY_ID_NOTE}"
+    return f"«{entry['label']}»"
 
 
 def _plan_project_name(project_id: str, given: str = "") -> str:
@@ -1705,9 +1844,25 @@ def _split_tasks_by_state(
                              "actual": g.title or "(без названия)",
                              "project": names.get(g.project_id, "")})
         else:
+            # У БЕЗЫМЯННОЙ задачи сверка не «не состоялась», а прошла ПО id
+            # (П15, 2026-08-09): имени нет ни у вызывающего, ни в живом
+            # состоянии — сравнивать нечего, объект опознан идентификатором.
+            # Это отдельный признак, а не `armed`: armed по-прежнему значит
+            # «имя реально сверено», и раздувать его смыслом нельзя.
+            #
+            # ЗАМЕНИТЕЛЬ ЖИВЁТ В ОТДЕЛЬНОМ ПОЛЕ `label`, а `title` остаётся
+            # ПУСТЫМ, каким он и есть у задачи. Иначе «(без названия · 📎 1
+            # файл)» уехало бы в манифест плана как настоящее название, и на
+            # исполнении сверка сравнивала бы выдуманное имя с пустым живым —
+            # то есть отказывала бы ровно в том случае, ради которого правка
+            # и делалась.
+            by_id_only = _is_untitled(exp_title) and _is_untitled(g.title)
             found.append({"taskId": tid, "title": exp_title or g.title,
+                          "label": (exp_title or g.title
+                                    or _untitled_label(by_id.get(tid) or {})),
                           "projectId": g.project_id,
-                          "armed": bool((exp_title or "").strip())})
+                          "armed": bool((exp_title or "").strip()),
+                          "by_id": by_id_only})
     return found, mismatch, missing
 
 
@@ -1769,11 +1924,27 @@ def _unarmed_note(found: List[Dict]) -> str:
     """Warning line when some items were mutated WITHOUT the id↔title check
     (the caller sent no title, so the guard had nothing to verify). Makes the
     over-claim visible instead of silently pretending the guard ran."""
-    loose = [f for f in found if not f.get("armed", True)]
-    if not loose:
-        return ""
-    return (f"⚠️ {len(loose)} выполнено БЕЗ сверки названия (title не передан): "
-            + ", ".join(f"«{f['title']}»" for f in loose))
+    # Безымянные задачи из этой жалобы вынуты (П15, 2026-08-09): у них сверять
+    # было НЕЧЕГО не по недосмотру вызывающего, а потому что имени нет ни с
+    # одной стороны, и объект опознан по id. Смешивать это с «title не
+    # передан» — значит пугать владельца ⚠️ там, где всё в порядке, и заодно
+    # прятать настоящие непроверенные строки среди ложных.
+    loose = [f for f in found
+             if not f.get("armed", True) and not f.get("by_id")]
+    by_id_rows = [f for f in found if f.get("by_id")]
+    notes = []
+    if loose:
+        notes.append(f"⚠️ {len(loose)} выполнено БЕЗ сверки названия (title не "
+                     "передан): "
+                     + ", ".join(f"«{f.get('label') or f['title']}»"
+                                 for f in loose))
+    if by_id_rows:
+        notes.append(f"ℹ️ {len(by_id_rows)} опознано ПО id — названия у этих "
+                     "задач нет, сверять нечего (возможно, стоит сначала их "
+                     "назвать): "
+                     + ", ".join(f"«{f.get('label') or f['title']}»"
+                                 for f in by_id_rows))
+    return "\n".join(notes)
 
 
 def _guard_project(project_id: str, expected_name: str = "", *,
@@ -5650,7 +5821,16 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
              _plan_id_line(mid, "ничего ещё не удалено"), ""]
     for i, it in enumerate(items, 1):
         mark = "↳ " * it.get("depth", 0)
-        lines.append(f"{i}. {mark}**«{it['title']}»** — {it['project']} (`{it['taskId']}`)")
+        # Строка про безымянную задачу говорит, ЧТО в ней лежит, и что её
+        # личность сверена по id (П15, 2026-08-09). До этого здесь печаталось
+        # `**«»**` — пустое место, по которому владелец и включил в удаление
+        # чек Home Depot вместе с настоящим мусором. Название в манифесте
+        # при этом остаётся ПУСТЫМ: по нему сверяется исполнение, и подменять
+        # его заменителем значило бы сверять выдуманное имя.
+        shown = (f"**«{it['title']}»**" if not _is_untitled(it["title"]) else
+                 f"**«{_untitled_label(by_id.get(it['taskId']) or {})}»** "
+                 f"— {_BY_ID_NOTE}")
+        lines.append(f"{i}. {mark}{shown} — {it['project']} (`{it['taskId']}`)")
     if mismatch:
         lines.append(_mismatch_report(mismatch, "включил в план"))
     if missing:
@@ -5768,10 +5948,30 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
                 drifted.append((it.get("title") or f"[task {str(it['taskId'])[:8]}…]",
                                 "нет среди открытых задач"))
                 continue
-            if not planned_title:
-                drifted.append((live_title or f"[task {str(it['taskId'])[:8]}…]",
-                                "в плане не было названия — сверить id↔задачу "
-                                "нечем"))
+            # ОДИН новый разрешённый случай: имени НЕТ С ОБЕИХ СТОРОН (П15,
+            # 2026-08-09). Сверка «имя из плана == живое имя» защищает от
+            # подмены объекта, но у безымянной задачи сравнивать нечего, и
+            # прежний безусловный отказ здесь не защищал, а запирал: три
+            # задачи владельца (среди них фотография чека Home Depot на
+            # возврат $374.92) нельзя было ни удалить, ни переименовать —
+            # штатного выхода из состояния не было вовсе.
+            #
+            # ГРАНИЦА ПОСЛАБЛЕНИЯ, УЖЕ ЕЁ НЕ БЫВАЕТ: пусто И в плане, И в
+            # живом состоянии. Пустое имя в плане при НЕ пустом живом (или
+            # наоборот) — по-прежнему расхождение и отказ: это ровно случай
+            # «id теперь указывает на другую задачу», от которого сверка и
+            # стоит. Задачу при этом всё равно опознали — по id, — и об этом
+            # сказано вслух в карточке плана (_plan_task_name/_BY_ID_NOTE),
+            # а не пропущено молча.
+            if _is_untitled(planned_title) and not _is_untitled(live_title):
+                drifted.append((live_title,
+                                "в плане не было названия, а у живой задачи "
+                                "оно есть — сверить id↔задачу нечем"))
+                continue
+            if not _is_untitled(planned_title) and _is_untitled(live_title):
+                drifted.append((planned_title,
+                                "у живой задачи по этому id названия НЕТ, а в "
+                                "плане оно было — это другой объект"))
                 continue
             if not _names_agree(planned_title, live_title):
                 drifted.append((planned_title,
@@ -5795,7 +5995,12 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
                 continue
             ready.append({"taskId": it["taskId"],
                           "projectId": live_pid or it.get("projectId", ""),
-                          "title": planned_title, "snapshot": it["snapshot"]})
+                          # Отчёт об удалении обязан НАЗЫВАТЬ объект: пустое
+                          # `planned_title` печаталось бы как «» — строка, по
+                          # которой нельзя понять, что именно исчезло (П15,
+                          # 2026-08-09).
+                          "title": planned_title or _untitled_label(live),
+                          "snapshot": it["snapshot"]})
         journal = _journal_write({
             "ts": datetime.now(timezone.utc).isoformat(),
             "manifest": manifest_id, "summary": m.get("summary"),
@@ -13212,10 +13417,16 @@ def _describe_abandon_task(p: Dict, live_title: Optional[str] = None) -> str:
     # вызывающего (см. abandon_task ниже). Раньше сюда доставался фолбэк
     # `task_title or task_id`: при пустом summary карточка говорила «задачу
     # «6a7571238f0854e347f51407»» — id в позиции имени, в кавычках.
+    # Фолбэк на `_live_task_title` (П15, 2026-08-09): у БЕЗЫМЯННОЙ задачи
+    # guard возвращает пустое живое имя, и карточка говорила «её нет в живом
+    # состоянии аккаунта» про задачу, которую сам же guard только что
+    # подтвердил. `_live_task_title` в этом случае даёт заменитель по
+    # содержимому и None только когда задачи действительно нет.
     return p.get("summary") or (
         "Отмечаю «не буду делать» задачу "
         + _plan_task_name({"taskId": p.get("task_id"),
-                           "title": live_title or p.get("task_title")}))
+                           "title": (live_title or p.get("task_title")
+                                     or _live_task_title(p.get("task_id") or ""))}))
 
 
 @mcp.tool()
@@ -13366,7 +13577,8 @@ def _describe_duplicate_task(p: Dict, live_title: Optional[str] = None) -> str:
     return p.get("summary") or (
         "Дублирую задачу "
         + _plan_task_name({"taskId": p.get("task_id"),
-                           "title": live_title or p.get("task_title")}))
+                           "title": (live_title or p.get("task_title")
+                                     or _live_task_title(p.get("task_id") or ""))}))
 
 
 @mcp.tool()
@@ -15156,11 +15368,10 @@ def _describe_triage_op(op: Dict) -> str:
         # класс, что в карточках гейта): молчаливый показ id читается как
         # имя. Здесь он и достижим-то только когда имени нет НИОТКУДА —
         # значит это надо сказать словами.
-        shown = _plan_task_name({"task_id": op.get("task_id"),
-                                 "title": op.get("title") or op.get("_live_title")})
+        shown = _triage_task_label(
+            {**op, "_live_title": op.get("title") or op.get("_live_title")})
         return f"⚠️ ПРОПУЩЕНО — {shown}: {op['_skip']}"
-    title = _plan_task_name({"task_id": op.get("task_id"),
-                             "title": op.get("_live_title") or op.get("title")})
+    title = _triage_task_label(op)
     orphan = _triage_orphan_note(op.get("_open_children") or 0)
     if kind in ("delete", "complete"):
         bits = ([f"проект «{proj}»"] if proj else []) + ([orphan] if orphan else [])
@@ -15407,6 +15618,12 @@ def _resolve_triage_ops(operations: List[Dict], by_id: Dict[str, Dict],
         e["_project_id"] = pid
         e["_project_name"] = names.get(pid, "")
         e["_live_title"] = live_title
+        # Как НАЗВАТЬ эту задачу в превью и в отчёте (П15, 2026-08-09).
+        # Задача найдена — значит «имени нет» здесь означает «у неё его нет»,
+        # а не «мы её не нашли», и печатать про недоступное живое состояние
+        # (как делал общий фолбэк) было бы прямой ложью.
+        e["_untitled"] = _is_untitled(live_title)
+        e["_label"] = live_title or _untitled_label(live)
         e["_snapshot"] = _snapshot_of(live)
         if e["op"] in ("delete", "complete", "merge"):
             e["_open_children"] = kids.get(e["task_id"], 0)
@@ -15506,6 +15723,20 @@ def _triage_plan_notes(ops: List[Dict]) -> List[str]:
 # (50 операций, константой в коде, `max_items` может только опустить).
 
 
+def _triage_task_label(op: Dict) -> str:
+    """Как строка триажа НАЗЫВАЕТ свою задачу. Обёртка над `_plan_task_name`,
+    которая доносит до него уже прочитанное живое состояние строки: у
+    безымянной задачи (П15, 2026-08-09) это заменитель по содержимому плюс
+    признание, что личность сверена по id, а не общий текст «её нет в живом
+    состоянии аккаунта» — задачу-то нашли."""
+    tid = str(op.get("task_id") or "")
+    titles = ({tid: {"label": op["_label"], "untitled": bool(op.get("_untitled"))}}
+              if op.get("_label") else {})
+    return _plan_task_name(
+        {"task_id": tid, "title": op.get("_live_title") or op.get("title")},
+        titles)
+
+
 def _triage_expected_changes(changes: Dict) -> Dict:
     """Перевод «интерфейсных» полей changes (в том виде, в каком их понимает
     _update_tasks_impl) в поля ЖИВОЙ задачи, по которым _verify_item умеет
@@ -15559,7 +15790,10 @@ def _verify_triage_op(op: Dict, live_map: Dict[str, Dict],
     состоянию, а НЕ по тексту ответа под-исполнителя. Возвращает
     (статус ∈ ok/fail/unchecked, строка вердикта)."""
     kind = op["op"]
-    title = op.get("_live_title") or op.get("title") or ""
+    # `_label` — заменитель для безымянной задачи (П15, 2026-08-09): без него
+    # вердикт печатал «- ✅ **«»** — удалена», то есть отчитывался о том, чего
+    # человек не может опознать.
+    title = op.get("_live_title") or op.get("title") or op.get("_label") or ""
     item: Dict[str, Any] = {"taskId": op.get("task_id"), "title": title}
     if kind in ("delete", "merge"):
         status, line = _verify_item("delete", item, live_map, names)
@@ -15589,8 +15823,7 @@ def _verify_triage_op(op: Dict, live_map: Dict[str, Dict],
 def _triage_blocked_lines(blocked: List[Tuple[Dict, str]]) -> List[str]:
     out = ["#### ⏭ Пропущено — НЕ выполнено"]
     for op, why in blocked:
-        shown = _plan_task_name({"task_id": op.get("task_id"),
-                                 "title": op.get("_live_title") or op.get("title")})
+        shown = _triage_task_label(op)
         emoji = _TRIAGE_EMOJI.get(op.get("op"), "•")
         verb = _TRIAGE_VERB.get(op.get("op"), op.get("op"))
         out.append(f"- {emoji} {shown} ({verb}): {why}")
