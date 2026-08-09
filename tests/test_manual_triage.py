@@ -2337,3 +2337,39 @@ def test_the_reference_record_still_carries_nothing_executable():
         {"op": "delete", "task_id": "ghost", "title": "Призрак",
          "said": "убери", "_skip": "не найдена среди открытых задач"}])[0]
     assert set(ghost) == {"task_id", "op", "title", "why"}
+
+
+# ═══════ 25. Отказ по капу не молчит о непрошедших (Д9) ════════════════════
+
+
+async def test_the_cap_refusal_still_names_what_did_not_pass_the_check(
+        monkeypatch, tmp_path):
+    """Д9 (2026-08-09). План больше капа отвергается целиком — но справка о
+    непрошедших сверку уже посчитана, и жить ей больше негде: манифеста нет,
+    превью нет, второго шанса рассказать про эти операции не будет. Без неё
+    модель делит список пополам и строит новый план на те же непрошедшие."""
+    live, ops = _long_plan(s._TRIAGE_HARD_CAP + 1)
+    live["ghost"] = {"id": "ghost", "title": "Уже удалена", "projectId": "p_in"}
+    ops.append({"op": "delete", "task_id": "ghost", "title": "Уже удалена",
+                "said": "неактуально"})
+    _wire(monkeypatch, live, tmp_path)
+    live.pop("ghost")                      # исчезла к моменту построения плана
+
+    out = await _assert_refused_outright(monkeypatch, live, ops, "больше капа")
+
+    assert "❌ Не вошло: 1" in out, f"отказ по капу молчит о непрошедшей:\n{out}"
+    assert "id ghost" in out
+    assert "«Уже удалена»" in out
+    assert "не найдена среди открытых задач" in out, "причина не названа"
+
+
+async def test_a_clean_overflow_refusal_has_no_empty_reference_block(
+        monkeypatch, tmp_path):
+    """Зеркало: когда непрошедших нет, отказ по капу не обрастает пустой
+    рубрикой «❌ Не вошло: 0»."""
+    live, ops = _long_plan(s._TRIAGE_HARD_CAP + 1)
+    _wire(monkeypatch, live, tmp_path)
+
+    out = await _assert_refused_outright(monkeypatch, live, ops, "больше капа")
+
+    assert "Не вошло" not in out, out

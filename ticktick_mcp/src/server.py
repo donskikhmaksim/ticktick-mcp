@@ -16716,7 +16716,15 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         # `_triage_cap_refusal`.
         refusal = _triage_cap_refusal(len(enriched), max_items)
         if refusal:
-            return refusal
+            # Д9 (2026-08-09): справка о непрошедших едет ВМЕСТЕ с отказом.
+            # Она к этому моменту уже посчитана, а жить ей больше негде: плана
+            # нет, манифеста нет, второго шанса рассказать про эти операции не
+            # будет. Без неё модель видит только «больше предела», делит список
+            # пополам и строит новый план на те же непрошедшие — они отвалятся
+            # снова, уже без единого слова о причине.
+            return "\n".join(
+                [refusal, ""] + _triage_not_planned_lines(not_planned)) \
+                if not_planned else refusal
         summary = _triage_summary_with_counts(summary, checked)
         # Справка едет через тот же `notes`, что и прочие предупреждения про
         # весь план: он печатается ПОД списком операций и попадает разом и в
