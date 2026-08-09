@@ -1088,7 +1088,7 @@ async def test_executor_ran_but_verification_did_not_confirm(monkeypatch, tmp_pa
     out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
 
     assert [c[0] for c in calls] == ["complete", "delete"]
-    assert "✅ Выполнено 0 из 2" in out
+    assert "❌ Выполнено 0 из 2" in out, "галочка рядом с нулём (побочный пункт Д7)"
     assert "❌ Не подтверждено сверкой: 2" in out
     assert "ВСЁ ЕЩЁ существует" in out and "всё ещё среди открытых" in out
 
@@ -1274,7 +1274,7 @@ async def test_changes_invisible_in_the_open_list_are_reported_as_unchecked(
 
     assert [c[0] for c in calls] == ["update"]
     assert "⚠️ не проверяется автоматически: 1" in out
-    assert "✅ Выполнено 0 из 1" in out
+    assert "❌ Выполнено 0 из 1" in out, "галочка рядом с нулём (побочный пункт Д7)"
     assert "не проверить" in out
 
 
@@ -1288,7 +1288,7 @@ async def test_changes_invisible_in_the_open_list_are_reported_as_unchecked(
 # убрала — план доставляется ЦЕЛИКОМ, разбитый на несколько сообщений
 # (split_for_telegram / send_message_chunked). Отказ вместе с его причиной
 # снят, а тесты ниже держат новое: длинный план строится и доезжает полностью.
-# Предел разового ущерба по-прежнему на _TRIAGE_HARD_CAP (50 операций).
+# Предел разового ущерба по-прежнему на _TRIAGE_PLAN_DAMAGE_CAP (50 операций).
 
 def _tg_on(monkeypatch, allowlist=None):
     monkeypatch.setattr(s, "_TG_CFG", tg.TgApprovalConfig(
@@ -1671,13 +1671,13 @@ async def test_max_items_cannot_be_raised_above_the_hard_cap(monkeypatch, tmp_pa
     """Кап, который волен поднять сам вызывающий, — не кап. `max_items=10000`
     строил план на 200 удалений; для фичи, родившейся из «слишком большой
     готовый к исполнению план», это существенно."""
-    live, ops = _long_plan(s._TRIAGE_HARD_CAP + 1)
+    live, ops = _long_plan(s._TRIAGE_PLAN_DAMAGE_CAP + 1)
     _wire(monkeypatch, live, tmp_path)
 
     out = await _assert_refused_outright(monkeypatch, live, ops, "больше капа",
                                          max_items=10000)
 
-    assert f"больше капа {s._TRIAGE_HARD_CAP}" in out
+    assert f"больше капа {s._TRIAGE_PLAN_DAMAGE_CAP}" in out
     assert "max_items=10000" in out and "НЕ поднимает" in out
 
 
@@ -1693,7 +1693,7 @@ async def test_max_items_can_still_be_lowered(monkeypatch, tmp_path):
 
 
 async def test_the_hard_cap_is_fifty():
-    assert s._TRIAGE_HARD_CAP == 50
+    assert s._TRIAGE_PLAN_DAMAGE_CAP == 50
 
 
 # ═══════ 20. Повторяющееся обоснование — заметное предупреждение ════════════
@@ -2219,7 +2219,7 @@ async def test_the_cap_counts_the_plan_not_the_rejected_input(
     """50 валидных + 1 непрошедшая = 50 исполнимых, то есть ровно кап.
     Отказывать здесь — значит отказывать из-за мусора, который и так выброшен
     (кап ограничивает разовый УЩЕРБ, а ущерб наносит только исполнимое)."""
-    live, ops = _long_plan(s._TRIAGE_HARD_CAP)
+    live, ops = _long_plan(s._TRIAGE_PLAN_DAMAGE_CAP)
     live["gone"] = {"id": "gone", "title": "Уже удалена", "projectId": "p_in"}
     ops.append({"op": "delete", "task_id": "gone", "title": "Уже удалена",
                 "said": "неактуально"})
@@ -2229,7 +2229,7 @@ async def test_the_cap_counts_the_plan_not_the_rejected_input(
     preview = await s.manual_triage("Разбираю входящие", ops)
 
     assert "больше капа" not in preview
-    assert len(s._MANIFESTS[_mid(preview)]["tasks"]) == s._TRIAGE_HARD_CAP
+    assert len(s._MANIFESTS[_mid(preview)]["tasks"]) == s._TRIAGE_PLAN_DAMAGE_CAP
     assert "❌ Не вошло: 1" in preview
 
 
@@ -2237,7 +2237,7 @@ async def test_the_cap_still_refuses_when_the_plan_itself_is_too_big(
         monkeypatch, tmp_path):
     """Зеркало: считать по исполнимым — не значит ослабить. 51 исполнимая по
     прежнему отвергается целиком."""
-    live, ops = _long_plan(s._TRIAGE_HARD_CAP + 1)
+    live, ops = _long_plan(s._TRIAGE_PLAN_DAMAGE_CAP + 1)
     _wire(monkeypatch, live, tmp_path)
 
     await _assert_refused_outright(monkeypatch, live, ops, "больше капа")
@@ -2247,3 +2247,300 @@ def test_a_short_id_is_printed_without_a_promise_of_more():
     """`a1…` обещало продолжение, которого у короткого id нет."""
     assert s._short_task_id("a1") == "a1"
     assert s._short_task_id("6a73adfc1234567890") == "6a73adfc…"
+
+
+# ═══════ 24. Справка о невошедшем не врёт про НАЙДЕННУЮ задачу (Д10) ═══════
+
+
+def _live_with_untitled_attachment():
+    """Живое состояние, где есть безымянная задача С ВЛОЖЕНИЕМ.
+
+    Название — один zero-width space: `_looks_untitled` (показ) считает такую
+    задачу безымянной, а `_names_agree` (предохранитель) сверяет её с планом
+    посимвольно, поэтому операция доходит до сверки и падает на СВОЕЙ
+    причине, а не на несовпадении имени."""
+    live = _live_inbox()
+    live["u1"] = {"id": "u1", "title": "​", "projectId": "p_in",
+                  "attachments": [{"id": "f1", "fileName": "чек.jpg"}]}
+    return live
+
+
+async def test_the_reference_names_an_untitled_task_it_actually_read(
+        monkeypatch, tmp_path):
+    """Д10 (2026-08-09). Задача НАЙДЕНА в живом состоянии и прочитана (у неё
+    посчитано вложение), а из плана выброшена по ДРУГОЙ причине — проект
+    назначения не существует. Справка обязана назвать её заменителем по
+    содержимому, а не общим фолбэком «её нет в живом состоянии»: это
+    дословно тот текст, который П15 объявил ложью, и он уезжает в Postgres
+    вместе с манифестом и в архивный отчёт навсегда."""
+    live = _live_with_untitled_attachment()
+    _wire(monkeypatch, live, tmp_path)
+    _stub_sub_impls(monkeypatch, live)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "move", "task_id": "u1", "title": "​",
+         "to_project": "Проект, которого нет", "said": "это в работу"},
+        {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "сделал"}])
+
+    assert "❌ Не вошло: 1" in preview, preview
+    assert "(без названия: 📎 1 файл)" in preview, \
+        f"справка не назвала задачу её заменителем:\n{preview}"
+    assert s._NO_NAME_TASK not in preview, \
+        f"справка соврала про НАЙДЕННУЮ задачу:\n{preview}"
+    assert s._BY_ID_NOTE in preview, "не сказано, что личность сверена по id"
+
+
+async def test_the_label_reaches_the_archived_report_through_the_manifest(
+        monkeypatch, tmp_path):
+    """Та же метка обязана пережить кнопку: отчёт после исполнения — это
+    единственный текст, который уходит в группу-архив навсегда, а справка в
+    нём собирается из записи манифеста, а не из памяти вызова."""
+    live = _live_with_untitled_attachment()
+    _wire(monkeypatch, live, tmp_path)
+    _stub_sub_impls(monkeypatch, live)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "move", "task_id": "u1", "title": "​",
+         "to_project": "Проект, которого нет", "said": "это в работу"},
+        {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "сделал"}])
+    m = s._MANIFESTS[_mid(preview)]
+    rec = m["extra"]["not_planned"][0]
+
+    assert rec["label"] == "(без названия: 📎 1 файл)", rec
+    assert rec["untitled"] is True, rec
+
+    out = await s._generic_gate_auto_execute(_mid(preview), m)
+
+    assert "(без названия: 📎 1 файл)" in out, out
+    assert s._NO_NAME_TASK not in out, out
+
+
+def test_the_reference_record_still_carries_nothing_executable():
+    """Зеркало к Д10: метка добавлена, но запись по-прежнему НЕ операция —
+    ни одного ключа, по которому её можно было бы исполнить."""
+    rec = s._triage_not_planned_records([
+        {"op": "move", "task_id": "u1", "title": "​", "said": "в работу",
+         "changes": {"new_title": "подмена"}, "keep_task_id": "e6",
+         "to_project_id": "p_work", "_label": "(без названия: 📎 1 файл)",
+         "_untitled": True, "_live_title": "​",
+         "_skip": "проект назначения не найден"}])[0]
+
+    assert set(rec) == {"task_id", "op", "title", "label", "untitled", "why"}
+    assert not ({"changes", "keep_task_id", "to_project_id", "to_project",
+                 "said", "_skip", "_to_project_id"} & set(rec))
+
+    # Задача, которую даже не нашли, метки не имеет — и полей под неё в записи
+    # не заводится: пустое «имя» в базе хуже отсутствия ключа.
+    ghost = s._triage_not_planned_records([
+        {"op": "delete", "task_id": "ghost", "title": "Призрак",
+         "said": "убери", "_skip": "не найдена среди открытых задач"}])[0]
+    assert set(ghost) == {"task_id", "op", "title", "why"}
+
+
+# ═══════ 25. Отказ по капу не молчит о непрошедших (Д9) ════════════════════
+
+
+async def test_the_cap_refusal_still_names_what_did_not_pass_the_check(
+        monkeypatch, tmp_path):
+    """Д9 (2026-08-09). План больше капа отвергается целиком — но справка о
+    непрошедших сверку уже посчитана, и жить ей больше негде: манифеста нет,
+    превью нет, второго шанса рассказать про эти операции не будет. Без неё
+    модель делит список пополам и строит новый план на те же непрошедшие."""
+    live, ops = _long_plan(s._TRIAGE_PLAN_DAMAGE_CAP + 1)
+    live["ghost"] = {"id": "ghost", "title": "Уже удалена", "projectId": "p_in"}
+    ops.append({"op": "delete", "task_id": "ghost", "title": "Уже удалена",
+                "said": "неактуально"})
+    _wire(monkeypatch, live, tmp_path)
+    live.pop("ghost")                      # исчезла к моменту построения плана
+
+    out = await _assert_refused_outright(monkeypatch, live, ops, "больше капа")
+
+    assert "❌ Не вошло: 1" in out, f"отказ по капу молчит о непрошедшей:\n{out}"
+    assert "id ghost" in out
+    assert "«Уже удалена»" in out
+    assert "не найдена среди открытых задач" in out, "причина не названа"
+
+
+async def test_a_clean_overflow_refusal_has_no_empty_reference_block(
+        monkeypatch, tmp_path):
+    """Зеркало: когда непрошедших нет, отказ по капу не обрастает пустой
+    рубрикой «❌ Не вошло: 0»."""
+    live, ops = _long_plan(s._TRIAGE_PLAN_DAMAGE_CAP + 1)
+    _wire(monkeypatch, live, tmp_path)
+
+    out = await _assert_refused_outright(monkeypatch, live, ops, "больше капа")
+
+    assert "Не вошло" not in out, out
+
+
+# ═══════ 26. Ранний выход исполнителя не теряет справку (Д8) ═══════════════
+
+
+_NOT_PLANNED_ONE = [{"task_id": "a1", "op": "delete", "title": "Купить хлеб",
+                     "why": "название не совпало — по этому id сейчас "
+                            "«Купить молоко», а в плане «Купить хлеб»"}]
+
+
+async def test_the_state_unavailable_exit_still_names_what_did_not_make_it(
+        monkeypatch, tmp_path):
+    """Д8 (2026-08-09). Манифест погашен, исполнитель стартовал, живое
+    состояние недоступно. Про операции, не прошедшие сверку, сказать больше
+    негде и некогда: план одноразовый, справка жила только в нём, превью в
+    личке уже затёрто сводкой."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
+
+    out = await s._manual_triage_impl(
+        "Разбираю",
+        [{"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+          "said": "сделал", "_project_id": "p_in",
+          "_live_title": "Оплатить интернет"}],
+        not_planned=list(_NOT_PLANNED_ONE))
+
+    assert "состояние TickTick недоступно" in out, out
+    assert "#### ❌ Не вошло в план" in out, f"справка потеряна:\n{out}"
+    assert "id a1" in out and "название не совпало" in out
+
+
+async def test_the_not_ready_exit_still_names_what_did_not_make_it(
+        monkeypatch, tmp_path):
+    """Тот же ранний выход этажом выше: сервер вообще не готов. Справка
+    одноразовая ровно так же."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    monkeypatch.setattr(s, "_ensure_ready", lambda: "🛑 Сервер не настроен.")
+
+    out = await s._manual_triage_impl(
+        "Разбираю",
+        [{"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+          "said": "сделал", "_project_id": "p_in",
+          "_live_title": "Оплатить интернет"}],
+        not_planned=list(_NOT_PLANNED_ONE))
+
+    assert "Сервер не настроен" in out
+    assert "#### ❌ Не вошло в план" in out, f"справка потеряна:\n{out}"
+
+
+async def test_an_early_exit_without_a_reference_is_byte_for_byte_the_old_text(
+        monkeypatch, tmp_path):
+    """Зеркало: когда справки нет, ранний выход не обрастает ни пустой
+    рубрикой, ни лишним переводом строки."""
+    live = _live_inbox()
+    _wire(monkeypatch, live, tmp_path)
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
+
+    out = await s._manual_triage_impl(
+        "Разбираю",
+        [{"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+          "said": "сделал", "_project_id": "p_in",
+          "_live_title": "Оплатить интернет"}])
+
+    assert out == s._STATE_UNAVAILABLE_MSG
+
+
+async def test_the_reference_survives_the_button_path_into_a_dead_state(
+        monkeypatch, tmp_path):
+    """Полный кнопочный путь: план построен, справка уехала в манифест, а к
+    моменту исполнения живое состояние отвалилось. Отчёт — единственный текст,
+    который увидит человек, и он обязан назвать невошедшее."""
+    live, _calls = _plan_with_one_rename(monkeypatch, tmp_path)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "delete", "task_id": "a1", "title": "Купить хлеб",
+         "said": "не нужно"},
+        {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "сделал"}])
+    m = s._MANIFESTS[_mid(preview)]
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
+
+    out = await s._generic_gate_auto_execute(_mid(preview), m)
+
+    assert "состояние TickTick недоступно" in out, out
+    assert "#### ❌ Не вошло в план" in out, f"справка потеряна:\n{out}"
+    assert "«Купить молоко»" in out
+
+
+# ═══════ 27. Два предела: объём входа и ущерб плана (Д12) ══════════════════
+
+
+async def test_a_huge_input_is_refused_before_live_state_is_even_read(
+        monkeypatch, tmp_path):
+    """Д12 (2026-08-09). Предел ущерба считается по прошедшим сверку — и это
+    правильно, но верхней границы на ДЛИНУ ВХОДА после той правки не осталось
+    ни одной. Вызов, где сверку переживает горстка строк, а остальные тысячи
+    едут в превью, в манифест и в архивный отчёт, обязан отвергаться ДО
+    чтения живого состояния."""
+    live, ops = _long_plan(s._TRIAGE_INPUT_VOLUME_CAP + 1)
+    _wire(monkeypatch, live, tmp_path)
+    reads = []
+    monkeypatch.setattr(s, "_open_by_id",
+                        lambda fresh=False: reads.append(1) or dict(live))
+
+    out = await _assert_refused_outright(
+        monkeypatch, live, ops, "больше предела на объём одного вызова")
+
+    assert reads == [], "живое состояние читалось, хотя вход отвергнут"
+    assert str(s._TRIAGE_INPUT_VOLUME_CAP) in out
+
+
+async def test_the_volume_limit_does_not_care_how_many_survive_the_check(
+        monkeypatch, tmp_path):
+    """Тот самый сценарий: почти всё не проходит сверку, план получается
+    крошечный. Предел УЩЕРБА такой вызов честно пропускает — держать его
+    обязан отдельный предел объёма."""
+    live, ops = _long_plan(s._TRIAGE_INPUT_VOLUME_CAP + 40)
+    _wire(monkeypatch, live, tmp_path)
+    # Всё, кроме десяти, исчезло из живого состояния — в план ушло бы 10.
+    for tid in list(live)[10:]:
+        live.pop(tid)
+
+    out = await _assert_refused_outright(
+        monkeypatch, live, ops, "больше предела на объём одного вызова")
+
+    assert "больше капа" not in out, "перепутаны два разных предела"
+
+
+async def test_the_two_limits_are_different_numbers_and_different_checks(
+        monkeypatch, tmp_path):
+    """Зеркало к обоим: 60 операций — больше предела УЩЕРБА (50), но меньше
+    предела ОБЪЁМА (200). Отказ должен быть по ущербу, а не по объёму, иначе
+    пределы снова сведены в один."""
+    assert s._TRIAGE_PLAN_DAMAGE_CAP == 50
+    assert s._TRIAGE_INPUT_VOLUME_CAP == 200
+    assert s._TRIAGE_INPUT_VOLUME_CAP > s._TRIAGE_PLAN_DAMAGE_CAP
+
+    live, ops = _long_plan(s._TRIAGE_PLAN_DAMAGE_CAP + 10)
+    _wire(monkeypatch, live, tmp_path)
+
+    out = await _assert_refused_outright(monkeypatch, live, ops, "больше капа")
+
+    assert "объём одного вызова" not in out
+
+
+async def test_the_volume_limit_is_not_a_lever_the_caller_can_pull(
+        monkeypatch, tmp_path):
+    """`max_items` — рычаг вызывающего на УЩЕРБ («сделай план поменьше»).
+    Объём собственного ввода вызывающий регулировать не вправе: и щедрый, и
+    скупой max_items одинаково не спасают вызов на 201 операцию."""
+    live, ops = _long_plan(s._TRIAGE_INPUT_VOLUME_CAP + 1)
+    _wire(monkeypatch, live, tmp_path)
+
+    for lever in (10_000, 5):
+        await _assert_refused_outright(
+            monkeypatch, live, ops, "больше предела на объём одного вызова",
+            max_items=lever)
+
+
+async def test_a_plan_at_the_damage_cap_still_builds(monkeypatch, tmp_path):
+    """И главное: ни один из двух пределов не съел законный разбор — ровно
+    кап ущерба по-прежнему проходит."""
+    live, ops = _long_plan(s._TRIAGE_PLAN_DAMAGE_CAP)
+    _wire(monkeypatch, live, tmp_path)
+
+    preview = await s.manual_triage("Разбираю входящие", ops)
+
+    assert "🛑" not in preview
+    assert len(s._MANIFESTS[_mid(preview)]["tasks"]) == s._TRIAGE_PLAN_DAMAGE_CAP

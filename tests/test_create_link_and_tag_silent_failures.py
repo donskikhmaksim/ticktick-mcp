@@ -40,10 +40,14 @@ class _FakeV2:
     `reject` — множество операций, которые канал ОТКЛОНЯЕТ (кладёт id2error и
     ничего не применяет): "parent" (обе привязки), "tags", "assignee".
     `blind_after_write` — после первой записи живое чтение открытых задач
-    падает: имитация «канал ответил, перепроверить не удалось»."""
+    падает: имитация «канал ответил, перепроверить не удалось».
+    `reject_create_titles` — названия задач, которые канал НЕ создаёт: кладёт
+    их в id2error и не пишет в живое состояние (ровно так /batch/task и
+    отвечает на частично непринятое дерево)."""
 
     def __init__(self, projects, live, tags=None, reject=(), blind_after_write=False,
-                 drop_parent=False, drop_tags=False, inbox_id="inbox1"):
+                 drop_parent=False, drop_tags=False, inbox_id="inbox1",
+                 reject_create_titles=()):
         self.projects = projects
         self.live = live
         self.tags = tags if tags is not None else []
@@ -54,6 +58,7 @@ class _FakeV2:
         self.drop_parent = drop_parent
         self.drop_tags = drop_tags
         self.inbox_id = inbox_id
+        self.reject_create_titles = set(reject_create_titles)
         self.calls = []
         self._wrote = False
 
@@ -76,11 +81,15 @@ class _FakeV2:
     # ---- запись ----------------------------------------------------------
     def batch_create_tasks(self, tasks):
         self.calls.append(("create", [t["id"] for t in tasks]))
+        errs = {}
         for t in tasks:
+            if t.get("title") in self.reject_create_titles:
+                errs[t["id"]] = "quota exceeded"
+                continue
             self.live[t["id"]] = {"id": t["id"], "title": t.get("title"),
                                   "projectId": t.get("projectId"), "tags": []}
         self._wrote = True
-        return {}
+        return {"id2error": errs} if errs else {}
 
     def _request(self, method, path, json=None):
         rows = json or []
@@ -378,3 +387,55 @@ async def test_assignee_rejection_at_update_is_reported(monkeypatch):
 
     assert "исполнитель НЕ назначен" in result
     assert "assignee not a project member" in result
+
+
+# ===========================================================================
+# Д11. Счёт в главной строке — по СОЗДАННОМУ, а не по запрошенному
+# ===========================================================================
+
+async def test_a_partially_rejected_tree_is_not_counted_as_whole(monkeypatch):
+    """Д11 (2026-08-09). Канал принял корень и одну подзадачу из трёх,
+    отклонив две. Число в ГЛАВНОЙ строке считалось по всему запрошенному
+    списку — «+ 3 подзадач» — прямо противореча предупреждению об отказе,
+    которое печаталось строкой ниже. Соседняя ветка того же метода (плоские
+    подзадачи) отказы вычитала всегда."""
+    v2, _ = _wire(monkeypatch,
+                  reject_create_titles={"Позвать мастера", "Вывезти мусор"},
+                  blind_after_write=True)
+
+    result = await s._create_tasks_impl("тест", [
+        {"title": "Ремонт", "project_id": "pA",
+         "subtasks": [{"title": "Купить краску"}, {"title": "Позвать мастера"},
+                      {"title": "Вывезти мусор"}]}])
+
+    assert "+ 1 подзадач" in result, f"счёт завышен:\n{result}"
+    assert "+ 3 подзадач" not in result
+    assert "2 из 4" in result, f"не сказано, сколько из скольких:\n{result}"
+    assert "TickTick отклонил 2 из 4" in result
+
+
+async def test_a_rejected_root_is_not_reported_as_created(monkeypatch):
+    """Крайний случай того же счёта: канал отклонил САМ корень. «✓ «Ремонт»»
+    было бы ложью про задачу, а не только про число подзадач."""
+    v2, _ = _wire(monkeypatch, reject_create_titles={"Ремонт"},
+                  blind_after_write=True)
+
+    result = await s._create_tasks_impl("тест", [
+        {"title": "Ремонт", "project_id": "pA",
+         "subtasks": [{"title": "Купить краску"}]}])
+
+    assert "✓ «Ремонт»" not in result, f"отклонённый корень выдан за созданный:\n{result}"
+    assert "САМА задача НЕ создана" in result
+    assert "создано 1 из 2" in result
+
+
+async def test_a_fully_accepted_tree_still_reads_exactly_as_before(monkeypatch):
+    """Зеркало: когда канал не отклонил ничего, строка побайтово прежняя —
+    правка счёта не имеет права переписывать успешный отчёт."""
+    v2, _ = _wire(monkeypatch, blind_after_write=True)
+
+    result = await s._create_tasks_impl("тест", [
+        {"title": "Ремонт", "project_id": "pA",
+         "subtasks": [{"title": "Купить краску"}, {"title": "Позвать мастера"}]}])
+
+    assert "✓ «Ремонт» + 2 подзадач (дерево, 3 всего)" in result, result
