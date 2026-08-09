@@ -354,9 +354,13 @@ class TickTickClient:
             response = _issue()
 
             # Retry on 429/5xx with exponential backoff (1s, 2s) — rate limits
-            # on bursts usually clear after a short wait.
+            # on bursts usually clear after a short wait. 2026-08-09: added
+            # 502/504 — Cloudflare-proxy transients — to match the v2 client's
+            # set (ticktick_v2_client.py's _request), which already retries
+            # them; the two channels had silently drifted apart, and this one
+            # was the narrower of the two.
             for _attempt in range(2):
-                if response.status_code not in (429, 500, 503):
+                if response.status_code not in (429, 500, 502, 503, 504):
                     break
                 time.sleep(2 ** _attempt)
                 response = _issue()
