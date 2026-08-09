@@ -49,6 +49,24 @@ def _a_date(days):
             + timedelta(days=days)).strftime("%Y-%m-%d")
 
 
+def _wire_stale_snapshot(monkeypatch, live, official_tasks):
+    """Живая задача ВЫПАЛА из v2-снимка открытых задач, но существует и
+    читается официальным Open API — инцидент 2026-08-07: задача отсутствовала в
+    той выборке 25 минут, ради него guard и получил официальный запасной канал.
+
+    Ровно это положение и разоружало сверку переименования: пакетный путь брал
+    «живое имя» из снимка, получал по ЖИВОЙ задаче пустоту и читал её как
+    «имени нет».
+
+    `live` — то, что видно ОБОИМ каналам; задачи из `official_tasks` живут
+    ТОЛЬКО в официальном, то есть в снимке их нет ни до записи, ни после."""
+    v2, official = _wire(monkeypatch, live)
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: dict(live))
+    official.get_task = lambda project_id, task_id: dict(
+        official_tasks.get((project_id, task_id)) or {"error": "404 Not Found"})
+    return v2, official
+
+
 # ═══════════════ 1. Главное: отказ ДО записи, одиночный путь ═══════════════
 
 async def test_rename_without_title_is_refused_before_the_write(monkeypatch):
@@ -253,3 +271,201 @@ async def test_batch_counts_add_up_when_one_row_is_refused(monkeypatch, tmp_path
     assert live["ok1"]["priority"] == 3 and live["ok2"]["priority"] == 3
     # 2 обновлено + 1 отказано + 0 mismatch + 0 missing == 3 запрошенных
     assert out.count("🛑") == 1, out
+
+
+# ═════ 5. Живая задача ВНЕ v2-снимка: «я не смотрел» ≠ «имени нет» ═════
+
+async def test_batch_refuses_when_the_task_is_outside_the_v2_snapshot(
+        monkeypatch, tmp_path):
+    """ГЛАВНАЯ дыра доработки (воспроизведена тремя скептиками независимо).
+
+    Задача «Отчёт для налоговой» жива и открыта, но выпала из v2-снимка —
+    guard находит её официальным запасным каналом и пропускает в разрешённые.
+    Пакетный путь брал живое имя из снимка, получал пустоту и разоружался:
+    ни одного 🛑, канал записи дёрнут, имя затёрто, а в журнал ушло НОВОЕ имя.
+    Верное значение всё это время лежало в руке — в строке `found`."""
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+    v2, official = _wire_stale_snapshot(
+        monkeypatch,
+        live={"Y": {"id": "Y", "title": "Вторая", "projectId": "pA"}},
+        official_tasks={("pA", "X"): {"id": "X", "title": "Отчёт для налоговой",
+                                      "projectId": "pA", "status": 0}})
+
+    out = await s._update_tasks_impl("правлю двух", [
+        {"taskId": "X", "projectId": "pA", "new_title": "ЗАТЁРТО"},
+        {"taskId": "Y", "projectId": "pA", "title": "Вторая", "priority": 3}])
+
+    assert _no_writes(v2, official) or all(
+        "X" != c.get("taskId") for call in v2.calls if call[0] == "update"
+        for c in call[1]), f"строку X всё-таки отправили: {v2.calls}"
+    assert "🛑" in out, out
+    assert "Отчёт для налоговой" in out, out
+    # И жалобы «выполнено БЕЗ сверки названия» после записи тоже быть не может.
+    assert "БЕЗ сверки названия" not in out, out
+
+
+async def test_batch_refuses_a_false_untitled_marker_outside_the_snapshot(
+        monkeypatch, tmp_path):
+    """Та же причина, второй симптом: ветка «маркер разошёлся с живым
+    состоянием» сравнивала маркер с пустотой из снимка, и ложь о личности
+    объекта проходила. Одиночным путём тот же вход отказывался — расхождение
+    двух путей и выдавало ошибку."""
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+    v2, official = _wire_stale_snapshot(
+        monkeypatch,
+        live={"Y": {"id": "Y", "title": "Вторая", "projectId": "pA"}},
+        official_tasks={("pA", "X"): {"id": "X", "title": "Отчёт для налоговой",
+                                      "projectId": "pA", "status": 0}})
+
+    out = await s._update_tasks_impl("правлю двух", [
+        {"taskId": "X", "projectId": "pA", "untitled": True,
+         "new_title": "ЗАТЁРТО"},
+        {"taskId": "Y", "projectId": "pA", "title": "Вторая", "priority": 3}])
+
+    assert "🛑" in out and "untitled" in out, out
+    assert "Отчёт для налоговой" in out, out
+
+
+def test_the_predicate_refuses_when_the_live_name_was_never_read():
+    """Единица различения, на которой держатся оба теста выше: «прочитали, там
+    пусто» (пустая строка) разрешает опознание по id, «не читали» (None) — не
+    разрешает ничего. Раньше это было одно и то же значение."""
+    assert s._title_check_armed("", False, "") is True      # прочитали, пусто
+    assert s._title_check_armed("", False, None) is False   # не читали
+    assert s._title_check_armed("", True, None) is False    # маркер не спасает
+    assert s._title_check_armed("", False, "Отчёт") is False
+
+
+def test_the_guard_tells_a_nameless_task_from_an_answer_without_the_field(
+        monkeypatch):
+    """Источник этого различения — сам guard. Объект без ключа `title`
+    (урезанный ответ канала) не имеет права выглядеть как задача без
+    названия."""
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {"pA": "Работа"})
+
+    named = s._guard_task("t1", "", "pA",
+                          by_id={"t1": {"id": "t1", "title": "", "projectId": "pA"}})
+    fieldless = s._guard_task("t2", "", "pA",
+                              by_id={"t2": {"id": "t2", "projectId": "pA"}})
+
+    assert named.status == "ok" and named.title_known is True
+    assert fieldless.status == "ok" and fieldless.title_known is False
+
+
+# ═════ 6. Регресс: задача с невидимым именем снова переименовывается ═════
+
+async def test_a_task_named_with_an_invisible_character_can_be_renamed(
+        monkeypatch, tmp_path):
+    """Внесённый регресс. План признаёт такое имя пустым по `_looks_untitled`,
+    а исполнение отказывало по `_is_untitled` — два разных ответа на вопрос
+    «пусто ли это» в одной цепочке, и переименовать задачу становилось нельзя
+    вообще. Плюс текст отказа был непроходим для человека: «у живой задачи
+    название ЕСТЬ: «​»» — пустые кавычки, подставить нечего."""
+    live = {"t_zw": {"id": "t_zw", "title": "​", "projectId": "pA"}}
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+    v2, official = _wire(monkeypatch, live)
+
+    out = await s._update_tasks_impl("назову чек", [
+        {"taskId": "t_zw", "projectId": "pA", "title": "",
+         "new_title": "Чек Home Depot"}])
+
+    assert "🛑" not in out, out
+    assert live["t_zw"]["title"] == "Чек Home Depot"
+
+
+# ═════ 7. Переименование В ПУСТОТУ при честно взведённой сверке ═════
+
+async def test_an_empty_new_title_is_refused_even_with_a_correct_title(
+        monkeypatch, tmp_path):
+    """Сверка взведена честно — имя передано и совпало, — но `ch["title"] = ""`
+    стирало название в пустоту, а отчёт рапортовал успех именем, которого уже
+    нет. Взведённость сверки и осмысленность записи — разные вопросы."""
+    live = {"t_lease": {"id": "t_lease", "title": _LEASE, "projectId": "pA"},
+            "ok1": {"id": "ok1", "title": "Первая", "projectId": "pA"}}
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+    v2, official = _wire(monkeypatch, live)
+
+    out = await s._update_tasks_impl("правлю двух", [
+        {"taskId": "t_lease", "projectId": "pA", "title": _LEASE,
+         "new_title": ""},
+        {"taskId": "ok1", "projectId": "pA", "title": "Первая", "priority": 3}])
+
+    assert "🛑" in out and "new_title" in out, out
+    assert live["t_lease"]["title"] == _LEASE
+
+
+async def test_an_empty_new_title_is_refused_in_the_single_path_too(
+        monkeypatch, tmp_path):
+    """Одиночный путь молчал иначе: настоящий клиент фильтрует `if title:` и
+    пустое имя не отправлял, а отчёт всё равно печатал «обновлено». Отказ
+    обязан быть одинаковым на обоих путях."""
+    live = _lease_live()
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+    v2, official = _wire(monkeypatch, live)
+
+    out = await s._update_tasks_impl("переименую", [
+        {"taskId": "t_lease", "projectId": "pA", "title": _LEASE,
+         "new_title": "   "}])
+
+    assert out.startswith("🛑"), out
+    assert _no_writes(v2, official)
+    assert live["t_lease"]["title"] == _LEASE
+
+
+# ═════ 8. Мелочи, за которые платит читатель отчёта ═════
+
+async def test_a_refusal_does_not_mute_the_warning_about_another_row(
+        monkeypatch, tmp_path):
+    """Один и тот же id стоит в вызове дважды: первая строка законна, но без
+    сверки (меняет приоритет), вторая отказана. Вычитание отказанных ПО id
+    глушило честное предупреждение про первую заодно со второй."""
+    live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "pA"},
+            "t2": {"id": "t2", "title": "Вторая", "projectId": "pA"}}
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+    v2, official = _wire(monkeypatch, live)
+
+    out = await s._update_tasks_impl("правлю", [
+        {"taskId": "t1", "projectId": "pA", "priority": 3},
+        {"taskId": "t1", "projectId": "pA", "new_title": "ЗАТЁРТО"},
+        {"taskId": "t2", "projectId": "pA", "title": "Вторая", "priority": 1}])
+
+    assert "БЕЗ сверки названия" in out, \
+        f"предупреждение про законную строку проглочено отказом по соседней:\n{out}"
+    assert "🛑" in out, out
+    assert live["t1"]["title"] == "Купить молоко"
+
+
+async def test_a_refusal_never_claims_that_nothing_changed(monkeypatch, tmp_path):
+    """«Ничего не изменено» в строке отказа — про строку, а читатель понимает
+    про объект, который в этом же вызове действительно переименован."""
+    live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "pA"},
+            "t2": {"id": "t2", "title": "Вторая", "projectId": "pA"}}
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+    v2, official = _wire(monkeypatch, live)
+
+    out = await s._update_tasks_impl("правлю", [
+        {"taskId": "t1", "projectId": "pA", "title": "Купить молоко",
+         "new_title": "Купить молоко и хлеб"},
+        {"taskId": "t2", "projectId": "pA", "new_title": "ЗАТЁРТО"}])
+
+    assert "🛑" in out, out
+    assert "Ничего не изменено" not in out, \
+        f"отказ обещает нетронутый объект, а он переименован:\n{out}"
+    assert live["t1"]["title"] == "Купить молоко и хлеб"
+
+
+def test_the_predicate_survives_a_non_string_title():
+    """Проверка безопасности не имеет права падать исключением на словаре,
+    собранном моделью: `{"title": 123}` — это отказ, а не AttributeError."""
+    assert s._title_check_armed(123, False, "Отчёт") is True
+    assert s._title_check_armed(None, False, "") is True
+    assert s._title_check_armed("", False, 0) is False
+
+
+def test_is_untitled_matches_its_own_docstring_on_invisible_characters():
+    """Докстринг `_is_untitled` обещал, что невидимые символы не вычищаются.
+    Пробельные по Unicode (NBSP) `strip()`-ом снимаются, нулевой ширины — нет.
+    Расхождение убрано в тексте докстринга; тест держит границу на месте."""
+    assert s._is_untitled(" ") is True      # NBSP — пробельный
+    assert s._is_untitled("​") is False     # zero-width — нет
+    assert "U+00A0" in s._is_untitled.__doc__
