@@ -15577,7 +15577,13 @@ def _resolve_triage_ops(operations: List[Dict], by_id: Dict[str, Dict],
     """Сверяет КАЖДУЮ переданную операцию с живым состоянием и обогащает её
     тем, что нужно для предпросмотра и исполнения. Ничего не добавляет и
     ничего не выкидывает: операция, не прошедшая сверку, помечается `_skip` с
-    причиной и остаётся видимой в плане."""
+    причиной.
+
+    2026-08-09: пометка `_skip` — это ПРИГОВОР, а не примечание. Разбор, что
+    делать с помеченными, живёт у вызывающего (`manual_triage`), и там они
+    из плана ВЫБРАСЫВАЮТСЯ: в манифест попадает только прошедшее сверку.
+    Здесь по-прежнему возвращается ПОЛНЫЙ список — чтобы про каждую
+    непрошедшую операцию было что сказать человеку поимённо."""
     # Сколько ОТКРЫТЫХ детей у каждой задачи — считается по УЖЕ прочитанному
     # живому состоянию, без единого дополнительного запроса. Дети в план не
     # добавляются (тул не имеет права разрастаться сверх названного), но
@@ -15660,15 +15666,67 @@ def _resolve_triage_ops(operations: List[Dict], by_id: Dict[str, Dict],
 def _triage_summary_with_counts(summary: str, ops: List[Dict]) -> str:
     """Заголовок предпросмотра (он же уходит в Telegram): исходная фраза плюс
     сводка по типам. Считается по операциям, которые ДЕЙСТВИТЕЛЬНО пойдут в
-    работу — пропущенные вынесены отдельным хвостом, а не спрятаны в числах."""
+    работу — не прошедшие сверку вынесены отдельным хвостом, а не спрятаны в
+    числах.
+
+    2026-08-09: формулировка хвоста — «не вошло в план N», а не «пропущено N».
+    «Пропущено» читается как «строка плана с пометкой» — ровно та иллюзия,
+    которую и убирали: этих операций в плане БОЛЬШЕ НЕТ, подтверждение к ним
+    не относится."""
     doing = [o for o in ops if not o.get("_skip")]
     counts = collections.Counter(o["op"] for o in doing)
     parts = [f"{_TRIAGE_VERB[k]} {counts[k]}" for k in _TRIAGE_OPS if counts.get(k)]
     out = f"{summary} — " + ", ".join(parts) if parts else summary
     skipped = len(ops) - len(doing)
     if skipped:
-        out += f"; пропущено {skipped}"
+        out += f"; не вошло в план {skipped}"
     return out
+
+
+def _ops_plural(n: int) -> str:
+    """«1 операция» / «3 операции» / «17 операций» — число вместе со словом.
+    Без склонения текст читается как машинный лог, а это то самое место, где
+    человек должен ПОНЯТЬ, сколько строк он подтверждает."""
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} операция"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return f"{n} операции"
+    return f"{n} операций"
+
+
+def _triage_mismatch_line(op: Dict) -> str:
+    """Одна строка справочного блока про операцию, НЕ вошедшую в план:
+    что за операция, какая задача (название из плана — живого может не быть
+    вовсе), её id и ПОЧЕМУ она не прошла — дословной причиной сверки, где уже
+    сказано «сейчас такое-то, а в плане такое-то».
+
+    Id печатается ОБРЕЗАННЫМ (8 символов + …), как везде в отчётах: он нужен
+    как якорь для следующего вызова, а не для чтения глазами."""
+    tid = str(op.get("task_id") or "")
+    shown = _plan_task_name({"task_id": tid,
+                             "title": op.get("_live_title") or op.get("title")})
+    emoji = _TRIAGE_EMOJI.get(op.get("op"), "•")
+    verb = _TRIAGE_VERB.get(op.get("op"), op.get("op"))
+    head = f"id {tid[:8]}…" if tid else "id не указан"
+    return f"• {head} — {emoji} {verb} {shown}: {op.get('_skip')}"
+
+
+def _triage_mismatch_block(doable: List[Dict], blocked: List[Dict]) -> List[str]:
+    """Справочный блок «что НЕ вошло в план» (2026-08-09, П19).
+
+    Раньше не прошедшие сверку операции оставались строками ТОГО ЖЕ плана с
+    пометкой ⚠️ ПРОПУЩЕНО. Человек видел двадцать строк, три из них помеченные,
+    жал одну кнопку — и пометки проходили мимо внимания: решение принималось
+    по большинству. Теперь их в плане нет, а сюда выносится справка: она
+    печатается ПОД списком операций (в чат и в Telegram одним и тем же
+    текстом, через `notes`), и кнопки к ней не относятся."""
+    if not blocked:
+        return []
+    return [f"✅ В план вошло: {_ops_plural(len(doable))} → отправлено на "
+            "подтверждение\n"
+            f"❌ Не вошло: {len(blocked)} — разберите с человеком в чате "
+            "(подтверждение относится ТОЛЬКО к списку выше)\n"
+            + "\n".join(_triage_mismatch_line(o) for o in blocked)]
 
 
 def _triage_plan_notes(ops: List[Dict]) -> List[str]:
@@ -15862,11 +15920,21 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
     Call #1 (manifest_id omitted): each `task_id` is checked against LIVE
     state (does it exist, does its live title still match the `title` you
     sent, for move — does the destination project resolve, for merge — is the
-    task you want to KEEP alive and correctly named). Anything that fails is
-    marked ПРОПУЩЕНО with a reason and is NOT executed. The result is a
-    numbered preview, ordered least-destructive-first (update → move →
-    complete → merge → delete), where every line shows the real task/project
-    names and the human's own words. NOTHING is mutated.
+    task you want to KEEP alive and correctly named). This check is the first
+    step INSIDE the tool and CANNOT be skipped — no argument turns it off,
+    because there is no other way to create a manifest.
+    Whatever fails it is DROPPED FROM THE PLAN — it is not a plan row with a
+    warning on it, it is not in the manifest, and the confirmation the human
+    gives does not cover it. It comes back to you, the caller, in a separate
+    "❌ Не вошло" block (id, what was expected, what is there now, why it
+    blocks) — sort those out with the human in chat and, if still needed,
+    build a NEW plan. The same block is shown to the owner below the line in
+    Telegram, WITHOUT buttons. If nothing survives the check, no manifest is
+    created at all and nothing is sent to Telegram.
+    What does survive becomes a numbered preview, ordered
+    least-destructive-first (update → move → complete → merge → delete),
+    where every line shows the real task/project names and the human's own
+    words. NOTHING is mutated.
     Call #2 (ONLY after the human actually replied, in a LATER turn): repeat
     the call with manifest_id=<id from call #1> and user_reply=<their literal
     last message>. `operations` may be repeated verbatim or omitted — either
@@ -15957,6 +16025,7 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
 
     enriched: Optional[List[Dict]] = None
     notes: Optional[List[str]] = None
+    mismatch: List[str] = []
     if not manifest_id:
         refusal = _validate_triage_ops(list(operations or []), max_items)
         if refusal:
@@ -15965,22 +16034,31 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         if by_id is None:
             return _STATE_UNAVAILABLE_MSG
         names = _v2_project_names()
-        enriched = _resolve_triage_ops(list(operations), by_id, names)
-        # list.sort устойчива: внутри одного типа исходный порядок сохраняется,
-        # а всё пропущенное уезжает в конец, не перемешиваясь между собой.
-        enriched.sort(key=lambda o: (1, 0) if o.get("_skip")
-                      else (0, _TRIAGE_ORDER[o["op"]]))
-        if all(o.get("_skip") for o in enriched):
+        checked = _resolve_triage_ops(list(operations), by_id, names)
+        # 2026-08-09 (П19). Не прошедшее сверку В ПЛАН НЕ ПОПАДАЕТ ВОВСЕ.
+        # Раньше оно оставалось строкой того же плана с пометкой ⚠️ ПРОПУЩЕНО,
+        # и это была видимость честности: человеку показывали двадцать строк,
+        # три из них помеченные, он жал ОДНУ кнопку — пометки проходили мимо
+        # внимания, решение принималось по большинству. Теперь результат
+        # делится надвое: выполнимое → манифест и кнопки, невыполнимое →
+        # справка человеку (ниже черты, без кнопок) и в ответ модели.
+        blocked = [o for o in checked if o.get("_skip")]
+        enriched = [o for o in checked if not o.get("_skip")]
+        # list.sort устойчива: внутри одного типа исходный порядок сохраняется.
+        enriched.sort(key=lambda o: _TRIAGE_ORDER[o["op"]])
+        if not enriched:
             # Просить «да» на план, где исполнять нечего, — это выпрашивать
-            # согласие на пустоту. Манифест не создаётся вовсе.
+            # согласие на пустоту. Манифест не создаётся вовсе, в Telegram
+            # ничего не уходит.
             return ("🛑 Ни одна операция не прошла сверку с живым состоянием — "
                     "план НЕ построен, ничего не изменено:\n"
-                    + "\n".join(f"- {_describe_triage_op(o)}" for o in enriched))
-        summary = _triage_summary_with_counts(summary, enriched)
-        notes = _triage_plan_notes(enriched)
-        # Проверки «влезает ли план в одно Telegram-сообщение» здесь БОЛЬШЕ НЕТ
-        # и быть не должно: превью доставляется целиком, несколькими
-        # сообщениями (см. снятый `_triage_tg_preview_refusal` выше).
+                    + "\n".join(_triage_mismatch_line(o) for o in blocked))
+        summary = _triage_summary_with_counts(summary, checked)
+        mismatch = _triage_mismatch_block(enriched, blocked)
+        # Справка едет через тот же `notes`, что и прочие предупреждения про
+        # весь план: он печатается ПОД списком операций и попадает разом и в
+        # чат, и в Telegram — своей копии сборки текста здесь не заводим.
+        notes = _triage_plan_notes(enriched) + mismatch
 
     outcome = await _gate_batch("manual_triage", "manual_triage", enriched, summary,
                                 manifest_id, user_reply, _describe_triage_op,
@@ -15988,7 +16066,13 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
                                 automation_key=automation_key)
     if not outcome.proceed:
         return outcome.message
-    return await _manual_triage_impl(outcome.summary, outcome.tasks)
+    report = await _manual_triage_impl(outcome.summary, outcome.tasks)
+    # Единственный путь, доходящий сюда с непустым `mismatch`, — headless-
+    # автоматика с верным ключом (она исполняет с первого вызова, минуя
+    # кнопку). Отчёт `_manual_triage_impl` знает только про то, что вошло в
+    # план, поэтому расхождения приклеиваются здесь: молчание о них было бы
+    # ровно тем же обманом, только в другом канале.
+    return report + ("\n\n" + "\n".join(mismatch) if mismatch else "")
 
 
 async def _manual_triage_impl(summary: str, tasks: List[Dict]) -> str:
@@ -16017,6 +16101,11 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict]) -> str:
     blocked: List[Tuple[Dict, str]] = []
     for op in ops:
         if op.get("_skip"):
+            # С 2026-08-09 (П19) помеченные `_skip` в манифест не кладутся
+            # вовсе — эта ветка осталась ради манифестов, СОХРАНЁННЫХ старым
+            # кодом: они живут в базе и поднимаются `_rehydrate_manifest`
+            # после перезапуска. Исполнить такую операцию «раз уж она в
+            # плане» нельзя ни при каких условиях.
             blocked.append((op, op["_skip"]))
             continue
         why = _triage_drift_reason(op, by_id, names)
