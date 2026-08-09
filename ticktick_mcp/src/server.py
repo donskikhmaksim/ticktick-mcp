@@ -16468,6 +16468,76 @@ _GENERIC_GATE_ENTRY = _AutoExecutorEntry(_generic_gate_rehash,
                                          _generic_gate_auto_execute)
 
 
+def _tool_registration_status(tool: str) -> str:
+    """Источник истины о том, жив ли инструмент `tool` СЕЙЧАС (2026-08-09):
+    реестр самого FastMCP (`mcp._tool_manager`), а не globals(). Отключение
+    тула здесь делается комментированием ОДНОГО декоратора `@mcp.tool()`
+    (см. плашки «DISABLED» у plan_declutter/execute_declutter/
+    resume_declutter/set_declutter_decision выше) — сама функция и её `_impl`
+    остаются в модуле нетронутыми, поэтому проверка `globals().get(...)` их
+    по-прежнему находит и НИЧЕГО не говорит о том, отключён ли тул. Прямой
+    `mcp._tool_manager.get_tool(...)` — синхронный (в отличие от публичного
+    async `mcp.list_tools()`, которым пользуется tests/test_tool_registry.py)
+    и не требует await из этой синхронной функции.
+
+    Возвращает одну из трёх строк:
+      "registered" — тул в реестре есть, исполнять можно как раньше;
+      "disabled"   — тула в реестре нет (или имя пустое) — обычный,
+                     ожидаемый случай отключённого/удалённого тула;
+      "unknown"    — САМА ПРОВЕРКА упала (правка 2026-08-09, независимый
+                     аудит нашёл дефект в первой версии этого фикса:
+                     `_tool_manager` — приватный, без подчёркивания в имени
+                     не гарантированный атрибут FastMCP, и `get_tool` теми же
+                     основаниями может бросить при будущем обновлении
+                     библиотеки). Различие "disabled" / "unknown" важно для
+                     текста отказа ниже: «тул отключён» — это решение
+                     владельца, а «проверка упала» — поломка сервера, и
+                     звучать они обязаны по-разному. В обоих случаях —
+                     fail-closed (план НЕ исполняется), но `unknown`
+                     дополнительно уходит в лог с трассировкой, потому что
+                     это баг, а не ожидаемое состояние."""
+    if not tool:
+        return "disabled"
+    try:
+        found = mcp._tool_manager.get_tool(tool) is not None
+    except Exception:
+        logger.exception(
+            f"_tool_registration_status: проверка регистрации «{tool}» в "
+            "реестре FastMCP упала — считаю тул НЕисполнимым (fail-closed), "
+            "но это отдельная от «тул отключён» причина")
+        return "unknown"
+    return "registered" if found else "disabled"
+
+
+def _auto_execute_tool_disabled_refusal(tool: str, reason: str):
+    """Фабрика исполнителя-отказника для `_resolve_auto_executor`: вместо
+    того чтобы молча вернуть None (кандидат просто выпал бы из очереди без
+    единого слова владельцу — см. `continue` в `_tg_auto_execute_tick`),
+    исполняет по ТОЙ ЖЕ схеме, что и обычный отказ (`_auto_execute_rename_tag`
+    выше, начинается с 🛑) — а значит проходит весь штатный конвейер:
+    `_auto_execute_report_is_failure` увидит 🛑, надгробие ляжет как
+    «нажато, но не выполнено», и текст уйдёт владельцу в Telegram, а не в
+    лог, который никто не читает в моменте.
+
+    `reason` — "disabled" или "unknown" из `_tool_registration_status`; текст
+    сознательно различается (см. её докстринг): владелец не должен читать
+    сбой самой проверки как «я же его выключил»."""
+    async def _refuse(manifest_id: str, m: Dict) -> str:
+        if reason == "unknown":
+            return (f"🛑 Автоисполнение отменено: не удалось проверить, "
+                    f"зарегистрирован ли инструмент «{tool}» в сервере — "
+                    "упала сама проверка реестра (см. лог с трассировкой), "
+                    "а не решение владельца отключить инструмент — план "
+                    "исполнен не будет. Это техническая проблема сервера, "
+                    "которую нужно чинить, а не декоратор, который нужно "
+                    "включать обратно.")
+        return (f"🛑 Автоисполнение отменено: инструмент «{tool}» в сервере "
+                "отсутствует (отключён или удалён) — план исполнен не "
+                "будет. Если функция должна быть доступна, инструмент нужно "
+                "сперва вернуть в реестр (раскомментировать @mcp.tool()).")
+    return _refuse
+
+
 def _resolve_auto_executor(tool: str, m: Dict) -> Optional[_AutoExecutorEntry]:
     """Which executor runs this manifest: an explicitly registered one wins
     (delete_tasks today — its manifest shape predates the shared gates), the
@@ -16475,16 +16545,40 @@ def _resolve_auto_executor(tool: str, m: Dict) -> Optional[_AutoExecutorEntry]:
     and everything else returns None (candidate skipped, nothing happens).
     Deliberately does NOT resolve declutter: its registration stays commented
     out above, and a declutter manifest has no `_gate` key, so it falls
-    through to None here too — both layers stay disabled together."""
+    through to None here too — both layers stay disabled together.
+
+    2026-08-09: раньше отсюда не проверялось НИЧЕГО, кроме факта, что где-то
+    в модуле есть подходящая функция (`_AUTO_EXECUTORS` — регистрация в
+    отдельном словаре; generic-путь — просто `globals()`). Ни то, ни другое
+    не связано с тем, зарегистрирован ли тул в MCP-сервере СЕЙЧАС: отключение
+    комментированием ОДНОГО декоратора `@mcp.tool()` не трогает ни функцию,
+    ни (для generic-пути) `_<tool>_impl`, ни (для explicit-пути) саму запись
+    в `_AUTO_EXECUTORS`, если её кто-то забыл закомментировать вместе с
+    декоратором. ВАЖНО: для declutter эта дыра сегодня НЕ активна — двойная
+    защита совпала независимо (регистрация в `_register_auto_executor`
+    закомментирована ТОЖЕ, а его манифест вообще не содержит ключа `_gate`,
+    так что generic-путь по нему не сработал бы, даже будь регистрация жива)
+    — так что до этой правки `_resolve_auto_executor("execute_declutter", …)`
+    и так возвращал None всегда. Ценность правки — не в закрытии дыры,
+    которой сейчас нет, а в защите от ТОЙ ЖЕ самой забывчивости в будущем:
+    для ЛЮБОГО тула, у которого декоратор сняли, а explicit-регистрацию или
+    `_impl` — забыли. Раз нашёлся исполнитель-кандидат (explicit или
+    generic), но `tool` не зарегистрирован — не отдаём его как есть:
+    подменяем на явный отказ (`_auto_execute_tool_disabled_refusal`), который
+    объясняет причину владельцу, а не просто исчезает молча."""
     if not tool:
         return None
     entry = _AUTO_EXECUTORS.get(tool)
-    if entry is not None:
-        return entry
-    if m.get("_gate") in ("batch", "single") and callable(
+    if entry is None and m.get("_gate") in ("batch", "single") and callable(
             globals().get(f"_{tool}_impl")):
-        return _GENERIC_GATE_ENTRY
-    return None
+        entry = _GENERIC_GATE_ENTRY
+    if entry is None:
+        return None
+    status = _tool_registration_status(tool)
+    if status == "registered":
+        return entry
+    return _AutoExecutorEntry(entry.rehash,
+                              _auto_execute_tool_disabled_refusal(tool, status))
 
 
 def _auto_execute_tool_of(m: Dict) -> str:
