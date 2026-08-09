@@ -532,6 +532,25 @@ async def test_untitled_relaxation_does_not_delete_a_neighbouring_task(
     assert "Удалено 1" in out and "Пропущены 1" in out
 
 
+async def test_report_names_the_deleted_task_instead_of_its_id(
+        monkeypatch, tmp_path):
+    """Отчёт печатал про безымянную задачу «- ✅ **«[task tB…]»** — удалена»:
+    идентификатор в кавычках, в позиции имени — та самая форма, которую
+    сервер осуждает везде ещё. Причём абзацем выше тот же объект уже назван
+    по-человечески. Один объект — одно имя (аудит 2026-08-09)."""
+    live = {"t_receipt": _receipt_task()}
+    _wire(monkeypatch, live, tmp_path)
+    _delete_manifest("mid-report", [
+        {"taskId": "t_receipt", "projectId": "p_inbox", "title": "",
+         "project": "Inbox", "snapshot": s._snapshot_of(live["t_receipt"])}])
+
+    out = await s.execute_task_deletion("mid-report", user_reply="да")
+    report = await s.operation_report("mid-report")
+
+    for text in (out, report):
+        assert "(без названия · 📎 1 файл)" in text
+        assert "[task t_receip" not in text
+
 
 # ═════════════ 5. ПОЛНЫЙ ЦИКЛ ═════════════
 

@@ -5319,10 +5319,16 @@ def _journal_write(record: Dict) -> str:
 
 
 def _snapshot_of(live: Optional[Dict]) -> Dict:
-    """Compact snapshot of a live task for the journal."""
+    """Compact snapshot of a live task for the journal.
+
+    `attachments` в наборе полей (аудит 2026-08-09) по двум причинам сразу:
+    вердикт отчёта строит по снимку ИМЯ безымянной задачи («(без названия ·
+    📎 1 файл)» вместо голого id — см. `_verify_item`), а человек, читающий
+    журнал удалённого, обязан видеть, что вместе с задачей уехал файл."""
     return {k: (live or {}).get(k) for k in
             ("title", "content", "desc", "dueDate", "startDate", "priority",
-             "tags", "projectId", "parentId", "columnId", "isAllDay")
+             "tags", "projectId", "parentId", "columnId", "isAllDay",
+             "attachments")
             if (live or {}).get(k) is not None}
 
 
@@ -5823,9 +5829,13 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
             "taskId": tid, "projectId": pid,
             "title": (live or {}).get("title") or "",
             "project": names.get(pid, ""),
+            # `attachments` — та же причина, что в `_snapshot_of` (аудит
+            # 2026-08-09): по снимку строится имя безымянной задачи в отчёте,
+            # и по нему же видно, что вместе с задачей удалён файл.
             "snapshot": {k: (live or {}).get(k) for k in
                          ("title", "content", "desc", "dueDate", "startDate",
-                          "priority", "tags", "projectId", "parentId", "isAllDay")
+                          "priority", "tags", "projectId", "parentId",
+                          "isAllDay", "attachments")
                          if (live or {}).get(k) is not None},
         }
 
@@ -6132,8 +6142,24 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
     return ниже явно указывает статус рядом со строкой, к которой он относится.
     """
     tid = item.get("taskId")
-    title = item.get("title") or (item.get("snapshot") or {}).get("title") \
-        or f"[task {str(tid)[:8]}…]"
+    # КАК ЗОВУТ ОБЪЕКТ В ВЕРДИКТЕ (аудит 2026-08-09). Раньше безымянная
+    # задача падала на последний фолбэк, и отчёт печатал «- ✅ **«[task
+    # tB…]»** — удалена» — идентификатор в кавычках, в позиции имени, ровно
+    # та форма, которую сервер осуждает везде ещё. Причём строкой выше тот же
+    # объект уже был назван по-человечески («🗑 Удалено 1/1: «(без названия ·
+    # 📎 1 файл)»»), то есть один объект в одном сообщении звался двумя
+    # разными способами. Снимок удалённой задачи несёт её содержимое (включая
+    # метаданные вложений — см. `_mk_item`), поэтому заменитель строится из
+    # него и совпадает с тем, что человек видел в плане.
+    snap = item.get("snapshot") or {}
+    if not _looks_untitled(item.get("title")):
+        title = item["title"]
+    elif not _looks_untitled(snap.get("title")):
+        title = snap["title"]
+    elif snap:
+        title = _untitled_label(snap)
+    else:
+        title = f"[task {str(tid)[:8]}…]"
     live = live_map.get(tid)
     exp = item.get("expect") or {}
 
