@@ -2247,3 +2247,93 @@ def test_a_short_id_is_printed_without_a_promise_of_more():
     """`a1…` обещало продолжение, которого у короткого id нет."""
     assert s._short_task_id("a1") == "a1"
     assert s._short_task_id("6a73adfc1234567890") == "6a73adfc…"
+
+
+# ═══════ 24. Справка о невошедшем не врёт про НАЙДЕННУЮ задачу (Д10) ═══════
+
+
+def _live_with_untitled_attachment():
+    """Живое состояние, где есть безымянная задача С ВЛОЖЕНИЕМ.
+
+    Название — один zero-width space: `_looks_untitled` (показ) считает такую
+    задачу безымянной, а `_names_agree` (предохранитель) сверяет её с планом
+    посимвольно, поэтому операция доходит до сверки и падает на СВОЕЙ
+    причине, а не на несовпадении имени."""
+    live = _live_inbox()
+    live["u1"] = {"id": "u1", "title": "​", "projectId": "p_in",
+                  "attachments": [{"id": "f1", "fileName": "чек.jpg"}]}
+    return live
+
+
+async def test_the_reference_names_an_untitled_task_it_actually_read(
+        monkeypatch, tmp_path):
+    """Д10 (2026-08-09). Задача НАЙДЕНА в живом состоянии и прочитана (у неё
+    посчитано вложение), а из плана выброшена по ДРУГОЙ причине — проект
+    назначения не существует. Справка обязана назвать её заменителем по
+    содержимому, а не общим фолбэком «её нет в живом состоянии»: это
+    дословно тот текст, который П15 объявил ложью, и он уезжает в Postgres
+    вместе с манифестом и в архивный отчёт навсегда."""
+    live = _live_with_untitled_attachment()
+    _wire(monkeypatch, live, tmp_path)
+    _stub_sub_impls(monkeypatch, live)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "move", "task_id": "u1", "title": "​",
+         "to_project": "Проект, которого нет", "said": "это в работу"},
+        {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "сделал"}])
+
+    assert "❌ Не вошло: 1" in preview, preview
+    assert "(без названия: 📎 1 файл)" in preview, \
+        f"справка не назвала задачу её заменителем:\n{preview}"
+    assert s._NO_NAME_TASK not in preview, \
+        f"справка соврала про НАЙДЕННУЮ задачу:\n{preview}"
+    assert s._BY_ID_NOTE in preview, "не сказано, что личность сверена по id"
+
+
+async def test_the_label_reaches_the_archived_report_through_the_manifest(
+        monkeypatch, tmp_path):
+    """Та же метка обязана пережить кнопку: отчёт после исполнения — это
+    единственный текст, который уходит в группу-архив навсегда, а справка в
+    нём собирается из записи манифеста, а не из памяти вызова."""
+    live = _live_with_untitled_attachment()
+    _wire(monkeypatch, live, tmp_path)
+    _stub_sub_impls(monkeypatch, live)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "move", "task_id": "u1", "title": "​",
+         "to_project": "Проект, которого нет", "said": "это в работу"},
+        {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
+         "said": "сделал"}])
+    m = s._MANIFESTS[_mid(preview)]
+    rec = m["extra"]["not_planned"][0]
+
+    assert rec["label"] == "(без названия: 📎 1 файл)", rec
+    assert rec["untitled"] is True, rec
+
+    out = await s._generic_gate_auto_execute(_mid(preview), m)
+
+    assert "(без названия: 📎 1 файл)" in out, out
+    assert s._NO_NAME_TASK not in out, out
+
+
+def test_the_reference_record_still_carries_nothing_executable():
+    """Зеркало к Д10: метка добавлена, но запись по-прежнему НЕ операция —
+    ни одного ключа, по которому её можно было бы исполнить."""
+    rec = s._triage_not_planned_records([
+        {"op": "move", "task_id": "u1", "title": "​", "said": "в работу",
+         "changes": {"new_title": "подмена"}, "keep_task_id": "e6",
+         "to_project_id": "p_work", "_label": "(без названия: 📎 1 файл)",
+         "_untitled": True, "_live_title": "​",
+         "_skip": "проект назначения не найден"}])[0]
+
+    assert set(rec) == {"task_id", "op", "title", "label", "untitled", "why"}
+    assert not ({"changes", "keep_task_id", "to_project_id", "to_project",
+                 "said", "_skip", "_to_project_id"} & set(rec))
+
+    # Задача, которую даже не нашли, метки не имеет — и полей под неё в записи
+    # не заводится: пустое «имя» в базе хуже отсутствия ключа.
+    ghost = s._triage_not_planned_records([
+        {"op": "delete", "task_id": "ghost", "title": "Призрак",
+         "said": "убери", "_skip": "не найдена среди открытых задач"}])[0]
+    assert set(ghost) == {"task_id", "op", "title", "why"}
