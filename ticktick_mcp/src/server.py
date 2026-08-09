@@ -2612,6 +2612,36 @@ def _flatten_task_tree(node: Dict, project_id: str, parent_id: str = None,
     return tasks, relations
 
 
+# П19 (2026-08-09): «создаётся подзадачей — жив ли родитель и он ли это».
+# Отказы печатаются ОДНИМ текстом на обоих входах — на фазе плана
+# (plan_task_creation) и в ядре мутации (_create_tasks_impl), — чтобы
+# владелец читал одно и то же, каким бы путём запрос ни пришёл. Слова взяты
+# у _create_subtask_impl, который эту же сверку делает с самого начала; там
+# же и причина, почему «не среди открытых» — это отказ, а не пометка: без
+# живого родителя TickTick кладёт новую задачу отдельной строкой В КОРЕНЬ
+# списка, и «✓ создано» оказывается правдой про запись и ложью про место.
+def _dead_parent_note(parent_label: str, parent_id: str) -> str:
+    who = (f"родитель «{parent_label}» ({str(parent_id)[:8]}…)"
+           if parent_label else f"родитель {str(parent_id)[:8]}…")
+    return (f"{who} не среди открытых задач (завершён/удалён/в корзине) — "
+            "подзадача НЕ создаётся, иначе она легла бы отдельной задачей "
+            "в корне")
+
+
+def _wrong_parent_note(real_title: str, expected_title: str) -> str:
+    return (f"родитель по id это «{real_title}», а НЕ «{expected_title}» "
+            "(защита от «не той задачи») — подзадача НЕ создаётся")
+
+
+# Единственная формулировка «родителя сверить не удалось». На ПЛАНЕ это не
+# отказ (разовый сбой чтения не имеет права заблокировать всякое создание —
+# решение уже принято в create_subtask), но сказать об этом владельцу вслух
+# обязательно: он подтверждает вложение, которого сервер не читал.
+_PARENT_UNVERIFIED_NOTE = (
+    "⚠️ Родителя сверить с живым состоянием НЕ удалось (чтение не удалось) — "
+    "сверка повторится при исполнении, и расхождение его остановит.")
+
+
 @mcp.tool()
 async def create_tasks(
     summary: str = "",
@@ -2650,6 +2680,12 @@ async def create_tasks(
       assignee (user ID; requires shared project + v2),
       column_id (kanban section ID; root task only; use list_project_columns),
       parent_id (existing task ID to attach root as a subtask; requires v2),
+      parent_title (the parent's CURRENT title — optional but strongly
+        advised whenever parent_id is set: the server checks the parent is
+        still alive either way, and this additionally proves the id names
+        the task you mean. A mismatch refuses the row BEFORE anything is
+        created, instead of quietly attaching your subtask to whatever that
+        id now points at),
       repeat_flag (RRULE; root task only via official API; use build_recurrence_rule),
       reminders (list of triggers; root task only via official API; use build_reminder),
       subtasks (list of strings OR list of full task objects — recursive, up to 4 levels deep)
@@ -2819,6 +2855,45 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                 _depth_by_id = _open_by_id(fresh=True)
             if _depth_by_id is None:
                 failed.append(f"#{i+1} «{title}»: {_STATE_UNAVAILABLE_MSG}")
+                continue
+            # П19 (2026-08-09): ЖИВ ЛИ РОДИТЕЛЬ — до записи, а не после.
+            # Раньше единственным обращением к живому состоянию здесь был
+            # расчёт глубины, а он на неизвестном id молча отвечает «уровень
+            # 1»: мёртвый родитель читался как живой корневой, задача
+            # создавалась и ложилась ОТДЕЛЬНОЙ строкой в корень, а отчёт
+            # говорил «создано» (привязку разбирал только пост-verify —
+            # после факта).
+            #
+            # Тот же снимок, что уже загружен ради глубины (by_id=), — ни
+            # одного лишнего запроса. Порядок важен: сперва существование,
+            # потом глубина, иначе остаётся ветка, где «уровень 1» получен
+            # из пустоты.
+            #
+            # Различие «объекта нет» и «я не смотрел» держится тем, что оба
+            # состояния приходят РАЗНЫМИ ответами и оба закрыты: снимок
+            # прочитать не удалось → выход выше (_STATE_UNAVAILABLE_MSG);
+            # снимок прочитан и родителя в нём нет → _guard_task сам
+            # доспрашивает официальный Open API (штатный запасной канал —
+            # v2-лента отстаёт, см. _official_task_snapshot) и лишь потом
+            # отвечает 'missing'. Пустота как разрешение не читается ни в
+            # одной из веток.
+            pg = _guard_task(ext_parent_id, t.get("parent_title") or "",
+                             project_id, by_id=_depth_by_id)
+            if pg.status == "unavailable":
+                failed.append(f"#{i+1} «{title}»: {pg.message}")
+                continue
+            # 🛑 приклеивается ЗДЕСЬ, а не внутрь общей формулировки: на фазе
+            # плана тот же текст уже стоит под шапкой «🛑 Исключены N», и
+            # второй значок в строке читался бы как вторая беда.
+            if pg.status == "missing":
+                failed.append(f"#{i+1} «{title}»: 🛑 " + _dead_parent_note(
+                    t.get("parent_title") or "", ext_parent_id)
+                    + ". Ничего не изменено.")
+                continue
+            if pg.status == "mismatch":
+                failed.append(f"#{i+1} «{title}»: 🛑 " + _wrong_parent_note(
+                    pg.title, t.get("parent_title") or "")
+                    + ". Ничего не изменено.")
                 continue
             base_level = _task_level(ext_parent_id, _depth_by_id)
         total_depth = base_level + _requested_tree_depth(t)
@@ -3277,6 +3352,14 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     duplicates already open in the destination. The user answers per item
     («2 — в Fix&Roll»); re-plan with explicit project_id for corrections.
 
+    Attaching under an EXISTING task: pass parent_id AND parent_title (the
+    parent's current title). The plan checks the parent against live state
+    BEFORE it is shown — a parent that is completed, deleted or in the trash,
+    or an id whose real title is a different one, drops that row from the
+    plan entirely (it is never a confirmable line), because such a "subtask"
+    would land as a separate top-level task instead. The card names the
+    attachment («→ подзадача «…»») so the owner confirms nesting he can read.
+
     IMPORTANT: reprint the returned text VERBATIM and IN FULL to the user, ask
     for explicit confirmation («ок?»), and only after their real reply call
     execute_task_creation(manifest_id, user_reply=<their literal message>).
@@ -3344,7 +3427,7 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
             refused.append(f"#{i} «{title}»: project_id это «{pname}», а НЕ "
                            f"«{exp_name}»")
             continue
-        good.append((t, pname or pid, None))
+        good.append((t, pname or pid, None, i))
 
     # No project named → the SERVER thinks: per-task destination suggestions
     # via the Claude shim (sure/unsure + a clarifying question when unsure).
@@ -3355,10 +3438,70 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
             if sug.get("project_id"):
                 t = dict(t)
                 t["project_id"] = sug["project_id"]
-                good.append((t, sug["project"], sug))
+                good.append((t, sug["project"], sug, i))
             else:
                 refused.append(f"#{i} «{t.get('title')}»: проект не указан "
                                "(подсказчик недоступен) — назови проект")
+
+    # П19 (2026-08-09): ЖИВ ЛИ РОДИТЕЛЬ — на фазе плана, до того как владелец
+    # увидел карточку. Слово parent_id раньше не встречалось в этой функции
+    # ни разу: план на подзадачу удалённого родителя показывался как обычный
+    # план, и узнавал владелец из предупреждения ПОСЛЕ создания. Не прошло
+    # сверку → строка не помечается, а вообще не попадает в манифест: пометка
+    # оставила бы кнопку, нажатие на которую даёт ровно то, от чего защищаемся.
+    #
+    # Место цикла выбрано осознанно — ПОСЛЕ ветки `pending`, когда проект
+    # известен у каждой строки, включая те, которым его предложил подсказчик.
+    # Стой сверка выше, вызов без project_id обходил бы её целиком.
+    #
+    # `plan_state_read` (флаг «живое состояние уже читали») отделён от самого
+    # снимка НЕ ради красоты: `_open_by_id` возвращает None и когда читать
+    # нечем, и это единственный способ не спутать «ещё не смотрел» с
+    # «посмотрел, состояние недоступно». Читаем лениво — план без единого
+    # parent_id не платит за эту проверку ни одним запросом.
+    checked = []
+    plan_by_id = None
+    plan_state_read = False
+    for (t, pname, sug, i) in good:
+        parent_id = t.get("parent_id")
+        if not parent_id:
+            checked.append((t, pname, sug, ""))
+            continue
+        exp_parent = t.get("parent_title") or t.get("parentTitle") or ""
+        if not plan_state_read:
+            plan_by_id = _open_by_id(fresh=True)
+            plan_state_read = True
+        if plan_by_id is None:
+            # Fail-OPEN здесь и только здесь: разовый сбой чтения не имеет
+            # права заблокировать всякое создание (так же решено в
+            # create_subtask). Строка остаётся, но карточка говорит вслух,
+            # что имя родителя не сверено, а исполнение переспросит — там
+            # недоступное чтение уже отказ, и это последняя линия.
+            checked.append((t, pname, sug,
+                            (exp_parent or str(parent_id)[:8] + "…")
+                            + " — НЕ сверено"))
+            continue
+        g = _guard_task(parent_id, exp_parent,
+                        t.get("project_id") or t.get("projectId") or "",
+                        by_id=plan_by_id)
+        if g.status == "missing":
+            refused.append(f"#{i} «{t.get('title')}»: "
+                           + _dead_parent_note(exp_parent, parent_id))
+            continue
+        if g.status == "mismatch":
+            refused.append(f"#{i} «{t.get('title')}»: "
+                           + _wrong_parent_note(g.title, exp_parent))
+            continue
+        if g.status == "unavailable":
+            checked.append((t, pname, sug,
+                            (exp_parent or str(parent_id)[:8] + "…")
+                            + " — НЕ сверено"))
+            continue
+        # Имя для карточки берётся у ТОГО, КТО ЕГО ПРОЧИТАЛ (живое `g.title`),
+        # а не у вызывающего: владелец должен видеть, куда задача ляжет на
+        # самом деле, а не что про это думает модель.
+        checked.append((t, pname, sug, g.title or exp_parent))
+    good = checked
 
     # Duplicate radar: same-normalised title already open in the destination.
     open_titles: Dict[str, set] = {}
@@ -3366,9 +3509,19 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
         open_titles.setdefault(lt.get("projectId") or "", set()).add(
             _norm_name(lt.get("title") or ""))
 
+    # Не осталось ни одной прошедшей строки — плана нет (2026-08-09, П19).
+    # Пустой манифест был бы кнопкой, которая ничего не создаёт, и его же
+    # уносил бы в Telegram второй фактор; отказ обязан прийти ответом здесь.
+    if not good:
+        return ("### 📋 План создания — 0\n"
+                "🛑 Плана нет — ни одна строка сверку не прошла, манифест НЕ "
+                "создан, подтверждать нечего.\n"
+                f"🛑 **Исключены {len(refused)}:** " + "; ".join(refused)
+                + "\nНичего не изменено.")
+
     mid = uuid.uuid4().hex[:12]
     now = time.monotonic()
-    raw_items = [t for t, _, _ in good]
+    raw_items = [t for t, _, _, _ in good]
     _MANIFESTS[mid] = {"kind": "create", "raw": raw_items,
                        "created": now, "plan_shown_at": now,
                        "summary": summary, "consumed": False,
@@ -3386,8 +3539,13 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
                        "object_hash": _create_object_hash(raw_items)}
     lines = [f"### 📋 План создания — {len(good)}",
              _plan_id_line(mid, "ничего ещё не создано"), ""]
-    for i, (t, pname, sug) in enumerate(good, 1):
+    for i, (t, pname, sug, parent_label) in enumerate(good, 1):
         bits = [f"{i}. **«{t.get('title')}»** → **{pname}**"]
+        # Вложение названо В КАРТОЧКЕ (2026-08-09, П19): до этого из плана
+        # не было видно вовсе, что задача уйдёт под другую — владелец
+        # подтверждал вложение, которого не читал.
+        if parent_label:
+            bits.append(f"→ подзадача «{parent_label}»")
         if sug:
             if (sug.get("confidence") or "unsure") == "sure":
                 bits.append(f"(моё предложение: {sug.get('reason') or 'подходит по смыслу'})")
@@ -3406,7 +3564,11 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     if refused:
         lines.append("")
         lines.append(f"🛑 **Исключены {len(refused)}:** " + "; ".join(refused))
-    if any(s and (s.get("confidence") or "unsure") != "sure" for _, _, s in good):
+    if any(lbl.endswith("НЕ сверено") for _, _, _, lbl in good):
+        lines.append("")
+        lines.append(_PARENT_UNVERIFIED_NOTE)
+    if any(s and (s.get("confidence") or "unsure") != "sure"
+           for _, _, s, _ in good):
         lines.append("")
         lines.append("❗ _По задачам с ❓ уточни проект — можно ответить пунктами "
                      "(«2 — в Fix&Roll»), тогда план пересоберётся с явными "
