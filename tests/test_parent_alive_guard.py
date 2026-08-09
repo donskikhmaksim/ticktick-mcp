@@ -219,6 +219,25 @@ async def test_creation_under_a_dead_parent_is_refused_before_the_write(
     assert "Создано" not in out
 
 
+async def test_engine_itself_refuses_a_dead_parent(monkeypatch):
+    """То же самое одним слоем ниже — прямым вызовом ядра создания, минуя и
+    план, и гейт автоматики. Слой назван отдельно нарочно: проверка,
+    поставленная только в `plan_task_creation`, оставила бы этот вход
+    открытым, и тест выше зеленел бы вместе с дырой."""
+    live = {}
+    v2, official = _wire(monkeypatch, live)
+
+    out = await s._create_tasks_impl(
+        "тест",
+        [{"title": "Покрасить стену", "project_id": "pA",
+          "parent_id": "root1", "parent_title": "Дом"}])
+
+    assert official.create_calls == []
+    assert v2.calls == []
+    assert live == {}
+    assert "🛑" in out and "Дом" in out
+
+
 async def test_dead_parent_among_living_tasks_is_refused(monkeypatch):
     """Снимок НЕПУСТОЙ: в нём есть живые задачи, мёртв только родитель.
     Тест с полностью пустым снимком зеленел бы и от падения по другой
