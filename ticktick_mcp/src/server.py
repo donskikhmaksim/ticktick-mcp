@@ -15230,6 +15230,32 @@ def _triage_change_refusal(i: int, title: str, changes: Dict) -> Optional[str]:
     return None
 
 
+def _triage_cap_refusal(planned: int, max_items: int) -> Optional[str]:
+    """Потолок числа операций В ПЛАНЕ. Считается по тому, что РЕАЛЬНО уходит в
+    манифест, а не по длине входного списка (2026-08-09).
+
+    Кап — это предел разового ущерба, а ущерб наносит только исполнимое. С
+    тех пор как не прошедшее сверку в план не попадает вовсе (П19), «50
+    валидных + 1 непрошедшая» отвергалось с формулировкой «операций 51 —
+    больше капа 50», хотя исполнить предлагалось ровно 50. Отказ по мусору,
+    который и так выброшен, — это отказ ни за что.
+
+    `max_items` может потолок только ОПУСТИТЬ: кап, который волен поднять сам
+    вызывающий, — не кап (он же и передаёт аргумент)."""
+    cap = max_items if isinstance(max_items, int) and not isinstance(max_items, bool) \
+        else _TRIAGE_HARD_CAP
+    cap = max(1, min(cap, _TRIAGE_HARD_CAP))
+    if planned <= cap:
+        return None
+    raised = (f" Переданный max_items={max_items} потолок НЕ поднимает: "
+              f"{_TRIAGE_HARD_CAP} задан константой в коде."
+              if isinstance(max_items, int) and max_items > _TRIAGE_HARD_CAP
+              else "")
+    return (f"🛑 Отказ: операций {planned} — больше капа "
+            f"{cap}.{raised} Разбей разбор на части и подтверди каждую "
+            "отдельно. Ничего не сделано.")
+
+
 def _validate_triage_ops(operations: List[Dict], max_items: int) -> Optional[str]:
     """Fail-closed валидация ВСЕГО плана до единой мутации. Любое нарушение —
     отказ ЦЕЛИКОМ (не «выкинем плохую строку и сделаем остальное»): человек
@@ -15240,17 +15266,6 @@ def _validate_triage_ops(operations: List[Dict], max_items: int) -> Optional[str
         return ("🛑 Пустой список операций — разбирать нечего. Этот инструмент "
                 "НЕ выбирает задачи сам: передай явный список того, что "
                 "человек сказал сделать.")
-    cap = max_items if isinstance(max_items, int) and not isinstance(max_items, bool) \
-        else _TRIAGE_HARD_CAP
-    cap = max(1, min(cap, _TRIAGE_HARD_CAP))
-    if len(operations) > cap:
-        raised = (f" Переданный max_items={max_items} потолок НЕ поднимает: "
-                  f"{_TRIAGE_HARD_CAP} задан константой в коде."
-                  if isinstance(max_items, int) and max_items > _TRIAGE_HARD_CAP
-                  else "")
-        return (f"🛑 Отказ: операций {len(operations)} — больше капа "
-                f"{cap}.{raised} Разбей разбор на части и подтверди каждую "
-                "отдельно. Ничего не сделано.")
     kind_of: Dict[str, str] = {}
     for i, op in enumerate(operations, 1):
         if not isinstance(op, dict):
@@ -15465,6 +15480,14 @@ def _ops_plural(n: int) -> str:
     return f"{n} операций"
 
 
+def _short_task_id(task_id: str) -> str:
+    """`6a73adfc…` — якорь для следующего вызова, а не текст для чтения
+    глазами. Многоточие ставится ТОЛЬКО когда за ним правда что-то обрезано:
+    «id a1…» обещало продолжение, которого у короткого id нет (2026-08-09)."""
+    tid = str(task_id or "")
+    return tid[:8] + "…" if len(tid) > 8 else tid
+
+
 def _triage_not_planned_records(blocked: List[Dict]) -> List[Dict]:
     """Не прошедшие сверку операции → ПЛОСКИЕ справочные записи (2026-08-09).
 
@@ -15489,8 +15512,8 @@ def _triage_not_planned_line(rec: Dict) -> str:
                              "title": rec.get("title")})
     emoji = _TRIAGE_EMOJI.get(rec.get("op"), "•")
     verb = _TRIAGE_VERB.get(rec.get("op"), rec.get("op"))
-    tid = str(rec.get("task_id") or "")
-    head = f"id {tid[:8]}…" if tid else "id не указан"
+    tid = _short_task_id(rec.get("task_id") or "")
+    head = f"id {tid}" if tid else "id не указан"
     return f"• {head} — {emoji} {verb} {shown}: {rec.get('why')}"
 
 
@@ -15854,6 +15877,11 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
             return ("🛑 Ни одна операция не прошла сверку с живым состоянием — "
                     "план НЕ построен, ничего не изменено:\n"
                     + "\n".join(_triage_not_planned_lines(not_planned)))
+        # Кап считается по тому, что РЕАЛЬНО уходит в манифест, — см.
+        # `_triage_cap_refusal`.
+        refusal = _triage_cap_refusal(len(enriched), max_items)
+        if refusal:
+            return refusal
         summary = _triage_summary_with_counts(summary, checked)
         # Справка едет через тот же `notes`, что и прочие предупреждения про
         # весь план: он печатается ПОД списком операций и попадает разом и в

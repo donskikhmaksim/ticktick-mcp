@@ -610,7 +610,7 @@ async def test_operation_on_a_vanished_task_is_dropped_from_the_plan(
     assert "ПРОПУЩЕНО" not in preview, "строки-пометки в плане больше нет"
     assert "❌ Не вошло: 1" in preview
     assert "не найдена среди открытых" in preview
-    assert "id ghost…" in preview, "справка обязана называть идентификатор"
+    assert "id ghost" in preview, "справка обязана называть идентификатор"
     assert "не вошло в план 1" in preview
     m = s._MANIFESTS[_mid(preview)]
     assert [o["task_id"] for o in m["tasks"]] == ["d4"]
@@ -910,6 +910,7 @@ async def test_merge_is_refused_when_the_kept_copy_is_missing_at_plan_time(
 
     assert "ПРОПУЩЕНО" not in preview
     assert "❌ Не вошло: 1" in preview and "дубль НЕ удаляю" in preview
+    assert [o["task_id"] for o in s._MANIFESTS[mid]["tasks"]] == ["d4"]
 
     out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
 
@@ -1868,7 +1869,7 @@ async def test_one_renamed_task_out_of_twenty_leaves_the_plan_but_is_reported(
     assert "P007" not in [o["task_id"] for o in m["tasks"]]
     assert "✅ В план вошло: 19 операций" in preview
     assert "❌ Не вошло: 1" in preview
-    assert "id P007…" in preview
+    assert "id P007" in preview
     # Что ожидалось и что на самом деле — обе стороны названы, а не «пропущено».
     assert "Позвонить по объявлению №7 (уже созвонились)" in preview
     assert "ПРОПУЩЕНО" not in preview
@@ -1892,7 +1893,7 @@ async def test_the_only_dead_task_creates_no_manifest_and_no_telegram_message(
     assert seen == [], f"в Telegram что-то ушло: {seen}"
     assert s._MANIFESTS == before, "манифест создан на пустом плане"
     assert "🛑" in out and "план НЕ построен" in out
-    assert "id ghost…" in out and "не найдена среди открытых" in out
+    assert "id ghost" in out and "не найдена среди открытых" in out
 
 
 async def test_a_plan_where_everything_matches_shows_no_reference_block(
@@ -1928,7 +1929,7 @@ async def test_the_reference_block_reaches_telegram_below_the_plan(
     assert len(seen) == 1
     sent = seen[0]["preview"]
     assert "❌ Не вошло: 1" in sent
-    assert "id ghost…" in sent
+    assert "id ghost" in sent
     # Справка стоит ПОСЛЕ списка операций, а не вместо/выше него.
     assert sent.index("1. ✅ Закрыть") < sent.index("❌ Не вошло")
     assert sent in preview
@@ -2015,7 +2016,7 @@ async def test_the_execution_report_names_what_did_not_make_the_plan(
 
     assert "❌ не вошло в план 1" in out, "шапка отчёта молчит о невошедшем"
     assert "#### ❌ Не вошло в план" in out
-    assert "id a1…" in out
+    assert "id a1" in out
     assert "«Купить молоко»" in out, "отчёт не назвал задачу"
     assert "название не совпало" in out, "отчёт не назвал причину"
     # Рубрика отдельная от «⏭ Пропущено»: то был дрейф ПОСЛЕ подтверждения,
@@ -2122,7 +2123,7 @@ async def test_every_single_mismatch_is_printed_not_just_the_first(
     printed = [ln for ln in preview.splitlines() if ln.startswith("• id ")]
     assert len(printed) == 3, f"напечатано {len(printed)} строк из 3:\n{preview}"
     # И каждая из трёх названа поимённо, а не «и ещё две».
-    for needle in ("id a1…", "id ghost1…", "id c3…"):
+    for needle in ("id a1", "id ghost1", "id c3"):
         assert needle in preview, needle
 
 
@@ -2152,7 +2153,7 @@ async def test_a_failed_update_is_reported_like_any_other_kind(
                  "title": "Оплатить интернет", "said": "сделал"}])
 
         assert "❌ Не вошло: 1" in preview, f"{kind}: нет блока\n{preview}"
-        assert "id ghost1…" in preview, f"{kind}: расхождение не названо"
+        assert "id ghost1" in preview, f"{kind}: расхождение не названо"
         assert "«Призрак»" in preview, f"{kind}: задача не названа"
 
 
@@ -2209,3 +2210,40 @@ async def test_the_report_quotes_the_summary_with_its_counts(
 
     assert "_Разбираю входящие после созвона — закрыть 1; " \
            "не вошло в план 1_" in out, out
+
+
+# ═══════ 23. Кап считается по тому, что реально уходит в манифест ══════════
+
+async def test_the_cap_counts_the_plan_not_the_rejected_input(
+        monkeypatch, tmp_path):
+    """50 валидных + 1 непрошедшая = 50 исполнимых, то есть ровно кап.
+    Отказывать здесь — значит отказывать из-за мусора, который и так выброшен
+    (кап ограничивает разовый УЩЕРБ, а ущерб наносит только исполнимое)."""
+    live, ops = _long_plan(s._TRIAGE_HARD_CAP)
+    live["gone"] = {"id": "gone", "title": "Уже удалена", "projectId": "p_in"}
+    ops.append({"op": "delete", "task_id": "gone", "title": "Уже удалена",
+                "said": "неактуально"})
+    _wire(monkeypatch, live, tmp_path)
+    live.pop("gone")                       # исчезла к моменту построения плана
+
+    preview = await s.manual_triage("Разбираю входящие", ops)
+
+    assert "больше капа" not in preview
+    assert len(s._MANIFESTS[_mid(preview)]["tasks"]) == s._TRIAGE_HARD_CAP
+    assert "❌ Не вошло: 1" in preview
+
+
+async def test_the_cap_still_refuses_when_the_plan_itself_is_too_big(
+        monkeypatch, tmp_path):
+    """Зеркало: считать по исполнимым — не значит ослабить. 51 исполнимая по
+    прежнему отвергается целиком."""
+    live, ops = _long_plan(s._TRIAGE_HARD_CAP + 1)
+    _wire(monkeypatch, live, tmp_path)
+
+    await _assert_refused_outright(monkeypatch, live, ops, "больше капа")
+
+
+def test_a_short_id_is_printed_without_a_promise_of_more():
+    """`a1…` обещало продолжение, которого у короткого id нет."""
+    assert s._short_task_id("a1") == "a1"
+    assert s._short_task_id("6a73adfc1234567890") == "6a73adfc…"
