@@ -231,7 +231,7 @@ async def tg_own_bot_webhook(request: Request) -> Response:
 
 # --- Attachment transfer links (/dl, /ul) -----------------------------------
 # Big files must not travel through the MCP response body (download_task_
-# attachment base64-encodes into the answer and caps at 15 MB). Instead a tool
+# attachment base64-encodes into the answer and caps at 256 KB). Instead a tool
 # hands out a short-lived URL on THIS server, and the bytes are streamed
 # straight between the client (phone/browser/script) and TickTick.
 #
@@ -12411,10 +12411,16 @@ async def _attach_file_to_task_impl(task_title: str, task_id: str, project_id: s
         return f"Error attaching file: {str(e)}"
 
 
-# Base64-encoded response payloads are ~4/3 the raw byte size, plus the MCP
-# transport itself has overhead — cap well under upload's 20 MB so a giant
-# attachment doesn't blow up the tool response instead of failing cleanly.
-DOWNLOAD_ATTACHMENT_MAX_BYTES = 15 * 1024 * 1024  # 15 MB
+# 2026-08-09 (П9 пакет ТЗ, пункт 4): было 15 МБ — теоретический потолок,
+# который на практике никогда не достигался, потому что ответ падал ГОРАЗДО
+# раньше. Живые случаи: фотография чека вернула 572 879 символов base64
+# (~420 КБ сырых байт), вторая — 1 081 351 символов (~792 КБ) — и ОБА ответа
+# были отброшены целиком транспортом MCP, до всякой проверки этого предела.
+# Base64 добавляет ~4/3 к размеру, плюс накладные расходы самого транспорта
+# MCP — отсюда предел ниже, с запасом, чем самый маленький из двух реальных
+# провалов. Ставить впритык к наблюдаемой границе бессмысленно: возврат
+# всё равно есть только у get_attachment_download_url (ссылка, без предела).
+DOWNLOAD_ATTACHMENT_MAX_BYTES = 256 * 1024  # 256 KB
 
 
 def _merged_task_attachments(task_id: str) -> List[Dict]:
@@ -12574,14 +12580,19 @@ async def download_task_attachment(task_id: str, project_id: str = None,
                                    filename: str = None,
                                    index: int = None) -> str:
     """
-    Download a file attachment from a task (requires v2 API) and return its
-    content as base64, so it can be re-saved elsewhere (e.g. uploaded to
-    Google Drive). Identify the attachment by ONE of: attachment_id (from
-    list_task_attachments), filename (exact match), or index (1-based, as
-    shown by list_task_attachments). Refuses files over 15 MB (base64 bloats
-    the response) — for those (and whenever the user just wants the file on
-    their phone/computer) use get_attachment_download_url instead: it hands
-    back a short-lived link and the bytes never enter this conversation.
+    RULE: for photos/scans and any file that might be over ~256 KB, use
+    get_attachment_download_url instead — it hands back a short-lived link,
+    the bytes never enter this conversation, and it has no size limit. Use
+    THIS tool only for small text-like attachments you actually need inlined
+    (e.g. to read/quote their content). Refuses anything over 256 KB outright
+    (base64-bloated response; confirmed live that responses this size get
+    dropped by the transport well before that, see DOWNLOAD_ATTACHMENT_MAX_BYTES).
+
+    When it doesn't refuse: downloads a file attachment from a task (requires
+    v2 API) and returns its content as base64, so it can be re-saved
+    elsewhere (e.g. uploaded to Google Drive). Identify the attachment by ONE
+    of: attachment_id (from list_task_attachments), filename (exact match),
+    or index (1-based, as shown by list_task_attachments).
 
     Endpoint: GET /api/v1/attachment/{projectId}/{taskId}/{attachmentId}
     (mirrors the working upload path minus '/upload'; confirmed by probing —
@@ -12609,9 +12620,11 @@ async def download_task_attachment(task_id: str, project_id: str = None,
             pid, task_id, att_id, filename=want_name))
 
         if len(data) > DOWNLOAD_ATTACHMENT_MAX_BYTES:
-            return (f"'{name}' is {len(data) // (1024*1024)} MB — over the "
-                    f"{DOWNLOAD_ATTACHMENT_MAX_BYTES // (1024*1024)} MB base64-response "
-                    "limit. Not downloaded.")
+            return (f"'{name}' is {len(data) // 1024} KB — over the "
+                    f"{DOWNLOAD_ATTACHMENT_MAX_BYTES // 1024} KB limit for this tool "
+                    "(base64-bloated responses this size get dropped by the transport). "
+                    "Not downloaded. Use get_attachment_download_url instead — it returns "
+                    "a direct link with no size limit and costs no tokens.")
 
         b64 = base64.b64encode(data).decode("ascii")
         return (f"filename: {name}\n"
@@ -12639,11 +12652,10 @@ async def get_attachment_download_url(task_id: str, project_id: str = None,
                                       index: int = None,
                                       ttl_minutes: int = 15) -> str:
     """
-    Get a temporary direct download LINK for a task attachment (requires v2
-    API) instead of pulling the file through this conversation. Use this for
-    anything big, and whenever the user actually wants the file on their phone
-    or computer — download_task_attachment base64-encodes into the answer and
-    refuses over 15 MB, this has no such limit and costs no tokens.
+    RULE: use this for photos/scans and anything over ~256 KB — and whenever
+    the user actually wants the file on their phone or computer, not inlined
+    in chat. download_task_attachment base64-encodes into the answer and
+    refuses over 256 KB; this tool has no size limit and costs no tokens.
 
     The link points at this MCP server (not at TickTick — TickTick has no
     public/pre-signed file URLs), which streams the bytes through; the TickTick

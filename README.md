@@ -42,6 +42,16 @@ Fills the gaps the official API lacks:
 > eventually expires; when it does the v2 tools return a "re-extract the cookie"
 > message and the official API keeps working.
 
+> 🔴 **Declutter is currently DISABLED** (since 2026-08-04, owner's direct
+> instruction after a QA incident where `plan_declutter` silently mixed real
+> and test tasks into one executable manifest). `plan_declutter`,
+> `execute_declutter`, and `resume_declutter` are commented out of the tool
+> registry — the sections below describe how they're *designed* to work once
+> re-enabled, not current live behaviour. Re-enabling means uncommenting the
+> `@mcp.tool()` decorators in `ticktick_mcp/src/server.py` after the mixing
+> bug is actually fixed and safely tested — see the `DISABLED 2026-08-04`
+> comments there. The owner cleans up manually until then.
+
 ### Optional LLM judge (set `CLAUDE_CLI_URL`)
 Want smarter fuzzy-duplicate detection and SMART-rewrite suggestions in
 `plan_declutter`, plus project-destination suggestions in

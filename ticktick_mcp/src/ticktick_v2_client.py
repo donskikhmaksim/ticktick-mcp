@@ -27,7 +27,7 @@ import time
 import urllib.parse
 import uuid
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -279,7 +279,14 @@ class TickTickV2Client:
         from_str/to_str are 'YYYY-MM-DD HH:MM:SS' bounds (empty = unbounded)."""
         limit = max(1, min(limit, COMPLETED_MAX_LIMIT))
         if to_str is None:
-            to_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # 2026-08-09: было datetime.now() без tz — время ПРОЦЕССА
+            # (сервер на Railway обычно в UTC), а не владельца. Весь
+            # остальной код в этом файле аккуратно ходит через _USER_TZ
+            # (см. её докстринг выше), чтобы "сейчас" для фильтра/среза
+            # совпадало с тем, что владелец считает "сейчас" у себя. Эта
+            # верхняя граница "recently completed" была единственным
+            # местом, где это правило нарушалось.
+            to_str = datetime.now(_USER_TZ).strftime("%Y-%m-%d %H:%M:%S")
         params = {"from": from_str, "to": to_str, "limit": limit}
         data = self._request("GET", "/project/all/completed", params=params)
         return data if isinstance(data, list) else data.get("tasks", [])
@@ -424,7 +431,11 @@ class TickTickV2Client:
     # ---- habits ----------------------------------------------------------
     @staticmethod
     def _now_iso() -> str:
-        return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000+0000")
+        # 2026-08-09: datetime.utcnow() — naive-время, помеченное Python как
+        # deprecated (будет удалено). Час тот же самый UTC, меняется только
+        # то, что объект теперь aware (несёт tzinfo=timezone.utc) — формат
+        # строки на выходе не менялся ни на символ.
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000+0000")
 
     def get_habits(self) -> List[Dict]:
         data = self._request("GET", "/habits")
