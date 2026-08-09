@@ -95,6 +95,8 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from . import log_redaction
+
 logger = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org"
@@ -1346,7 +1348,16 @@ def notify_plan(cfg: TgApprovalConfig, manifest_id: str, preview_body: str,
         create_tg_approval(manifest_id, cfg.owner_chat_id, None, expires_at, [])
     except Exception as e:  # noqa: BLE001 — не смогли создать строку = гейта нет
         logger.warning(f"TG: не смог создать строку подтверждения {manifest_id}: {e}")
-        return False, f"не удалось создать строку подтверждения в Postgres: {e}"
+        # 2026-08-09 (независимый аудит, расширение П7 на файлы вне
+        # server.py): `e` здесь может быть исключением psycopg на сбое
+        # подключения — то есть DSN с логином:паролем в открытом виде (см.
+        # test_log_redaction.py::test_postgres_dsn_credentials_are_redacted).
+        # Единственный вызывающий (server.py's _maybe_tg_notify_plan) СЕГОДНЯ
+        # прогоняет `err` через `_redact_for_user` перед показом — но
+        # полагаться на то, что КАЖДЫЙ будущий вызывающий об этом не забудет,
+        # неправильно: редактировать нужно там, где исключение поймано.
+        return False, ("не удалось создать строку подтверждения в Postgres: "
+                       f"{log_redaction.redact(str(e))}")
 
     text = f"{preview_body}\n\n{tool} · ticktick"
     res = send_message_chunked(

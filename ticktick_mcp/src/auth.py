@@ -20,6 +20,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 import logging
 
+from . import log_redaction
+
 # Set up logging
 logger = logging.getLogger(__name__)
 
@@ -293,7 +295,15 @@ class TickTickAuth:
             
         except Exception as e:
             logger.error(f"Error during OAuth flow: {e}")
-            return f"Error during OAuth flow: {str(e)}"
+            # 2026-08-09 (независимый аудит, расширение П7 на файлы вне
+            # server.py): этот текст печатается в терминал ПОЛЬЗОВАТЕЛЯ во
+            # время первичной настройки — он же может дословно попасть в
+            # тикет поддержки/переписку с ассистентом, если человек ищет
+            # помощь по ошибке настройки. Тот же редактор секретов, что и в
+            # server.py's _redact_for_user (общий log_redaction.redact —
+            # здесь нет доступа к SECRET сервера, но позиционные маски
+            # DSN/Bearer/PEM/bot-token срабатывают и без него).
+            return f"Error during OAuth flow: {log_redaction.redact(str(e))}"
         finally:
             # Clean up the server
             if httpd:
@@ -344,13 +354,19 @@ class TickTickAuth:
             
         except requests.exceptions.RequestException as e:
             logger.error(f"Error exchanging code for token: {e}")
+            # 2026-08-09 (тот же аудит, то же рассуждение, что и выше): тело
+            # ответа сервера токенов и текст самого исключения тоже проходят
+            # через редактор — `error_details`/`e.response.text` вполне могут
+            # включать эхо запроса (см. tests/test_log_redaction.py).
             if hasattr(e, 'response') and e.response is not None:
                 try:
                     error_details = e.response.json()
-                    return f"Error exchanging code for token: {error_details}"
+                    return ("Error exchanging code for token: "
+                           f"{log_redaction.redact(str(error_details))}")
                 except (ValueError, AttributeError):
-                    return f"Error exchanging code for token: {e.response.text}"
-            return f"Error exchanging code for token: {str(e)}"
+                    return ("Error exchanging code for token: "
+                           f"{log_redaction.redact(e.response.text)}")
+            return f"Error exchanging code for token: {log_redaction.redact(str(e))}"
     
     def _save_tokens_to_env(self) -> None:
         """Save the tokens to the .env file."""
