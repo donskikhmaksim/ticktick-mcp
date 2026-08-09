@@ -2658,6 +2658,20 @@ async def create_tasks(
         the created task's id as `(id:<id>)` so callers can link it without a
         follow-up title search.
 
+        A created task is NOT the same claim as a created TREE. Nesting, tags
+        and assignee each travel over the v2 batch endpoints, which answer
+        HTTP 200 with per-item rejections INSIDE the body — every one of those
+        answers is read, and anything TickTick refused is named in the report
+        («связи родитель-подзадача не применились», «теги НЕ применились»,
+        «исполнитель НЕ назначен») instead of being smoothed into the ✓ line.
+        The post-operation block additionally re-reads live state and checks
+        the LINKS themselves, so subtasks that exist but sit at top level are
+        reported («подзадачи созданы, но НЕ вложены под родителя»); the same
+        expectations go into the operation journal, so operation_report
+        re-checks them independently. New tags are registered in the account
+        tag list first — a tag set here shows up in list_tags and is deletable
+        with delete_tag, never an orphan label.
+
     TELEGRAM CONFIRMATION LAYER (optional, off by default): "create_tasks" is
     also the NAME this server announces creation plans under in Telegram —
     plan_task_creation sends the owner a message with [✅ Подтвердить]/
@@ -2696,8 +2710,13 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
     created = []
     failed = []
 
-    to_verify = []  # (title, id, expected_pid, expected_col) — checked at the end
-    sub_verify = []  # (title, id) of created SUBTASKS — existence re-checked too
+    # (title, id, expected_pid, expected_col, expected_parent, expected_tags)
+    # — checked at the end. expected_parent/expected_tags появились 2026-08-09
+    # (д5/д6): раньше привязка и теги не проверялись после операции вообще.
+    to_verify = []
+    # (title, id, project_id, expected_parent) созданных ПОДЗАДАЧ — сверяется
+    # и существование, и то, что подзадача реально лежит под родителем.
+    sub_verify = []
     _depth_by_id = None  # lazily-fetched live state, only if some task attaches to an existing parent
 
     # Один сброс кэша на весь вызов (не на каждую задачу): официальный API
@@ -2780,6 +2799,7 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                     lambda: ticktick_v2.batch_create_tasks(tasks_flat))
                 tree_fail = id2error_failures(
                     resp, [x["id"] for x in tasks_flat])
+                rel_fail = {}
                 if relations:
                     rel_resp = await _run_blocking(lambda: ticktick_v2._request(
                         "POST", "/batch/taskParent", json=relations))
@@ -2805,12 +2825,23 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                         sub_notes.append(f"⚠️ раздел (column) не применился: {_redact_for_user(e)}")
                 total = len(tasks_flat)
                 line = f"✓ «{title}» + {total - 1} подзадач (дерево, {total} всего)"
+                # Родитель КОРНЯ дерева (когда всё дерево вешают под уже
+                # существующую задачу) — такое же ожидание, как у подзадач:
+                # ожидается только если канал не сообщил об отказе по этой
+                # связи (д5, 2026-08-09).
+                root_rel = next((r for r in relations
+                                 if r.get("taskId") == tasks_flat[0]["id"]), None)
+                root_parent = (root_rel or {}).get("parentId") \
+                    if root_rel and root_rel.get("taskId") not in rel_fail else None
                 if root_id:
                     line += f" (id:{root_id})"
-                    to_verify.append((title, root_id, project_id, t.get("column_id")))
+                    to_verify.append((title, root_id, project_id,
+                                      t.get("column_id"), root_parent, None))
+                want_parent = {r.get("taskId"): r.get("parentId") for r in relations}
                 for x in tasks_flat[1:]:
                     if x["id"] not in tree_fail:
-                        sub_verify.append((x.get("title") or "?", x["id"]))
+                        sub_verify.append((x.get("title") or "?", x["id"],
+                                           project_id, want_parent.get(x["id"])))
                 if sub_notes:
                     line += "\n  " + "\n  ".join(sub_notes)
                 created.append(line)
@@ -2835,17 +2866,41 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
             task_id = task.get("id")
 
             sub_notes = []
+            tags_expect = None   # набор тегов, который ОТПРАВЛЕН (для журнала)
+            parent_expect = None  # родитель, привязка к которому подтверждена
             if ticktick_v2 and task_id:
                 if t.get("tags"):
+                    # д6 (2026-08-09). Здесь звался голый
+                    # `ticktick_v2.set_task_tags`: ответ канала не читался
+                    # (а /batch/task отвечает 200 с отказами внутри id2error),
+                    # живой сверки не было, и новый тег уезжал на задачу БЕЗ
+                    # регистрации в аккаунте — «тег-сирота», невидимый в
+                    # list_tags и неудаляемый delete_tag. Все три вещи уже
+                    # умеет отдельная команда простановки тегов, поэтому
+                    # зовётся ЕЁ ядро (`_apply_tags_verified`), а не пишется
+                    # похожий код второй раз.
                     try:
-                        await _run_blocking(lambda: ticktick_v2.set_task_tags(task_id, t["tags"]))
+                        tag_out = await _apply_tags_verified(
+                            [{"taskId": task_id, "title": title,
+                              "projectId": project_id, "tags": t["tags"]}])
+                        sub_notes.extend(_tag_notes_for_create(tag_out))
+                        tags_expect = tag_out.tags_by_id.get(task_id)
                     except Exception as e:
                         logger.warning(f"Tagging failed: {e}")
                         sub_notes.append(f"⚠️ теги не применились: {_redact_for_user(e)}")
                 if t.get("assignee") is not None:
                     try:
-                        await _run_blocking(lambda: ticktick_v2.batch_update_tasks(
+                        # д6 (2026-08-09): ответ /batch/task читается на
+                        # предмет отказа именно по ЭТОЙ задаче — раньше
+                        # отклонённое назначение исполнителя не давало ни
+                        # исключения, ни строки в отчёте.
+                        a_resp = await _run_blocking(lambda: ticktick_v2.batch_update_tasks(
                             [{"taskId": task_id, "assignee": t["assignee"]}]))
+                        a_err = id2error_failures(a_resp, [task_id]).get(task_id)
+                        if a_err:
+                            sub_notes.append(
+                                f"⚠️ исполнитель НЕ назначен — TickTick "
+                                f"отклонил: {a_err}")
                     except Exception as e:
                         logger.warning(f"Assignee failed: {e}")
                         sub_notes.append(f"⚠️ исполнитель не назначен: {_redact_for_user(e)}")
@@ -2857,8 +2912,21 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                         sub_notes.append(f"⚠️ раздел (column) не применился: {_redact_for_user(e)}")
                 if t.get("parent_id"):
                     try:
-                        await _run_blocking(lambda: ticktick_v2.batch_set_task_parent(
+                        # д5 (2026-08-09): /batch/taskParent отвечает 200 и
+                        # кладёт отказ по конкретной задаче в id2error —
+                        # непрочитанный ответ означал «✓ создано» на задаче,
+                        # которая осталась лежать КОРНЕВОЙ, а не под
+                        # родителем. Родитель попадает в ожидания пост-проверки
+                        # только когда канал не сообщил об отказе.
+                        p_resp = await _run_blocking(lambda: ticktick_v2.batch_set_task_parent(
                             [task_id], t["parent_id"], project_id))
+                        p_err = id2error_failures(p_resp, [task_id]).get(task_id)
+                        if p_err:
+                            sub_notes.append(
+                                "⚠️ привязка к родителю НЕ применилась — "
+                                f"TickTick отклонил: {p_err}")
+                        else:
+                            parent_expect = t["parent_id"]
                     except Exception as e:
                         logger.warning(f"Parent link failed: {e}")
                         sub_notes.append(f"⚠️ привязка к родителю не применилась: {_redact_for_user(e)}")
@@ -2886,18 +2954,44 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                         lambda: ticktick_v2.batch_create_tasks(all_sub_tasks))
                     sub_fail = id2error_failures(
                         resp, [x["id"] for x in all_sub_tasks])
+                    rel_fail = {}
                     if all_sub_rels:
-                        await _run_blocking(lambda: ticktick_v2._request(
+                        # д5 (2026-08-09). Здесь ответ на /batch/taskParent
+                        # выбрасывался целиком — а именно в нём канал сообщает
+                        # (внутри 200) о непринятых связях. Отчёт печатал
+                        # «✓ «X» + N подзадач», подзадачи существовали, но
+                        # лежали КОРНЕВЫМИ: дерева не было, и по тексту это
+                        # было неотличимо от успеха. Соседняя ветка того же
+                        # метода (PATH A, выше) читала этот ответ уже давно —
+                        # здесь ровно та же проверка.
+                        rel_resp = await _run_blocking(lambda: ticktick_v2._request(
                             "POST", "/batch/taskParent", json=all_sub_rels))
+                        rel_fail = id2error_failures(
+                            rel_resp, [r.get("taskId") for r in all_sub_rels])
+                        if rel_fail:
+                            sub_notes.append(
+                                f"⚠️ связи родитель-подзадача не применились у "
+                                f"{len(rel_fail)} (подзадачи созданы, но НЕ "
+                                "вложены): "
+                                + "; ".join(f"{k[:8]}…: {v}"
+                                            for k, v in rel_fail.items()))
                     await _run_blocking(lambda: ticktick_v2.invalidate_cache())
                     sub_count = len(all_sub_tasks) - len(sub_fail)
                     if sub_fail:
                         sub_notes.append(
                             f"⚠️ TickTick отклонил {len(sub_fail)} подзадач: "
                             + "; ".join(f"{k[:8]}…: {v}" for k, v in sub_fail.items()))
+                    # Ожидаемый родитель едет вместе с подзадачей в
+                    # пост-проверку и в журнал: до этой правки проверялось
+                    # только СУЩЕСТВОВАНИЕ подзадачи, то есть развалившееся
+                    # дерево не ловил ни блок проверки, ни независимый отчёт.
+                    want_parent = {r.get("taskId"): r.get("parentId")
+                                   for r in all_sub_rels}
                     for x in all_sub_tasks:
                         if x["id"] not in sub_fail:
-                            sub_verify.append((x.get("title") or "?", x["id"]))
+                            sub_verify.append((x.get("title") or "?", x["id"],
+                                               project_id,
+                                               want_parent.get(x["id"])))
                 except Exception as e:
                     logger.warning(f"Batch subtasks failed: {e}")
                     sub_notes.append(
@@ -2912,7 +3006,8 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                 line += f" + {sub_count} подзадач"
             if task_id:
                 line += f" (id:{task_id})"
-                to_verify.append((title, task_id, project_id, t.get("column_id")))
+                to_verify.append((title, task_id, project_id,
+                                  t.get("column_id"), parent_expect, tags_expect))
             if sub_notes:
                 line += "\n  " + "\n  ".join(sub_notes)
             created.append(line)
@@ -2934,7 +3029,7 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
             skip_verify = False
         names = _v2_project_names()
         if not skip_verify:
-            for v_title, v_id, v_pid, v_col in to_verify:
+            for v_title, v_id, v_pid, v_col, v_parent, _v_tags in to_verify:
                 live = fresh.get(v_id)
                 if not live:
                     warnings.append(f"⚠️ «{v_title}»: создание НЕ подтвердилось "
@@ -2947,14 +3042,34 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                         f"а НЕ в запрошенный «{names.get(v_pid, v_pid)}»")
                 if v_col and live.get("columnId") != v_col:
                     warnings.append(f"⚠️ «{v_title}»: раздел (column) не применился")
+                # ПРИВЯЗКА — такой же предмет проверки, как проект и раздел
+                # (д5, 2026-08-09): раньше её тут не было вовсе, и задача,
+                # оставшаяся корневой вместо подзадачи, проходила блок
+                # проверки без единого замечания.
+                if v_parent and live.get("parentId") != v_parent:
+                    warnings.append(
+                        f"⚠️ «{v_title}»: НЕ вложена под родителя "
+                        f"{str(v_parent)[:8]}… (parentId="
+                        f"{live.get('parentId')!r}) — лежит отдельно")
             # Subtasks: existence check (a rejected subtask must not survive
             # as a phantom «+ N подзадач» claim).
-            lost_subs = [s_title for s_title, s_id in sub_verify
+            lost_subs = [s_title for s_title, s_id, _s_pid, _s_par in sub_verify
                          if s_id not in fresh]
             if lost_subs:
                 warnings.append(
                     f"⚠️ подзадачи НЕ подтвердились ({len(lost_subs)}): "
                     + ", ".join(f"«{t}»" for t in lost_subs))
+            # …и вторая, независимая от неё проверка: подзадача существует, но
+            # лежит ли она ПОД родителем. Существование без привязки — ровно
+            # тот случай, когда отчёт хвалился деревом, которого нет.
+            orphan_subs = [s_title for s_title, s_id, _s_pid, s_par in sub_verify
+                           if s_par and s_id in fresh
+                           and (fresh.get(s_id) or {}).get("parentId") != s_par]
+            if orphan_subs:
+                warnings.append(
+                    f"⚠️ подзадачи созданы, но НЕ вложены под родителя "
+                    f"({len(orphan_subs)}): "
+                    + ", ".join(f"«{t}»" for t in orphan_subs))
 
     parts = []
     if created:
@@ -2963,11 +3078,24 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
         parts.append("Проверка назначения:\n" + "\n".join(warnings))
     if failed:
         parts.append(f"Ошибки ({len(failed)}):\n" + "\n".join(failed))
-    if to_verify:
+    if to_verify or sub_verify:
+        # В журнал (и, значит, в независимый operation_report) едут и
+        # ПОДЗАДАЧИ, и ожидаемая привязка — до этой правки журнал знал только
+        # корневые задачи и только их проект/раздел, поэтому развалившееся
+        # дерево независимая проверка не увидела бы никогда (д5, 2026-08-09).
         rid = _op_journal("create", [
             {"taskId": v_id, "title": v_title,
-             "expect": {"projectId": v_pid, **({"columnId": v_col} if v_col else {})}}
-            for v_title, v_id, v_pid, v_col in to_verify], summary)
+             "expect": {"projectId": v_pid,
+                        **({"columnId": v_col} if v_col else {}),
+                        **({"parentId": v_parent} if v_parent else {}),
+                        **({"tags": v_tags} if v_tags is not None else {})}}
+            for v_title, v_id, v_pid, v_col, v_parent, v_tags in to_verify
+        ] + [
+            {"taskId": s_id, "title": s_title,
+             "expect": {"projectId": s_pid,
+                        **({"parentId": s_par} if s_par else {})}}
+            for s_title, s_id, s_pid, s_par in sub_verify
+        ], summary)
         parts.append(_report_line(rid))
     return "\n\n".join(parts)
 
@@ -3684,7 +3812,15 @@ async def _update_tasks_impl(
                         sub_fails.append(f"раздел (column) не применился ({_redact_for_user(e)})")
                 if t.get("assignee") is not None and ticktick_v2:
                     try:
-                        await _run_blocking(lambda: ticktick_v2.batch_update_tasks([{"taskId": tid, "assignee": t["assignee"]}]))
+                        # д6 (2026-08-09), та же дыра, что в создании: ответ
+                        # /batch/task приходит 200 даже когда назначение
+                        # отклонено — отказ лежит внутри, в id2error, и до
+                        # этой правки не читался ничем.
+                        a_resp = await _run_blocking(lambda: ticktick_v2.batch_update_tasks([{"taskId": tid, "assignee": t["assignee"]}]))
+                        a_err = id2error_failures(a_resp, [tid]).get(tid)
+                        if a_err:
+                            sub_fails.append(
+                                f"исполнитель НЕ назначен — TickTick отклонил: {a_err}")
                     except Exception as e:
                         logger.warning(f"Updated but assignee failed: {e}")
                         sub_fails.append(f"исполнитель не назначен ({_redact_for_user(e)})")
@@ -6302,6 +6438,21 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
                          f"«{names.get(want_pid, want_pid)}»")
         if exp.get("columnId") and live.get("columnId") != exp.get("columnId"):
             probs.append("раздел не применился")
+        # Привязка и теги (д5/д6, 2026-08-09). Создание умеет и то и другое,
+        # но независимая проверка знала только про проект и раздел — задача,
+        # оставшаяся корневой вместо подзадачи, и потерянный тег получали
+        # от отчёта чистое «✅ создана».
+        want_parent = exp.get("parentId")
+        if want_parent and live.get("parentId") != want_parent:
+            parent_title = (live_map.get(want_parent) or {}).get("title") \
+                or f"{str(want_parent)[:8]}…"
+            probs.append(f"НЕ вложена под «{parent_title}» "
+                         f"(parentId={live.get('parentId')!r})")
+        want_tags = exp.get("tags")
+        if want_tags is not None \
+                and set(live.get("tags") or []) != set(want_tags):
+            probs.append(f"теги: {_fmt_tag_set(set(live.get('tags') or []))}, "
+                         f"ожидались {_fmt_tag_set(set(want_tags))}")
         if probs:
             return ("warn", f"- ⚠️ **«{title}»** — создана, но: "
                     + "; ".join(probs))
@@ -10998,6 +11149,191 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
     return await _set_task_tags_impl(outcome.summary, outcome.tasks)
 
 
+class _TagsOutcome:
+    """ФАКТЫ одной простановки тегов — что зарегистрировано, что реально
+    легло на задачи, что канал отклонил. Без единой строки отчёта.
+
+    Зачем отдельный тип (2026-08-09, д6). Раньше ВСЯ логика тегов —
+    регистрация тега в аккаунте (защита от «тега-сироты»), чтение отказов из
+    id2error и живая сверка «что просили = что стало» — жила внутри
+    `_set_task_tags_impl`, вперемешку со сборкой текста отчёта. Путь СОЗДАНИЯ
+    задачи переиспользовать это не мог (ему нужен не готовый отчёт, а факты,
+    которые он вплетёт в свою строку) и потому звал голый
+    `ticktick_v2.set_task_tags` — без обеих проверок: теги при создании
+    терялись молча. Ядро вынесено сюда, чтобы у обоих путей была ОДНА
+    реализация, а не две похожие."""
+    __slots__ = ("state_unavailable", "found", "mismatch", "missing",
+                 "changes", "tags_by_id", "display_by_key", "registered",
+                 "failed_register", "skipped", "applied", "failed",
+                 "api_fail", "unverified")
+
+    def __init__(self):
+        self.state_unavailable = False  # живое состояние не прочиталось вовсе
+        self.found, self.mismatch, self.missing = [], [], []
+        self.changes = []               # то, что реально ушло в /batch/task
+        self.tags_by_id = {}            # taskId -> запрошенный набор тегов
+        self.display_by_key = {}        # ключ тега -> написание для человека
+        self.registered = []            # новые теги, ЗАВЕДЁННЫЕ в аккаунте
+        self.failed_register = []       # не удалось завести → не пишем никуда
+        self.skipped = []               # [(title, [плохие теги])] — не тронуты
+        self.applied = []               # titles: живьём видно запрошенный набор
+        self.failed = []                # titles: НЕ видно (или отказ канала)
+        self.api_fail = {}              # id2error по /batch/task
+        self.unverified = False         # отправлено, но перечитать не удалось
+
+
+async def _apply_tags_verified(tasks: List[Dict[str, Any]]) -> _TagsOutcome:
+    """Set tags on tasks with BOTH guarantees the account expects, and report
+    the facts (no formatting): every not-yet-existing tag is registered in the
+    account tag list first (no orphan tags), per-item rejections inside the
+    batch response are read (`id2error_failures`), and the live state is
+    re-read afterwards so "applied" means observed, never assumed.
+
+    The single implementation behind BOTH `set_task_tags` (the standalone
+    gated tool) and the tagging step of task creation."""
+    out = _TagsOutcome()
+    by_id = _open_by_id(fresh=True)
+    if by_id is None:
+        out.state_unavailable = True
+        return out
+    found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
+    out.found, out.mismatch, out.missing = found, mismatch, missing
+    ok = {f["taskId"]: f for f in found}
+    # Normalise like the single-task path: TickTick keys tags by lowercase
+    # bare name — a raw '#Работа' would create a phantom tag.
+    changes = [{"taskId": t.get("taskId") or t.get("task_id"),
+                "tags": [x.lstrip("#").lower() for x in (t.get("tags") or [])]}
+               for t in tasks
+               if (t.get("taskId") or t.get("task_id")) in ok]
+
+    # TickTick keeps tags in TWO places: the account's tag list
+    # (/batch/tag — what list_tags/create_tag/delete_tag see) and a raw
+    # label string on each task (/batch/task). Writing a brand-new label
+    # straight onto a task WITHOUT registering it in the account tag list
+    # first creates an ORPHAN tag: invisible to list_tags, undeletable via
+    # delete_tag, but still attached to the task. So: register every
+    # not-yet-existing tag through the same account-level path create_tag
+    # uses, BEFORE touching any task — and post-verify the registration
+    # itself, not just assume the 200 meant it worked.
+    requested = sorted({t for c in changes for t in c["tags"] if t})
+    # Регистр (2026-08-07). У тега ДВА поля: `name` — ключ, всегда нижним
+    # регистром (по нему тег ищется, он же пишется на задачу), и `label`
+    # — написание, которое человек видит в списке тегов. Настоящий
+    # `TickTickV2Client.create_tag` это уважает сам: он понижает `name` и
+    # кладёт в `label` строку КАК ПЕРЕДАЛИ. Раньше сюда уходил уже
+    # пониженный ключ — нормализация, нужная для записи на задачу,
+    # утекала и в регистрацию, — и «Работа», заведённая постановкой на
+    # задачу, оседала в аккаунте как «работа», хотя через create_tag то
+    # же слово сохраняло регистр. Здесь запоминается первое встреченное
+    # написание каждого ключа и отдаётся в регистрацию именно оно.
+    display_by_key: Dict[str, str] = {}
+    for t in tasks:
+        for raw in (t.get("tags") or []):
+            bare = str(raw).lstrip("#")
+            if bare:
+                display_by_key.setdefault(bare.lower(), bare)
+    out.display_by_key = display_by_key
+    # force=False: _open_by_id(fresh=True) just above already forced a
+    # fresh sync-state fetch (tags included) within the TTL window — no
+    # need for a second network round-trip for the same snapshot.
+    existing_tags = set(await _live_tag_names(force=False))
+    to_register = [t for t in requested if t not in existing_tags]
+    for tag_name in to_register:
+        try:
+            shown = display_by_key.get(tag_name, tag_name)
+            await _run_blocking(lambda tn=shown: ticktick_v2.create_tag(tn))
+        except Exception:
+            logger.exception(
+                f"set_task_tags: auto-registration of tag '{tag_name}' "
+                "raised")
+    after_create = (set(await _live_tag_names(force=True))
+                    if to_register else existing_tags)
+    out.registered = [t for t in to_register if t in after_create]
+    out.failed_register = [t for t in to_register if t not in after_create]
+
+    # Fail closed for exactly the tags that couldn't be registered: drop
+    # the WHOLE per-task change rather than send a truncated tag list —
+    # set_task_tags REPLACES all tags on a task, so silently stripping
+    # just the bad tag from a change could wipe tags the user never
+    # asked to touch. The task is left completely untouched instead.
+    if out.failed_register:
+        bad_set = set(out.failed_register)
+        kept = []
+        for c in changes:
+            bad = set(c["tags"]) & bad_set
+            if bad:
+                out.skipped.append((ok[c["taskId"]]["title"], sorted(bad)))
+            else:
+                kept.append(c)
+        changes = kept
+    out.changes = changes
+
+    if changes:
+        resp = await _run_blocking(
+            lambda: ticktick_v2.batch_update_tasks(changes))
+        out.api_fail = id2error_failures(resp, [c["taskId"] for c in changes])
+    # Inline post-verify: live tags must equal the requested set, AND any
+    # newly-registered tag must be visible in the account's own tag list
+    # (list_tags) — this is the proof that (b) actually closed the
+    # orphan hole, not just moved it.
+    out.tags_by_id = {c["taskId"]: c["tags"] for c in changes}
+    if changes:
+        fresh = _open_by_id(fresh=True)
+        if fresh is None:
+            out.unverified = True
+        else:
+            for f in found:
+                if f["taskId"] not in out.tags_by_id:
+                    continue  # skipped above — never sent, don't verify
+                want = set(out.tags_by_id.get(f["taskId"], []))
+                got = set((fresh.get(f["taskId"]) or {}).get("tags") or [])
+                ok_item = want == got and f["taskId"] not in out.api_fail
+                (out.applied if ok_item else out.failed).append(f["title"])
+    return out
+
+
+def _tag_notes_for_create(out: _TagsOutcome) -> List[str]:
+    """Short per-task notes about tagging, for the CREATE report.
+
+    Same facts the standalone set_task_tags prints, condensed to the one task
+    being created — silence here means the tags were verified live, never
+    "we sent something and moved on"."""
+    notes = []
+    if out.state_unavailable:
+        return ["⚠️ теги НЕ проставлены: живое состояние не прочиталось "
+                "(перепроверь и поставь теги отдельно)"]
+    if out.missing:
+        return ["⚠️ теги НЕ проставлены: созданная задача не нашлась среди "
+                "открытых при перепроверке"]
+    if out.mismatch:
+        return ["⚠️ теги НЕ проставлены: id созданной задачи указывает на "
+                "другую задачу (сверка не прошла)"]
+    if out.failed_register:
+        notes.append(
+            "⚠️ теги НЕ проставлены — не удалось завести их в аккаунте (иначе "
+            "получился бы тег-сирота: не виден в list_tags, не удаляется "
+            "delete_tag): "
+            + ", ".join(f"«{out.display_by_key.get(t, t)}»"
+                        for t in out.failed_register))
+    if out.registered:
+        notes.append(
+            "🆕 новые теги заведены в аккаунте (проверено): "
+            + ", ".join(f"«{out.display_by_key.get(t, t)}»"
+                        for t in out.registered))
+    if out.unverified:
+        notes.append(f"⚠️ теги отправлены, но {_UNVERIFIED_MSG}")
+    if out.failed:
+        extra = "; ".join(f"{k[:8]}…: {v}" for k, v in out.api_fail.items())
+        notes.append("⚠️ теги НЕ применились"
+                     + (f" — TickTick сообщил: {extra}" if extra else
+                        " (в живом состоянии их нет)"))
+    if out.applied:
+        shown = sorted({t for tags in out.tags_by_id.values() for t in tags})
+        notes.append("🏷 теги проставлены (проверено): "
+                     + ", ".join(f"«{t}»" for t in shown))
+    return notes
+
+
 async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
     """Pure mutation logic for set_task_tags — no consent gate. Called
     only by the public gated set_task_tags() below."""
@@ -11005,103 +11341,23 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
     if err:
         return err
     try:
-        by_id = _open_by_id(fresh=True)
-        if by_id is None:
+        outcome = await _apply_tags_verified(tasks)
+        if outcome.state_unavailable:
             return _STATE_UNAVAILABLE_MSG
-        found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
-        ok = {f["taskId"]: f for f in found}
-        # Normalise like the single-task path: TickTick keys tags by lowercase
-        # bare name — a raw '#Работа' would create a phantom tag.
-        changes = [{"taskId": t.get("taskId") or t.get("task_id"),
-                    "tags": [x.lstrip("#").lower() for x in (t.get("tags") or [])]}
-                   for t in tasks
-                   if (t.get("taskId") or t.get("task_id")) in ok]
-
-        # TickTick keeps tags in TWO places: the account's tag list
-        # (/batch/tag — what list_tags/create_tag/delete_tag see) and a raw
-        # label string on each task (/batch/task). Writing a brand-new label
-        # straight onto a task WITHOUT registering it in the account tag list
-        # first creates an ORPHAN tag: invisible to list_tags, undeletable via
-        # delete_tag, but still attached to the task. So: register every
-        # not-yet-existing tag through the same account-level path create_tag
-        # uses, BEFORE touching any task — and post-verify the registration
-        # itself, not just assume the 200 meant it worked.
-        requested = sorted({t for c in changes for t in c["tags"] if t})
-        # Регистр (2026-08-07). У тега ДВА поля: `name` — ключ, всегда нижним
-        # регистром (по нему тег ищется, он же пишется на задачу), и `label`
-        # — написание, которое человек видит в списке тегов. Настоящий
-        # `TickTickV2Client.create_tag` это уважает сам: он понижает `name` и
-        # кладёт в `label` строку КАК ПЕРЕДАЛИ. Раньше сюда уходил уже
-        # пониженный ключ — нормализация, нужная для записи на задачу,
-        # утекала и в регистрацию, — и «Работа», заведённая постановкой на
-        # задачу, оседала в аккаунте как «работа», хотя через create_tag то
-        # же слово сохраняло регистр. Здесь запоминается первое встреченное
-        # написание каждого ключа и отдаётся в регистрацию именно оно.
-        display_by_key: Dict[str, str] = {}
-        for t in tasks:
-            for raw in (t.get("tags") or []):
-                bare = str(raw).lstrip("#")
-                if bare:
-                    display_by_key.setdefault(bare.lower(), bare)
-        # force=False: _open_by_id(fresh=True) just above already forced a
-        # fresh sync-state fetch (tags included) within the TTL window — no
-        # need for a second network round-trip for the same snapshot.
-        existing_tags = set(await _live_tag_names(force=False))
-        to_register = [t for t in requested if t not in existing_tags]
-        for tag_name in to_register:
-            try:
-                shown = display_by_key.get(tag_name, tag_name)
-                await _run_blocking(lambda tn=shown: ticktick_v2.create_tag(tn))
-            except Exception:
-                logger.exception(
-                    f"set_task_tags: auto-registration of tag '{tag_name}' "
-                    "raised")
-        after_create = (set(await _live_tag_names(force=True))
-                        if to_register else existing_tags)
-        registered = [t for t in to_register if t in after_create]
-        failed_register = [t for t in to_register if t not in after_create]
-
-        # Fail closed for exactly the tags that couldn't be registered: drop
-        # the WHOLE per-task change rather than send a truncated tag list —
-        # set_task_tags REPLACES all tags on a task, so silently stripping
-        # just the bad tag from a change could wipe tags the user never
-        # asked to touch. The task is left completely untouched instead.
-        skipped_tasks = []
-        if failed_register:
-            bad_set = set(failed_register)
-            kept = []
-            for c in changes:
-                bad = set(c["tags"]) & bad_set
-                if bad:
-                    skipped_tasks.append((ok[c["taskId"]]["title"], sorted(bad)))
-                else:
-                    kept.append(c)
-            changes = kept
-
-        api_fail = {}
-        if changes:
-            resp = await _run_blocking(
-                lambda: ticktick_v2.batch_update_tasks(changes))
-            api_fail = id2error_failures(resp, [c["taskId"] for c in changes])
-        # Inline post-verify: live tags must equal the requested set, AND any
-        # newly-registered tag must be visible in the account's own tag list
-        # (list_tags) — this is the proof that (b) actually closed the
-        # orphan hole, not just moved it.
-        tags_by_id = {c["taskId"]: c["tags"] for c in changes}
-        applied, failed = [], []
-        unverified = False
-        if changes:
-            fresh = _open_by_id(fresh=True)
-            if fresh is None:
-                unverified = True
-            else:
-                for f in found:
-                    if f["taskId"] not in tags_by_id:
-                        continue  # skipped above — never sent, don't verify
-                    want = set(tags_by_id.get(f["taskId"], []))
-                    got = set((fresh.get(f["taskId"]) or {}).get("tags") or [])
-                    ok_item = want == got and f["taskId"] not in api_fail
-                    (applied if ok_item else failed).append(f["title"])
+        found, mismatch, missing = (outcome.found, outcome.mismatch,
+                                    outcome.missing)
+        # Имена локальных переменных ниже сохранены как были — отчёт ниже
+        # не переписывался, у него ровно те же входные данные, просто теперь
+        # они приходят из общего ядра, а не считаются здесь.
+        registered = outcome.registered
+        failed_register = outcome.failed_register
+        skipped_tasks = outcome.skipped
+        applied, failed = outcome.applied, outcome.failed
+        api_fail = outcome.api_fail
+        unverified = outcome.unverified
+        changes = outcome.changes
+        tags_by_id = outcome.tags_by_id
+        display_by_key = outcome.display_by_key
         lines = []
         if applied:
             lines.append(f"🏷 Теги обновлены у {len(applied)} (проверено): "
