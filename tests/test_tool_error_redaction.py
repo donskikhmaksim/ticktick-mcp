@@ -12,20 +12,30 @@
 Секреты здесь ВЫДУМАННЫЕ (как и в tests/test_log_redaction.py) — боевое
 значение не должно появляться ни в тестах, ни в отчётах.
 
-Проверено на четырёх разных командах, двумя разными путями отказа:
+Проверено на пяти разных командах/путях отказа:
   * `get_projects` — исключение клиента (SECRET-путь, `_tool_error`);
   * `get_project`  — уже готовая строка ошибки в `{'error': ...}` (сигнатурная
     ссылка `/dl/<token>`, позиционный редактор без знания секрета);
   * `get_task`     — исключение клиента с сигнатурной ссылкой (`_tool_error`);
   * `_create_project_impl` — отдельная (не через `_tool_error`) точка правки,
-    русский текст «TickTick отклонил» / «Ошибка», see server.py:7868.
+    русский текст «TickTick отклонил» / «Ошибка», see server.py:7868;
+  * `_maybe_tg_notify_plan` — КРИТИЧНЫЙ дефект, найденный независимым
+    аудитом 2026-08-09 (доказан рабочим примером): при сбое отправки в
+    Telegram `err` из `tg_approval.notify_plan` возвращался моделью как
+    есть, а `tg_approval._tg_call` строит URL с ТОКЕНОМ БОТА буквально
+    (`f"{TELEGRAM_API}/bot{cfg.bot_token}/{method}"`) — токен бота даёт
+    полный контроль над вторым фактором подтверждения удалений.
 """
+import time
+
 import ticktick_mcp.src.server as s
+import ticktick_mcp.src.tg_approval as tg_approval
 
 # Выдуманные значения, похожие по форме на настоящие (длинные, url-safe) —
 # как в tests/test_log_redaction.py.
 FAKE_SECRET = "fake0secret0do0not0use0abcdef123456"
 FAKE_LINK_TOKEN = "eyJwIjoiMSIsInQiOiIyIn0.ZmFrZXNpZ25hdHVyZQ"
+FAKE_BOT_TOKEN = "123456789:AAHfake0bot0token0DO0NOT0USE"
 
 
 class FakeOfficial:
@@ -75,8 +85,16 @@ def test_redact_for_user_strips_mcp_secret(monkeypatch):
 
 def test_redact_for_user_strips_signed_link_token():
     # Позиционное правило (/dl/, /ul/) срабатывает даже без знания секрета —
-    # тут SECRET сознательно не задаётся.
-    exc = RuntimeError(f"upstream 502 while replaying /dl/{FAKE_LINK_TOKEN}")
+    # тут SECRET сознательно не задаётся. РЕАЛЬНЫЙ формат ссылки (не
+    # придуманный для теста): `_public_base_url()` в server.py собирает
+    # `f"{base}/dl/{token}"` с ПОЛНЫМ https-адресом перед "/dl/" — именно
+    # так, а не голым путём после пробела, ссылка и попадает в текст
+    # исключения при сетевом сбое (независимый аудит 2026-08-09, см.
+    # tests/test_log_redaction.py::test_link_token_is_redacted_inside_a_full_url,
+    # где под этот формат чинился сам редактор).
+    exc = RuntimeError(
+        f"upstream 502 while replaying https://ticktick-mcp.up.railway.app"
+        f"/dl/{FAKE_LINK_TOKEN}")
     out = s._redact_for_user(exc)
     assert FAKE_LINK_TOKEN not in out
     assert "<link-token>" in out
@@ -84,7 +102,9 @@ def test_redact_for_user_strips_signed_link_token():
 
 
 def test_tool_error_builds_uniform_message_and_redacts():
-    out = s._tool_error("fetching widgets", RuntimeError(f"boom /dl/{FAKE_LINK_TOKEN}"))
+    exc = RuntimeError(
+        f"boom https://ticktick-mcp.up.railway.app/dl/{FAKE_LINK_TOKEN}")
+    out = s._tool_error("fetching widgets", exc)
     assert out.startswith("Error fetching widgets: ")
     assert FAKE_LINK_TOKEN not in out
     assert "<link-token>" in out
@@ -115,7 +135,8 @@ async def test_get_projects_exception_does_not_leak_secret(monkeypatch):
 
 async def test_get_project_error_dict_does_not_leak_signed_link(monkeypatch):
     monkeypatch.setattr(s, "ticktick_v2", None)  # выключает проверку Inbox
-    err_text = f"404 while fetching /dl/{FAKE_LINK_TOKEN} for retry-diagnostics"
+    err_text = (f"404 while fetching https://ticktick-mcp.up.railway.app"
+                f"/dl/{FAKE_LINK_TOKEN} for retry-diagnostics")
     monkeypatch.setattr(s, "ticktick", FakeOfficial(project_result={"error": err_text}))
 
     out = await s.get_project(project_id="proj1")
@@ -130,7 +151,9 @@ async def test_get_project_error_dict_does_not_leak_signed_link(monkeypatch):
 # ---------------------------------------------------------------------------
 
 async def test_get_task_exception_does_not_leak_link_token(monkeypatch):
-    err = RuntimeError(f"connection reset while streaming /ul/{FAKE_LINK_TOKEN}")
+    err = RuntimeError(
+        f"connection reset while streaming https://ticktick-mcp.up.railway.app"
+        f"/ul/{FAKE_LINK_TOKEN}")
     monkeypatch.setattr(s, "ticktick", FakeOfficial(task_error=err))
 
     out = await s.get_task(project_id="proj1", task_id="task1")
@@ -155,3 +178,49 @@ async def test_create_project_impl_rejection_does_not_leak_secret(monkeypatch):
     assert FAKE_SECRET not in out
     assert "<mcp-secret>" in out
     assert "НЕ создан" in out
+
+
+# ---------------------------------------------------------------------------
+# Команда 5: _maybe_tg_notify_plan — токен Telegram-бота не должен уезжать
+# модели, когда отправка плана на подтверждение проваливается по сети.
+# Живой пример из аудита: HTTPSConnectionPool(...): Max retries exceeded
+# with url: /bot<токен>/sendMessage — весь URL целиком лежит в str(e)
+# requests-исключения, которое tg_approval._tg_call кладёт в description.
+# ---------------------------------------------------------------------------
+
+def _plan_manifest_for_tg(mid: str) -> dict:
+    """Минимальный манифест — только то, что читает _maybe_tg_notify_plan
+    (пометка tg_notified/_tg_tool/_tg_manifest_id и попытка persist, которая
+    молча пропускается без настроенного Postgres — см. manifest_store.store_ready)."""
+    now = time.monotonic()
+    s._MANIFESTS[mid] = {
+        "kind": "delete", "items": [], "created": now,
+        "plan_shown_at": now, "summary": "план", "consumed": False,
+        "object_hash": s._manifest_object_hash("delete", []),
+    }
+    return s._MANIFESTS[mid]
+
+
+async def test_maybe_tg_notify_plan_failure_does_not_leak_bot_token(monkeypatch):
+    monkeypatch.setattr(s, "_TG_CFG", tg_approval.TgApprovalConfig(
+        enabled=True, bot_token=FAKE_BOT_TOKEN, owner_chat_id="1",
+        server="ticktick", tools_allowlist=None, ttl_s=3600))
+    mid = "mid-tg-leak-test"
+    _plan_manifest_for_tg(mid)
+
+    # Ровно то, что кладёт tg_approval._tg_call в description при сетевом
+    # сбое requests.post(f"{TELEGRAM_API}/bot{cfg.bot_token}/{method}", ...).
+    leak_text = (
+        "HTTPSConnectionPool(host='api.telegram.org', port=443): Max "
+        f"retries exceeded with url: /bot{FAKE_BOT_TOKEN}/sendMessage")
+    monkeypatch.setattr(tg_approval, "notify_plan",
+                        lambda *a, **k: (False, leak_text))
+
+    try:
+        out = await s._maybe_tg_notify_plan("delete_tasks", mid, "### план")
+    finally:
+        s._MANIFESTS.pop(mid, None)
+
+    assert FAKE_BOT_TOKEN not in out
+    assert "/bot<tg-bot-token>" in out
+    assert "Не смог отправить запрос подтверждения в Telegram" in out

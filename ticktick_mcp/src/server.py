@@ -2600,7 +2600,7 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                 reminders=t.get("reminders"),
             )
             if 'error' in task:
-                failed.append(f"#{i+1} «{title}»: {task['error']}")
+                failed.append(f"#{i+1} «{title}»: {_redact_for_user(task['error'])}")
                 continue
             task_id = task.get("id")
 
@@ -3435,7 +3435,7 @@ async def _update_tasks_impl(
                     reminders=t.get("reminders"),
                 )
                 if 'error' in task:
-                    results.append(f"✗ «{shown_title}»: {task['error']}")
+                    results.append(f"✗ «{shown_title}»: {_redact_for_user(task['error'])}")
                     continue
                 # Sub-steps (tags/column/assignee) — failures go into the RESULT
                 # text, not only the log: «обновлено» must not hide a lost tag.
@@ -3779,7 +3779,7 @@ async def _complete_tasks_impl(summary: str, tasks: List[Dict[str, str]]) -> str
                 pname = t.get("projectName") or _v2_project_names().get(pid, "")
                 res = await _run_blocking(lambda: ticktick.complete_task(pid, tid))
                 if 'error' in res:
-                    results.append(f"✗ «{title}»: {res['error']}")
+                    results.append(f"✗ «{title}»: {_redact_for_user(res['error'])}")
                     continue
                 # Post-verify: the official API can silently no-op a complete
                 # with a mismatched projectId — «✓» only after the task is
@@ -4815,7 +4815,8 @@ async def _maybe_tg_notify_plan(tool: str, manifest_id: str,
             m.pop("tg_notified", None)
             m.pop("_tg_tool", None)
             m.pop("_tg_manifest_id", None)
-        return (f"🛑 Не смог отправить запрос подтверждения в Telegram ({err}). "
+        return (f"🛑 Не смог отправить запрос подтверждения в Telegram "
+                f"({_redact_for_user(err)}). "
                 "Действие НЕ запланировано, ничего не изменено. Проверьте "
                 "бота/настройки Telegram-подтверждения и попробуйте снова.")
     # УСПЕШНО отправлено → манифест ПОМЕЧЕН (2026-08-06, фикс
@@ -8128,7 +8129,7 @@ async def _delete_project_impl(project_id: str, project_name: str,
         result = await _run_blocking(lambda: ticktick.delete_project(project_id))
         if 'error' in result:
             return (f"❌ TickTick отклонил удаление проекта «{live_name}»: "
-                    f"{result['error']}\n{_report_line(record_id)}")
+                    f"{_redact_for_user(result['error'])}\n{_report_line(record_id)}")
 
         # Post-verify against FRESH state: the project must no longer resolve.
         if ticktick_v2:
