@@ -449,3 +449,120 @@ async def test_direct_create_with_matching_non_ascii_key_is_allowed(monkeypatch)
                                automation_key="секрет-🔑")
 
     assert called, f"валидный не-ASCII ключ не пропустили: {out}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Д7 (2026-08-09) — надгробие ставится по ВЕРДИКТУ, а не по первому символу
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Отчёт ручного разбора начинается с нейтрального «### 🧾», а внутри него
+# строка «✅ Выполнено 0 из 3» — с галочкой РЯДОМ С НУЛЁМ. Признак «первый
+# символ отчёта не 🛑/❌» на таком тексте означает ровно ничего, но именно по
+# нему раньше решалось, писать ли «выполнено».
+
+
+_ZERO_OF_THREE = "\n".join([
+    "### 🧾 Ручной разбор — итог",
+    "_Разбираю входящие_",
+    "",
+    "✅ Выполнено 0 из 3",
+    "✏️ Изменено 0 · ↪ Перенесено 0 · ✅ Закрыто 0 · 🗑 Удалено 0 · 🔗 Объединено 0",
+    "❌ Не подтверждено сверкой: 3",
+])
+
+
+def _run_auto_execute(monkeypatch, mid, report):
+    async def _exec(manifest_id, m):
+        return report
+
+    monkeypatch.setattr(s._AUTO_EXECUTORS["delete_tasks"], "execute", _exec)
+    asyncio.run(s._tg_auto_execute_tick())
+
+
+def test_zero_confirmed_of_three_is_not_marked_executed(monkeypatch):
+    """Три мутации отправлены, независимое чтение не подтвердило ни одной.
+    Надгробие «выполнено» здесь — прямая ложь, а следующий вызов слышал от
+    неё «Повторять нечего, ничего не потеряно»."""
+    _tg_on(monkeypatch)
+    mid = _plant_delete_manifest("d7-zero")
+    _approved(monkeypatch, mid)
+    _collect_reports(monkeypatch)
+    monkeypatch.setattr(s, "_build_operation_report", lambda m: "\n".join([
+        "### 🔍 Независимая проверка",
+        "- ❌ **«Купить молоко»** — расхождение",
+        "**Итог: ✅ 0 подтверждено, ⚠️ 0 не проверено, ❌ 3 расхождения**"]))
+
+    _run_auto_execute(monkeypatch, mid, _ZERO_OF_THREE)
+
+    assert _reason(mid) != s._TOMBSTONE_EXECUTED, \
+        "нуль подтверждённых помечен как «выполнено»"
+    assert _reason(mid) == s._TOMBSTONE_FAILED
+    msg = s._manifest_gone_msg(mid, "DEFAULT")
+    assert "УЖЕ исполнен" not in msg
+    assert "ничего не потеряно" not in msg
+
+
+def test_an_unprovable_outcome_is_neither_executed_nor_failed(monkeypatch):
+    """Тот же отчёт, но подтвердить его нечем: журнала для этого класса
+    операций нет вовсе. Это НЕ «выполнено» (никто ничего не доказал) и НЕ
+    «не выполнено» (мутации ушли, часть могла примениться) — отдельное
+    четвёртое состояние, иначе выбор был бы между двумя враньём."""
+    _tg_on(monkeypatch)
+    mid = _plant_delete_manifest("d7-unproven")
+    _approved(monkeypatch, mid)
+    _collect_reports(monkeypatch)
+    monkeypatch.setattr(s, "_build_operation_report",
+                        lambda m: "Журнал не найден")
+
+    _run_auto_execute(monkeypatch, mid, _ZERO_OF_THREE)
+
+    assert _reason(mid) == s._TOMBSTONE_UNCONFIRMED
+    msg = s._manifest_gone_msg(mid, "DEFAULT")
+    assert "УЖЕ исполнен" not in msg and "ничего не потеряно" not in msg
+    assert "подтвердила НЕ ВСЁ" in msg
+    assert "«сделано» НЕЛЬЗЯ" in msg
+    # …и не выдаёт неподтверждённое за провал: «ничего не произошло» тоже ложь
+    assert "могла примениться" in msg
+    assert "unverified" in (s._MANIFEST_TOMBSTONES[mid].get("detail") or "")
+
+
+def test_a_confirmed_success_is_still_marked_executed(monkeypatch):
+    """Зеркало ко всем трём: настоящий подтверждённый успех по-прежнему
+    читается как «уже исполнено» — правка не имеет права глушить полезный
+    ответ."""
+    _tg_on(monkeypatch)
+    mid = _plant_delete_manifest("d7-ok")
+    _approved(monkeypatch, mid)
+    _collect_reports(monkeypatch)
+    monkeypatch.setattr(s, "_build_operation_report", lambda m: "\n".join([
+        "### 🔍 Независимая проверка",
+        "- ✅ **«Купить молоко»** — удалена",
+        "**Итог: ✅ 1 подтверждено, ⚠️ 0 не проверено, ❌ 0 расхождений**"]))
+
+    _run_auto_execute(monkeypatch, mid, "### ✅ Удалено 1 задание (проверено).")
+
+    assert _reason(mid) == s._TOMBSTONE_EXECUTED
+    assert "УЖЕ исполнен" in s._manifest_gone_msg(mid, "DEFAULT")
+
+
+def test_the_tombstone_follows_the_verdict_and_the_stricter_of_two_signals():
+    """Таблица решений целиком — все пять вердиктов, оба сигнала.
+
+    Самоотчёт участвует ровно одним способом: он может исход УХУДШИТЬ («я
+    ничего не сделал» перебивает даже "ok"), но никогда не улучшить."""
+    by_verdict = {v: s._tombstone_reason_for_verdict(v, False)
+                  for v in ("ok", "partial", "mismatch", "failed", "unverified")}
+
+    assert by_verdict == {
+        "ok": s._TOMBSTONE_EXECUTED,
+        "partial": s._TOMBSTONE_UNCONFIRMED,
+        "unverified": s._TOMBSTONE_UNCONFIRMED,
+        "mismatch": s._TOMBSTONE_FAILED,
+        "failed": s._TOMBSTONE_FAILED,
+    }
+    # Строжайший из двух: отказ исполнителя строкой перебивает любой вердикт.
+    for v in ("ok", "partial", "unverified", "mismatch", "failed"):
+        assert s._tombstone_reason_for_verdict(v, True) == s._TOMBSTONE_FAILED
+    # Незнакомое значение вердикта не считается успехом (fail-closed).
+    assert s._tombstone_reason_for_verdict("нечто новое", False) \
+        == s._TOMBSTONE_UNCONFIRMED

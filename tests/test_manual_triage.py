@@ -1088,7 +1088,7 @@ async def test_executor_ran_but_verification_did_not_confirm(monkeypatch, tmp_pa
     out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
 
     assert [c[0] for c in calls] == ["complete", "delete"]
-    assert "✅ Выполнено 0 из 2" in out
+    assert "❌ Выполнено 0 из 2" in out, "галочка рядом с нулём (побочный пункт Д7)"
     assert "❌ Не подтверждено сверкой: 2" in out
     assert "ВСЁ ЕЩЁ существует" in out and "всё ещё среди открытых" in out
 
@@ -1274,7 +1274,7 @@ async def test_changes_invisible_in_the_open_list_are_reported_as_unchecked(
 
     assert [c[0] for c in calls] == ["update"]
     assert "⚠️ не проверяется автоматически: 1" in out
-    assert "✅ Выполнено 0 из 1" in out
+    assert "❌ Выполнено 0 из 1" in out, "галочка рядом с нулём (побочный пункт Д7)"
     assert "не проверить" in out
 
 
