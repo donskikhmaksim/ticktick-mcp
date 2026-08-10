@@ -1418,14 +1418,23 @@ async def test_numeric_due_date_is_refused_at_plan_time(monkeypatch, tmp_path):
 
 async def test_non_string_tags_are_refused_at_plan_time(monkeypatch, tmp_path):
     """Раньше этот случай ронял ФАЗУ ПЛАНА traceback'ом (`', '.join([1, 2])`)
-    — то есть тул падал ещё до всякой мутации, но с невнятной ошибкой."""
+    — то есть тул падал ещё до всякой мутации, но с невнятной ошибкой.
+
+    2026-08-09 (1.3.3/изм-4, дизайн раздел 9): теги через `changes` у
+    `update` запрещены ВОВСЕ — тег, записанный обновлением задачи, ложится на
+    неё без регистрации в аккаунте (тег-сирота: не виден в list_tags, не
+    удаляется delete_tag). Отказ по запрещённому ключу приходит РАНЬШЕ
+    типизации, поэтому нетипизированный список теперь проверяется на
+    собственном типе `op="tags"` (tests/test_triage_new_types.py), а здесь
+    закреплено, что отказ у `update` называет ЗАМЕНУ, а не просто «нельзя»:
+    иначе вызывающий либо бросит законное намерение, либо пойдёт в обход."""
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
 
     out = await _assert_refused_outright(monkeypatch, live, [
         {"op": "update", "task_id": "b2", "title": "Отчёт",
          "changes": {"tags": [1, 2]}, "said": "перетегируй"}], "tags")
-    assert "списком СТРОК" in out
+    assert 'op="tags"' in out and "тег-сирота" in out
 
 
 @pytest.mark.parametrize("bad", [2, 4, "5", 5.0, True])

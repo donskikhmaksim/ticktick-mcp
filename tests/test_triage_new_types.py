@@ -57,6 +57,20 @@ class _FakeV2:
     def get_open_tasks(self):
         return list(self.live.values())
 
+    def get_state(self, force=False):
+        return {"tags": list(self.account_tags)}
+
+    # ---- теги ----
+    def get_tags(self):
+        return list(self.account_tags)
+
+    def create_tag(self, name):
+        """Как настоящий клиент: `name` — ключ нижним регистром, `label` —
+        написание, которое человек увидит в списке тегов."""
+        self.calls.append(("create_tag", name))
+        self.account_tags.append({"name": str(name).lower(), "label": name})
+        return {}
+
     # ---- родитель ----
     def set_task_parents(self, rows):
         self.calls.append(("parent", [r["taskId"] for r in rows],
@@ -315,6 +329,106 @@ async def test_unparent_rejects_fields_of_other_types(monkeypatch, tmp_path):
     assert "🛑" in out and "to_project_id" in out
     assert s._MANIFESTS == {} and v2.calls == []
     assert live["kid"]["parentId"] == "par"
+
+
+# ════════════════════════════════ tags ════════════════════════════════════
+
+async def test_tags_replaces_set_and_registers_tag(monkeypatch, tmp_path):
+    """Набор тегов ЗАМЕНЯЕТСЯ целиком, а незнакомый тег заводится в аккаунте.
+    Оба факта проверяются по живому состоянию: `tags` на задаче и список
+    тегов аккаунта."""
+    live = {
+        "t1": {"id": "t1", "title": "Позвонить в банк", "projectId": "p_in",
+               "tags": ["старый"]},
+        "zz": {"id": "zz", "title": "Посторонняя", "projectId": "p_in",
+               "tags": ["старый"]},
+    }
+    v2 = _wire(monkeypatch, live, tmp_path,
+               tags=[{"name": "старый", "label": "старый"}])
+
+    preview, out = await _run([
+        {"op": "tags", "task_id": "t1", "title": "Позвонить в банк",
+         "changes": {"tags": ["Ипотека", "звонки"]},
+         "said": "пометь ипотекой и звонками"}])
+
+    assert set(live["t1"]["tags"]) == {"ипотека", "звонки"}, \
+        "набор заменяется целиком, старый тег обязан уйти"
+    assert live["zz"]["tags"] == ["старый"], "чужая задача не тронута"
+    # Незнакомый тег ЗАВЕДЁН в аккаунте — иначе он тег-сирота.
+    assert {t["name"] for t in v2.account_tags} >= {"ипотека", "звонки"}
+    assert ("create_tag", "Ипотека") in v2.calls
+    # Превью говорит «было → станет» и называет, что придётся завести.
+    assert "«старый» →" in preview and "будут заведены" in preview
+    assert "✅ Выполнено 1 из 1" in out
+
+
+async def test_tags_on_update_is_refused_and_names_the_replacement(
+        monkeypatch, tmp_path):
+    """Дыра тега-сироты закрыта запретом, а не тихой переадресацией: `update`
+    с тегами и `tags` — разные строки превью, и подменять одно другим ПОСЛЕ
+    подтверждения человека нельзя."""
+    live = {"t1": {"id": "t1", "title": "Позвонить в банк",
+                   "projectId": "p_in", "tags": []}}
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "update", "task_id": "t1", "title": "Позвонить в банк",
+         "changes": {"tags": ["ипотека"]}, "said": "пометь ипотекой"}])
+
+    assert "🛑" in out and 'op="tags"' in out
+    assert s._MANIFESTS == {} and v2.calls == []
+    assert live["t1"]["tags"] == []
+
+
+async def test_tags_rejects_foreign_change_keys(monkeypatch, tmp_path):
+    live = {"t1": {"id": "t1", "title": "Позвонить в банк",
+                   "projectId": "p_in", "tags": []}}
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "tags", "task_id": "t1", "title": "Позвонить в банк",
+         "changes": {"tags": ["ипотека"], "priority": 5},
+         "said": "пометь и подними приоритет"}])
+
+    assert "🛑" in out and "priority" in out
+    assert s._MANIFESTS == {} and v2.calls == []
+
+
+async def test_tags_refuses_non_string_list(monkeypatch, tmp_path):
+    """Типизация переехала на собственный тип: раньше её держал общий
+    `_triage_change_refusal` у `update`, куда теги больше не ходят."""
+    live = {"t1": {"id": "t1", "title": "Позвонить в банк",
+                   "projectId": "p_in", "tags": []}}
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "tags", "task_id": "t1", "title": "Позвонить в банк",
+         "changes": {"tags": [1, 2]}, "said": "перетегируй"}])
+
+    assert "🛑" in out and "списком СТРОК" in out
+    assert s._MANIFESTS == {} and v2.calls == []
+
+
+async def test_tags_plan_survives_unreadable_account_tag_list(
+        monkeypatch, tmp_path):
+    """Список тегов аккаунта читается BEST-EFFORT: он нужен только чтобы
+    сказать, какие теги придётся завести. Его недоступность план НЕ роняет, а
+    превью честно говорит «сказать не могу» вместо тишины."""
+    live = {"t1": {"id": "t1", "title": "Позвонить в банк",
+                   "projectId": "p_in", "tags": []}}
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    def _boom():
+        raise RuntimeError("v2 недоступен")
+
+    monkeypatch.setattr(v2, "get_tags", _boom)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "tags", "task_id": "t1", "title": "Позвонить в банк",
+         "changes": {"tags": ["ипотека"]}, "said": "пометь ипотекой"}])
+
+    assert "Манифест" in preview, "план обязан строиться"
+    assert "сказать не могу" in preview
 
 
 def _plan_lines(preview: str):

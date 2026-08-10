@@ -13976,8 +13976,24 @@ async def _create_project_column_impl(project_id: str, name: str,
 # полями элемента, который уходит в _update_tasks_impl, и молча разоружили бы
 # identity-guard (например changes={"title": ...} подменил бы «текущее
 # название» на желаемое, и сверка id↔задача сравнила бы значение сама с собой).
+# `tags` попал сюда 2026-08-09 (1.3.3/изм-4, дизайн раздел 9) по ДРУГОЙ
+# причине, чем остальные пять: он не разоружает сверку — он ПОРТИТ АККАУНТ.
+# Тег, записанный обновлением задачи, ложится на неё БЕЗ регистрации в списке
+# тегов: его нет в `list_tags` и его не удаляет `delete_tag`, а массовое
+# удаление по списку такой тег не найдёт. Рабочий путь есть — `op="tags"`
+# через `_set_task_tags_impl`, который заводит незнакомый тег и fail-closed
+# отказывается ставить незаведённый. Именно ЗАПРЕТ, а не тихая переадресация:
+# `update` с тегами и `tags` — разные строки превью, и подменять одно другим
+# ПОСЛЕ подтверждения человека нельзя.
 _TRIAGE_FORBIDDEN_CHANGE_KEYS = ("title", "taskId", "task_id", "projectId",
-                                 "project_id")
+                                 "project_id", "tags")
+# Чем ИМЕННО заменить запрещённый ключ — по ключу, а не одной общей фразой:
+# «переименование через new_title» ничего не говорит тому, кто прислал теги.
+_TRIAGE_FORBIDDEN_CHANGE_HINTS = {
+    "tags": "теги задаются операцией op=\"tags\" (она заводит незнакомый тег "
+            "в аккаунте, иначе получается тег-сирота: не виден в list_tags, "
+            "не удаляется delete_tag)",
+}
 # ДВА РАЗНЫХ ПРЕДЕЛА, И СВОДИТЬ ИХ В ОДИН НЕЛЬЗЯ (Д12, 2026-08-09).
 #
 # `_TRIAGE_PLAN_DAMAGE_CAP` — предел разового УЩЕРБА: сколько операций может
@@ -14082,6 +14098,22 @@ def _describe_triage_op(op: Dict) -> str:
     if kind == "unparent":
         pname = op.get("_parent_label") or op.get("_parent_live_title") or "?"
         return f"⤴ Отцепить {title}{where} от «{pname}»{tail}"
+    if kind == "tags":
+        want = op.get("_tags_shown") or []
+        now = op.get("_tags_now") or []
+        # Набор ЗАМЕНЯЕТСЯ целиком, поэтому печатается «было → станет»: без
+        # «было» человек не видит, что подтверждает и снятие тоже.
+        was = ", ".join(f"«{t}»" for t in now) if now else "без тегов"
+        will = ", ".join(f"«{t}»" for t in want) if want else "без тегов"
+        new = op.get("_tags_new")
+        extra = ""
+        if new:
+            extra = (f" (в аккаунте пока нет {', '.join(f'«{t}»' for t in new)}"
+                     " — будут заведены)")
+        elif new is None:
+            extra = " (список тегов аккаунта не прочитался — какие из них "
+            extra += "придётся завести, сказать не могу)"
+        return f"🏷 Теги {title}{where}: {was} → {will}{extra}{tail}"
     if kind == "merge":
         keep_title = op.get("_keep_live_title") or op.get("keep_title") or "?"
         keep_proj = op.get("_keep_project_name") or ""
@@ -15118,6 +15150,106 @@ async def _op_unparent_execute(summary: str, ops: List[Dict],
     return out
 
 
+# ──────────────────────────────── tags ─────────────────────────────────────
+
+def _op_tags_validate(i: int, op: Dict, shown: str) -> Optional[str]:
+    changes = op.get("changes")
+    if not isinstance(changes, dict) or not changes:
+        return (f"🛑 Отказ: операция #{i} («{shown}») — tags без changes. "
+                "Набор задаётся ЦЕЛИКОМ: changes={\"tags\": [\"дом\", "
+                "\"звонки\"]}; пустой список снимает все теги. "
+                "Ничего не сделано.")
+    extra = [k for k in changes if k != "tags"]
+    if extra:
+        return (f"🛑 Отказ: операция #{i} («{shown}») — у op=\"tags\" в "
+                f"changes допустим ТОЛЬКО ключ tags, а пришли ещё {extra}: "
+                "они молча не применились бы, а отчёт отрапортовал бы "
+                "«выполнено». Правка прочих полей — отдельная операция "
+                "op=\"update\". Ничего не сделано.")
+    val = changes.get("tags")
+    if not isinstance(val, list):
+        return (f"🛑 Отказ: операция #{i} («{shown}») — changes['tags'] должно "
+                f"быть списком, а пришло {type(val).__name__} ({val!r}). "
+                "Ничего не сделано.")
+    bad = [x for x in val if not isinstance(x, str)]
+    if bad:
+        return (f"🛑 Отказ: операция #{i} («{shown}») — changes['tags'] должен "
+                f"быть списком СТРОК, а внутри {bad!r}. Ничего не сделано.")
+    return None
+
+
+def _op_tags_plan(e: Dict, ctx: _TriagePlanCtx) -> str:
+    """Сверка плана для `tags`. Набор нормализуется ЗДЕСЬ ровно так же, как
+    его нормализует `_apply_tags_verified` перед записью (без «#», нижним
+    регистром), — иначе превью обещало бы «#Работа», а сверка ждала бы
+    «работа» и объявила бы удачную операцию провалом.
+
+    Живой список тегов аккаунта читается BEST-EFFORT: он нужен только чтобы
+    сказать человеку, какие теги придётся ЗАВЕСТИ, и его недоступность план
+    не роняет — решение «заводить или нет» принимает `_set_task_tags_impl` по
+    СВОЕМУ чтению непосредственно перед записью, и повторить это здесь
+    нечем."""
+    want = [str(x).lstrip("#") for x in (e.get("changes") or {}).get("tags") or []]
+    e["_tags"] = [t.lower() for t in want if t]
+    e["_tags_shown"] = [t for t in want if t]
+    e["_tags_now"] = sorted(set((ctx.by_id.get(e["task_id"]) or {}).get("tags")
+                                or []))
+    try:
+        known = {(t.get("name") or "").lower()
+                 for t in (ticktick_v2.get_tags() if ticktick_v2 else [])}
+    except Exception:
+        logger.exception("manual_triage: список тегов аккаунта не прочитался")
+        known = None
+    e["_tags_new"] = ([t for t in e["_tags_shown"] if t.lower() not in known]
+                      if known is not None else None)
+    return ""
+
+
+def _op_tags_drift(op: Dict, by_id: Dict[str, Dict], names: Dict) -> str:
+    """ОТДЕЛЬНОЙ ВЕТКИ ДРЕЙФА ПО ТЕГАМ ЗДЕСЬ НЕТ — и это решение, а не
+    пропуск (дизайн, раздел 2).
+
+    Причина: fail-closed регистрация тега живёт внутри `_set_task_tags_impl`
+    и решает по СВОЕМУ чтению живого состояния прямо перед записью —
+    повторить это здесь нечем, а повторить наполовину значило бы получить
+    второй, расходящийся с первым, ответ на тот же вопрос. Личность задачи
+    (жива, названа так же) сверяется общей веткой выше и от типа не зависит."""
+    return ""
+
+
+def _op_tags_verify(op: Dict, item: Dict, live_map: Dict[str, Dict],
+                    names: Dict) -> Tuple[str, str]:
+    item["expect"] = {"tags": op.get("_tags")
+                      or [str(x).lstrip("#").lower()
+                          for x in (op.get("changes") or {}).get("tags") or []]}
+    return _verify_item("tags", item, live_map, names)
+
+
+async def _op_tags_execute(summary: str, ops: List[Dict],
+                           ctx: _TriageExecCtx) -> List[Tuple[str, str]]:
+    """ТОЛЬКО через `_set_task_tags_impl`, своего пути записи нет (дизайн,
+    раздел 9). Он через `_apply_tags_verified` заводит незнакомый тег в
+    аккаунте (`create_tag`), проверяет саму регистрацию и FAIL-CLOSED
+    отказывается ставить тег, который завести не удалось. Тег, записанный
+    мимо этого пути, попадает на задачу БЕЗ регистрации: его нет в
+    `list_tags` и его не удаляет `delete_tag` — порча данных, которую
+    массовое удаление по списку тегов не найдёт."""
+    # ПЕРЕДАЁТСЯ НАПИСАНИЕ, А НЕ КЛЮЧ (`_tags_shown`, а не `_tags`). У тега
+    # два поля: `name` — ключ, всегда нижним регистром (по нему тег ищется и
+    # пишется на задачу), и `label` — написание, которое человек видит в
+    # списке тегов. Понижение регистра — забота записи, и `_apply_tags_verified`
+    # делает его сам; отдать ему уже пониженную строку значит завести в
+    # аккаунте «ипотека» там, где человек сказал «Ипотека» (тот же дефект,
+    # что чинили 2026-08-07 в самом set_task_tags).
+    items = [{"taskId": o["task_id"], "title": o.get("title") or "",
+              "projectId": o.get("_project_id", ""),
+              "tags": o.get("_tags_shown")
+              or [str(x).lstrip("#") for x in
+                  (o.get("changes") or {}).get("tags") or []]}
+             for o in ops]
+    return [("🏷 Теги", await _set_task_tags_impl(summary, items))]
+
+
 # ─────────────────────────────── update ────────────────────────────────────
 
 def _op_update_validate(i: int, op: Dict, shown: str) -> Optional[str]:
@@ -15127,11 +15259,18 @@ def _op_update_validate(i: int, op: Dict, shown: str) -> Optional[str]:
                 "непустого changes. Ничего не сделано.")
     bad = [k for k in _TRIAGE_FORBIDDEN_CHANGE_KEYS if k in changes]
     if bad:
+        hints = [_TRIAGE_FORBIDDEN_CHANGE_HINTS[k] for k in bad
+                 if k in _TRIAGE_FORBIDDEN_CHANGE_HINTS]
+        # Отказ обязан НАЗВАТЬ ЗАМЕНУ по каждому запрещённому ключу: без неё
+        # он читается как «этого нельзя вообще» и вызывающий либо бросает
+        # законное намерение, либо ищет обходной путь.
+        tail = (" " + "; ".join(hints) + ".") if hints else ""
         return (f"🛑 Отказ: операция #{i} («{shown}») — в changes "
                 f"запрещённые ключи {bad}: они разоружили бы сверку "
-                "id↔задача. Переименование — это changes={\"new_title\": "
-                "\"...\"}, а перенос — отдельная операция op=\"move\". "
-                "Ничего не сделано.")
+                "id↔задача либо пишут мимо проверенного пути. "
+                "Переименование — это changes={\"new_title\": "
+                "\"...\"}, а перенос — отдельная операция op=\"move\"."
+                f"{tail} Ничего не сделано.")
     return _triage_change_refusal(i, shown, changes)
 
 
@@ -15425,6 +15564,11 @@ def _triage_registry() -> Tuple[_TriageType, ...]:
             drift=_op_unparent_drift, verify=_op_unparent_verify,
             execute=_op_unparent_execute),
         _TriageType(
+            op="tags", emoji="🏷", verb="перетегировать",
+            validate=_op_tags_validate, plan=_op_tags_plan,
+            drift=_op_tags_drift, verify=_op_tags_verify,
+            execute=_op_tags_execute),
+        _TriageType(
             op="update", emoji="✏️", verb="изменить",
             validate=_op_update_validate, plan=_op_update_plan,
             drift=_op_update_drift, verify=_op_update_verify,
@@ -15558,7 +15702,7 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
     Each element of `operations`:
       {
         "op":      "delete" | "complete" | "update" | "move" | "merge"
-                   | "parent" | "unparent",
+                   | "parent" | "unparent" | "tags",
         "task_id": "<task id>",                      # required, non-empty
         "title":   "<the task's exact CURRENT title>",  # required — identity guard
         "untitled": true,   # INSTEAD of "title", ONLY for a task that really
@@ -15587,6 +15731,13 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         "to_untitled": true   # INSTEAD of "to_title", same rule as "untitled"
         # op="unparent" takes NO extra fields at all: which parent to detach
         # from is read from LIVE state, not taken from the plan.
+        # op="tags" only — REPLACES the whole tag set (an empty list clears
+        # it). This is the ONLY way to set tags: `changes.tags` on an
+        # op="update" is REFUSED, because writing a tag through a task update
+        # leaves it UNREGISTERED in the account (invisible to list_tags,
+        # undeletable by delete_tag). op="tags" registers unknown tags first
+        # and refuses fail-closed if it cannot:
+        "changes": {"tags": ["дом", "звонки"]},
       }
 
     `untitled` — the ONLY way to name a task that has no name. Some tasks
