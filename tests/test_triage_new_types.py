@@ -169,6 +169,15 @@ class _FakeOfficial:
         self.live = live
         self.calls = []
 
+    def create_task(self, title, project_id, content=None, start_date=None,
+                    due_date=None, priority=0, is_all_day=False,
+                    repeat_flag=None, reminders=None):
+        tid = f"new-{len(self.live)}-{abs(hash(title)) % 10000}"
+        self.calls.append(("create", title, project_id))
+        self.live[tid] = {"id": tid, "title": title, "projectId": project_id,
+                          "priority": priority, "tags": []}
+        return {"id": tid, "title": title, "projectId": project_id}
+
     def complete_task(self, project_id, task_id):
         self.calls.append(("complete", task_id))
         self.live.pop(task_id, None)
@@ -789,6 +798,82 @@ async def test_restore_reads_the_trash_once_per_pass(monkeypatch, tmp_path):
          "said": "верни"} for i in range(4)])
 
     assert sum(1 for c in v2.calls if c[0] == "get_trash") == 1, v2.calls
+
+
+# ═══════════════════════════════ create ═══════════════════════════════════
+
+async def test_create_makes_task_and_verifies_project(monkeypatch, tmp_path):
+    """Задача появляется в ЖИВОМ состоянии и именно в названном проекте."""
+    live = {}
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    preview, out = await _run([
+        {"op": "create", "title": "Позвонить в страховую",
+         "to_project_id": "p_work", "said": "заведи задачу позвонить в страховую"}])
+
+    made = [t for t in live.values() if t["title"] == "Позвонить в страховую"]
+    assert len(made) == 1, "ровно одна новая задача"
+    assert made[0]["projectId"] == "p_work"
+    assert "не проверяется автоматически" not in out, out
+    assert "✅ Выполнено 1 из 1" in out
+    assert "➕ Создать «Позвонить в страховую» в «Работа»" in preview
+
+
+async def test_create_with_a_task_id_is_refused(monkeypatch, tmp_path):
+    """Задачи ещё нет — присланный за неё id мог прийти только выдуманным, а
+    выдуманный id, принятый молча, увёл бы сверку на ЧУЖУЮ живую задачу."""
+    live = {"x1": {"id": "x1", "title": "Чужая", "projectId": "p_work"}}
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "create", "task_id": "x1", "title": "Позвонить в страховую",
+         "to_project_id": "p_work", "said": "заведи"}])
+
+    assert "🛑" in out and "выдуманным" in out
+    assert s._MANIFESTS == {} and v2.calls == []
+
+
+async def test_create_without_destination_is_refused(monkeypatch, tmp_path):
+    """Молчаливый Inbox — это не выбор человека."""
+    live = {}
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "create", "title": "Позвонить в страховую", "said": "заведи"}])
+
+    assert "🛑" in out and "to_project_id" in out
+    assert s._MANIFESTS == {} and v2.calls == []
+
+
+async def test_create_rejects_new_title_in_changes(monkeypatch, tmp_path):
+    """Два источника имени дали бы строку, про которую нельзя сказать, что
+    именно подтвердил человек."""
+    live = {}
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "create", "title": "Позвонить в страховую",
+         "to_project_id": "p_work", "changes": {"new_title": "Другое имя"},
+         "said": "заведи"}])
+
+    assert "🛑" in out and "new_title" in out
+    assert s._MANIFESTS == {} and v2.calls == []
+
+
+async def test_create_under_a_dead_parent_never_reaches_the_plan(
+        monkeypatch, tmp_path):
+    """Мёртвый родитель: задача легла бы ОТДЕЛЬНОЙ строкой в корень, а отчёт
+    сказал бы «создана» — ровно дефект, закрытый П19 в create_tasks."""
+    live = {}
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "create", "title": "Собрать документы",
+         "to_project_id": "p_work", "to_task_id": "ghost",
+         "to_title": "Ипотека", "said": "подзадача к ипотеке"}])
+
+    assert "🛑" in out and "в корень" in out
+    assert v2.calls == []
 
 
 def _plan_lines(preview: str):

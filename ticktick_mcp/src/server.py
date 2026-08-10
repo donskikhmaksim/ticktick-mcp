@@ -3308,9 +3308,18 @@ async def create_tasks(
                                     tasks or [])
 
 
-async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
+async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]],
+                             sink: Optional[Dict[str, Any]] = None) -> str:
     """Shared creation engine behind create_tasks (direct/headless) and
-    execute_task_creation (approved manifest)."""
+    execute_task_creation (approved manifest).
+
+    `sink` (1.3.3/изм-8, 2026-08-09) — необязательный словарь, куда движок
+    кладёт `created: {индекс входного элемента: {task_id, title,
+    project_id}}`. Нужен агрегатору: его независимая сверка судит созданную
+    задачу по свежему живому состоянию и обязана знать её id ИЗ ДАННЫХ, а не
+    выковыривать из готового текста этого ответа — разбор собственного текста
+    запрещён по всему серверу (название объекта попадает в текст дословно и
+    извне). Ни на поведение, ни на текст ответа не влияет."""
     err = _ensure_official()
     if err:
         return err
@@ -3549,6 +3558,10 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                     to_verify.append((title, root_id, project_id,
                                       t.get("column_id"), root_parent,
                                       tags_expect_root, assignee_expect_root))
+                    if sink is not None:
+                        sink.setdefault("created", {})[i] = {
+                            "task_id": root_id, "title": title,
+                            "project_id": project_id}
                 want_parent = {r.get("taskId"): r.get("parentId") for r in relations}
                 for x in tasks_flat[1:]:
                     if x["id"] not in tree_fail:
@@ -3730,6 +3743,10 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                 to_verify.append((title, task_id, project_id,
                                   t.get("column_id"), parent_expect, tags_expect,
                                   assignee_expect))
+                if sink is not None:
+                    sink.setdefault("created", {})[i] = {
+                        "task_id": task_id, "title": title,
+                        "project_id": project_id}
             if sub_notes:
                 line += "\n  " + "\n  ".join(sub_notes)
             created.append(line)
@@ -14154,6 +14171,16 @@ def _describe_triage_op(op: Dict) -> str:
         # из которой человек не может понять, откуда задача переезжает.
         frm = proj or "неизвестный проект"
         return f"↪ Перенести {title}: «{frm}» → «{to}»{tail}"
+    if kind == "create":
+        # У создания `title` — ЖЕЛАЕМОЕ имя, а не сверка личности: печатается
+        # оно как есть, а «где» — это проект НАЗНАЧЕНИЯ, а не текущий.
+        to = op.get("_to_project_name") or op.get("to_project") \
+            or op.get("to_project_id") or "?"
+        under = (f" под «{op.get('_parent_label') or op.get('to_title')}»"
+                 if op.get("_parent_id") else "")
+        bits = _update_change_bits(op.get("changes") or {}, sep=", ")
+        extra = f" ({bits})" if bits else ""
+        return (f"➕ Создать «{op.get('title')}» в «{to}»{under}{extra}{tail}")
     if kind == "parent":
         # Имя РОДИТЕЛЯ — живое, прочитанное на фазе плана: голый to_task_id в
         # позиции имени человек проверить не может (тот же запрет, что и на
@@ -14364,7 +14391,14 @@ def _validate_triage_ops(operations: List[Dict], max_items: int) -> Optional[str
             return (f"🛑 Отказ: операция #{i} — неизвестный op={op.get('op')!r}. "
                     f"Допустимо: {', '.join(_TRIAGE_OPS)}. Ничего не сделано.")
         tid = str(op.get("task_id") or "").strip()
-        if not tid:
+        if not reg.needs_task_id and tid:
+            # У создания объекта ещё нет — присланный за него id мог прийти
+            # только выдуманным, а выдуманный id, принятый молча, увёл бы
+            # сверку на ЧУЖУЮ живую задачу.
+            return (f"🛑 Отказ: операция #{i} ({kind}) — у op=\"{kind}\" не "
+                    "может быть task_id: задачи ещё нет, и такой id мог "
+                    "прийти только выдуманным. Ничего не сделано.")
+        if reg.needs_task_id and not tid:
             return (f"🛑 Отказ: операция #{i} ({kind}) — пустой task_id. "
                     "Ничего не сделано.")
         title = str(op.get("title") or "").strip()
@@ -14400,11 +14434,12 @@ def _validate_triage_ops(operations: List[Dict], max_items: int) -> Optional[str
                     "В нём должны быть СЛОВА ЧЕЛОВЕКА про ЭТУ задачу "
                     "(дословно или сжато), иначе в предпросмотре не видно, "
                     "откуда взялась строка плана. Ничего не сделано.")
-        if tid in kind_of:
-            return (f"🛑 Отказ: task_id {tid[:8]}… встречается в плане дважды "
-                    f"({kind_of[tid]} и {kind}) — одну задачу нельзя и "
-                    "изменить, и удалить одним планом. Ничего не сделано.")
-        kind_of[tid] = kind
+        if tid:
+            if tid in kind_of:
+                return (f"🛑 Отказ: task_id {tid[:8]}… встречается в плане дважды "
+                        f"({kind_of[tid]} и {kind}) — одну задачу нельзя и "
+                        "изменить, и удалить одним планом. Ничего не сделано.")
+            kind_of[tid] = kind
         # Специфика ТИПА — в его собственном валидаторе из реестра (1.3.3/
         # изм-1, 2026-08-09). Здесь остаётся только то, что одинаково у ВСЕХ
         # типов; лестница `if kind == …` на двенадцати типах — ровно тот рост
@@ -14991,6 +15026,9 @@ class _TriageType(NamedTuple):
     exec_group: str = ""
     needs_live: bool = True
     creates: bool = False
+    # Требуется ли `task_id` на входе. Ложь ровно у `create`: объекта ещё нет,
+    # и любой присланный за него идентификатор мог прийти ТОЛЬКО выдуманным.
+    needs_task_id: bool = True
 
 
 class _TriagePlanCtx(NamedTuple):
@@ -15071,6 +15109,269 @@ def _triage_no_changes_refusal(i: int, op: Dict, shown: str,
     return (f"🛑 Отказ: операция #{i} («{shown}») — у op=\"{kind}\" поля "
             f"changes нет: оно молча не применилось бы, а отчёт отрапортовал "
             f"бы «выполнено». {instead} Ничего не сделано.")
+
+
+# ─────────────────────────────── create ────────────────────────────────────
+
+# Близость названий — СУЩЕСТВУЮЩИЙ алгоритм и СУЩЕСТВУЮЩИЙ порог, перенесён
+# из `attic/declutter_disabled.py` как есть (1.3.3/изм-8; ТЗ прямо требует:
+# «порог близости брать существующий (0.6), новый не подбирать»). Новый порог
+# пришлось бы обосновывать данными, которых нет, а старый уже отработал на
+# живом аккаунте.
+_DC_FUZZY_THRESHOLD = 0.6
+
+
+def _dc_tokens(title: str) -> set:
+    """Normalised word-token set of a title (for Jaccard similarity)."""
+    return set(re.findall(r"\w+", _norm_name(title), flags=re.UNICODE))
+
+
+def _dc_jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _dedup_stage0_plan(ops: List[Dict]) -> Tuple[Optional[str], List[str]]:
+    """РУБЕЖ 0 — против дублей ВНУТРИ ОДНОГО плана. → (отказ, предупреждения).
+
+    Два создания с ОДИНАКОВЫМ нормализованным названием в один проект
+    назначения — план не строится вовсе: это не «человек попросил дважды», а
+    заведомая ошибка сборки плана, и исполнить её значит выдать два объекта
+    там, где человек назвал один. Близкие названия — предупреждение: «купить
+    молоко» и «купить молоко 2л» бывают разными делами, и запрет здесь стоил
+    бы законного плана."""
+    creating = [o for o in ops
+                if _TRIAGE_BY_OP[o["op"]].creates and not o.get("_skip")]
+    seen: Dict[Tuple[str, str], Dict] = {}
+    notes: List[str] = []
+    for o in creating:
+        key = (str(o.get("_to_project_id") or ""), _norm_name(o.get("title") or ""))
+        if key[1] and key in seen:
+            return (f"🛑 Отказ: в плане ДВА создания с одинаковым названием "
+                    f"«{o.get('title')}» в один и тот же проект "
+                    f"«{o.get('_to_project_name') or key[0]}». Это не «сделай "
+                    "дважды», а почти всегда ошибка сборки плана: исполнив "
+                    "его, сервер выдал бы два объекта там, где человек назвал "
+                    "один. Оставь одну строку (или, если дубль нужен "
+                    "намеренно, назови их по-разному). Ничего не сделано.",
+                    notes)
+        seen[key] = o
+    # Близость — отдельным проходом, чтобы точное совпадение всегда било
+    # первым: предупреждение о похожем поверх отказа читалось бы как повод
+    # его обойти.
+    toks = {id(o): _dc_tokens(o.get("title") or "") for o in creating}
+    for i, a in enumerate(creating):
+        for b in creating[i + 1:]:
+            if (a.get("_to_project_id") or "") != (b.get("_to_project_id") or ""):
+                continue
+            if _dc_jaccard(toks[id(a)], toks[id(b)]) >= _DC_FUZZY_THRESHOLD:
+                notes.append(
+                    f"⚠️ В плане два ПОХОЖИХ создания в один проект: "
+                    f"«{a.get('title')}» и «{b.get('title')}». Если это одно и "
+                    "то же дело — оставь одну строку.")
+    return None, notes
+
+
+def _dedup_stage1_live(ops: List[Dict], by_id: Dict[str, Dict],
+                       names: Dict) -> List[str]:
+    """РУБЕЖ 1 — против ЖИВОГО состояния. Только предупреждения.
+
+    Тем же снимком `_open_by_id(fresh=True)`, который агрегатор и так взял на
+    фазе плана: ни одного лишнего запроса и НИ ОДНОГО ЧТЕНИЯ ИЗ КЭША — первой
+    причиной, по которой радар `plan_task_creation` не сработал в живом
+    инциденте, было именно чтение несвежего списка.
+
+    Исход — предупреждение, а не отказ: «сделать ещё раз то же» бывает
+    законным (еженедельная задача, повторная покупка), и запрет здесь ломал
+    бы больше, чем чинил."""
+    creating = [o for o in ops
+                if _TRIAGE_BY_OP[o["op"]].creates and not o.get("_skip")]
+    if not creating:
+        return []
+    notes: List[str] = []
+    by_project: Dict[str, List[Dict]] = {}
+    for live in by_id.values():
+        by_project.setdefault(live.get("projectId") or "", []).append(live)
+    for o in creating:
+        dest = str(o.get("_to_project_id") or "")
+        want = _norm_name(o.get("title") or "")
+        if not want:
+            continue
+        want_toks = _dc_tokens(o.get("title") or "")
+        exact = [t for t in by_project.get(dest, [])
+                 if _norm_name(t.get("title") or "") == want]
+        if exact:
+            notes.append(
+                f"⚠️ «{o.get('title')}» уже есть в «{o.get('_to_project_name') or dest}» "
+                f"среди открытых задач ({_short_task_id(exact[0].get('id') or '')}) — "
+                "создастся ВТОРАЯ. Если нужна именно вторая, всё в порядке; "
+                "если нет — убери эту строку.")
+            continue
+        near = [t for t in by_project.get(dest, [])
+                if _dc_jaccard(want_toks, _dc_tokens(t.get("title") or ""))
+                >= _DC_FUZZY_THRESHOLD]
+        if near:
+            notes.append(
+                f"⚠️ «{o.get('title')}» похоже на уже открытую "
+                f"«{near[0].get('title')}» в «{o.get('_to_project_name') or dest}» — "
+                "проверьте, не одно ли это дело.")
+    return notes
+
+
+def _op_create_validate(i: int, op: Dict, shown: str) -> Optional[str]:
+    if op.get("untitled") is True:
+        return (f"🛑 Отказ: операция #{i} (create) — маркер untitled=true у "
+                "создания не имеет смысла: `title` здесь не сверка личности, "
+                "а ЖЕЛАЕМОЕ имя новой задачи, и создавать безымянную задачу "
+                "нарочно незачем. Ничего не сделано.")
+    if not (str(op.get("to_project_id") or "").strip()
+            or str(op.get("to_project") or "").strip()):
+        return (f"🛑 Отказ: операция #{i} («{shown}») — create без "
+                "to_project_id и без to_project: сервер не выбирает список за "
+                "человека, а молчаливый Inbox — это не выбор. Ничего не сделано.")
+    ref = str(op.get("parent_ref") or "").strip()
+    if ref:
+        return (f"🛑 Отказ: операция #{i} («{shown}») — {_TRIAGE_REF_NOT_YET} "
+                "Ничего не сделано.")
+    changes = op.get("changes")
+    if changes is not None:
+        if not isinstance(changes, dict):
+            return (f"🛑 Отказ: операция #{i} («{shown}») — changes должен быть "
+                    f"объектом, а пришло {type(changes).__name__}. "
+                    "Ничего не сделано.")
+        if "new_title" in changes:
+            # Два источника имени дали бы строку, про которую нельзя сказать,
+            # что именно подтвердил человек: в превью он читал одно, а
+            # создалось бы другое.
+            return (f"🛑 Отказ: операция #{i} («{shown}») — у create ключ "
+                    "changes.new_title запрещён: имя новой задачи задаёт "
+                    "поле title, и два источника имени дали бы строку, про "
+                    "которую нельзя сказать, что именно подтвердил человек. "
+                    "Ничего не сделано.")
+        bad = [k for k in _TRIAGE_FORBIDDEN_CHANGE_KEYS if k in changes]
+        if bad:
+            hints = [_TRIAGE_FORBIDDEN_CHANGE_HINTS[k] for k in bad
+                     if k in _TRIAGE_FORBIDDEN_CHANGE_HINTS]
+            tail = (" " + "; ".join(hints) + ".") if hints else ""
+            return (f"🛑 Отказ: операция #{i} («{shown}») — в changes "
+                    f"запрещённые ключи {bad}.{tail} Ничего не сделано.")
+        refusal = _triage_change_refusal(i, shown, changes)
+        if refusal:
+            return refusal
+    return None
+
+
+def _op_create_plan(e: Dict, ctx: _TriagePlanCtx) -> str:
+    """Сверка плана для `create`. Личность сверять не с чем — объекта ещё
+    нет; вместо неё проверяется ВСЁ, от чего зависит попадание задачи туда,
+    куда человек сказал: живой проект назначения и живой родитель."""
+    to_id, to_name, why = _resolve_triage_destination(e, ctx.names)
+    if why:
+        return why
+    e["_to_project_id"] = to_id
+    e["_to_project_name"] = to_name
+    # Поля, по которым независимая сверка потом судит результат, — те же, что
+    # у превью: один источник, иначе они разъедутся.
+    e["_project_id"] = to_id
+    e["_project_name"] = to_name
+    e["_live_title"] = e.get("title") or ""
+    e["_label"] = e.get("title") or ""
+    e["_untitled"] = False
+    parent_id = str(e.get("to_task_id") or "").strip()
+    if parent_id:
+        parent_live = ctx.by_id.get(parent_id)
+        if not parent_live:
+            return ("родитель не найден среди открытых задач — задача легла бы "
+                    "ОТДЕЛЬНОЙ строкой в корень, а отчёт сказал бы «создана»")
+        parent_title = parent_live.get("title") or ""
+        if not _names_agree(e.get("to_title") or "", parent_title):
+            return (f"название родителя не совпало — по to_task_id сейчас "
+                    f"«{parent_title}», а в плане «{e.get('to_title')}»")
+        parent_pid = parent_live.get("projectId") or ""
+        if parent_pid and parent_pid != to_id:
+            return (f"родитель лежит в «{ctx.names.get(parent_pid, parent_pid)}», "
+                    f"а задачу просят создать в «{to_name}» — TickTick не "
+                    "вкладывает через проекты")
+        depth = 0
+        cur = parent_id
+        seen = set()
+        while cur and cur not in seen:
+            seen.add(cur)
+            depth += 1
+            cur = (ctx.by_id.get(cur) or {}).get("parentId")
+        if depth + 1 > MAX_TASK_NEST_LEVELS:
+            return (f"вложенность глубже {MAX_TASK_NEST_LEVELS} уровней: "
+                    f"получилось бы {depth + 1}")
+        e["_parent_id"] = parent_id
+        e["_parent_live_title"] = parent_title
+        e["_parent_label"] = parent_title
+    return ""
+
+
+def _op_create_drift(op: Dict, by_id: Dict[str, Dict], names: Dict) -> str:
+    to_id = op.get("_to_project_id") or ""
+    if not to_id or to_id not in names:
+        return "проект назначения больше не существует"
+    parent_id = op.get("_parent_id") or ""
+    if parent_id:
+        parent_live = by_id.get(parent_id)
+        if not parent_live:
+            return ("родитель исчез из открытых задач между планом и "
+                    "исполнением — задача легла бы отдельной строкой в корень")
+        if not _names_agree(op.get("to_title") or "",
+                            parent_live.get("title") or ""):
+            return (f"родителя переименовали после плана (сейчас "
+                    f"«{parent_live.get('title')}»)")
+    return ""
+
+
+def _op_create_verify(op: Dict, item: Dict, live_map: Dict[str, Dict],
+                      names: Dict) -> Tuple[str, str]:
+    new_id = op.get("_created_id")
+    if not new_id:
+        return "bad", (f"- ❌ **«{op.get('title')}»** — НЕ создана: исполнитель "
+                       "не вернул идентификатор новой задачи")
+    expect: Dict[str, Any] = {"projectId": op.get("_to_project_id")}
+    changes = op.get("changes") or {}
+    if op.get("_parent_id"):
+        expect["parentId"] = op["_parent_id"]
+    if changes.get("column_id"):
+        expect["columnId"] = changes["column_id"]
+    if changes.get("assignee") is not None:
+        expect["assignee"] = changes["assignee"]
+    return _verify_item("create", {"taskId": new_id, "title": op.get("title"),
+                                   "expect": expect}, live_map, names)
+
+
+async def _op_create_execute(summary: str, ops: List[Dict],
+                             ctx: _TriageExecCtx) -> List[Tuple[str, str]]:
+    """Партия — весь уровень одним `_create_tasks_impl`, как он и умеет.
+
+    `sink` — как исполнитель отдаёт наверх идентификаторы созданных задач:
+    независимая сверка обязана знать их ИЗ ДАННЫХ, а не выковыривать из
+    собственного текста ответа (см. `_duplicate_task_impl`)."""
+    changes_keys = ("content", "due_date", "start_date", "priority",
+                    "repeat_flag", "reminders", "column_id", "assignee")
+    items = []
+    for o in ops:
+        ch = o.get("changes") or {}
+        row: Dict[str, Any] = {"title": o.get("title") or "",
+                               "project_id": o.get("_to_project_id"),
+                               "project_name": o.get("_to_project_name") or ""}
+        for k in changes_keys:
+            if ch.get(k) is not None:
+                row[k] = ch[k]
+        if o.get("_parent_id"):
+            row["parent_id"] = o["_parent_id"]
+        items.append(row)
+    sink: Dict[str, Any] = {}
+    text = await _create_tasks_impl(summary, items, sink=sink)
+    made = sink.get("created") or {}
+    for idx, o in enumerate(ops):
+        rec = made.get(idx) or {}
+        o["_created_id"] = rec.get("task_id")
+    return [("➕ Создание", text)]
 
 
 # ─────────────────────────────── parent ────────────────────────────────────
@@ -16022,6 +16323,15 @@ def _triage_registry() -> Tuple[_TriageType, ...]:
     чем её успели поправить."""
     return (
         _TriageType(
+            op="create", emoji="➕", verb="создать",
+            validate=_op_create_validate, plan=_op_create_plan,
+            drift=_op_create_drift, verify=_op_create_verify,
+            execute=_op_create_execute,
+            # Объекта ещё нет: ни идентификатора на входе, ни сверки личности
+            # по живому состоянию — вместо неё сверяется всё, от чего зависит
+            # попадание задачи туда, куда человек сказал.
+            needs_live=False, needs_task_id=False, creates=True),
+        _TriageType(
             op="parent", emoji="⤵", verb="вложить",
             validate=_op_parent_validate, plan=_op_parent_plan,
             drift=_op_parent_drift, verify=_op_parent_verify,
@@ -16339,6 +16649,15 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         # внимания, решение принималось по большинству. Теперь результат
         # делится надвое: выполнимое → манифест и кнопки, невыполнимое →
         # справка человеку (ниже черты, без кнопок) и в ответ модели.
+        # РУБЕЖИ ПРОТИВ ДУБЛЕЙ (1.3.3/изм-8, дизайн раздел 8). Живой случай:
+        # владелец подтвердил два похожих манифеста подряд и получил пять
+        # задач дважды. Рубеж 0 — внутри плана, единственный, кто ОТКАЗЫВАЕТ;
+        # рубеж 1 — против живого состояния, только предупреждает, потому что
+        # «сделать ещё раз то же» бывает законным.
+        dedup_refusal, dedup_notes = _dedup_stage0_plan(checked)
+        if dedup_refusal:
+            return dedup_refusal
+        dedup_notes += _dedup_stage1_live(checked, by_id, names)
         blocked = [o for o in checked if o.get("_skip")]
         enriched = [o for o in checked if not o.get("_skip")]
         # list.sort устойчива: внутри одного типа исходный порядок сохраняется.
@@ -16369,7 +16688,7 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         # Справка едет через тот же `notes`, что и прочие предупреждения про
         # весь план: он печатается ПОД списком операций и попадает разом и в
         # чат, и в Telegram — своей копии сборки текста здесь не заводим.
-        notes = _triage_plan_notes(enriched) \
+        notes = _triage_plan_notes(enriched) + dedup_notes \
             + _triage_mismatch_block(enriched, not_planned)
         # …и ОТДЕЛЬНО едет в манифест, чтобы пережить нажатие кнопки
         # (2026-08-09, найдено независимым аудитом). Превью живёт до нажатия:
