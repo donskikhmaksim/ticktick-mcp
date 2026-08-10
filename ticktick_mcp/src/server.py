@@ -3096,8 +3096,20 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
         try:
             # ── PATH A: nested dict subtasks → tree via two v2 calls ──
             if ticktick_v2 and has_nested and not has_advanced:
+                # д6 (2026-08-09): теги и исполнитель КОРНЯ убраны из полезной
+                # нагрузки создания — раньше _build_v2_task_obj клал их прямо
+                # в тело /batch/task вместе с самим созданием, и это МИМО
+                # проверенного ядра простановки тегов (_apply_tags_verified):
+                # без регистрации тега в аккаунте, без живой сверки «что
+                # просили = что стало». Оба поля проставляются НИЖЕ, отдельно,
+                # тем же путём, что и в соседней ветке (не дерево). Подзадачи
+                # дерева не тронуты — их теги/исполнитель по-прежнему едут
+                # внутри payload, это вне этой правки.
+                _root_for_tree = dict(t)
+                _root_for_tree.pop("tags", None)
+                _root_for_tree.pop("assignee", None)
                 tasks_flat, relations = _flatten_task_tree(
-                    t, project_id, parent_id=t.get("parent_id"))
+                    _root_for_tree, project_id, parent_id=t.get("parent_id"))
                 sub_notes = []
                 resp = await _run_blocking(
                     lambda: ticktick_v2.batch_create_tasks(tasks_flat))
@@ -3157,10 +3169,43 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                                  if r.get("taskId") == tasks_flat[0]["id"]), None)
                 root_parent = (root_rel or {}).get("parentId") \
                     if root_rel and root_rel.get("taskId") not in rel_fail else None
+                # Теги и исполнитель КОРНЯ (д6, 2026-08-09) — тем же ядром
+                # (`_apply_tags_verified`) и тем же приёмом чтения id2error,
+                # что в соседней ветке (не дерево), см. PATH B выше. Только
+                # когда сам корень реально создан: назначать поля
+                # несуществующей задаче бессмысленно.
+                tags_expect_root = None
+                assignee_expect_root = None
+                if root_ok:
+                    if t.get("tags"):
+                        try:
+                            tag_out = await _apply_tags_verified(
+                                [{"taskId": root_id, "title": title,
+                                  "projectId": project_id, "tags": t["tags"]}])
+                            sub_notes.extend(_tag_notes_for_create(tag_out))
+                            tags_expect_root = tag_out.tags_by_id.get(root_id)
+                        except Exception as e:
+                            logger.warning(f"Tagging failed (tree root): {e}")
+                            sub_notes.append(f"⚠️ теги не применились: {_redact_for_user(e)}")
+                    if t.get("assignee") is not None:
+                        try:
+                            a_resp = await _run_blocking(lambda: ticktick_v2.batch_update_tasks(
+                                [{"taskId": root_id, "assignee": t["assignee"]}]))
+                            a_err = id2error_failures(a_resp, [root_id]).get(root_id)
+                            if a_err:
+                                sub_notes.append(
+                                    f"⚠️ исполнитель НЕ назначен — TickTick "
+                                    f"отклонил: {a_err}")
+                            else:
+                                assignee_expect_root = t["assignee"]
+                        except Exception as e:
+                            logger.warning(f"Assignee failed (tree root): {e}")
+                            sub_notes.append(f"⚠️ исполнитель не назначен: {_redact_for_user(e)}")
                 if root_id:
                     line += f" (id:{root_id})"
                     to_verify.append((title, root_id, project_id,
-                                      t.get("column_id"), root_parent, None))
+                                      t.get("column_id"), root_parent,
+                                      tags_expect_root, assignee_expect_root))
                 want_parent = {r.get("taskId"): r.get("parentId") for r in relations}
                 for x in tasks_flat[1:]:
                     if x["id"] not in tree_fail:
@@ -3192,6 +3237,7 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
             sub_notes = []
             tags_expect = None   # набор тегов, который ОТПРАВЛЕН (для журнала)
             parent_expect = None  # родитель, привязка к которому подтверждена
+            assignee_expect = None  # исполнитель, назначение которого подтверждено
             if ticktick_v2 and task_id:
                 if t.get("tags"):
                     # д6 (2026-08-09). Здесь звался голый
@@ -3217,7 +3263,7 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                         # д6 (2026-08-09): ответ /batch/task читается на
                         # предмет отказа именно по ЭТОЙ задаче — раньше
                         # отклонённое назначение исполнителя не давало ни
-                        # исключения, ни строки в отчёте.
+                        # исключения, ни строки в отчёте. Это ПЕРВЫЙ слой.
                         a_resp = await _run_blocking(lambda: ticktick_v2.batch_update_tasks(
                             [{"taskId": task_id, "assignee": t["assignee"]}]))
                         a_err = id2error_failures(a_resp, [task_id]).get(task_id)
@@ -3225,6 +3271,14 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
                             sub_notes.append(
                                 f"⚠️ исполнитель НЕ назначен — TickTick "
                                 f"отклонил: {a_err}")
+                        else:
+                            # ВТОРОЙ слой (2026-08-09, д6): ожидание идёт в
+                            # to_verify/журнал ТОЛЬКО когда канал не сообщил
+                            # об отказе — по образцу parent_expect ниже,
+                            # иначе один и тот же провал был бы назван дважды
+                            # разными словами (отказ канала здесь, и «не
+                            # применилось» независимой перепроверкой позже).
+                            assignee_expect = t["assignee"]
                     except Exception as e:
                         logger.warning(f"Assignee failed: {e}")
                         sub_notes.append(f"⚠️ исполнитель не назначен: {_redact_for_user(e)}")
@@ -3331,7 +3385,8 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
             if task_id:
                 line += f" (id:{task_id})"
                 to_verify.append((title, task_id, project_id,
-                                  t.get("column_id"), parent_expect, tags_expect))
+                                  t.get("column_id"), parent_expect, tags_expect,
+                                  assignee_expect))
             if sub_notes:
                 line += "\n  " + "\n  ".join(sub_notes)
             created.append(line)
@@ -3353,7 +3408,7 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
             skip_verify = False
         names = _v2_project_names()
         if not skip_verify:
-            for v_title, v_id, v_pid, v_col, v_parent, _v_tags in to_verify:
+            for v_title, v_id, v_pid, v_col, v_parent, _v_tags, _v_assignee in to_verify:
                 live = fresh.get(v_id)
                 if not live:
                     warnings.append(f"⚠️ «{v_title}»: создание НЕ подтвердилось "
@@ -3412,8 +3467,9 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
              "expect": {"projectId": v_pid,
                         **({"columnId": v_col} if v_col else {}),
                         **({"parentId": v_parent} if v_parent else {}),
-                        **({"tags": v_tags} if v_tags is not None else {})}}
-            for v_title, v_id, v_pid, v_col, v_parent, v_tags in to_verify
+                        **({"tags": v_tags} if v_tags is not None else {}),
+                        **({"assignee": v_assignee} if v_assignee is not None else {})}}
+            for v_title, v_id, v_pid, v_col, v_parent, v_tags, v_assignee in to_verify
         ] + [
             {"taskId": s_id, "title": s_title,
              "expect": {"projectId": s_pid,
@@ -4325,17 +4381,25 @@ async def _update_tasks_impl(
                     except Exception as e:
                         logger.warning(f"Updated but column assignment failed: {e}")
                         sub_fails.append(f"раздел (column) не применился ({_redact_for_user(e)})")
+                assignee_expect = None  # исполнитель, назначение которого подтверждено
                 if t.get("assignee") is not None and ticktick_v2:
                     try:
                         # д6 (2026-08-09), та же дыра, что в создании: ответ
                         # /batch/task приходит 200 даже когда назначение
                         # отклонено — отказ лежит внутри, в id2error, и до
-                        # этой правки не читался ничем.
+                        # этой правки не читался ничем. Это ПЕРВЫЙ слой.
                         a_resp = await _run_blocking(lambda: ticktick_v2.batch_update_tasks([{"taskId": tid, "assignee": t["assignee"]}]))
                         a_err = id2error_failures(a_resp, [tid]).get(tid)
                         if a_err:
                             sub_fails.append(
                                 f"исполнитель НЕ назначен — TickTick отклонил: {a_err}")
+                        else:
+                            # ВТОРОЙ слой (2026-08-09, д6): в `changes` (а
+                            # значит и в живую сверку `_verify_item`, и в
+                            # журнал) исполнитель попадает ТОЛЬКО когда канал
+                            # не отказал — иначе один и тот же провал был бы
+                            # назван дважды разными словами.
+                            assignee_expect = t["assignee"]
                     except Exception as e:
                         logger.warning(f"Updated but assignee failed: {e}")
                         sub_fails.append(f"исполнитель не назначен ({_redact_for_user(e)})")
@@ -4352,6 +4416,8 @@ async def _update_tasks_impl(
                     changes["priority"] = priority
                 if t.get("tags") is not None:
                     changes["tags"] = [x.lstrip("#").lower() for x in t["tags"]]
+                if assignee_expect is not None:
+                    changes["assignee"] = assignee_expect
                 for src, dst, val_raw in (("due_date", "dueDate", sync_due),
                                            ("start_date", "startDate", sync_start)):
                     if val_raw:
@@ -7067,6 +7133,22 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
                 and set(live.get("tags") or []) != set(want_tags):
             probs.append(f"теги: {_fmt_tag_set(set(live.get('tags') or []))}, "
                          f"ожидались {_fmt_tag_set(set(want_tags))}")
+        # Исполнитель (д6, 2026-08-09), рядом с тегами — та же дыра, тот же
+        # адрес. Сравнение СТРОКОВОЕ (`str(got) != str(want)`), а не по
+        # равенству значений: TickTick отдаёт assignee числом, вызывающие —
+        # то числом, то строкой, и точное сравнение типов даёт ложную
+        # тревогу на исправном назначении (отдельный дефект внутри Д6, не
+        # косметика). Сверяется только ЗАПРОШЕННОЕ (`is not None`); пустое
+        # живое поле трактуется как «никто», как и в _assignee_matches
+        # (ticktick_v2_client.py) — личный проект не должен пугать ложной
+        # тревогой на каждом созданной задаче без исполнителя.
+        want_assignee = exp.get("assignee")
+        if want_assignee is not None \
+                and str(live.get("assignee")) != str(want_assignee):
+            members = _member_names(live.get("projectId") or want_pid or "")
+            probs.append(
+                f"исполнитель: {_person_label(live.get('assignee'), members)}, "
+                f"ожидался {_person_label(want_assignee, members)}")
         if probs:
             return ("warn", f"- ⚠️ **«{title}»** — создана, но: "
                     + "; ".join(probs))
@@ -7137,6 +7219,12 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
             elif field == "tags":
                 if set(got or []) != set(want or []):
                     diffs.append(f"tags: {got} ≠ {want}")
+            elif field == "assignee":
+                # д6 (2026-08-09): тот же дефект, что в ветке "create" выше —
+                # assignee приходит то числом, то строкой, и точное
+                # сравнение давало ложную тревогу на исправном назначении.
+                if str(got) != str(want):
+                    diffs.append(f"assignee: {got!r} ≠ {want!r}")
             elif got != want:
                 diffs.append(f"{field}: {got!r} ≠ {want!r}")
         return (("bad", f"- ❌ **«{title}»** — не применилось: " + "; ".join(diffs))
@@ -17050,8 +17138,14 @@ def _triage_expected_changes(changes: Dict) -> Dict:
     """Перевод «интерфейсных» полей changes (в том виде, в каком их понимает
     _update_tasks_impl) в поля ЖИВОЙ задачи, по которым _verify_item умеет
     судить факт. Поля, невидимые в списке открытых задач (напоминания, повтор,
-    колонка, исполнитель), сюда НЕ попадают — про них отчёт честно скажет «не
-    проверяется автоматически», а не выдаст непроверенное за подтверждённое."""
+    колонка), сюда НЕ попадают — про них отчёт честно скажет «не проверяется
+    автоматически», а не выдаст непроверенное за подтверждённое.
+
+    Исполнитель (2026-08-09, д6) — ИСКЛЮЧЕНИЕ из этого правила, а не пример
+    его: раньше этот докстринг называл его «невидимым в списке открытых
+    задач» — неверно. `_open_by_id`/`ticktick_v2.get_open_tasks()` отдают
+    тот же сырой объект задачи, что несёт `assignee` (get_task_info читает
+    его оттуда же), — значит поле сверяемо, и перевод ниже это делает."""
     exp: Dict[str, Any] = {}
     if changes.get("new_title") is not None:
         exp["title"] = changes["new_title"]
@@ -17061,6 +17155,8 @@ def _triage_expected_changes(changes: Dict) -> Dict:
         exp["priority"] = changes["priority"]
     if changes.get("tags") is not None:
         exp["tags"] = [str(x).lstrip("#").lower() for x in changes["tags"]]
+    if changes.get("assignee") is not None:
+        exp["assignee"] = changes["assignee"]
     for src, dst in (("due_date", "dueDate"), ("start_date", "startDate")):
         if changes.get(src):
             val, _all_day = _normalize_date(changes[src])
