@@ -2115,6 +2115,157 @@ def _guard_task_incl_completed(
     return _Guard("completed", real_pid, real_title, _COMPLETED_TASK_NOTE)
 
 
+# ЕДИНЫЙ ОТВЕТ ОХРАННИКА ЛИЧНОСТИ ОБЪЕКТА (2026-08-09, ZAHOD1.md 1.2.3, П11).
+# Цепочка `if g.status == …` была написана в файле ДВАДЦАТЬ ПЯТЬ раз (в ТЗ
+# значилось девятнадцать — за одну ночную работу стало на шесть больше). Цена
+# копий не эстетическая: сервер удаляет задачи по кнопке, и «поправили в
+# двадцати четырёх местах, забыли в двадцать пятом» означает операцию не над
+# тем объектом.
+#
+# ПОЧЕМУ ПАРАМЕТРЫ, А НЕ ОДИН ОБЩИЙ ТЕКСТ. Формулировки площадок разные не по
+# недосмотру: `add_task_comment` говорит «id это «X», а НЕ «Y»» (свой текст),
+# `attach_file_to_task` — «id указывает на «X», а НЕ «Y»» (из `.message`).
+# Вариант через `.message` встречается чаще, но «привести к большинству»
+# значит ИЗМЕНИТЬ ОТВЕТ СЕРВЕРА у живых команд, а ответы разбирают регулярками
+# телеграм-бот и агент в n8n. Поэтому свёрнута СТРУКТУРА (порядок веток,
+# префикс, хвост, политика корзины), а слова вынесены в параметры и сохранены
+# посимвольно — это доказывает `tests/test_refusal_texts_frozen.py`, чьи
+# ожидания сняты ДО свёртки.
+#
+# `_split_tasks_by_state` (ниже) НЕ переведён на помощник осознанно: он не
+# возвращает текст отказа, а раскладывает строки пакета по спискам
+# found/mismatch/missing, и подгонка под общую форму изменила бы поведение
+# пакетных команд, где отказ не возвращается, а копится.
+
+# Четыре текста «сверить не удалось» — по одному на класс площадок; раньше
+# каждый был написан столько раз, сколько площадок его использует.
+_UNVERIFIED_PARENT_TITLE = ("⚠️ Название родительской задачи НЕ удалось "
+                            "сверить с живым состоянием (чтение не удалось) — "
+                            "сверка повторится при подтверждении, и "
+                            "расхождение остановит исполнение.")
+_UNVERIFIED_TASK_TITLE = ("⚠️ Название задачи НЕ удалось сверить с живым "
+                          "состоянием (чтение не удалось) — сверка "
+                          "повторится при подтверждении, и расхождение "
+                          "остановит исполнение.")
+_UNVERIFIED_TASK = ("⚠️ Задачу НЕ удалось сверить с живым состоянием (чтение "
+                    "не удалось) — сверка повторится при подтверждении, и "
+                    "расхождение остановит исполнение.")
+_UNVERIFIED_PARENT_NAME = ("⚠️ Имя родителя НЕ удалось сверить с живым "
+                           "состоянием (чтение не удалось) — сверка "
+                           "повторится при подтверждении.")
+# Родителя нет среди открытых — для `unset_task_parent` это НЕ повод
+# отказать (отцепляют как раз от завершённого/удалённого), но сказать вслух
+# обязательно.
+_PARENT_GONE_NOTE = ("⚠️ Родитель не среди открытых задач (возможно "
+                     "завершён/удалён) — имя не сверено; связь "
+                     "перепроверится при подтверждении.")
+
+# Хвост отказа: чем фаза кончает фразу. «План НЕ построен» ничего не менял,
+# исполнение — не трогал, пакетная строка хвоста не имеет вовсе (она едет в
+# общий список результатов, где хвост у каждой строки читался бы как шум).
+_STAGE_TAIL = {"план": "Ничего не изменено.",
+               "исполнение": "Ничего не тронул.",
+               "пакет-строка": "",
+               "пакет-родитель": ""}
+
+
+def _guard_or_refuse(g: "_Guard", *, stage: str, verb: str = "",
+                     verb_mismatch: str = "", expected: str = "",
+                     parent: bool = False, parent_id: str = "",
+                     says: str = "own", missing_says: str = "own",
+                     missing_name: str = "", missing_extra: str = "",
+                     missing_note: str = "", shield: bool = False,
+                     unavailable_note: str = "") -> Tuple[str, str]:
+    """Ответ площадки на вердикт охранника: (текст отказа, текст предупреждения).
+
+    Пустой отказ означает «можно работать дальше» — предупреждение при этом
+    может быть непустым (завершённая задача, нечитаемое живое состояние).
+
+    stage — фаза, она же задаёт префикс и хвост:
+      «план»        → «🛑 План НЕ построен — …  Ничего не изменено.»
+      «исполнение»  → «🛑 {verb} — …  Ничего не тронул.»
+      «пакет-строка»→ «🛑 {verb} — …» (хвоста нет, строка едет в общий список)
+      «пакет-родитель» → голая нота про внешнего родителя: значок и номер
+                         строки приклеивает сама площадка.
+    verb — глагол площадки («НЕ добавил комментарий»), verb_mismatch — он же,
+      если на ветке mismatch площадка называет задачу другим именем (так в
+      `update_tasks`/`complete_tasks`: там mismatch печатает ЗАЯВЛЕННОЕ имя, а
+      остальные ветки — то, что удалось найти).
+    says / missing_says — «own» (текст собирает помощник) или «message» (текст
+      приходит готовым из `_Guard.message`); «skip» у missing означает, что
+      площадка обрабатывает эту ветку сама (в `complete_tasks` пропуск строки
+      не отказ).
+    parent — речь о РОДИТЕЛЕ, а не о самой задаче (меняет и подлежащее, и род
+      причастий в «завершён/завершена»).
+    shield — приписка «(защита от «не той задачи»)»; на плане она стоит
+      всегда, на исполнении — только там, где стояла раньше.
+    """
+    # Пакетное создание отвечает ГОЛОЙ нотой про внешнего родителя: значок и
+    # «#3 «Купить бумагу»: » приклеивает площадка (у неё на плане свой
+    # заголовок «🛑 Исключены N»), а тексты уже свёрнуты в
+    # _wrong_parent_note / _dead_parent_note. Ветки при этом ТЕ ЖЕ — иначе
+    # политика снова разъедется на два места.
+    batch_parent = stage == "пакет-родитель"
+    plan = stage == "план"
+    head = "🛑 План НЕ построен" if plan else f"🛑 {verb}"
+    tail = _STAGE_TAIL[stage]
+    # Тело, которое кончается точкой (`{tail}` уже с ней), и тело, которое
+    # НЕ кончается: _TRASHED_TASK_NOTE несёт свою точку, вторая читалась бы
+    # как опечатка.
+    dotted = f". {tail}" if tail else ""
+    plain = f" {tail}" if tail else ""
+
+    if g.status == "unavailable":
+        # На плане разовый сбой чтения — не отказ (иначе он блокирует всякую
+        # работу), но карточка обязана сказать об этом вслух; на исполнении
+        # это отказ, и последнее слово именно за ним. Пакетная СТРОКА при
+        # этом называет себя («🛑 НЕ обновил «Отчёт» — …»): в общем списке
+        # результатов голое сообщение было бы неизвестно про какую задачу.
+        if plan:
+            return "", unavailable_note
+        if batch_parent:
+            # Сверить не удалось — решает площадка: на плане строка остаётся
+            # с пометкой «НЕ сверено», на исполнении отбраковывается.
+            return "", ""
+        return (g.message if tail else f"{head} — {g.message}"), ""
+    if g.status == "mismatch":
+        if batch_parent:
+            return _wrong_parent_note(g.title, expected), ""
+        if says == "message":
+            body = g.message
+        else:
+            body = (f"{'родитель по id это' if parent else 'id это'} "
+                    f"«{g.title}», а НЕ «{expected}»")
+        if plan or shield:
+            body += " (защита от «не той задачи»)"
+        prefix = f"🛑 {verb_mismatch}" if verb_mismatch else head
+        return f"{prefix} — {body}{dotted}", ""
+    if g.status == "trashed":
+        # Политика класса для УДАЛЁННОЙ задачи — отказ, до всякого согласия
+        # (см. _guard_task_incl_completed). Раньше такая задача проходила как
+        # открытая: `status` в корзине остаётся 0.
+        return f"{head} — {g.message}{plain}", ""
+    if g.status == "missing":
+        if batch_parent:
+            return _dead_parent_note(expected, parent_id), ""
+        if missing_says == "skip":
+            return "", ""
+        if missing_note:
+            return "", missing_note
+        if missing_says == "message":
+            return f"{head} — {g.message}{dotted}", ""
+        who = ("родитель " if parent else "") + f"«{missing_name or expected}»"
+        gone = ("завершён/удалён/неверный id" if parent
+                else "завершена/удалена/неверный id")
+        return (f"{head} — {who} не среди открытых задач "
+                f"({gone}){missing_extra}{dotted}", "")
+    if g.status == "completed":
+        # ℹ️, а не ⚠️: это ФАКТ о состоянии объекта, а не сомнение в проверке
+        # — см. _COMPLETED_TASK_NOTE.
+        return "", f"ℹ️ {_COMPLETED_TASK_NOTE}."
+    return "", ""
+
+
 def _split_tasks_by_state(
     tasks: List[Dict], by_id: Optional[Dict[str, Dict]] = None, fresh: bool = True
 ) -> tuple:
@@ -2460,6 +2611,29 @@ def _guard_project(project_id: str, expected_name: str = "", *,
     return None
 
 
+def _guard_project_or_refuse(project_id: str, expected_name: str = "", *,
+                             fresh: bool = False, require_known: bool = False,
+                             prefix: str = "") -> Optional[str]:
+    """Обёртка отказа по папке: сам отказ плюс ПРЕФИКС фазы (2026-08-09,
+    ZAHOD1.md 1.2.3, П11).
+
+    Пятнадцать площадок писали это вручную, и пять из них ещё и подменяли
+    префикс собственной парой `.replace(...)`, скопированной слово в слово.
+    Префикс — ПАРАМЕТР одной обёртки, а не её вторая версия: на плане
+    «🛑 План НЕ построен — … Ничего не изменено.», на исполнении — то, что
+    печатает сам `_guard_project`. Пустой `prefix` ничего не подменяет."""
+    refusal = _guard_project(project_id, expected_name, fresh=fresh,
+                             require_known=require_known)
+    if refusal and prefix:
+        refusal = (refusal.replace("🛑 Отказ —", prefix, 1)
+                          .replace("Ничего не тронул.", "Ничего не изменено."))
+    return refusal
+
+
+# Префикс плановой фазы для обёртки выше — один литерал вместо пяти копий.
+_PLAN_REFUSAL_PREFIX = "🛑 План НЕ построен —"
+
+
 def _mismatch_report(mismatch: List[Dict], verb: str) -> str:
     """Human line for the identity guard: ids whose live task didn't match the
     name the caller expected, so we refused to touch them."""
@@ -2608,6 +2782,19 @@ def _last_page_offset(total: int, limit: int) -> int:
     """Offset of the last non-empty page — what to tell a caller who overshot."""
     limit = max(1, limit)
     return max(0, (max(total, 1) - 1) // limit * limit)
+
+
+def _valid_offset_range(total_roots: int) -> str:
+    """Готовый хвост про диапазон допустимых offset — для читателей, режущих
+    ДЕРЕВЬЯ (2026-08-09, ZAHOD1.md 1.2.3, П11).
+
+    Отдельный помощник от `_last_page_offset`: у `_page_task_forest` страницы
+    плавающие (поддерево дописывается целиком), поэтому назвать «начало
+    последней страницы» нельзя — врать про неё хуже, чем назвать диапазон.
+    Отдаётся только ЧИСЛО в готовом хвосте, предложение по-прежнему собирает
+    вызывающий: у трёх площадок вокруг него разные слова, и сведение их к
+    одному тексту меняло бы ответ сервера."""
+    return f"valid offsets are 0-{total_roots - 1}"
 
 
 # --- Readiness helpers ------------------------------------------------------
@@ -3159,9 +3346,10 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
         # TickTick молча сбрасывал задачу в Inbox — баг доставки, который
         # читается как чистый «✓ создано».
         exp_proj = t.get("project_name") or t.get("projectName") or ""
-        refuse = _guard_project(project_id, exp_proj, require_known=True)
-        if refuse:
-            failed.append(f"#{i+1} «{title}»: {refuse}")
+        refusal = _guard_project_or_refuse(project_id, exp_proj,
+                                           require_known=True)
+        if refusal:
+            failed.append(f"#{i+1} «{title}»: {refusal}")
             continue
         priority = t.get("priority", 0)
         if priority not in [0, 1, 3, 5]:
@@ -3213,15 +3401,11 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
             # 🛑 приклеивается ЗДЕСЬ, а не внутрь общей формулировки: на фазе
             # плана тот же текст уже стоит под шапкой «🛑 Исключены N», и
             # второй значок в строке читался бы как вторая беда.
-            if pg.status == "missing":
-                failed.append(f"#{i+1} «{title}»: 🛑 " + _dead_parent_note(
-                    t.get("parent_title") or "", ext_parent_id)
-                    + ". Ничего не изменено.")
-                continue
-            if pg.status == "mismatch":
-                failed.append(f"#{i+1} «{title}»: 🛑 " + _wrong_parent_note(
-                    pg.title, t.get("parent_title") or "")
-                    + ". Ничего не изменено.")
+            note, _warn = _guard_or_refuse(
+                pg, stage="пакет-родитель",
+                expected=t.get("parent_title") or "", parent_id=ext_parent_id)
+            if note:
+                failed.append(f"#{i+1} «{title}»: 🛑 {note}. Ничего не изменено.")
                 continue
             base_level = _task_level(ext_parent_id, _depth_by_id)
         total_depth = base_level + _requested_tree_depth(t)
@@ -3868,13 +4052,10 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
         g = _guard_task(parent_id, exp_parent,
                         t.get("project_id") or t.get("projectId") or "",
                         by_id=plan_by_id)
-        if g.status == "missing":
-            refused.append(f"#{i} «{t.get('title')}»: "
-                           + _dead_parent_note(exp_parent, parent_id))
-            continue
-        if g.status == "mismatch":
-            refused.append(f"#{i} «{t.get('title')}»: "
-                           + _wrong_parent_note(g.title, exp_parent))
+        note, _warn = _guard_or_refuse(g, stage="пакет-родитель",
+                                       expected=exp_parent, parent_id=parent_id)
+        if note:
+            refused.append(f"#{i} «{t.get('title')}»: {note}")
             continue
         if g.status == "unavailable":
             checked.append((t, pname, sug,
@@ -4456,16 +4637,16 @@ async def _update_tasks_impl(
                 continue
             # Identity guard: refuse to edit a DIFFERENT task if the id is stale.
             g = _guard_task(tid, t.get("title") or "", pid, by_id=_by_id)
-            if g.status == "mismatch":
-                results.append(f"🛑 НЕ обновил «{t.get('title')}» — {g.message}")
-                continue
-            if g.status == "unavailable":
-                results.append(f"🛑 НЕ обновил «{shown_title}» — {g.message}")
-                continue
-            if g.status == "missing":
-                # Not among open tasks: the official API would silently no-op
-                # an update with a stale projectId — refuse instead of lying.
-                results.append(f"🛑 НЕ обновил «{shown_title}» — {g.message}")
+            # `missing` здесь — тоже отказ: официальный API молча превратил бы
+            # правку со старым projectId в пустую операцию. На ветке mismatch
+            # строка называет ЗАЯВЛЕННОЕ имя (о нём и спор), на остальных —
+            # то, которое удалось найти.
+            refusal, _warn = _guard_or_refuse(
+                g, stage="пакет-строка", verb=f"НЕ обновил «{shown_title}»",
+                verb_mismatch=f"НЕ обновил «{t.get('title')}»",
+                says="message", missing_says="message")
+            if refusal:
+                results.append(refusal)
                 continue
             # Н9 (2026-08-09): запись В ПОЛЕ НАЗВАНИЯ при невзведённой сверке —
             # отказ ЗДЕСЬ, до единого обращения к TickTick. Живое имя берётся у
@@ -4866,15 +5047,17 @@ async def _complete_tasks_impl(summary: str, tasks: List[Dict[str, str]]) -> str
                 title = t.get("title") or _lookup_task_title(tid)
                 # Identity guard for the single-completion path too.
                 g = _guard_task(tid, t.get("title") or "", pid)
-                if g.status == "mismatch":
-                    results.append(f"🛑 НЕ завершил «{t.get('title')}» — {g.message}")
-                    continue
-                if g.status == "unavailable":
-                    results.append(f"🛑 НЕ завершил «{title}» — {g.message}")
+                refusal, _warn = _guard_or_refuse(
+                    g, stage="пакет-строка", verb=f"НЕ завершил «{title}»",
+                    verb_mismatch=f"НЕ завершил «{t.get('title')}»",
+                    says="message", missing_says="skip")
+                if refusal:
+                    results.append(refusal)
                     continue
                 if g.status == "missing":
-                    # Not among open tasks: completing would either no-op
-                    # silently (stale projectId) or hit an already-closed task.
+                    # Ветка своя, а не общая: «не среди открытых» для
+                    # ЗАВЕРШЕНИЯ — не отказ, а пропуск (задача и так закрыта
+                    # либо удалена; выполнять нечего, врать не о чем).
                     results.append(f"↷ «{title}» — не среди открытых "
                                    "(уже завершена/удалена/неверный id), "
                                    "пропущено")
@@ -9211,10 +9394,10 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
         return err
     # Destructive: verify against FRESH names and FAIL CLOSED when the id
     # can't be resolved — never delete what can't be identified.
-    refuse = _guard_project(project_id, project_name, fresh=True,
-                            require_known=True)
-    if refuse:
-        return refuse
+    refusal = _guard_project_or_refuse(project_id, project_name, fresh=True,
+                                       require_known=True)
+    if refusal:
+        return refusal
     live_name = _v2_project_names().get(project_id, project_name)
 
     # Blast-radius disclosure: read the project's CURRENT contents fresh on
@@ -9721,7 +9904,7 @@ def _get_project_tasks_by_filter(filter_func, filter_name: str,
                 # def-D4: пустая страница за концом списка — это НЕ «задач нет».
                 return (f"Tasks that are '{filter_name}': {total} total, but offset={offset} "
                         f"is past the end (last page starts at offset="
-                        f"{max(0, (total - 1) // limit * limit)}).")
+                        f"{_last_page_offset(total, limit)}).")
             shown_to = offset + len(page)
             if offset or shown_to < total:
                 out = (f"Tasks that are '{filter_name}' ({total} total; "
@@ -9819,8 +10002,8 @@ async def get_all_tasks(limit: int = _ALL_TASKS_PAGE, offset: int = 0) -> str:
                 # что называть «начало последней страницы» нельзя — врать про
                 # неё хуже, чем назвать диапазон допустимых offset.
                 return (f"All open tasks: {total_roots} top-level tasks total, but "
-                        f"offset={offset} is past the end (valid offsets are "
-                        f"0-{total_roots - 1}).")
+                        f"offset={offset} is past the end "
+                        f"({_valid_offset_range(total_roots)}).")
             names = _v2_project_names()
             by_project: Dict[str, list] = {}
             for t in page:
@@ -10210,19 +10393,12 @@ async def create_subtask(
     name_warning = ""
     if not manifest_id:
         g = _guard_task(parent_task_id, parent_task_title or "", project_id)
-        if g.status == "mismatch":
-            return (f"🛑 План НЕ построен — родитель по id это «{g.title}», а "
-                    f"НЕ «{parent_task_title}» (защита от «не той задачи»). "
-                    "Ничего не изменено.")
-        elif g.status == "missing":
-            return (f"🛑 План НЕ построен — родитель «{parent_task_title}» не "
-                    "среди открытых задач (завершён/удалён/неверный id). "
-                    "Ничего не изменено.")
-        elif g.status == "unavailable":
-            name_warning = (" ⚠️ Название родительской задачи НЕ удалось "
-                            "сверить с живым состоянием (чтение не удалось) — "
-                            "сверка повторится при подтверждении, и "
-                            "расхождение остановит исполнение.")
+        refusal, warn = _guard_or_refuse(
+            g, stage="план", expected=parent_task_title, parent=True,
+            unavailable_note=_UNVERIFIED_PARENT_TITLE)
+        if refusal:
+            return refusal
+        name_warning = f" {warn}" if warn else ""
 
     params = {"parent_task_title": parent_task_title, "subtask_title": subtask_title,
               "parent_task_id": parent_task_id, "project_id": project_id,
@@ -10251,14 +10427,11 @@ async def _create_subtask_impl(parent_task_title: str, subtask_title: str,
     # Identity guard on the PARENT: a stale parent_task_id would attach the new
     # subtask under a different task (or a dead one) while reporting success.
     g = _guard_task(parent_task_id, parent_task_title or "", project_id, by_id=by_id)
-    if g.status == "unavailable":
-        return g.message
-    if g.status == "mismatch":
-        return (f"🛑 НЕ создал подзадачу — родитель по id это «{g.title}», а НЕ "
-                f"«{parent_task_title}». Ничего не тронул.")
-    if g.status == "missing":
-        return (f"🛑 НЕ создал подзадачу — родитель «{parent_task_title}» не "
-                "среди открытых задач (завершён/удалён/неверный id). Ничего не тронул.")
+    refusal, _warn = _guard_or_refuse(
+        g, stage="исполнение", verb="НЕ создал подзадачу",
+        expected=parent_task_title, parent=True)
+    if refusal:
+        return refusal
     # Depth guard: TickTick supports at most MAX_TASK_NEST_LEVELS total levels
     # counting from the root task — see MAX_TASK_NEST_LEVELS above for the
     # source. Computed from the LIVE parentId chain, not from anything the
@@ -10435,8 +10608,8 @@ async def get_inbox_tasks(limit: int = _TREE_PAGE, offset: int = 0) -> str:
         if not page:
             # Пустая страница за концом списка — это НЕ «Входящие пусты».
             return (f"Inbox: {len(tasks)} task(s) ({total_roots} top-level), but "
-                    f"offset={offset} is past the end (valid offsets are "
-                    f"0-{total_roots - 1}).")
+                    f"offset={offset} is past the end "
+                    f"({_valid_offset_range(total_roots)}).")
         if offset or shown_to < total_roots:
             out = (f"Inbox tasks ({len(tasks)} total, {total_roots} top-level; "
                    f"showing top-level {offset + 1}-{shown_to} with their "
@@ -10540,10 +10713,10 @@ async def _move_tasks_impl(summary: str, tasks: List[Dict[str, str]],
         # Destination guard: the id must resolve to a LIVE project, and when
         # the caller also names it, the name must match — otherwise tasks land
         # in «Архив» while the success line claims «Работа».
-        refuse = _guard_project(to_project_id, to_project_name or "",
-                                fresh=True, require_known=True)
-        if refuse:
-            return refuse
+        refusal = _guard_project_or_refuse(to_project_id, to_project_name or "",
+                                           fresh=True, require_known=True)
+        if refusal:
+            return refusal
         # Render the destination from the LIVE map — never echo the caller.
         to_name = _v2_project_names().get(to_project_id, to_project_id)
         by_id = _open_by_id(fresh=True)
@@ -11333,20 +11506,15 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
     if not manifest_id:
         titles = _plan_task_titles(tasks)
         pg = _guard_task(parent_task_id, parent_task_title or "", project_id)
-        if pg.status == "mismatch":
-            return (f"🛑 План НЕ построен — родитель по id это «{pg.title}», а "
-                    f"НЕ «{parent_task_title}» (защита от «не той задачи»). "
-                    "Ничего не изменено.")
-        if pg.status == "missing":
-            return (f"🛑 План НЕ построен — родитель «{parent_task_title or parent_task_id}» "
-                    "не среди открытых задач (завершён/удалён/неверный id) — "
-                    "вложение под мёртвого родителя осиротит задачи. Ничего "
-                    "не изменено.")
-        if pg.status == "unavailable":
-            notes = ["⚠️ Название родительской задачи НЕ удалось сверить с "
-                     "живым состоянием (чтение не удалось) — сверка "
-                     "повторится при подтверждении, и расхождение остановит "
-                     "исполнение."]
+        refusal, warn = _guard_or_refuse(
+            pg, stage="план", expected=parent_task_title, parent=True,
+            missing_name=parent_task_title or parent_task_id,
+            missing_extra=" — вложение под мёртвого родителя осиротит задачи",
+            unavailable_note=_UNVERIFIED_PARENT_TITLE)
+        if refusal:
+            return refusal
+        if warn:
+            notes = [warn]
         # ЖИВОЕ написание побеждает переданное: `_names_agree` пропускает
         # разницу в регистре/маркерах, а карточка должна показывать
         # состояние аккаунта, а не пересказ вызывающего. При недоступном
@@ -11399,13 +11567,13 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
             return _STATE_UNAVAILABLE_MSG
         pg = _guard_task(parent_task_id, parent_task_title or "", project_id,
                          by_id=by_id)
-        if pg.status == "mismatch":
-            return (f"🛑 НЕ вложил — родитель по id это «{pg.title}», а НЕ "
-                    f"«{parent_task_title}». Ничего не тронул.")
-        if pg.status == "missing":
-            return (f"🛑 НЕ вложил — родитель «{parent_task_title or parent_task_id}» "
-                    "не среди открытых задач (завершён/удалён/неверный id) — "
-                    "вложение под мёртвого родителя осиротит задачи. Ничего не тронул.")
+        refusal, _warn = _guard_or_refuse(
+            pg, stage="исполнение", verb="НЕ вложил",
+            expected=parent_task_title, parent=True,
+            missing_name=parent_task_title or parent_task_id,
+            missing_extra=" — вложение под мёртвого родителя осиротит задачи")
+        if refusal:
+            return refusal
         parent_pid = pg.project_id or project_id
         # Ancestor chain of the parent — nesting a task under its own
         # descendant (or under itself) would corrupt the tree with a cycle.
@@ -11596,18 +11764,12 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
     name_warning = ""
     if not manifest_id:
         g = _guard_task(task_id, task_title or "", project_id)
-        if g.status == "mismatch":
-            return (f"🛑 План НЕ построен — id это «{g.title}», а НЕ "
-                    f"«{task_title}» (защита от «не той задачи»). Ничего не "
-                    "изменено.")
-        elif g.status == "missing":
-            return (f"🛑 План НЕ построен — «{task_title}» не среди открытых "
-                    "задач (завершена/удалена/неверный id). Ничего не изменено.")
-        elif g.status == "unavailable":
-            name_warning = (" ⚠️ Название задачи НЕ удалось сверить с живым "
-                            "состоянием (чтение не удалось) — сверка "
-                            "повторится при подтверждении, и расхождение "
-                            "остановит исполнение.")
+        refusal, warn = _guard_or_refuse(
+            g, stage="план", expected=task_title,
+            unavailable_note=_UNVERIFIED_TASK_TITLE)
+        if refusal:
+            return refusal
+        name_warning = f" {warn}" if warn else ""
     # def-126: parent_task_id/parent_task_title (заявленный РОДИТЕЛЬ) не
     # сверялись НИ С ЧЕМ — ни здесь, ни в _unset_task_parent_impl, где есть
     # только проверка СВЯЗИ («live parentId субтаска == parent_task_id»), а не
@@ -11629,19 +11791,13 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
     parent_name_warning = ""
     if not manifest_id:
         pg = _guard_task(parent_task_id, parent_task_title or "", project_id)
-        if pg.status == "mismatch":
-            return (f"🛑 План НЕ построен — родитель по id это «{pg.title}», а "
-                    f"НЕ «{parent_task_title}» (защита от «не той задачи»). "
-                    "Ничего не изменено.")
-        elif pg.status == "missing":
-            parent_name_warning = (" ⚠️ Родитель не среди открытых задач "
-                                   "(возможно завершён/удалён) — имя не "
-                                   "сверено; связь перепроверится при "
-                                   "подтверждении.")
-        elif pg.status == "unavailable":
-            parent_name_warning = (" ⚠️ Имя родителя НЕ удалось сверить с "
-                                   "живым состоянием (чтение не удалось) — "
-                                   "сверка повторится при подтверждении.")
+        refusal, warn = _guard_or_refuse(
+            pg, stage="план", expected=parent_task_title, parent=True,
+            missing_note=_PARENT_GONE_NOTE,
+            unavailable_note=_UNVERIFIED_PARENT_NAME)
+        if refusal:
+            return refusal
+        parent_name_warning = f" {warn}" if warn else ""
     params = {"task_title": task_title, "parent_task_title": parent_task_title,
               "task_id": task_id, "parent_task_id": parent_task_id,
               "project_id": project_id}
@@ -11679,12 +11835,10 @@ async def _unset_task_parent_impl(task_title: str, parent_task_title: str,
         if by_id is None:
             return _STATE_UNAVAILABLE_MSG
         g = _guard_task(task_id, task_title or "", project_id, by_id=by_id)
-        if g.status == "mismatch":
-            return (f"🛑 НЕ отцепил — id это «{g.title}», а НЕ «{task_title}». "
-                    "Ничего не тронул.")
-        if g.status == "missing":
-            return (f"🛑 НЕ отцепил — «{task_title}» не среди открытых задач "
-                    "(завершена/удалена/неверный id). Ничего не тронул.")
+        refusal, _warn = _guard_or_refuse(
+            g, stage="исполнение", verb="НЕ отцепил", expected=task_title)
+        if refusal:
+            return refusal
         live_parent = (by_id.get(task_id) or {}).get("parentId")
         if not live_parent:
             return (f"↷ «{task_title}» и так не является подзадачей — "
@@ -11706,10 +11860,12 @@ async def _unset_task_parent_impl(task_title: str, parent_task_title: str,
         # подтверждена по id.
         pg = _guard_task(parent_task_id, parent_task_title or "", project_id,
                          by_id=by_id)
-        if pg.status == "mismatch":
-            return (f"🛑 НЕ отцепил — родитель по id это «{pg.title}», а НЕ "
-                    f"«{parent_task_title}» (защита от «не той задачи»). "
-                    "Ничего не тронул.")
+        refusal, _warn = _guard_or_refuse(
+            pg, stage="исполнение", verb="НЕ отцепил",
+            expected=parent_task_title, parent=True, shield=True,
+            missing_says="skip")
+        if refusal:
+            return refusal
         resp = await _run_blocking(lambda: ticktick_v2.unset_task_parent(
             task_id, live_parent, g.project_id or project_id))
         api_err = id2error_failures(resp, [task_id]).get(task_id)
@@ -12317,7 +12473,7 @@ async def run_filter(filter: str, limit: int = _TREE_PAGE, offset: int = 0) -> s
             # называется диапазон допустимых offset, а не «начало последней».
             return (warning + f"Filter '{filter}' — {len(tasks)} task(s) "
                     f"({total_roots} top-level), but offset={offset} is past the "
-                    f"end (valid offsets are 0-{total_roots - 1}).")
+                    f"end ({_valid_offset_range(total_roots)}).")
         if offset or shown_to < total_roots:
             out = (warning + f"Filter '{filter}' — {len(tasks)} task(s) "
                    f"({total_roots} top-level; showing top-level "
@@ -12734,11 +12890,10 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
     # (manifest_id пуст); automation_key НЕ пропускает эту проверку — она
     # стоит раньше самого гейта.
     if not manifest_id:
-        refuse = _guard_project(project_id, project_name, fresh=True,
-                                require_known=True)
-        if refuse:
-            return (refuse.replace("🛑 Отказ —", "🛑 План НЕ построен —", 1)
-                          .replace("Ничего не тронул.", "Ничего не изменено."))
+        refusal = _guard_project_or_refuse(project_id, project_name, fresh=True,
+                                           require_known=True, prefix=_PLAN_REFUSAL_PREFIX)
+        if refusal:
+            return refusal
     # Имя папки-НАЗНАЧЕНИЯ для карточки. Читается из ТОГО ЖЕ кэшированного
     # v2-снапшота, из которого работает list_project_groups (fresh=False —
     # _guard_project выше уже сбросил кэш, так что снапшот свежий и лишнего
@@ -12785,10 +12940,10 @@ async def _move_project_to_group_impl(project_name: str, project_id: str,
     approved."""
     try:
         # Identity guard on the project (fresh, fail-closed) …
-        refuse = _guard_project(project_id, project_name, fresh=True,
-                                require_known=True)
-        if refuse:
-            return refuse
+        refusal = _guard_project_or_refuse(project_id, project_name, fresh=True,
+                                           require_known=True)
+        if refusal:
+            return refusal
         # … and the destination group must actually exist (unless ungrouping).
         dest_name = None
         if group_id != "NONE":
@@ -12926,25 +13081,12 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
     name_warning = ""
     if not manifest_id:
         g = _guard_task_incl_completed(task_id, task_title or "", project_id)
-        if g.status == "mismatch":
-            return (f"🛑 План НЕ построен — id это «{g.title}», а НЕ "
-                    f"«{task_title}» (защита от «не той задачи»). Ничего не "
-                    "изменено.")
-        elif g.status == "unavailable":
-            name_warning = (" ⚠️ Название задачи НЕ удалось сверить с живым "
-                            "состоянием (чтение не удалось) — сверка "
-                            "повторится при подтверждении, и расхождение "
-                            "остановит исполнение.")
-        elif g.status == "missing":
-            return f"🛑 План НЕ построен — {g.message}. Ничего не изменено."
-        elif g.status == "trashed":
-            # Политика класса для УДАЛЁННОЙ задачи — отказ на плане, до
-            # всякого согласия (см. _guard_task_incl_completed). Раньше
-            # такая задача проходила как открытая: `status` в корзине
-            # остаётся 0.
-            return f"🛑 План НЕ построен — {g.message} Ничего не изменено."
-        elif g.status == "completed":
-            name_warning = f" ℹ️ {_COMPLETED_TASK_NOTE}."
+        refusal, warn = _guard_or_refuse(
+            g, stage="план", expected=task_title, missing_says="message",
+            unavailable_note=_UNVERIFIED_TASK_TITLE)
+        if refusal:
+            return refusal
+        name_warning = f" {warn}" if warn else ""
     params = {"task_title": task_title, "text": text, "project_id": project_id,
               "task_id": task_id}
     describe_fn = ((lambda p: _describe_add_task_comment(p) + name_warning)
@@ -12980,15 +13122,11 @@ async def _add_task_comment_impl(task_title: str, text: str, project_id: str,
     авторство записи."""
     try:
         g = _guard_task_incl_completed(task_id, task_title or "", project_id)
-        if g.status == "unavailable":
-            return g.message
-        if g.status == "mismatch":
-            return (f"🛑 НЕ добавил комментарий — id это «{g.title}», а НЕ "
-                    f"«{task_title}». Ничего не тронул.")
-        if g.status == "trashed":
-            return f"🛑 НЕ добавил комментарий — {g.message} Ничего не тронул."
-        if g.status == "missing":
-            return f"🛑 НЕ добавил комментарий — {g.message}. Ничего не тронул."
+        refusal, _warn = _guard_or_refuse(
+            g, stage="исполнение", verb="НЕ добавил комментарий",
+            expected=task_title, missing_says="message")
+        if refusal:
+            return refusal
         note = ""
         if g.status == "completed":
             # Комментировать завершённую задачу законно (дописать вывод,
@@ -13219,10 +13357,10 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
     try:
         # Destination (when overridden) must be a live project.
         if to_project_id:
-            refuse = _guard_project(to_project_id, "", fresh=True,
-                                    require_known=True)
-            if refuse:
-                return refuse
+            refusal = _guard_project_or_refuse(to_project_id, "", fresh=True,
+                                               require_known=True)
+            if refusal:
+                return refusal
         # Identity guard against the TRASH: the caller's title must match the
         # trash entry, mirroring _split_tasks_by_state for open tasks.
         trashed = await _run_blocking(lambda: ticktick_v2.get_trash(500))
@@ -13518,24 +13656,12 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
     name_warning = ""
     if not manifest_id:
         g = _guard_task_incl_completed(task_id, task_title or "", project_id)
-        if g.status == "mismatch":
-            return (f"🛑 План НЕ построен — {g.message} (защита от «не той "
-                    "задачи»). Ничего не изменено.")
-        elif g.status == "unavailable":
-            name_warning = (" ⚠️ Название задачи НЕ удалось сверить с живым "
-                            "состоянием (чтение не удалось) — сверка "
-                            "повторится при подтверждении, и расхождение "
-                            "остановит исполнение.")
-        elif g.status == "missing":
-            return f"🛑 План НЕ построен — {g.message}. Ничего не изменено."
-        elif g.status == "trashed":
-            # Политика класса для УДАЛЁННОЙ задачи — отказ на плане, до
-            # всякого согласия (см. _guard_task_incl_completed). Раньше
-            # такая задача проходила как открытая: `status` в корзине
-            # остаётся 0.
-            return f"🛑 План НЕ построен — {g.message} Ничего не изменено."
-        elif g.status == "completed":
-            name_warning = f" ℹ️ {_COMPLETED_TASK_NOTE}."
+        refusal, warn = _guard_or_refuse(
+            g, stage="план", expected=task_title, says="message",
+            missing_says="message", unavailable_note=_UNVERIFIED_TASK_TITLE)
+        if refusal:
+            return refusal
+        name_warning = f" {warn}" if warn else ""
     params = {"task_title": task_title, "task_id": task_id, "project_id": project_id,
               "url": url, "content_base64": content_base64, "filename": filename}
     describe_fn = ((lambda p: _describe_attach_file_to_task(p) + name_warning)
@@ -13564,13 +13690,11 @@ async def _attach_file_to_task_impl(task_title: str, task_id: str, project_id: s
     # хотя guard прямо здесь уже установил живое имя (тот же фолбэк, что в
     # _duplicate_task_impl).
     title = title if title != f"[task {task_id[:8]}…]" else (g.title or title)
-    if g.status == "mismatch":
-        return (f"🛑 НЕ прикрепил — id это «{g.title}», а НЕ «{task_title}». "
-                "Ничего не тронул.")
-    if g.status == "trashed":
-        return f"🛑 НЕ прикрепил — {g.message} Ничего не тронул."
-    if g.status == "missing":
-        return f"🛑 НЕ прикрепил — {g.message}. Ничего не тронул."
+    refusal, _warn = _guard_or_refuse(
+        g, stage="исполнение", verb="НЕ прикрепил", expected=task_title,
+        missing_says="message")
+    if refusal:
+        return refusal
     note = ""
     if g.status == "completed":
         note = f"\nℹ️ {_COMPLETED_TASK_NOTE}."
@@ -14487,20 +14611,13 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None,
     live_title = None
     if not manifest_id:
         g = _guard_task(task_id, task_title or "")
-        if g.status == "mismatch":
-            return (f"🛑 План НЕ построен — id это «{g.title}», а НЕ "
-                    f"«{task_title}» (защита от «не той задачи»). Ничего не "
-                    "изменено.")
-        elif g.status == "missing":
-            shown = task_title or _lookup_task_title(task_id)
-            return (f"🛑 План НЕ построен — «{shown}» не среди открытых "
-                    "задач (завершена/удалена/неверный id). Ничего не "
-                    "изменено.")
-        elif g.status == "unavailable":
-            name_warning = (" ⚠️ Задачу НЕ удалось сверить с живым "
-                            "состоянием (чтение не удалось) — сверка "
-                            "повторится при подтверждении, и расхождение "
-                            "остановит исполнение.")
+        refusal, warn = _guard_or_refuse(
+            g, stage="план", expected=task_title,
+            missing_name=task_title or _lookup_task_title(task_id),
+            unavailable_note=_UNVERIFIED_TASK)
+        if refusal:
+            return refusal
+        name_warning = f" {warn}" if warn else ""
         # Живое название для карточки: guard его уже прочитал (status "ok"),
         # и это оно, а не переданное, должно стоять в позиции имени.
         live_title = g.title if g.ok else None
@@ -14528,14 +14645,11 @@ async def _abandon_task_impl(summary: str, task_id: str,
     # (реально наблюдалось — см. комментарий к _official_task_snapshot),
     # печаталась как «[task 6a757123…]» на УСПЕШНОМ пути.
     title = title if title != f"[task {task_id[:8]}…]" else (g.title or title)
-    if g.status == "unavailable":
-        return g.message
-    if g.status == "mismatch":
-        return (f"🛑 НЕ отметил — id это «{g.title}», а НЕ «{task_title}». "
-                "Ничего не тронул.")
-    if g.status == "missing":
-        return (f"🛑 НЕ отметил — «{title}» не среди открытых задач "
-                "(завершена/удалена/неверный id). Ничего не тронул.")
+    refusal, _warn = _guard_or_refuse(
+        g, stage="исполнение", verb="НЕ отметил", expected=task_title,
+        missing_name=title)
+    if refusal:
+        return refusal
     try:
         await _run_blocking(lambda: ticktick_v2.abandon_task(task_id))
         rid = _op_journal("abandon", [{"taskId": task_id, "title": title}], summary)
@@ -14634,25 +14748,12 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
     live_title = None
     if not manifest_id:
         g = _guard_task_incl_completed(task_id, task_title or "")
-        if g.status == "mismatch":
-            return (f"🛑 План НЕ построен — id это «{g.title}», а НЕ "
-                    f"«{task_title}» (защита от «не той задачи»). Ничего не "
-                    "изменено.")
-        elif g.status == "missing":
-            return f"🛑 План НЕ построен — {g.message}. Ничего не изменено."
-        elif g.status == "trashed":
-            # Политика класса для УДАЛЁННОЙ задачи — отказ на плане, до
-            # всякого согласия (см. _guard_task_incl_completed). Раньше
-            # такая задача проходила как открытая: `status` в корзине
-            # остаётся 0.
-            return f"🛑 План НЕ построен — {g.message} Ничего не изменено."
-        elif g.status == "completed":
-            name_warning = f" ℹ️ {_COMPLETED_TASK_NOTE}."
-        elif g.status == "unavailable":
-            name_warning = (" ⚠️ Задачу НЕ удалось сверить с живым "
-                            "состоянием (чтение не удалось) — сверка "
-                            "повторится при подтверждении, и расхождение "
-                            "остановит исполнение.")
+        refusal, warn = _guard_or_refuse(
+            g, stage="план", expected=task_title, missing_says="message",
+            unavailable_note=_UNVERIFIED_TASK)
+        if refusal:
+            return refusal
+        name_warning = f" {warn}" if warn else ""
         # Живое название для карточки — и для ЗАВЕРШЁННОЙ задачи тоже
         # (status "completed" означает, что источник её знает и имя
         # сверено): голый id в позиции имени не оправдан ни в одном из
@@ -14676,15 +14777,11 @@ async def _duplicate_task_impl(summary: str, task_id: str, task_title: str = Non
     by the gated duplicate_task() above once the plan is approved."""
     title = task_title or _lookup_task_title(task_id)
     g = _guard_task_incl_completed(task_id, task_title or "")
-    if g.status == "unavailable":
-        return g.message
-    if g.status == "mismatch":
-        return (f"🛑 НЕ дублировал — id это «{g.title}», а НЕ «{task_title}». "
-                "Ничего не тронул.")
-    if g.status == "trashed":
-        return f"🛑 НЕ дублировал — {g.message} Ничего не тронул."
-    if g.status == "missing":
-        return f"🛑 НЕ дублировал — {g.message}. Ничего не тронул."
+    refusal, _warn = _guard_or_refuse(
+        g, stage="исполнение", verb="НЕ дублировал", expected=task_title,
+        missing_says="message")
+    if refusal:
+        return refusal
     warn = f"\nℹ️ {_COMPLETED_TASK_NOTE}." if g.status == "completed" else ""
     title = title if title != f"[task {task_id[:8]}…]" else (g.title or title)
     try:
@@ -14791,24 +14888,12 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
     name_warning = ""
     if not manifest_id:
         g = _guard_task_incl_completed(task_id, task_title or "", project_id)
-        if g.status == "mismatch":
-            return (f"🛑 План НЕ построен — {g.message} (защита от «не той "
-                    "задачи»). Ничего не изменено.")
-        elif g.status == "unavailable":
-            name_warning = (" ⚠️ Название задачи НЕ удалось сверить с живым "
-                            "состоянием (чтение не удалось) — сверка "
-                            "повторится при подтверждении, и расхождение "
-                            "остановит исполнение.")
-        elif g.status == "missing":
-            return f"🛑 План НЕ построен — {g.message}. Ничего не изменено."
-        elif g.status == "trashed":
-            # Политика класса для УДАЛЁННОЙ задачи — отказ на плане, до
-            # всякого согласия (см. _guard_task_incl_completed). Раньше
-            # такая задача проходила как открытая: `status` в корзине
-            # остаётся 0.
-            return f"🛑 План НЕ построен — {g.message} Ничего не изменено."
-        elif g.status == "completed":
-            name_warning = f" ℹ️ {_COMPLETED_TASK_NOTE}."
+        refusal, warn = _guard_or_refuse(
+            g, stage="план", expected=task_title, says="message",
+            missing_says="message", unavailable_note=_UNVERIFIED_TASK_TITLE)
+        if refusal:
+            return refusal
+        name_warning = f" {warn}" if warn else ""
     params = {"task_title": task_title, "text": text, "project_id": project_id,
               "task_id": task_id, "comment_id": comment_id}
     describe_fn = ((lambda p: _describe_update_task_comment(p) + name_warning)
@@ -14828,15 +14913,11 @@ async def _update_task_comment_impl(task_title: str, text: str, project_id: str,
     only by the gated update_task_comment() above once the plan is approved."""
     try:
         g = _guard_task_incl_completed(task_id, task_title or "", project_id)
-        if g.status == "unavailable":
-            return g.message
-        if g.status == "mismatch":
-            return (f"🛑 НЕ изменил комментарий — id это «{g.title}», а НЕ "
-                    f"«{task_title}». Ничего не тронул.")
-        if g.status == "trashed":
-            return f"🛑 НЕ изменил комментарий — {g.message} Ничего не тронул."
-        if g.status == "missing":
-            return f"🛑 НЕ изменил комментарий — {g.message}. Ничего не тронул."
+        refusal, _warn = _guard_or_refuse(
+            g, stage="исполнение", verb="НЕ изменил комментарий",
+            expected=task_title, missing_says="message")
+        if refusal:
+            return refusal
         pid = g.project_id or project_id
         # (client-side: update_task_comment fetches the comment first and
         # raises if comment_id is absent — a moved/stale pid errors loudly)
@@ -14923,24 +15004,12 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str,
     name_warning = ""
     if not manifest_id:
         g = _guard_task_incl_completed(task_id, task_title or "", project_id)
-        if g.status == "mismatch":
-            return (f"🛑 План НЕ построен — {g.message} (защита от «не той "
-                    "задачи»). Ничего не изменено.")
-        elif g.status == "unavailable":
-            name_warning = (" ⚠️ Название задачи НЕ удалось сверить с живым "
-                            "состоянием (чтение не удалось) — сверка "
-                            "повторится при подтверждении, и расхождение "
-                            "остановит исполнение.")
-        elif g.status == "missing":
-            return f"🛑 План НЕ построен — {g.message}. Ничего не изменено."
-        elif g.status == "trashed":
-            # Политика класса для УДАЛЁННОЙ задачи — отказ на плане, до
-            # всякого согласия (см. _guard_task_incl_completed). Раньше
-            # такая задача проходила как открытая: `status` в корзине
-            # остаётся 0.
-            return f"🛑 План НЕ построен — {g.message} Ничего не изменено."
-        elif g.status == "completed":
-            name_warning = f" ℹ️ {_COMPLETED_TASK_NOTE}."
+        refusal, warn = _guard_or_refuse(
+            g, stage="план", expected=task_title, says="message",
+            missing_says="message", unavailable_note=_UNVERIFIED_TASK_TITLE)
+        if refusal:
+            return refusal
+        name_warning = f" {warn}" if warn else ""
     params = {"task_title": task_title, "project_id": project_id,
               "task_id": task_id, "comment_id": comment_id}
     describe_fn = ((lambda p: _describe_delete_task_comment(p) + name_warning)
@@ -14960,15 +15029,11 @@ async def _delete_task_comment_impl(task_title: str, project_id: str,
     only by the gated delete_task_comment() above once the plan is approved."""
     try:
         g = _guard_task_incl_completed(task_id, task_title or "", project_id)
-        if g.status == "unavailable":
-            return g.message
-        if g.status == "mismatch":
-            return (f"🛑 НЕ удалил комментарий — id это «{g.title}», а НЕ "
-                    f"«{task_title}». Ничего не тронул.")
-        if g.status == "trashed":
-            return f"🛑 НЕ удалил комментарий — {g.message} Ничего не тронул."
-        if g.status == "missing":
-            return f"🛑 НЕ удалил комментарий — {g.message}. Ничего не тронул."
+        refusal, _warn = _guard_or_refuse(
+            g, stage="исполнение", verb="НЕ удалил комментарий",
+            expected=task_title, missing_says="message")
+        if refusal:
+            return refusal
         pid = g.project_id or project_id
         # Existence pre-check: refuse a stale comment_id instead of no-opping.
         cms = await _run_blocking(lambda: ticktick_v2.get_task_comments(pid, task_id))
@@ -15075,11 +15140,10 @@ async def update_project(project_name: str, project_id: str, name: str = None,
         # Префикс/хвост сообщения приведены к тому же виду, что у остальных
         # plan-отказов («План НЕ построен» / «Ничего не изменено») —
         # текстовая правка отображения, сама сверка не меняется.
-        refuse = _guard_project(project_id, project_name, fresh=True,
-                                require_known=True)
-        if refuse:
-            return (refuse.replace("🛑 Отказ —", "🛑 План НЕ построен —", 1)
-                          .replace("Ничего не тронул.", "Ничего не изменено."))
+        refusal = _guard_project_or_refuse(project_id, project_name, fresh=True,
+                                           require_known=True, prefix=_PLAN_REFUSAL_PREFIX)
+        if refusal:
+            return refusal
     params = {"project_name": project_name, "project_id": project_id,
               "name": name, "color": color, "view_mode": view_mode}
     outcome = await _gate_single("update_project", "update_project",
@@ -15096,10 +15160,10 @@ async def _update_project_impl(project_name: str, project_id: str,
                                view_mode: str = None) -> str:
     """Pure mutation logic for update_project — no consent gate. Called only
     by the gated update_project() above once the plan is approved."""
-    refuse = _guard_project(project_id, project_name, fresh=True,
-                            require_known=True)
-    if refuse:
-        return refuse
+    refusal = _guard_project_or_refuse(project_id, project_name, fresh=True,
+                                       require_known=True)
+    if refusal:
+        return refusal
     try:
         proj = await _run_blocking(lambda: ticktick.update_project(
             project_id, name=name, color=color, view_mode=view_mode))
@@ -15207,13 +15271,14 @@ async def archive_project(project_name: str, project_id: str, archived: bool = T
         # исход — нет отдельной мягкой ветки на «временную недоступность»
         # (см. move_project_to_group, 14907a9, тот же класс guard'а).
         if archived:
-            refuse = _guard_project(project_id, project_name, fresh=True,
-                                    require_known=True)
+            refusal = _guard_project_or_refuse(project_id, project_name, fresh=True,
+                                               require_known=True,
+                                               prefix=_PLAN_REFUSAL_PREFIX)
         else:
-            refuse = _guard_project(project_id, project_name, fresh=True)
-        if refuse:
-            return (refuse.replace("🛑 Отказ —", "🛑 План НЕ построен —", 1)
-                          .replace("Ничего не тронул.", "Ничего не изменено."))
+            refusal = _guard_project_or_refuse(project_id, project_name, fresh=True,
+                                               prefix=_PLAN_REFUSAL_PREFIX)
+        if refusal:
+            return refusal
     params = {"project_name": project_name, "project_id": project_id,
               "archived": archived}
     outcome = await _gate_single("archive_project", "archive_project",
@@ -15232,14 +15297,12 @@ async def _archive_project_impl(project_name: str, project_id: str,
     if archived:
         # Archiving pulls the project out of the sync pool — destructive-
         # adjacent, so verify FRESH and fail closed on an unresolvable id.
-        refuse = _guard_project(project_id, project_name, fresh=True,
-                                require_known=True)
-        if refuse:
-            return refuse
+        refusal = _guard_project_or_refuse(project_id, project_name, fresh=True,
+                                           require_known=True)
     else:
-        refuse = _guard_project(project_id, project_name, fresh=True)
-        if refuse:
-            return refuse
+        refusal = _guard_project_or_refuse(project_id, project_name, fresh=True)
+    if refusal:
+        return refusal
     live_name = _v2_project_names().get(project_id, project_name)
     verb = 'заархивирован' if archived else 'разархивирован'
     try:
@@ -15903,7 +15966,7 @@ async def get_changes(since: str, until: str = None,
         if not page:
             return (f"Изменений с {since} по {until}: всего {total}, но offset={offset} "
                     f"уже за концом ленты (последняя страница начинается с offset="
-                    f"{max(0, (total - 1) // limit * limit)}).")
+                    f"{_last_page_offset(total, limit)}).")
         shown_to = offset + len(page)
         if offset or shown_to < total:
             header = (f"Изменения с {since} по {until} (всего {total}, "
@@ -16155,11 +16218,11 @@ async def create_project_column(project_id: str, name: str,
     # id, который не резолвится ни в одно живое имя (там же, ниже).
     # automation_key НЕ пропускает эту проверку — она стоит раньше гейта.
     if not manifest_id:
-        refuse = _guard_project(project_id, project_name or "", fresh=True,
-                                require_known=True)
-        if refuse:
-            return (refuse.replace("🛑 Отказ —", "🛑 План НЕ построен —", 1)
-                          .replace("Ничего не тронул.", "Ничего не изменено."))
+        refusal = _guard_project_or_refuse(project_id, project_name or "",
+                                           fresh=True, require_known=True,
+                                           prefix=_PLAN_REFUSAL_PREFIX)
+        if refusal:
+            return refusal
     # Живое имя проекта для карточки — читается из снапшота, который
     # _guard_project(fresh=True) выше только что обновил (лишнего сетевого
     # запроса нет), и уходит в описание замыканием, а НЕ ключом в `params`:
@@ -16184,10 +16247,10 @@ async def _create_project_column_impl(project_id: str, name: str,
     approved."""
     # Identity guard: the id must resolve to a live project (and to the given
     # name when one is passed) — a wrong id would create the column elsewhere.
-    refuse = _guard_project(project_id, project_name or "", fresh=True,
-                            require_known=True)
-    if refuse:
-        return refuse
+    refusal = _guard_project_or_refuse(project_id, project_name or "",
+                                       fresh=True, require_known=True)
+    if refusal:
+        return refusal
     live_pname = _v2_project_names().get(project_id, project_id)
     try:
         cid = await _run_blocking(lambda: ticktick_v2.create_column(project_id, name))
@@ -16622,10 +16685,11 @@ def _resolve_triage_destination(op: Dict, names: Dict) -> Tuple[str, str, str]:
     to_id = str(op.get("to_project_id") or "").strip()
     claim = str(op.get("to_project") or "").strip()
     if to_id:
-        refuse = _guard_project(to_id, claim, fresh=False, require_known=True)
-        if refuse:
+        refusal = _guard_project_or_refuse(to_id, claim, fresh=False,
+                                           require_known=True)
+        if refusal:
             return "", "", ("проект назначения не подтверждён — "
-                            + refuse.lstrip("🛑 ").rstrip())
+                            + refusal.lstrip("🛑 ").rstrip())
         return to_id, names.get(to_id, to_id), ""
     matches = [pid for pid, nm in names.items() if _names_agree(claim, nm)]
     if not matches:
