@@ -34,6 +34,7 @@ import re
 import pytest
 
 import ticktick_mcp.src.server as s
+from tests import read_stand as rs
 
 
 def _extract_manifest_id(preview: str) -> str:
@@ -183,7 +184,7 @@ async def test_call1_only_plans_and_touches_nothing(monkeypatch, spec):
     name, args, kwargs, _expected = spec
     spy = _wire(monkeypatch, name)
 
-    preview = await getattr(s, name)(*args, **kwargs)
+    preview = await rs.direct(name)(*args, **kwargs)
 
     assert spy.calls == [], f"{name}: вызов #1 позвал исполнителя — гейт не держит"
     assert "📋 План" in preview
@@ -201,7 +202,7 @@ async def test_call1_only_plans_and_touches_nothing(monkeypatch, spec):
 async def test_call2_yes_runs_impl_with_planned_params(monkeypatch, spec):
     name, args, kwargs, expected = spec
     spy = _wire(monkeypatch, name)
-    tool = getattr(s, name)
+    tool = rs.direct(name)
 
     preview = await tool(*args, **kwargs)
     mid = _extract_manifest_id(preview)
@@ -219,7 +220,7 @@ async def test_call2_ignores_swapped_arguments(monkeypatch, spec):
     цель между планом и подтверждением нельзя."""
     name, args, kwargs, expected = spec
     spy = _wire(monkeypatch, name)
-    tool = getattr(s, name)
+    tool = rs.direct(name)
 
     preview = await tool(*args, **kwargs)
     mid = _extract_manifest_id(preview)
@@ -238,7 +239,7 @@ async def test_call2_ignores_swapped_arguments(monkeypatch, spec):
 async def test_call2_negative_reply_burns_the_manifest(monkeypatch, spec):
     name, args, kwargs, _expected = spec
     spy = _wire(monkeypatch, name)
-    tool = getattr(s, name)
+    tool = rs.direct(name)
 
     preview = await tool(*args, **kwargs)
     mid = _extract_manifest_id(preview)
@@ -257,7 +258,7 @@ async def test_call2_negative_reply_burns_the_manifest(monkeypatch, spec):
 async def test_call2_without_reply_is_refused(monkeypatch, spec):
     name, args, kwargs, _expected = spec
     spy = _wire(monkeypatch, name)
-    tool = getattr(s, name)
+    tool = rs.direct(name)
 
     preview = await tool(*args, **kwargs)
     mid = _extract_manifest_id(preview)
@@ -276,7 +277,7 @@ async def test_call2_unknown_manifest_is_refused_clearly(monkeypatch, spec):
     name, args, kwargs, _expected = spec
     spy = _wire(monkeypatch, name)
 
-    result = await getattr(s, name)(*args, manifest_id="deadbeefcafe",
+    result = await rs.direct(name)(*args, manifest_id="deadbeefcafe",
                                     user_reply="да", **kwargs)
 
     assert spy.calls == []
@@ -297,7 +298,7 @@ async def test_call2_manifest_of_another_tool_is_refused(monkeypatch, spec):
                            "plan_shown_at": s.time.monotonic(),
                            "consumed": False}
     try:
-        result = await getattr(s, name)(*args, manifest_id=other,
+        result = await rs.direct(name)(*args, manifest_id=other,
                                         user_reply="да", **kwargs)
     finally:
         s._MANIFESTS.pop(other, None)
@@ -314,7 +315,7 @@ async def test_call2_manifest_of_another_tool_is_refused(monkeypatch, spec):
 async def test_manifest_is_one_shot(monkeypatch, spec):
     name, args, kwargs, expected = spec
     spy = _wire(monkeypatch, name)
-    tool = getattr(s, name)
+    tool = rs.direct(name)
 
     preview = await tool(*args, **kwargs)
     mid = _extract_manifest_id(preview)
@@ -335,7 +336,7 @@ async def test_manifest_is_one_shot(monkeypatch, spec):
 async def test_automation_key_bypasses_user_reply(monkeypatch, spec):
     name, args, kwargs, expected = spec
     spy = _wire(monkeypatch, name)
-    tool = getattr(s, name)
+    tool = rs.direct(name)
 
     preview = await tool(*args, **kwargs)
     mid = _extract_manifest_id(preview)
@@ -351,7 +352,7 @@ async def test_automation_key_bypasses_user_reply(monkeypatch, spec):
 async def test_wrong_automation_key_still_refused(monkeypatch, spec):
     name, args, kwargs, _expected = spec
     spy = _wire(monkeypatch, name)
-    tool = getattr(s, name)
+    tool = rs.direct(name)
 
     preview = await tool(*args, **kwargs)
     mid = _extract_manifest_id(preview)
@@ -373,7 +374,7 @@ async def test_impl_name_and_param_contract(monkeypatch, spec):
     _wire_clients(monkeypatch)          # НЕ подменяем impl — он тут и изучается
     seen = _capture_gate(monkeypatch)
 
-    preview = await getattr(s, name)(*args, **kwargs)
+    preview = await rs.direct(name)(*args, **kwargs)
     assert "manifest_id" in preview
 
     # (1) kind и tool_name одинаковы и равны имени python-функции тула —
@@ -505,7 +506,7 @@ async def test_abandon_task_plan_identity_guard_blocks_wrong_title(monkeypatch):
     spy = _wire(monkeypatch, "abandon_task",
                tasks=[{"id": "t1", "title": "Купить хлеб", "projectId": "p1"}])
 
-    result = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко")
+    result = await s.abandon_task.direct("Отказываюсь", "t1", task_title="Купить молоко")
 
     assert result.startswith("🛑 План НЕ построен")
     assert "«Купить хлеб»" in result
@@ -520,7 +521,7 @@ async def test_abandon_task_plan_identity_guard_blocks_missing_task(monkeypatch)
     the plan-phase transfer must reproduce that same severity."""
     spy = _wire(monkeypatch, "abandon_task", tasks=[])
 
-    result = await s.abandon_task("Отказываюсь", "t-нет-такой", task_title="Купить молоко")
+    result = await s.abandon_task.direct("Отказываюсь", "t-нет-такой", task_title="Купить молоко")
 
     assert result.startswith("🛑 План НЕ построен")
     assert "manifest_id" not in result
@@ -545,12 +546,12 @@ async def test_abandon_task_plan_read_failure_does_not_block_but_warns(monkeypat
         return real_open_by_id(fresh=fresh)
     monkeypatch.setattr(s, "_open_by_id", _flaky)
 
-    preview = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко")
+    preview = await s.abandon_task.direct("Отказываюсь", "t1", task_title="Купить молоко")
     assert "🛑" not in preview, "временный сбой чтения не должен блокировать план"
     assert "НЕ удалось сверить" in preview
     mid = _extract_manifest_id(preview)
 
-    result = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко",
+    result = await s.abandon_task.direct("Отказываюсь", "t1", task_title="Купить молоко",
                                   manifest_id=mid, user_reply="да")
     assert "🛑" not in result
     assert spy.calls == [{"summary": "Отказываюсь", "task_id": "t1",
@@ -578,11 +579,11 @@ async def test_abandon_task_plan_read_failure_still_lets_execution_catch_a_real_
         return real_open_by_id(fresh=fresh)
     monkeypatch.setattr(s, "_open_by_id", _flaky)
 
-    preview = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко")
+    preview = await s.abandon_task.direct("Отказываюсь", "t1", task_title="Купить молоко")
     assert "🛑" not in preview
     mid = _extract_manifest_id(preview)
 
-    result = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко",
+    result = await s.abandon_task.direct("Отказываюсь", "t1", task_title="Купить молоко",
                                   manifest_id=mid, user_reply="да")
     assert result.startswith("🛑")
     assert "«Купить хлеб»" in result
@@ -597,7 +598,7 @@ async def test_abandon_task_automation_key_mismatch_is_refused_before_plan(monke
                tasks=[{"id": "t1", "title": "Купить хлеб", "projectId": "p1"}])
     monkeypatch.setattr(s, "SECRET", "test-secret")
 
-    result = await s.abandon_task("Отказываюсь", "t1", task_title="Купить молоко",
+    result = await s.abandon_task.direct("Отказываюсь", "t1", task_title="Купить молоко",
                                   automation_key="test-secret")
 
     assert result.startswith("🛑 План НЕ построен")

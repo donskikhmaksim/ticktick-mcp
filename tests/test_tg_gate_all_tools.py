@@ -42,6 +42,7 @@ import pytest
 
 import ticktick_mcp.src.server as s
 import ticktick_mcp.src.tg_approval as tg
+from tests import read_stand as rs
 
 
 # ───────────────────────── таблица 19 гейтованных тулов ─────────────────────
@@ -289,7 +290,7 @@ def _notify_ok(monkeypatch, seen=None):
 
 async def _plan(tool, monkeypatch):
     """call #1: возвращает (текст превью, id манифеста)."""
-    out = await getattr(s, tool)(**ALL_TOOLS[tool])
+    out = await rs.direct(tool)(**ALL_TOOLS[tool])
     return out, _mid_of(out)
 
 
@@ -315,7 +316,7 @@ async def test_layer_off_preview_is_unchanged_and_yes_still_works(tool, monkeypa
     assert calls == {"notify": 0, "check": 0}
     assert "tg_notified" not in s._MANIFESTS[mid]
 
-    out = await getattr(s, tool)(**ALL_TOOLS[tool], manifest_id=mid, user_reply="да")
+    out = await rs.direct(tool)(**ALL_TOOLS[tool], manifest_id=mid, user_reply="да")
 
     assert len(rec) == 1, f"chat-«да» не исполнил {tool}: {out}"
     assert calls == {"notify": 0, "check": 0}   # tg_approval не тронут вовсе
@@ -396,7 +397,7 @@ async def test_pending_button_blocks_execution_and_keeps_the_plan(tool, monkeypa
     _, mid = await _plan(tool, monkeypatch)
     monkeypatch.setattr(tg, "check_approval", lambda manifest_id: "pending")
 
-    out = await getattr(s, tool)(**ALL_TOOLS[tool], manifest_id=mid, user_reply="да")
+    out = await rs.direct(tool)(**ALL_TOOLS[tool], manifest_id=mid, user_reply="да")
 
     assert rec == [], f"{tool} исполнился БЕЗ нажатой кнопки"
     assert "Telegram" in out
@@ -414,7 +415,7 @@ async def test_rejected_button_kills_the_plan(tool, monkeypatch):
     _, mid = await _plan(tool, monkeypatch)
     monkeypatch.setattr(tg, "check_approval", lambda manifest_id: "rejected")
 
-    out = await getattr(s, tool)(**ALL_TOOLS[tool], manifest_id=mid, user_reply="да")
+    out = await rs.direct(tool)(**ALL_TOOLS[tool], manifest_id=mid, user_reply="да")
 
     assert rec == []
     assert "Отклонено" in out
@@ -435,7 +436,7 @@ async def test_approved_button_does_not_reopen_the_text_path(monkeypatch):
         rec = _stub_impl(monkeypatch, tool, [])
         _, mid = await _plan(tool, monkeypatch)
         monkeypatch.setattr(tg, "check_approval", lambda manifest_id: "approved")
-        out = await getattr(s, tool)(**ALL_TOOLS[tool], manifest_id=mid,
+        out = await rs.direct(tool)(**ALL_TOOLS[tool], manifest_id=mid,
                                      user_reply="да")
         assert rec == [], f"{tool} исполнился текстовым путём"
         assert "исполняет" in out and "САМ" in out, tool
@@ -451,7 +452,7 @@ async def test_failed_telegram_send_invalidates_the_plan(tool, monkeypatch):
     monkeypatch.setattr(tg, "notify_plan", lambda *a, **k: (False, "boom"))
     rec = _stub_impl(monkeypatch, tool, [])
 
-    out = await getattr(s, tool)(**ALL_TOOLS[tool])
+    out = await rs.direct(tool)(**ALL_TOOLS[tool])
 
     assert "Не смог отправить" in out and "boom" in out
     assert "НЕ запланировано" in out
@@ -460,7 +461,7 @@ async def test_failed_telegram_send_invalidates_the_plan(tool, monkeypatch):
     mids = [mid for mid, m in s._MANIFESTS.items() if m.get("tool") == tool]
     assert len(mids) == 1 and s._MANIFESTS[mids[0]]["consumed"] is True
     monkeypatch.setattr(tg, "check_approval", lambda manifest_id: "approved")
-    out2 = await getattr(s, tool)(**ALL_TOOLS[tool], manifest_id=mids[0], user_reply="да")
+    out2 = await rs.direct(tool)(**ALL_TOOLS[tool], manifest_id=mids[0], user_reply="да")
     assert rec == [], f"{tool} исполнился по сожжённому манифесту: {out2}"
 
 
@@ -539,7 +540,7 @@ async def test_button_path_calls_the_same_impl_with_the_same_arguments(tool, mon
 
     # (а) обычный чат-путь
     _, mid = await _plan(tool, monkeypatch)
-    await getattr(s, tool)(**ALL_TOOLS[tool], manifest_id=mid, user_reply="да")
+    await rs.direct(tool)(**ALL_TOOLS[tool], manifest_id=mid, user_reply="да")
     assert len(rec) == 1, f"chat-путь не позвал _{tool}_impl"
     chat_call = rec[-1]
 
@@ -651,7 +652,7 @@ async def test_tick_executes_and_reports_back_into_the_message(tool, monkeypatch
     # Модель, позвавшая execute следом, получает внятное «уже исполнено», а не
     # безликое «не найден/истёк».
     s._prune_manifests()
-    out = await getattr(s, tool)(**ALL_TOOLS[tool], manifest_id=mid, user_reply="да")
+    out = await rs.direct(tool)(**ALL_TOOLS[tool], manifest_id=mid, user_reply="да")
     assert "УЖЕ исполнен" in out and "кнопкой в Telegram" in out
 
 

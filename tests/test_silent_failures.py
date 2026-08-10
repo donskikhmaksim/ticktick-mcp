@@ -281,7 +281,7 @@ async def test_model_calling_execute_after_a_failed_auto_run_is_not_told_done(
 
     monkeypatch.setattr(s, "_complete_tasks_impl", boom)
 
-    preview = await s.complete_tasks(
+    preview = await s.complete_tasks.direct(
         summary="Закрываю 1",
         tasks=[{"taskId": "t1", "title": "A", "projectId": "p1"}])
     mid = _mid_of(preview)
@@ -289,7 +289,7 @@ async def test_model_calling_execute_after_a_failed_auto_run_is_not_told_done(
 
     await s._tg_auto_execute_tick()
 
-    out = await s.complete_tasks(
+    out = await s.complete_tasks.direct(
         summary="Закрываю 1",
         tasks=[{"taskId": "t1", "title": "A", "projectId": "p1"}],
         manifest_id=mid, user_reply="да")
@@ -445,7 +445,7 @@ async def test_direct_create_with_matching_non_ascii_key_is_allowed(monkeypatch)
 
     monkeypatch.setattr(s, "_create_tasks_impl", _impl)
 
-    out = await s.create_tasks("Создаю", [{"title": "A", "projectId": "p1"}],
+    out = await s.create_tasks.direct("Создаю", [{"title": "A", "projectId": "p1"}],
                                automation_key="секрет-🔑")
 
     assert called, f"валидный не-ASCII ключ не пропустили: {out}"

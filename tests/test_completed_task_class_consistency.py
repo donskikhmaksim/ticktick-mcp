@@ -90,7 +90,7 @@ def _wire(monkeypatch):
 
 
 async def _plan(tool: str, task_id: str, task_title: str) -> str:
-    return await rs.call(tool, **_args(tool, task_id, task_title))
+    return await rs.call_direct(tool, **_args(tool, task_id, task_title))
 
 
 # ===========================================================================

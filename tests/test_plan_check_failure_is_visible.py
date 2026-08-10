@@ -130,7 +130,7 @@ async def test_failed_check_is_said_out_loud(tool, monkeypatch):
     """Главное утверждение круга 8: сбой сверки виден ЧЕЛОВЕКУ, а не логу."""
     _break_live_state(monkeypatch)
 
-    preview = await rs.call(tool, **TOOLS[tool](LIVE_ROWS))
+    preview = await rs.call_direct(tool, **TOOLS[tool](LIVE_ROWS))
 
     assert _doubt_line(preview), (
         f"{tool}: сверить исполнимость не удалось, но план выглядит "
@@ -146,7 +146,7 @@ async def test_failed_check_still_builds_a_confirmable_plan(tool, monkeypatch):
     исполнитель на недоступном состоянии отказывает по каждой строке сам."""
     _break_live_state(monkeypatch)
 
-    preview = await rs.call(tool, **TOOLS[tool](LIVE_ROWS))
+    preview = await rs.call_direct(tool, **TOOLS[tool](LIVE_ROWS))
 
     assert re.search(r"Манифест `([0-9a-f]+)`", preview), (
         f"{tool}: сбой сверки превратился в отказ строить план:\n{preview}")
@@ -159,7 +159,7 @@ async def test_a_healthy_plan_carries_no_doubt(tool, monkeypatch):
     перестают читать, и тогда она не значит ничего."""
     rs.wire(monkeypatch)
 
-    preview = await rs.call(tool, **TOOLS[tool](LIVE_ROWS))
+    preview = await rs.call_direct(tool, **TOOLS[tool](LIVE_ROWS))
 
     assert not _doubt_line(preview), (
         f"{tool}: сверка прошла успешно, а план всё равно жалуется:\n{preview}")
@@ -191,7 +191,7 @@ async def test_failed_check_marks_no_row(tool, monkeypatch):
     ФАКТЕ «строка не применится», а фактов у сервера сейчас нет."""
     _break_live_state(monkeypatch)
 
-    preview = await rs.call(tool, **TOOLS[tool](LIVE_ROWS))
+    preview = await rs.call_direct(tool, **TOOLS[tool](LIVE_ROWS))
 
     rows = _numbered_rows(preview)
     assert len(rows) == len(LIVE_ROWS), f"{tool}: план не перечислил строки:\n{preview}"
@@ -207,8 +207,8 @@ async def test_unreadable_tag_list_does_not_invent_facts(monkeypatch):
     факт, причём за обратный действительности."""
     _break_live_state(monkeypatch)
 
-    preview = await rs.call(
-        "set_task_tags", summary="Ставлю тег",
+    preview = await rs.call_direct(
+"set_task_tags", summary="Ставлю тег",
         # «тег01» в аккаунте стенда ЕСТЬ (rs.TAGS) — «будет создан» про него
         # было бы прямой ложью.
         tasks=[dict(r, tags=["тег01"]) for r in LIVE_ROWS])
@@ -224,7 +224,7 @@ async def test_a_readable_tag_list_still_flags_new_tags(monkeypatch):
     тегов действительно прочитан и тега в нём действительно нет."""
     rs.wire(monkeypatch)
 
-    preview = await rs.call("set_task_tags", summary="Ставлю тег",
+    preview = await rs.call_direct("set_task_tags", summary="Ставлю тег",
                             tasks=[dict(r, tags=["совсем-новый-тег"])
                                    for r in LIVE_ROWS])
 
@@ -244,7 +244,7 @@ async def test_exception_inside_the_check_is_also_visible(monkeypatch):
 
     monkeypatch.setattr(s, "_open_by_id", boom)
 
-    preview = await rs.call("update_tasks", summary="Меняю приоритет",
+    preview = await rs.call_direct("update_tasks", summary="Меняю приоритет",
                             tasks=[dict(r, priority=1) for r in LIVE_ROWS])
 
     assert _doubt_line(preview), (

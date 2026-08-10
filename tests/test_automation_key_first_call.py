@@ -294,7 +294,13 @@ async def test_each_reported_tool_executes_on_the_first_call_with_a_valid_key(
 @pytest.mark.parametrize("tool_name,kwargs,impl_name,expected", _SIX)
 async def test_each_reported_tool_still_asks_when_the_key_is_wrong(
         wired, deletion, monkeypatch, tool_name, kwargs, impl_name, expected):
-    """Зеркало предыдущего: неверный ключ у тех же шести — план и кнопка."""
+    """Зеркало предыдущего: неверный ключ у тех же шести ничего не исполняет.
+
+    2026-08-10 (§1.3.4) исход РАЗДВОИЛСЯ, и это не косметика. У инструмента,
+    чей прямой путь закрыт (здесь это `delete_tasks`), неверный ключ больше не
+    строит план и не шлёт кнопку: приходит обучающий отказ, называющий
+    `apply_task_changes`. У остальных — прежний путь план → кнопка. Общее у
+    обеих веток одно, и оно главное: с неверным ключом НЕ ИСПОЛНЯЕТСЯ ничего."""
     live, fake = deletion
     calls = []
     if impl_name:
@@ -311,6 +317,16 @@ async def test_each_reported_tool_still_asks_when_the_key_is_wrong(
 
     assert calls == [] and fake.deleted_ids == [], \
         f"{tool_name}: исполнено с неверным ключом"
+    if tool_name in s._HIDDEN_TOOL_REPLACEMENT:
+        assert "apply_task_changes" in out, (
+            f"{tool_name}: прямой путь закрыт, отказ обязан назвать агрегатор")
+        assert wired.with_buttons() == [], f"{tool_name}: кнопка ушла на отказ"
+        assert _rows_in_tg_approvals() == []
+        # НЕ «manifest_id не в тексте»: обучающий отказ сам показывает форму
+        # второго вызова агрегатора, и это слово в нём есть законно. Плана нет
+        # — проверяем по базе, а не по буквам ответа.
+        assert _rows_in_mcp_manifests() == [], out
+        return
     assert len(wired.with_buttons()) == 1, f"{tool_name}: кнопка не ушла"
     assert _rows_in_tg_approvals() == ["PENDING"]
     assert "manifest_id" in out, out
@@ -330,35 +346,51 @@ async def test_bad_key_still_goes_through_plan_and_button_single(
 
 
 @pytest.mark.parametrize("key", _BAD_KEYS)
-async def test_bad_key_still_goes_through_plan_and_button_batch(
-        wired, complete_spy, key):
+async def test_bad_key_is_refused_on_a_closed_batch_tool(wired, complete_spy, key):
+    """`complete_tasks` — закрытый прямой путь (§1.3.4). До 2026-08-10 плохой
+    ключ уводил его в план и кнопку; теперь он получает обучающий отказ.
+
+    Что проверяется по сути — то же, что и раньше: НИ ОДИН плохой ключ не
+    исполняет операцию. Изменилось только то, чем отвечает сервер: раньше
+    планом, теперь маршрутом на агрегатор. Кнопка не уходит вовсе — просить
+    подтверждение на действие, которого не будет, значит приучать владельца
+    жать не глядя."""
     out = await s.complete_tasks("Закрываю 1", [{"title": "Отчёт", "taskId": "t9",
                                                  "projectId": "p1"}],
                                  automation_key=key)
 
     assert complete_spy == [], f"ключ {key!r} исполнил операцию без подтверждения"
-    assert len(wired.with_buttons()) == 1
-    assert _rows_in_tg_approvals() == ["PENDING"]
-    assert "manifest_id" in out, out
+    assert "apply_task_changes" in out, out
+    assert wired.with_buttons() == []
+    assert _rows_in_tg_approvals() == []
+    assert _rows_in_mcp_manifests() == [], out
 
 
 @pytest.mark.parametrize("key", _BAD_KEYS)
-async def test_bad_key_still_goes_through_plan_and_button_delete(
-        wired, deletion, key):
+async def test_bad_key_is_refused_on_a_closed_delete_tool(wired, deletion, key):
+    """То же для `delete_tasks` — и здесь «ничего не сделано» проверяется
+    живым состоянием фейкового TickTick, а не текстом ответа."""
     live, fake = deletion
 
     out = await s.delete_tasks(*_DELETE_ARGS, automation_key=key)
 
     assert fake.deleted_ids == [], f"ключ {key!r} удалил задачу без подтверждения"
     assert "t1" in live
-    assert len(wired.with_buttons()) == 1
-    assert _rows_in_tg_approvals() == ["PENDING"]
-    assert "manifest_id" in out, out
+    assert "apply_task_changes" in out, out
+    assert wired.with_buttons() == []
+    assert _rows_in_tg_approvals() == []
+    assert _rows_in_mcp_manifests() == [], out
 
 
 async def test_no_key_at_all_still_goes_through_plan_and_button(
         wired, tag_spy, complete_spy, deletion):
-    """Аргумент не передан вовсе — самый частый случай (интерактивный клиент)."""
+    """Аргумент не передан вовсе — самый частый случай (интерактивный клиент).
+
+    2026-08-10 (§1.3.4): у открытого инструмента (`create_tag`) это по-прежнему
+    план и кнопка, у двух закрытых — обучающий отказ. Ни один из трёх ничего
+    не исполняет, и это проверяется наблюдаемыми следами: шпионами
+    исполнителей, живым состоянием фейкового TickTick и строками в настоящем
+    Postgres."""
     live, fake = deletion
 
     single = await s.create_tag(name="из-чата")
@@ -373,10 +405,16 @@ async def test_no_key_at_all_still_goes_through_plan_and_button(
     delete = await s.delete_tasks(*_DELETE_ARGS)
 
     assert tag_spy == [] and complete_spy == [] and fake.deleted_ids == []
-    assert len(wired.with_buttons()) == 3, "не все три плана ушли владельцу"
-    assert _rows_in_tg_approvals() == ["PENDING"] * 3
-    for out in (single, batch, delete):
-        assert "manifest_id" in out, out
+    assert len(wired.with_buttons()) == 1, (
+        "владельцу обязан уйти ровно один план — от единственного открытого "
+        "инструмента; у двух закрытых плана нет вовсе")
+    assert _rows_in_tg_approvals() == ["PENDING"]
+    assert "manifest_id" in single, single
+    for out in (batch, delete):
+        assert "apply_task_changes" in out, out
+    assert _rows_in_mcp_manifests() == [_mid_of(single)], (
+        "в базе должен лежать ровно один план — от единственного открытого "
+        "инструмента; закрытые не строят плана вовсе")
 
 
 async def test_server_without_a_secret_does_not_open_on_an_empty_key(

@@ -209,7 +209,7 @@ async def test_create_tasks_automation_key_still_bypasses(monkeypatch):
         return "created"
 
     monkeypatch.setattr(s, "_create_tasks_impl", fake_impl)
-    result = await s.create_tasks("Test", [{"title": "X", "project_id": "p1"}],
+    result = await s.create_tasks.direct("Test", [{"title": "X", "project_id": "p1"}],
                                   automation_key=s.SECRET)
     assert result == "created"
     assert len(calls) == 1
@@ -329,7 +329,7 @@ async def test_delete_tasks_single_call_only_previews_never_deletes(monkeypatch,
     live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
     fake = _wire_delete_tasks(monkeypatch, live, tmp_path)
 
-    preview = await s.delete_tasks(
+    preview = await s.delete_tasks.direct(
         "⚠️ Удаляю «Купить молоко»",
         [{"taskId": "t1", "title": "Купить молоко", "projectId": "p1"}])
     assert fake.deleted_ids == []
@@ -342,12 +342,12 @@ async def test_delete_tasks_second_call_without_reply_is_refused(monkeypatch, tm
     live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
     fake = _wire_delete_tasks(monkeypatch, live, tmp_path)
 
-    preview = await s.delete_tasks(
+    preview = await s.delete_tasks.direct(
         "⚠️ Удаляю «Купить молоко»",
         [{"taskId": "t1", "title": "Купить молоко", "projectId": "p1"}])
     mid = _extract_manifest_id(preview)
 
-    result = await s.delete_tasks("⚠️ Удаляю «Купить молоко»", manifest_id=mid)
+    result = await s.delete_tasks.direct("⚠️ Удаляю «Купить молоко»", manifest_id=mid)
     assert fake.deleted_ids == []
     assert "t1" in live
     assert "🛑" in result
@@ -357,12 +357,12 @@ async def test_delete_tasks_with_genuine_yes_deletes(monkeypatch, tmp_path):
     live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
     fake = _wire_delete_tasks(monkeypatch, live, tmp_path)
 
-    preview = await s.delete_tasks(
+    preview = await s.delete_tasks.direct(
         "⚠️ Удаляю «Купить молоко»",
         [{"taskId": "t1", "title": "Купить молоко", "projectId": "p1"}])
     mid = _extract_manifest_id(preview)
 
-    result = await s.delete_tasks("⚠️ Удаляю «Купить молоко»", manifest_id=mid,
+    result = await s.delete_tasks.direct("⚠️ Удаляю «Купить молоко»", manifest_id=mid,
                                   user_reply="да, удаляй")
     assert fake.deleted_ids == ["t1"]
     assert "t1" not in live
@@ -373,18 +373,18 @@ async def test_delete_tasks_manifest_is_one_shot(monkeypatch, tmp_path):
     live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
     fake = _wire_delete_tasks(monkeypatch, live, tmp_path)
 
-    preview = await s.delete_tasks(
+    preview = await s.delete_tasks.direct(
         "⚠️ Удаляю «Купить молоко»",
         [{"taskId": "t1", "title": "Купить молоко", "projectId": "p1"}])
     mid = _extract_manifest_id(preview)
 
-    await s.delete_tasks("⚠️ Удаляю «Купить молоко»", manifest_id=mid,
+    await s.delete_tasks.direct("⚠️ Удаляю «Купить молоко»", manifest_id=mid,
                          user_reply="да")
     assert fake.deleted_ids == ["t1"]
 
     # Same manifest again — must be refused, not re-deleted (nothing left to
     # delete anyway, but the manifest itself must be dead).
-    second = await s.delete_tasks("⚠️ Удаляю «Купить молоко»", manifest_id=mid,
+    second = await s.delete_tasks.direct("⚠️ Удаляю «Купить молоко»", manifest_id=mid,
                                   user_reply="да")
     assert fake.deleted_ids == ["t1"]  # unchanged — no second delete attempt
     assert "🛑" in second
@@ -392,7 +392,7 @@ async def test_delete_tasks_manifest_is_one_shot(monkeypatch, tmp_path):
 
 async def test_delete_tasks_bulk_over_cap_is_unaffected_by_the_gate(monkeypatch):
     monkeypatch.setattr(s, "_ensure_ready", lambda: None)
-    result = await s.delete_tasks("⚠️ Удаляю 3", [
+    result = await s.delete_tasks.direct("⚠️ Удаляю 3", [
         {"taskId": "t1", "title": "A", "projectId": "p1"},
         {"taskId": "t2", "title": "B", "projectId": "p1"},
         {"taskId": "t3", "title": "C", "projectId": "p1"},
@@ -423,7 +423,7 @@ async def test_delete_tasks_plan_header_uses_the_caller_summary_verbatim(
     live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
     fake = _wire_delete_tasks(monkeypatch, live, tmp_path)
 
-    preview = await s.delete_tasks(
+    preview = await s.delete_tasks.direct(
         "⚠️ Удаляю задачу «Купить молоко» из «Покупки»",
         [{"taskId": "t1", "title": "Купить молоко", "projectId": "p1"}])
 
@@ -440,7 +440,7 @@ async def test_delete_tasks_plan_mentions_trash_reversibility(monkeypatch, tmp_p
     live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
     fake = _wire_delete_tasks(monkeypatch, live, tmp_path)
 
-    preview = await s.delete_tasks(
+    preview = await s.delete_tasks.direct(
         "⚠️ Удаляю задачу «Купить молоко» из «Покупки»",
         [{"taskId": "t1", "title": "Купить молоко", "projectId": "p1"}])
 
@@ -588,12 +588,12 @@ async def test_delete_reports_a_per_item_rejection_instead_of_success(
     live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
     fake = _wire_delete_tasks(monkeypatch, live, tmp_path, reject=["t1"])
 
-    preview = await s.delete_tasks(
+    preview = await s.delete_tasks.direct(
         "⚠️ Удаляю «Купить молоко»",
         [{"taskId": "t1", "title": "Купить молоко", "projectId": "p1"}])
     mid = _extract_manifest_id(preview)
 
-    result = await s.delete_tasks("⚠️ Удаляю «Купить молоко»", manifest_id=mid,
+    result = await s.delete_tasks.direct("⚠️ Удаляю «Купить молоко»", manifest_id=mid,
                                   user_reply="да, удаляй")
 
     assert fake.deleted_ids == []

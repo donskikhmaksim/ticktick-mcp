@@ -100,7 +100,7 @@ async def test_new_tag_flagged_in_preview_as_will_be_created(monkeypatch):
     live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1", "tags": []}}
     fake = _wire(monkeypatch, live, tags=[])
 
-    preview = await s.set_task_tags(
+    preview = await s.set_task_tags.direct(
         "Ставлю тег", [{"taskId": "t1", "title": "Купить молоко", "tags": ["новый"]}])
     assert fake.calls == []  # call #1 is read-only, nothing mutated
     assert "будет создан" in preview
@@ -111,10 +111,10 @@ async def test_new_tag_registered_before_task_write_and_post_verified(monkeypatc
     live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1", "tags": []}}
     fake = _wire(monkeypatch, live, tags=[])
 
-    preview = await s.set_task_tags(
+    preview = await s.set_task_tags.direct(
         "Ставлю тег", [{"taskId": "t1", "title": "Купить молоко", "tags": ["новый"]}])
     mid = _extract_manifest_id(preview)
-    result = await s.set_task_tags("Ставлю тег", manifest_id=mid, user_reply="да")
+    result = await s.set_task_tags.direct("Ставлю тег", manifest_id=mid, user_reply="да")
 
     # 1. The tag is now a REAL account tag (root-cause fix, not just a
     #    warning) — visible via get_tags(), the same thing list_tags reads.
@@ -136,11 +136,11 @@ async def test_already_existing_tag_is_not_re_registered(monkeypatch):
     live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1", "tags": []}}
     fake = _wire(monkeypatch, live, tags=[{"name": "дом", "label": "дом"}])
 
-    preview = await s.set_task_tags(
+    preview = await s.set_task_tags.direct(
         "Ставлю тег", [{"taskId": "t1", "title": "Купить молоко", "tags": ["дом"]}])
     assert "будет создан" not in preview
     mid = _extract_manifest_id(preview)
-    result = await s.set_task_tags("Ставлю тег", manifest_id=mid, user_reply="да")
+    result = await s.set_task_tags.direct("Ставлю тег", manifest_id=mid, user_reply="да")
 
     assert ("create_tag", "дом") not in fake.calls
     assert live["t1"]["tags"] == ["дом"]
@@ -158,11 +158,11 @@ async def test_failed_registration_skips_the_task_entirely(monkeypatch):
     fake = _wire(monkeypatch, live, tags=[{"name": "старый", "label": "старый"}],
                 poison_tags={"призрак"})
 
-    preview = await s.set_task_tags(
+    preview = await s.set_task_tags.direct(
         "Ставлю тег",
         [{"taskId": "t1", "title": "Купить молоко", "tags": ["призрак"]}])
     mid = _extract_manifest_id(preview)
-    result = await s.set_task_tags("Ставлю тег", manifest_id=mid, user_reply="да")
+    result = await s.set_task_tags.direct("Ставлю тег", manifest_id=mid, user_reply="да")
 
     # The poison tag never made it into the account tag list...
     assert not any(t.get("name") == "призрак" for t in fake.tags)
@@ -184,12 +184,12 @@ async def test_partial_failure_only_skips_the_affected_task(monkeypatch):
     }
     _wire(monkeypatch, live, tags=[], poison_tags={"призрак"})
 
-    preview = await s.set_task_tags("Ставлю теги", [
+    preview = await s.set_task_tags.direct("Ставлю теги", [
         {"taskId": "t1", "title": "Задача A", "tags": ["хороший"]},
         {"taskId": "t2", "title": "Задача B", "tags": ["призрак"]},
     ])
     mid = _extract_manifest_id(preview)
-    result = await s.set_task_tags("Ставлю теги", manifest_id=mid, user_reply="да")
+    result = await s.set_task_tags.direct("Ставлю теги", manifest_id=mid, user_reply="да")
 
     assert live["t1"]["tags"] == ["хороший"]  # good tag applied normally
     assert live["t2"]["tags"] == []  # untouched — bad tag never written
@@ -216,10 +216,10 @@ async def test_task_write_mismatch_after_registration_is_reported_as_failure(mon
         return {}
     fake.batch_update_tasks = _noop_update
 
-    preview = await s.set_task_tags(
+    preview = await s.set_task_tags.direct(
         "Ставлю тег", [{"taskId": "t1", "title": "Купить молоко", "tags": ["новый"]}])
     mid = _extract_manifest_id(preview)
-    result = await s.set_task_tags("Ставлю тег", manifest_id=mid, user_reply="да")
+    result = await s.set_task_tags.direct("Ставлю тег", manifest_id=mid, user_reply="да")
 
     # Registration still succeeded and is reported...
     assert any(t.get("name") == "новый" for t in fake.tags)
@@ -242,11 +242,11 @@ async def test_hash_and_case_are_normalised_by_the_server_not_by_the_double(
                    "tags": []}}
     fake = _wire(monkeypatch, live, tags=[])
 
-    preview = await s.set_task_tags(
+    preview = await s.set_task_tags.direct(
         "Ставлю тег",
         [{"taskId": "t1", "title": "Купить молоко", "tags": ["#Работа"]}])
     mid = _extract_manifest_id(preview)
-    await s.set_task_tags("Ставлю тег", manifest_id=mid, user_reply="да")
+    await s.set_task_tags.direct("Ставлю тег", manifest_id=mid, user_reply="да")
 
     registered = [c[1] for c in fake.calls if c[0] == "create_tag"]
     assert registered == ["работа"], (

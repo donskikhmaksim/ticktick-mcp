@@ -328,25 +328,25 @@ async def test_create_subtask_full_gate_cycle(monkeypatch):
     fake_v2 = FakeV2(live=live)
     _wire(monkeypatch, fake_v2=fake_v2, fake_official=official)
 
-    preview = await s.create_subtask("Купить молоко", "Купить хлеб", "p1", "proj1")
+    preview = await s.create_subtask.direct("Купить молоко", "Купить хлеб", "p1", "proj1")
     assert official.calls == []
     assert "manifest_id" in preview
     assert "«Купить хлеб»" in preview
 
     mid = _extract_manifest_id(preview)
-    refused = await s.create_subtask("Купить молоко", "Купить хлеб", "p1", "proj1",
+    refused = await s.create_subtask.direct("Купить молоко", "Купить хлеб", "p1", "proj1",
                                      manifest_id=mid, user_reply="")
     assert "🛑" in refused
     assert official.calls == []
 
-    result = await s.create_subtask("Купить молоко", "Купить хлеб", "p1", "proj1",
+    result = await s.create_subtask.direct("Купить молоко", "Купить хлеб", "p1", "proj1",
                                      manifest_id=mid, user_reply="да")
     # Проект назначения — часть ожидания: именно он решает, в каком списке
     # окажется подзадача, и без него подмена проекта была ненаблюдаемой.
     assert official.calls == [("create_subtask", "Купить хлеб", "p1", "p1")]
     _assert_confirmed_success(result)
 
-    again = await s.create_subtask("Купить молоко", "Купить хлеб", "p1", "proj1",
+    again = await s.create_subtask.direct("Купить молоко", "Купить хлеб", "p1", "proj1",
                                     manifest_id=mid, user_reply="да")
     assert "🛑" in again
     assert len(official.calls) == 1
@@ -368,10 +368,10 @@ async def test_create_subtask_reports_a_silent_refusal_instead_of_success(
     fake_v2 = FakeV2(live=live)
     _wire(monkeypatch, fake_v2=fake_v2, fake_official=official)
 
-    preview = await s.create_subtask("Купить молоко", "Купить хлеб", "p1", "proj1")
+    preview = await s.create_subtask.direct("Купить молоко", "Купить хлеб", "p1", "proj1")
     mid = _extract_manifest_id(preview)
 
-    result = await s.create_subtask("Купить молоко", "Купить хлеб", "p1", "proj1",
+    result = await s.create_subtask.direct("Купить молоко", "Купить хлеб", "p1", "proj1",
                                     manifest_id=mid, user_reply="да")
 
     assert "❌" in result, f"молчаливый отказ выдан за успех:\n{result}"
@@ -381,7 +381,7 @@ async def test_create_subtask_reports_a_silent_refusal_instead_of_success(
 async def test_create_subtask_invalid_priority_refused_before_gate(monkeypatch):
     official = FakeOfficial()
     _wire(monkeypatch, fake_v2=FakeV2(), fake_official=official)
-    result = await s.create_subtask("Купить молоко", "Купить хлеб", "p1", "proj1",
+    result = await s.create_subtask.direct("Купить молоко", "Купить хлеб", "p1", "proj1",
                                     priority=99)
     assert "🛑" in result or "Invalid priority" in result
     assert official.calls == []
@@ -413,7 +413,7 @@ async def test_create_subtask_plan_identity_guard_blocks_wrong_parent_title(
             "mismatch", project_id="p1", title="Купить хлеб",
             message='id указывает на «Купить хлеб», а НЕ «Купить молоко»'))
 
-    result = await s.create_subtask("Купить молоко", "Новый шаг", "t1", "p1")
+    result = await s.create_subtask.direct("Купить молоко", "Новый шаг", "t1", "p1")
 
     assert result.startswith("🛑 План НЕ построен")
     assert "«Купить хлеб»" in result
@@ -434,7 +434,7 @@ async def test_create_subtask_plan_identity_guard_blocks_missing_parent(
         lambda *a, **k: s._Guard("missing", project_id="p1",
                                  message="id … не среди открытых задач"))
 
-    result = await s.create_subtask("Купить молоко", "Новый шаг", "t-нет-такой", "p1")
+    result = await s.create_subtask.direct("Купить молоко", "Новый шаг", "t-нет-такой", "p1")
 
     assert result.startswith("🛑 План НЕ построен")
     assert "manifest_id" not in result
@@ -458,12 +458,12 @@ async def test_create_subtask_plan_read_failure_does_not_block_but_warns(
         s._Guard("ok", project_id="p1", title="Купить молоко"),   # call #2 (_impl)
     ))
 
-    preview = await s.create_subtask("Купить молоко", "Новый шаг", "t1", "p1")
+    preview = await s.create_subtask.direct("Купить молоко", "Новый шаг", "t1", "p1")
     assert "🛑" not in preview, "временный сбой чтения не должен блокировать план"
     assert "НЕ удалось сверить" in preview
     mid = _extract_manifest_id(preview)
 
-    result = await s.create_subtask("Купить молоко", "Новый шаг", "t1", "p1",
+    result = await s.create_subtask.direct("Купить молоко", "Новый шаг", "t1", "p1",
                                     manifest_id=mid, user_reply="да")
     assert official.calls == [("create_subtask", "Новый шаг", "t1", "p1")]
     _assert_confirmed_success(result)
@@ -487,11 +487,11 @@ async def test_create_subtask_plan_read_failure_still_lets_execution_catch_a_rea
                 message='id указывает на «Купить хлеб», а НЕ «Купить молоко»'),
     ))
 
-    preview = await s.create_subtask("Купить молоко", "Новый шаг", "t1", "p1")
+    preview = await s.create_subtask.direct("Купить молоко", "Новый шаг", "t1", "p1")
     assert "🛑" not in preview
     mid = _extract_manifest_id(preview)
 
-    result = await s.create_subtask("Купить молоко", "Новый шаг", "t1", "p1",
+    result = await s.create_subtask.direct("Купить молоко", "Новый шаг", "t1", "p1",
                                     manifest_id=mid, user_reply="да")
     assert result.startswith("🛑")
     assert "«Купить хлеб»" in result
@@ -519,7 +519,7 @@ async def test_create_subtask_automation_key_mismatch_is_refused_before_plan(
     monkeypatch.setattr(s, "_guard_task", _stub)
     monkeypatch.setattr(s, "SECRET", "test-secret")
 
-    result = await s.create_subtask("Купить молоко", "Новый шаг", "t1", "p1",
+    result = await s.create_subtask.direct("Купить молоко", "Новый шаг", "t1", "p1",
                                     automation_key="test-secret")
 
     assert result.startswith("🛑 План НЕ построен")
@@ -539,16 +539,16 @@ async def test_unset_task_parent_full_gate_cycle(monkeypatch):
     monkeypatch.setattr(s, "_guard_task",
                         lambda *a, **k: s._Guard("ok", project_id="p1", title="Шаг 1"))
 
-    preview = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1")
+    preview = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1")
     assert fake_v2.calls == []
 
     mid = _extract_manifest_id(preview)
-    refused = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1",
+    refused = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1",
                                         manifest_id=mid, user_reply="нет")
     assert "🛑" in refused
     assert live["c"]["parentId"] == "p"
 
-    dead = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1",
+    dead = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1",
                                      manifest_id=mid, user_reply="да")
     assert "🛑" in dead  # manifest was invalidated by the explicit "no" above
     assert live["c"]["parentId"] == "p"
@@ -561,9 +561,9 @@ async def test_unset_task_parent_confirmed_detaches(monkeypatch):
     monkeypatch.setattr(s, "_guard_task",
                         lambda *a, **k: s._Guard("ok", project_id="p1", title="Шаг 1"))
 
-    preview = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1")
+    preview = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1")
     mid = _extract_manifest_id(preview)
-    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1",
+    result = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1",
                                        manifest_id=mid, user_reply="да")
     assert ("unset_parent", "c") in fake_v2.calls
     _assert_confirmed_success(result)
@@ -673,7 +673,7 @@ async def test_unset_task_parent_plan_identity_guard_blocks_wrong_title(
         # first, and staging nothing for it makes that an assertion, not luck
     ))
 
-    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1")
+    result = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1")
 
     assert result.startswith("🛑 План НЕ построен")
     assert "«Шаг 2»" in result
@@ -696,7 +696,7 @@ async def test_unset_task_parent_plan_identity_guard_blocks_missing_task(
                             message="id … не среди открытых задач"),
     ))
 
-    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c-нет-такой", "p", "p1")
+    result = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c-нет-такой", "p", "p1")
 
     assert result.startswith("🛑 План НЕ построен")
     assert "manifest_id" not in result
@@ -725,12 +725,12 @@ async def test_unset_task_parent_plan_child_read_failure_does_not_block_but_warn
         impl_parent=_g_ok("Большой проект"),
     ))
 
-    preview = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1")
+    preview = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1")
     assert "🛑" not in preview, "временный сбой чтения не должен блокировать план"
     assert "Название задачи НЕ удалось сверить" in preview
     mid = _extract_manifest_id(preview)
 
-    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1",
+    result = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1",
                                        manifest_id=mid, user_reply="да")
     assert ("unset_parent", "c") in fake_v2.calls
     _assert_confirmed_success(result)
@@ -754,11 +754,11 @@ async def test_unset_task_parent_plan_read_failure_still_lets_execution_catch_a_
                             message='id указывает на «Шаг 2», а НЕ «Шаг 1»'),
     ))
 
-    preview = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1")
+    preview = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1")
     assert "🛑" not in preview
     mid = _extract_manifest_id(preview)
 
-    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1",
+    result = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1",
                                        manifest_id=mid, user_reply="да")
     assert result.startswith("🛑")
     assert "«Шаг 2»" in result
@@ -784,7 +784,7 @@ async def test_unset_task_parent_automation_key_mismatch_is_refused_before_plan(
     ))
     monkeypatch.setattr(s, "SECRET", "test-secret")
 
-    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1",
+    result = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1",
                                        automation_key="test-secret")
 
     assert result.startswith("🛑 План НЕ построен")
@@ -816,7 +816,7 @@ async def test_unset_task_parent_plan_identity_guard_blocks_wrong_parent_title(
             message='id указывает на «Большой проект», а НЕ «Другой родитель»'),
     ))
 
-    result = await s.unset_task_parent("Шаг 1", "Другой родитель", "c", "p", "p1")
+    result = await s.unset_task_parent.direct("Шаг 1", "Другой родитель", "c", "p", "p1")
 
     assert result.startswith("🛑 План НЕ построен")
     assert "родитель по id" in result
@@ -844,12 +844,12 @@ async def test_unset_task_parent_plan_missing_parent_does_not_block_but_warns(
         impl_parent=s._Guard("missing", project_id="p1"),
     ))
 
-    preview = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1")
+    preview = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1")
     assert "🛑" not in preview, "родитель, не найденный среди открытых, не должен блокировать план"
     assert "возможно завершён/удалён" in preview
     mid = _extract_manifest_id(preview)
 
-    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1",
+    result = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1",
                                        manifest_id=mid, user_reply="да")
     assert ("unset_parent", "c") in fake_v2.calls
     _assert_confirmed_success(result)
@@ -872,12 +872,12 @@ async def test_unset_task_parent_plan_parent_read_failure_does_not_block_but_war
         impl_parent=_g_ok("Большой проект"),
     ))
 
-    preview = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1")
+    preview = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1")
     assert "🛑" not in preview, "временный сбой чтения не должен блокировать план"
     assert "Имя родителя НЕ удалось сверить" in preview
     mid = _extract_manifest_id(preview)
 
-    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1",
+    result = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1",
                                        manifest_id=mid, user_reply="да")
     assert ("unset_parent", "c") in fake_v2.calls
     _assert_confirmed_success(result)
@@ -905,11 +905,11 @@ async def test_unset_task_parent_plan_read_failure_still_lets_execution_catch_a_
             message='id указывает на «Другой родитель», а НЕ «Большой проект»'),
     ))
 
-    preview = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1")
+    preview = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1")
     assert "🛑" not in preview
     mid = _extract_manifest_id(preview)
 
-    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1",
+    result = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1",
                                        manifest_id=mid, user_reply="да")
     assert result.startswith("🛑")
     assert "родитель по id" in result
@@ -938,7 +938,7 @@ async def test_unset_task_parent_automation_key_parent_mismatch_is_refused_befor
     ))
     monkeypatch.setattr(s, "SECRET", "test-secret")
 
-    result = await s.unset_task_parent("Шаг 1", "Другой родитель", "c", "p", "p1",
+    result = await s.unset_task_parent.direct("Шаг 1", "Другой родитель", "c", "p", "p1",
                                        automation_key="test-secret")
 
     assert result.startswith("🛑 План НЕ построен")
@@ -974,7 +974,7 @@ async def test_unset_task_parent_plan_warns_about_BOTH_child_and_parent(
         impl_parent=_g_ok("Большой проект"),
     ))
 
-    preview = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1")
+    preview = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1")
 
     assert "🛑" not in preview, "два мягких предупреждения не должны блокировать план"
     assert "Название задачи НЕ удалось сверить" in preview, (
@@ -989,7 +989,7 @@ async def test_unset_task_parent_plan_warns_about_BOTH_child_and_parent(
 
     # the plan still works end-to-end after warning about both
     mid = _extract_manifest_id(preview)
-    result = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1",
+    result = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1",
                                        manifest_id=mid, user_reply="да")
     assert ("unset_parent", "c") in fake_v2.calls
     _assert_confirmed_success(result)
@@ -1010,7 +1010,7 @@ async def test_unset_task_parent_plan_warns_about_both_when_parent_is_merely_mis
         impl_parent=s._Guard("missing", project_id="p1"),
     ))
 
-    preview = await s.unset_task_parent("Шаг 1", "Большой проект", "c", "p", "p1")
+    preview = await s.unset_task_parent.direct("Шаг 1", "Большой проект", "c", "p", "p1")
 
     assert "🛑" not in preview
     assert "Название задачи НЕ удалось сверить" in preview
@@ -1890,11 +1890,11 @@ async def test_duplicate_task_full_gate_cycle(monkeypatch):
     fake_v2 = FakeV2(live={"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}})
     _wire(monkeypatch, fake_v2=fake_v2)
 
-    preview = await s.duplicate_task("Дублирую задачу", "t1", "Купить молоко")
+    preview = await s.duplicate_task.direct("Дублирую задачу", "t1", "Купить молоко")
     assert fake_v2.calls == []
     mid = _extract_manifest_id(preview)
 
-    result = await s.duplicate_task("Дублирую задачу", "t1", "Купить молоко",
+    result = await s.duplicate_task.direct("Дублирую задачу", "t1", "Купить молоко",
                                     manifest_id=mid, user_reply="да")
     assert ("duplicate", "t1") in fake_v2.calls
     assert "t1-copy" in fake_v2.live
@@ -1924,7 +1924,7 @@ async def test_duplicate_task_plan_identity_guard_blocks_wrong_title(
             "mismatch", project_id="p1", title="Купить хлеб",
             message='id указывает на «Купить хлеб», а НЕ «Купить молоко»'))
 
-    result = await s.duplicate_task("Дублирую задачу", "t1", "Купить молоко")
+    result = await s.duplicate_task.direct("Дублирую задачу", "t1", "Купить молоко")
 
     assert result.startswith("🛑 План НЕ построен")
     assert "«Купить хлеб»" in result
@@ -1944,7 +1944,7 @@ async def test_duplicate_task_plan_identity_guard_blocks_missing_task(
         lambda *a, **k: s._Guard("missing", project_id="",
                                  message="id … не среди открытых задач"))
 
-    result = await s.duplicate_task("Дублирую задачу", "t-нет-такой", "Купить молоко")
+    result = await s.duplicate_task.direct("Дублирую задачу", "t-нет-такой", "Купить молоко")
 
     assert result.startswith("🛑 План НЕ построен")
     assert "manifest_id" not in result
@@ -1964,7 +1964,7 @@ async def test_duplicate_task_plan_identity_guard_blocks_missing_task_without_ti
         lambda *a, **k: s._Guard("missing", project_id="",
                                  message="id … не среди открытых задач"))
 
-    result = await s.duplicate_task("Дублирую задачу", "t-нет-такой")
+    result = await s.duplicate_task.direct("Дублирую задачу", "t-нет-такой")
 
     assert result.startswith("🛑 План НЕ построен")
     assert "manifest_id" not in result
@@ -1985,12 +1985,12 @@ async def test_duplicate_task_plan_read_failure_does_not_block_but_warns(
         s._Guard("ok", project_id="p1", title="Купить молоко"),   # call #2 (_impl)
     ))
 
-    preview = await s.duplicate_task("Дублирую задачу", "t1", "Купить молоко")
+    preview = await s.duplicate_task.direct("Дублирую задачу", "t1", "Купить молоко")
     assert "🛑" not in preview, "временный сбой чтения не должен блокировать план"
     assert "НЕ удалось сверить" in preview
     mid = _extract_manifest_id(preview)
 
-    result = await s.duplicate_task("Дублирую задачу", "t1", "Купить молоко",
+    result = await s.duplicate_task.direct("Дублирую задачу", "t1", "Купить молоко",
                                     manifest_id=mid, user_reply="да")
     assert ("duplicate", "t1") in fake_v2.calls
     _assert_confirmed_success(result)
@@ -2012,11 +2012,11 @@ async def test_duplicate_task_plan_read_failure_still_lets_execution_catch_a_rea
                 message='id указывает на «Купить хлеб», а НЕ «Купить молоко»'),
     ))
 
-    preview = await s.duplicate_task("Дублирую задачу", "t1", "Купить молоко")
+    preview = await s.duplicate_task.direct("Дублирую задачу", "t1", "Купить молоко")
     assert "🛑" not in preview
     mid = _extract_manifest_id(preview)
 
-    result = await s.duplicate_task("Дублирую задачу", "t1", "Купить молоко",
+    result = await s.duplicate_task.direct("Дублирую задачу", "t1", "Купить молоко",
                                     manifest_id=mid, user_reply="да")
     assert result.startswith("🛑")
     assert "«Купить хлеб»" in result
@@ -2041,7 +2041,7 @@ async def test_duplicate_task_automation_key_mismatch_is_refused_before_plan(
     monkeypatch.setattr(s, "_guard_task", _stub)
     monkeypatch.setattr(s, "SECRET", "test-secret")
 
-    result = await s.duplicate_task("Дублирую задачу", "t1", "Купить молоко",
+    result = await s.duplicate_task.direct("Дублирую задачу", "t1", "Купить молоко",
                                     automation_key="test-secret")
 
     assert result.startswith("🛑 План НЕ построен")

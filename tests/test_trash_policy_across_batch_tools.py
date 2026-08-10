@@ -126,7 +126,7 @@ async def test_a_lone_trashed_row_gets_no_plan(tool, monkeypatch):
     строку, поэтому плана быть не должно."""
     _wire(monkeypatch)
 
-    answer = await rs.call(tool, **BATCH_TOOLS[tool]([TRASHED_ROW]))
+    answer = await rs.call_direct(tool, **BATCH_TOOLS[tool]([TRASHED_ROW]))
 
     assert "🛑" in answer, f"{tool} строит план на УДАЛЁННУЮ задачу:\n{answer}"
     assert "manifest_id" not in answer, answer
@@ -138,7 +138,7 @@ async def test_the_refusal_names_the_trash_and_the_way_back(tool, monkeypatch):
     выполнено» читается как сбой сервера, а не как состояние объекта."""
     _wire(monkeypatch)
 
-    answer = await rs.call(tool, **BATCH_TOOLS[tool]([TRASHED_ROW]))
+    answer = await rs.call_direct(tool, **BATCH_TOOLS[tool]([TRASHED_ROW]))
 
     assert "корзин" in answer.lower(), (
         f"{tool} отказывает, но не произносит слово «корзина»:\n{answer}")
@@ -154,7 +154,7 @@ async def test_the_refusal_names_the_trash_and_the_way_back(tool, monkeypatch):
 async def test_mixed_batch_marks_only_the_trashed_row(tool, monkeypatch):
     _wire(monkeypatch)
 
-    preview = await rs.call(tool, **BATCH_TOOLS[tool](MIXED))
+    preview = await rs.call_direct(tool, **BATCH_TOOLS[tool](MIXED))
 
     rows = _rows(preview)
     assert len(rows) == len(MIXED), f"{tool}: план не перечислил всё:\n{preview}"
@@ -176,7 +176,7 @@ async def test_mixed_batch_is_still_confirmable(tool, monkeypatch):
     остаться подтверждаемым, иначе одна удалённая задача блокирует работу."""
     _wire(monkeypatch)
 
-    preview = await rs.call(tool, **BATCH_TOOLS[tool](MIXED))
+    preview = await rs.call_direct(tool, **BATCH_TOOLS[tool](MIXED))
 
     assert re.search(r"Манифест `([0-9a-f]+)`", preview), (
         f"{tool}: план не построен:\n{preview}")
@@ -190,7 +190,7 @@ async def test_a_healthy_batch_is_untouched(tool, monkeypatch):
     подряд — то же самое, что не помечать ничего."""
     _wire(monkeypatch)
 
-    preview = await rs.call(tool, **BATCH_TOOLS[tool](LIVE_ROWS))
+    preview = await rs.call_direct(tool, **BATCH_TOOLS[tool](LIVE_ROWS))
 
     assert "⛔" not in preview, f"{tool}: помечены живые строки:\n{preview}"
     assert re.search(r"Манифест `([0-9a-f]+)`", preview), preview

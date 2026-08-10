@@ -126,7 +126,7 @@ async def test_the_public_tool_refuses_it_at_the_plan_phase(monkeypatch,
     monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
     v2, official = _wire(monkeypatch, live)
 
-    out = await s.update_tasks("переименую", [
+    out = await s.update_tasks.direct("переименую", [
         {"taskId": "t_lease", "projectId": "pA", "new_title": "ЗАТЁРТО"}])
 
     assert "🛑" in out and "new_title" in out, out
