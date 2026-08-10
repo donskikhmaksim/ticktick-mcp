@@ -93,8 +93,18 @@ def test_gated_tools_declare_manifest_id_and_user_reply_in_schema():
     передать), должна содержать manifest_id и user_reply как свойства. Это
     ровно та проверка, что напрямую поймала бы баг из QA-отчёта — сигнатура
     может выглядеть правильно, а какая-то другая обёртка всё равно прячет
-    параметр из схемы."""
-    tools = asyncio.run(server.mcp.list_tools())
+    параметр из схемы.
+
+    2026-08-10 (§1.3.4): часть гейтованных тулов намеренно исключена из
+    ответа на `tools/list` — их зовёт автоматика по имени, и опубликованная
+    схема нужна ей ровно так же. Поэтому листинг берётся со СНЯТЫМ сокрытием
+    (той же переменной окружения, что и штатный откат), а не подменяется
+    собственным обходом реестра: схему строит FastMCP, и смотреть надо на неё."""
+    os.environ[server._HIDDEN_TOOLS_ENV] = ""
+    try:
+        tools = asyncio.run(server.mcp.list_tools())
+    finally:
+        os.environ.pop(server._HIDDEN_TOOLS_ENV, None)
     by_name = {t.name: t for t in tools}
     problems = []
     for name in _gated_tool_names():

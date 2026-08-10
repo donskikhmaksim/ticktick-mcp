@@ -100,7 +100,7 @@ async def test_plan_marks_the_blind_rename_row_and_leaves_the_legal_one_alone(
     monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
     _v2, _official = _wire(monkeypatch, live)
 
-    preview = await s.update_tasks("правлю двух", [
+    preview = await s.update_tasks.direct("правлю двух", [
         {"taskId": "t_lease", "projectId": "pA", "title": _LEASE,
          "new_title": "Договор аренды — подписан"},
         {"taskId": "t_milk", "projectId": "pA", "new_title": "Затёрто"}])
@@ -118,7 +118,7 @@ async def test_no_plan_is_built_when_every_row_is_a_blind_rename(monkeypatch):
             for i in range(60)}
     _v2, official = _wire(monkeypatch, live)
 
-    out = await s.update_tasks("массовое переименование", [
+    out = await s.update_tasks.direct("массовое переименование", [
         {"taskId": f"t{i}", "projectId": "pA", "new_title": f"Затёрто {i}"}
         for i in range(60)])
 
@@ -139,7 +139,7 @@ async def test_plan_does_not_mark_a_rename_that_carries_the_current_title(
     monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
     _wire(monkeypatch, live)
 
-    preview = await s.update_tasks("переименую", [
+    preview = await s.update_tasks.direct("переименую", [
         {"taskId": "t_lease", "projectId": "pA", "title": _LEASE,
          "new_title": "Договор аренды — подписан"}])
 
@@ -155,7 +155,7 @@ async def test_plan_does_not_mark_an_update_that_does_not_touch_the_title(
     monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
     _wire(monkeypatch, live)
 
-    preview = await s.update_tasks("подвину сроки", [
+    preview = await s.update_tasks.direct("подвину сроки", [
         {"taskId": "t_lease", "projectId": "pA", "due_date": _a_date(3)},
         {"taskId": "t_milk", "projectId": "pA", "priority": 5}])
 
@@ -172,7 +172,7 @@ async def test_the_mark_belongs_to_the_row_not_to_the_id(monkeypatch, tmp_path):
     monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
     _wire(monkeypatch, live)
 
-    preview = await s.update_tasks("две строки об одной задаче", [
+    preview = await s.update_tasks.direct("две строки об одной задаче", [
         {"taskId": "t_milk", "projectId": "pA", "due_date": _a_date(2)},
         {"taskId": "t_milk", "projectId": "pA", "new_title": "Затёрто"}])
 
@@ -188,7 +188,7 @@ async def test_the_plan_reason_is_the_same_text_the_executor_will_print(
     monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
     _wire(monkeypatch, live)
 
-    preview = await s.update_tasks("правлю двух", [
+    preview = await s.update_tasks.direct("правлю двух", [
         {"taskId": "t_lease", "projectId": "pA", "title": _LEASE,
          "new_title": "Договор аренды — подписан"},
         {"taskId": "t_milk", "projectId": "pA", "new_title": "Затёрто"}])
@@ -209,11 +209,11 @@ async def test_the_approved_plan_is_still_refused_by_the_core(monkeypatch,
     monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
     v2, official = _wire(monkeypatch, live)
 
-    preview = await s.update_tasks("правлю двух", [
+    preview = await s.update_tasks.direct("правлю двух", [
         {"taskId": "t_lease", "projectId": "pA", "title": _LEASE,
          "new_title": "Договор аренды — подписан"},
         {"taskId": "t_milk", "projectId": "pA", "new_title": "Затёрто"}])
-    out = await s.update_tasks("правлю двух", manifest_id=_manifest_id(preview),
+    out = await s.update_tasks.direct("правлю двух", manifest_id=_manifest_id(preview),
                                user_reply="да")
 
     assert "🛑" in out, out
@@ -237,7 +237,7 @@ async def test_automation_key_path_refuses_the_blind_rename(monkeypatch,
     monkeypatch.setattr(s, "SECRET", "s3cret-key-for-the-robot")
     _v2, official = _wire(monkeypatch, live)
 
-    out = await s.update_tasks(
+    out = await s.update_tasks.direct(
         "робот переименовывает",
         [{"taskId": "t_lease", "projectId": "pA", "new_title": "ЗАТЁРТО"}],
         automation_key="s3cret-key-for-the-robot")
@@ -272,7 +272,7 @@ async def test_automation_key_path_is_refused_by_the_core_after_the_plan_check(
 
     monkeypatch.setattr(s, "_plan_live_check", _named_right_after_the_plan)
 
-    out = await s.update_tasks(
+    out = await s.update_tasks.direct(
         "робот называет пустышку",
         [{"taskId": "t_receipt", "projectId": "pA", "untitled": True,
           "new_title": "Робот назвал"}],
@@ -292,7 +292,7 @@ async def test_automation_key_path_still_renames_with_the_current_title(
     monkeypatch.setattr(s, "SECRET", "s3cret-key-for-the-robot")
     _v2, official = _wire(monkeypatch, live)
 
-    out = await s.update_tasks(
+    out = await s.update_tasks.direct(
         "робот переименовывает",
         [{"taskId": "t_lease", "projectId": "pA", "title": _LEASE,
           "new_title": "Договор аренды — подписан"}],

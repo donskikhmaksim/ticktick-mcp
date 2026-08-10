@@ -208,7 +208,11 @@ _AUTO_EXECUTE_TOOL_FOR_KIND = {"delete": "delete_tasks", "declutter": "execute_d
 async def _generic_gate_auto_execute(manifest_id: str, m: Dict) -> str:
     """Replays a _gate_batch/_gate_single plan through the tool's own
     `_<tool>_impl`, exactly as the gated tool would have after a chat «да»."""
-    tool = m.get("tool") or m.get("_tg_tool") or ""
+    # 2026-08-10 (§1.3.4, место 3 из пяти): разрешение псевдонима стоит ДО
+    # поиска `_<tool>_impl` — иначе манифест, построенный под старым именем
+    # `manual_triage` и переживший выкат в Postgres, ищет несуществующий
+    # `_manual_triage_impl` и падает уже ПОСЛЕ нажатия кнопки владельцем.
+    tool = consent.resolve_tool_alias(m.get("tool") or m.get("_tg_tool") or "")
     impl = getattr(_server_module, f"_{tool}_impl", None)
     if not callable(impl):
         raise RuntimeError(f"нет исполнителя _{tool}_impl для манифеста {manifest_id}")
@@ -271,8 +275,20 @@ def _tool_registration_status(tool: str) -> str:
                      это баг, а не ожидаемое состояние."""
     if not tool:
         return "disabled"
+    # 2026-08-10 (§1.3.4, место 4 из пяти). Псевдоним — ЗАПАСНОЙ путь, а не
+    # подмена: сначала спрашиваем реестр про имя как есть (пока обёртка
+    # `manual_triage` зарегистрирована, ответ приходит отсюда), и только если
+    # такого имени в реестре нет — про каноническое. Порядок именно этот,
+    # чтобы снятие ОДНОГО декоратора по-прежнему честно читалось как
+    # «инструмент отключён», а не маскировалось живым псевдонимом; и чтобы
+    # после будущего удаления обёртки старый манифест не начал получать
+    # «инструмент отсутствует» на кнопке, которую владелец только что видел.
+    names = [tool]
+    canonical = consent.resolve_tool_alias(tool)
+    if canonical != tool:
+        names.append(canonical)
     try:
-        found = mcp._tool_manager.get_tool(tool) is not None
+        found = any(mcp._tool_manager.get_tool(n) is not None for n in names)
     except Exception:
         logger.exception(
             f"_tool_registration_status: проверка регистрации «{tool}» в "
@@ -341,9 +357,15 @@ def _resolve_auto_executor(tool: str, m: Dict) -> Optional[_AutoExecutorEntry]:
     объясняет причину владельцу, а не просто исчезает молча."""
     if not tool:
         return None
-    entry = _AUTO_EXECUTORS.get(tool)
+    # 2026-08-10 (§1.3.4, место 2 из пяти): ключ `_AUTO_EXECUTORS` — имя
+    # инструмента, поэтому старое имя обязано найти запись, заведённую под
+    # новым. Тот же резолв прикрывает и generic-путь (`_<tool>_impl`).
+    # В текстах отказа ниже печатается имя КАК ПОЗВАЛИ (`tool`), а не
+    # каноническое: владелец должен увидеть то имя, что стоит в его манифесте.
+    canonical = consent.resolve_tool_alias(tool)
+    entry = _AUTO_EXECUTORS.get(canonical)
     if entry is None and m.get("_gate") in ("batch", "single") and callable(
-            getattr(_server_module, f"_{tool}_impl", None)):
+            getattr(_server_module, f"_{canonical}_impl", None)):
         entry = _GENERIC_GATE_ENTRY
     if entry is None:
         return None
@@ -357,9 +379,19 @@ def _resolve_auto_executor(tool: str, m: Dict) -> Optional[_AutoExecutorEntry]:
 def _auto_execute_tool_of(m: Dict) -> str:
     """Tool name a live manifest belongs to: the TG notification's own tag
     first (set by _maybe_tg_notify_plan, the one place a button ever appears),
-    then the gate's stored `tool`, then the legacy kind→tool map."""
-    return (m.get("_tg_tool") or m.get("tool")
-            or _AUTO_EXECUTE_TOOL_FOR_KIND.get(m.get("kind") or "") or "")
+    then the gate's stored `tool`, then the legacy kind→tool map.
+
+    2026-08-10 (§1.3.4, место 2 из пяти — вторая его половина): результат
+    канонизируется. Именно это значение сверяется с `TG_APPROVAL_TOOLS`
+    (`_auto_executable_tool` → `tg_approval`) и печатается владельцу в
+    короткой сводке — старый манифест обязан пройти allowlist, где стоит уже
+    новое имя, и назваться владельцу тем именем, которое живо сегодня.
+    `_AUTO_EXECUTE_TOOL_FOR_KIND` — запасная ветка того же соответствия
+    «манифест → имя инструмента», поэтому резолв стоит ПОСЛЕ неё, один на
+    все три источника, а не по копии на каждый."""
+    return consent.resolve_tool_alias(
+        m.get("_tg_tool") or m.get("tool")
+        or _AUTO_EXECUTE_TOOL_FOR_KIND.get(m.get("kind") or "") or "")
 
 
 def _tg_auto_execute_pending() -> List[tuple]:

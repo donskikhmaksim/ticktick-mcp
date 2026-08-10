@@ -79,13 +79,16 @@ async def test_delete_task_with_subtasks_refuses_even_with_no_arguments_at_all()
 # ─────────── страж: «unused» и «required» несовместимы ───────────
 
 def _tool_docstrings() -> dict:
-    """{имя тула: докстринг} по всем зарегистрированным @mcp.tool()."""
-    tools = asyncio.run(s.mcp.list_tools())
+    """{имя тула: докстринг} по всем зарегистрированным @mcp.tool().
+
+    Источник — реестр, а не листинг: с §1.3.4 часть инструментов из
+    `list_tools()` исключена, но их описание читает автоматика, и правило
+    «не требуй того, что сам зовёшь мёртвым» на них распространяется."""
     out = {}
-    for t in tools:
-        fn = getattr(s, t.name, None)
+    for name in s.mcp._tool_manager._tools:
+        fn = getattr(s, name, None)
         if fn is not None:
-            out[t.name] = inspect.getdoc(fn) or ""
+            out[name] = inspect.getdoc(fn) or ""
     return out
 
 
@@ -123,7 +126,7 @@ def test_no_tool_requires_an_argument_it_calls_unused():
     assert not problems, "\n" + "\n".join(problems)
 
 
-def test_always_refusing_tools_require_nothing():
+def test_always_refusing_tools_require_nothing(monkeypatch):
     """Тул, чьё тело для обычного (неавтоматического) вызывающего сводится к
     одному `return "🛑 …"`, не имеет права требовать хоть один аргумент: весь
     его ответ от аргументов не зависит.
@@ -141,7 +144,23 @@ def test_always_refusing_tools_require_nothing():
         # тело-заглушка: единственный строковый return, и он — отказ
         if len(consts) == 1 and consts[0].startswith("🛑") and len(returns) <= 2:
             always_refusing.append(node.name)
+            continue
+        # …либо единственный return — вызов общей фабрики отказа
+        # (`_direct_path_refusal`, 2026-08-10 §1.3.4). Раньше текст отказа
+        # стоял константой прямо в теле; после свёртки в один помощник скан по
+        # строковым литералам перестал бы видеть такие тулы вовсе — и тест
+        # проходил бы впустую (это ловит проверка `checked` в конце).
+        if len(returns) == 1 and isinstance(returns[0].value, ast.Call):
+            if getattr(returns[0].value.func, "id", None) == "_direct_path_refusal":
+                always_refusing.append(node.name)
 
+    # Листинг со СНЯТЫМ сокрытием: с §1.3.4 закрытые инструменты из
+    # `list_tools()` намеренно исключены, а правило «всегда отказывающий не
+    # требует аргументов» касается их в первую очередь — автоматика зовёт их
+    # по имени и получает от сервера ту же опубликованную схему. Снятие через
+    # ту же переменную окружения, что и штатный откат, — второго механизма
+    # «показать всё» здесь заводить нельзя.
+    monkeypatch.setenv(s._HIDDEN_TOOLS_ENV, "")
     tools = {t.name: t for t in asyncio.run(s.mcp.list_tools())}
     checked, problems = [], []
     for name in always_refusing:

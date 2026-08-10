@@ -27,7 +27,7 @@ import re
 import pytest
 
 import ticktick_mcp.src.server as s
-from tests.read_stand import P_HOME, TASK_TAGGED, call, wire
+from tests.read_stand import P_HOME, TASK_TAGGED, call, call_direct, wire
 
 
 @pytest.fixture(autouse=True)
@@ -56,9 +56,9 @@ def _mid(preview: str) -> str:
 
 async def _approve(tool: str, **args) -> str:
     """План → «да» → исполнение, тем же тулом, как того требует гейт."""
-    preview = await call(tool, **args)
-    return await call(tool, **{**args, "manifest_id": _mid(preview),
-                               "user_reply": "да, давай"})
+    preview = await call_direct(tool, **args)
+    return await call_direct(tool, **{**args, "manifest_id": _mid(preview),
+                                      "user_reply": "да, давай"})
 
 
 # ─────────── эталон: create_tag ───────────

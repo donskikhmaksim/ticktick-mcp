@@ -48,7 +48,7 @@ import pytest
 import ticktick_mcp.src.server as s
 from tests.read_stand import (
     P_HOME, P_WORK, TASK_HIGH, TASK_MID, TASK_ROOT, TASK_TAGGED, TASK_TRASHED,
-    call, wire)
+    call_direct, wire)
 
 # Названия — из снимка стенда; они должны совпадать с живыми, иначе строка
 # уедет в mismatch по другой причине, и тест перестанет проверять корзину.
@@ -121,7 +121,7 @@ def _marked(text: str) -> bool:
 
 
 async def test_plan_marks_the_row_whose_task_is_in_the_trash():
-    preview = await call("update_tasks", summary="Понижаю приоритет у пяти задач",
+    preview = await call_direct("update_tasks", summary="Понижаю приоритет у пяти задач",
                          tasks=BATCH)
 
     rows = _plan_rows(preview)
@@ -136,7 +136,7 @@ async def test_plan_marks_the_row_whose_task_is_in_the_trash():
 async def test_live_rows_are_not_marked():
     """Пометка обязана быть ИЗБИРАТЕЛЬНОЙ: пометить всё подряд — то же самое,
     что не помечать ничего."""
-    preview = await call("update_tasks", summary="Понижаю приоритет у пяти задач",
+    preview = await call_direct("update_tasks", summary="Понижаю приоритет у пяти задач",
                          tasks=BATCH)
 
     rows = _plan_rows(preview)
@@ -150,7 +150,7 @@ async def test_the_plan_is_still_built_and_still_confirmable():
     """Пометка — не отказ: остальные четыре строки исполнимы, и план обязан
     остаться подтверждаемым (иначе одна мёртвая ссылка блокировала бы
     работу)."""
-    preview = await call("update_tasks", summary="Понижаю приоритет у пяти задач",
+    preview = await call_direct("update_tasks", summary="Понижаю приоритет у пяти задач",
                          tasks=BATCH)
 
     m = re.search(r"Манифест `([0-9a-f]+)`", preview)
@@ -165,7 +165,7 @@ async def test_mismatched_title_is_marked_too():
     Обречённая строка стоит ПЕРВОЙ по той же причине, что DEAD в BATCH:
     последним пунктом она собрала бы на себя сводку из-под списка и перестала
     бы что-либо проверять (см. шапку файла)."""
-    preview = await call(
+    preview = await call_direct(
         "update_tasks", summary="Меняю приоритет",
         tasks=[{"taskId": TASK_MID, "projectId": P_HOME,
                 "title": "Название, которого у этой задачи нет", "priority": 5},
@@ -187,7 +187,7 @@ async def test_plan_survives_when_live_state_is_unavailable(monkeypatch):
     где проверяется, что сам СБОЙ СВЕРКИ виден человеку."""
     monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
 
-    preview = await call("update_tasks", summary="Понижаю приоритет",
+    preview = await call_direct("update_tasks", summary="Понижаю приоритет",
                          tasks=BATCH)
 
     assert re.search(r"Манифест `([0-9a-f]+)`", preview), (

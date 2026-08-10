@@ -79,17 +79,17 @@ async def _sync(fn, *args, **kwargs):
 
 CASES = {
     # ── 1. create_subtask: план (родитель) ──────────────────────────────
-    "create_subtask/план/mismatch": lambda: rs.call(
-        "create_subtask", parent_task_title=WRONG, subtask_title="Пункт",
+    "create_subtask/план/mismatch": lambda: rs.call_direct(
+"create_subtask", parent_task_title=WRONG, subtask_title="Пункт",
         parent_task_id=rs.TASK_ROOT, project_id=rs.P_WORK),
-    "create_subtask/план/missing": lambda: rs.call(
-        "create_subtask", parent_task_title=GHOST_TITLE, subtask_title="Пункт",
+    "create_subtask/план/missing": lambda: rs.call_direct(
+"create_subtask", parent_task_title=GHOST_TITLE, subtask_title="Пункт",
         parent_task_id=GHOST, project_id=rs.P_WORK),
     # Корзина здесь приходит не отдельным статусом, а `missing` (обычный
     # `_guard_task`, подзадача у удалённого родителя смысла не имеет) —
     # поэтому кейс НЕ входит в набор политики корзины ниже.
-    "create_subtask/план/корзина_как_missing": lambda: rs.call(
-        "create_subtask", parent_task_title=TRASH_TITLE, subtask_title="Пункт",
+    "create_subtask/план/корзина_как_missing": lambda: rs.call_direct(
+"create_subtask", parent_task_title=TRASH_TITLE, subtask_title="Пункт",
         parent_task_id=rs.TASK_TRASHED, project_id=rs.P_HOME),
     # ── 2. create_subtask: исполнение ───────────────────────────────────
     "create_subtask/исполнение/mismatch": lambda: s._create_subtask_impl(
@@ -100,13 +100,13 @@ CASES = {
         TRASH_TITLE, "Пункт", rs.TASK_TRASHED, rs.P_HOME),
 
     # ── 3. set_task_parent: план (родитель) ─────────────────────────────
-    "set_task_parent/план/mismatch": lambda: rs.call(
-        "set_task_parent", summary="Вложить",
+    "set_task_parent/план/mismatch": lambda: rs.call_direct(
+"set_task_parent", summary="Вложить",
         tasks=[{"taskId": rs.TASK_MID, "title": "Записаться к врачу"}],
         parent_task_id=rs.TASK_ROOT, project_id=rs.P_WORK,
         parent_task_title=WRONG),
-    "set_task_parent/план/missing": lambda: rs.call(
-        "set_task_parent", summary="Вложить",
+    "set_task_parent/план/missing": lambda: rs.call_direct(
+"set_task_parent", summary="Вложить",
         tasks=[{"taskId": rs.TASK_MID, "title": "Записаться к врачу"}],
         parent_task_id=GHOST, project_id=rs.P_WORK,
         parent_task_title=GHOST_TITLE),
@@ -119,15 +119,15 @@ CASES = {
         GHOST, rs.P_WORK, GHOST_TITLE),
 
     # ── 5. unset_task_parent: план, САМА ЗАДАЧА ─────────────────────────
-    "unset_task_parent/план/задача/mismatch": lambda: rs.call(
-        "unset_task_parent", task_title=WRONG, parent_task_title=ROOT_TITLE,
+    "unset_task_parent/план/задача/mismatch": lambda: rs.call_direct(
+"unset_task_parent", task_title=WRONG, parent_task_title=ROOT_TITLE,
         task_id=rs.TASK_KID, parent_task_id=rs.TASK_ROOT, project_id=rs.P_WORK),
-    "unset_task_parent/план/задача/missing": lambda: rs.call(
-        "unset_task_parent", task_title=GHOST_TITLE, parent_task_title=ROOT_TITLE,
+    "unset_task_parent/план/задача/missing": lambda: rs.call_direct(
+"unset_task_parent", task_title=GHOST_TITLE, parent_task_title=ROOT_TITLE,
         task_id=GHOST, parent_task_id=rs.TASK_ROOT, project_id=rs.P_WORK),
     # ── 6. unset_task_parent: план, РОДИТЕЛЬ ────────────────────────────
-    "unset_task_parent/план/родитель/mismatch": lambda: rs.call(
-        "unset_task_parent", task_title=KID_TITLE, parent_task_title=WRONG,
+    "unset_task_parent/план/родитель/mismatch": lambda: rs.call_direct(
+"unset_task_parent", task_title=KID_TITLE, parent_task_title=WRONG,
         task_id=rs.TASK_KID, parent_task_id=rs.TASK_ROOT, project_id=rs.P_WORK),
     # ── 7. unset_task_parent: исполнение, САМА ЗАДАЧА ───────────────────
     "unset_task_parent/исполнение/задача/mismatch": lambda: s._unset_task_parent_impl(
@@ -178,16 +178,16 @@ CASES = {
         filename="чек.pdf"),
 
     # ── 13. abandon_task: план ──────────────────────────────────────────
-    "abandon_task/план/mismatch": lambda: rs.call(
-        "abandon_task", summary="Отказаться", task_id=rs.TASK_ROOT,
+    "abandon_task/план/mismatch": lambda: rs.call_direct(
+"abandon_task", summary="Отказаться", task_id=rs.TASK_ROOT,
         task_title=WRONG),
-    "abandon_task/план/missing": lambda: rs.call(
-        "abandon_task", summary="Отказаться", task_id=GHOST,
+    "abandon_task/план/missing": lambda: rs.call_direct(
+"abandon_task", summary="Отказаться", task_id=GHOST,
         task_title=GHOST_TITLE),
     # То же, что у create_subtask: `abandon_task` живёт на обычном
     # `_guard_task`, и корзина приходит к нему как `missing`.
-    "abandon_task/план/корзина_как_missing": lambda: rs.call(
-        "abandon_task", summary="Отказаться", task_id=rs.TASK_TRASHED,
+    "abandon_task/план/корзина_как_missing": lambda: rs.call_direct(
+"abandon_task", summary="Отказаться", task_id=rs.TASK_TRASHED,
         task_title=TRASH_TITLE),
     # ── 14. abandon_task: исполнение ────────────────────────────────────
     "abandon_task/исполнение/mismatch": lambda: s._abandon_task_impl(
@@ -198,14 +198,14 @@ CASES = {
         "Отказаться", rs.TASK_TRASHED, TRASH_TITLE),
 
     # ── 15. duplicate_task: план ────────────────────────────────────────
-    "duplicate_task/план/mismatch": lambda: rs.call(
-        "duplicate_task", summary="как шаблон", task_id=rs.TASK_ROOT,
+    "duplicate_task/план/mismatch": lambda: rs.call_direct(
+"duplicate_task", summary="как шаблон", task_id=rs.TASK_ROOT,
         task_title=WRONG),
-    "duplicate_task/план/missing": lambda: rs.call(
-        "duplicate_task", summary="как шаблон", task_id=GHOST,
+    "duplicate_task/план/missing": lambda: rs.call_direct(
+"duplicate_task", summary="как шаблон", task_id=GHOST,
         task_title=GHOST_TITLE),
-    "duplicate_task/план/trashed": lambda: rs.call(
-        "duplicate_task", summary="как шаблон", task_id=rs.TASK_TRASHED,
+    "duplicate_task/план/trashed": lambda: rs.call_direct(
+"duplicate_task", summary="как шаблон", task_id=rs.TASK_TRASHED,
         task_title=TRASH_TITLE),
     # ── 16. duplicate_task: исполнение ──────────────────────────────────
     "duplicate_task/исполнение/mismatch": lambda: s._duplicate_task_impl(
@@ -435,16 +435,16 @@ EXPECTED = {
 PARTIAL_CASES = {
     # unset_task_parent: родитель не среди открытых — это НЕ отказ, а
     # предупреждение в карточке (обычный повод отцеплять именно от него).
-    "unset_task_parent/план/родитель/missing": lambda: rs.call(
-        "unset_task_parent", task_title=KID_TITLE, parent_task_title=GHOST_TITLE,
+    "unset_task_parent/план/родитель/missing": lambda: rs.call_direct(
+"unset_task_parent", task_title=KID_TITLE, parent_task_title=GHOST_TITLE,
         task_id=rs.TASK_KID, parent_task_id=GHOST, project_id=rs.P_WORK),
     # add_task_comment на ЗАВЕРШЁННОЙ задаче: операция законна, карточка
     # обязана сказать о состоянии объекта вслух.
     "add_task_comment/план/completed": lambda: rs.call(
         "add_task_comment", task_title=DONE_TITLE, text="дописал вывод",
         project_id=rs.P_WORK, task_id=rs.TASK_COMPLETED),
-    "duplicate_task/план/completed": lambda: rs.call(
-        "duplicate_task", summary="как шаблон", task_id=rs.TASK_COMPLETED,
+    "duplicate_task/план/completed": lambda: rs.call_direct(
+"duplicate_task", summary="как шаблон", task_id=rs.TASK_COMPLETED,
         task_title=DONE_TITLE),
 }
 
@@ -460,23 +460,23 @@ EXPECTED_CONTAINS = {
 # работу — исполнение перепроверит и остаётся последней линией). Три разных
 # текста на разных площадках; свёртка обязана сохранить все три.
 UNAVAILABLE_CASES = {
-    "create_subtask/план/unavailable": lambda: rs.call(
-        "create_subtask", parent_task_title=ROOT_TITLE, subtask_title="Пункт",
+    "create_subtask/план/unavailable": lambda: rs.call_direct(
+"create_subtask", parent_task_title=ROOT_TITLE, subtask_title="Пункт",
         parent_task_id=rs.TASK_ROOT, project_id=rs.P_WORK),
-    "unset_task_parent/план/unavailable": lambda: rs.call(
-        "unset_task_parent", task_title=KID_TITLE, parent_task_title=ROOT_TITLE,
+    "unset_task_parent/план/unavailable": lambda: rs.call_direct(
+"unset_task_parent", task_title=KID_TITLE, parent_task_title=ROOT_TITLE,
         task_id=rs.TASK_KID, parent_task_id=rs.TASK_ROOT, project_id=rs.P_WORK),
     "add_task_comment/план/unavailable": lambda: rs.call(
         "add_task_comment", task_title=ROOT_TITLE, text="дописал вывод",
         project_id=rs.P_WORK, task_id=rs.TASK_ROOT),
-    "abandon_task/план/unavailable": lambda: rs.call(
-        "abandon_task", summary="Отказаться", task_id=rs.TASK_ROOT,
+    "abandon_task/план/unavailable": lambda: rs.call_direct(
+"abandon_task", summary="Отказаться", task_id=rs.TASK_ROOT,
         task_title=ROOT_TITLE),
-    "duplicate_task/план/unavailable": lambda: rs.call(
-        "duplicate_task", summary="как шаблон", task_id=rs.TASK_ROOT,
+    "duplicate_task/план/unavailable": lambda: rs.call_direct(
+"duplicate_task", summary="как шаблон", task_id=rs.TASK_ROOT,
         task_title=ROOT_TITLE),
-    "set_task_parent/план/unavailable": lambda: rs.call(
-        "set_task_parent", summary="Вложить",
+    "set_task_parent/план/unavailable": lambda: rs.call_direct(
+"set_task_parent", summary="Вложить",
         tasks=[{"taskId": rs.TASK_MID, "title": "Записаться к врачу"}],
         parent_task_id=rs.TASK_ROOT, project_id=rs.P_WORK,
         parent_task_title=ROOT_TITLE),

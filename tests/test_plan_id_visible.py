@@ -44,6 +44,7 @@ import ticktick_mcp.src.tg_approval as tg
 # требует, чтобы каждый вызов _gate_batch/_gate_single был в ней). Импорт, а
 # не копия: копия разъехалась бы, и новый тул опять остался бы непроверенным.
 from tests.test_tg_gate_all_tools import ALL_TOOLS
+from tests import read_stand as rs
 
 
 # ───────────────────────── взгляд сетевого клиента ─────────────────────────
@@ -333,14 +334,14 @@ async def test_every_gated_tool_prints_its_own_plan_id(tool, monkeypatch):
     seen = _capture_notify(monkeypatch)
     _stub_impl(monkeypatch, tool)
 
-    response = await getattr(s, tool)(**ALL_TOOLS[tool])
+    response = await rs.direct(tool)(**ALL_TOOLS[tool])
 
     plan_id = _network_client_reads_plan_id(response)
     assert plan_id in s._MANIFESTS, f"{tool}: напечатан id несуществующего плана"
     assert seen and seen[0]["manifest_id"] == plan_id
     # и этот id реально работает как ключ второго вызова
     monkeypatch.setattr(tg, "check_approval", lambda manifest_id: "pending")
-    out2 = await getattr(s, tool)(**ALL_TOOLS[tool], manifest_id=plan_id,
+    out2 = await rs.direct(tool)(**ALL_TOOLS[tool], manifest_id=plan_id,
                                   user_reply="да")
     assert "не найден" not in out2, (
         f"{tool}: сервер не узнал id, который сам же напечатал: {out2}")
@@ -380,7 +381,7 @@ async def test_delete_tasks_first_call_prints_its_plan_id(monkeypatch):
     monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Покупки"})
     _tg_off(monkeypatch)
 
-    response = await s.delete_tasks(
+    response = await s.delete_tasks.direct(
         "Удаляю 1", [{"taskId": "t1", "title": "Купить молоко"}])
 
     assert _network_client_reads_plan_id(response) in s._MANIFESTS

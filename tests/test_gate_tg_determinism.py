@@ -206,7 +206,7 @@ async def test_delete_tasks_and_execute_task_deletion_agree_under_tg(
     _plan_manifest("mid-a")
     _plan_manifest("mid-b")
 
-    out_direct = await s.delete_tasks("⚠️ Удаляю 1", manifest_id="mid-a",
+    out_direct = await s.delete_tasks.direct("⚠️ Удаляю 1", manifest_id="mid-a",
                                       user_reply="да")
     out_two_phase = await s.execute_task_deletion("mid-b", user_reply="да")
 

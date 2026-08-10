@@ -176,7 +176,7 @@ async def test_delete_tasks_direct_card_has_no_agent_instructions(monkeypatch):
     _tg_on(monkeypatch)
     seen = _capture_notify(monkeypatch)
 
-    out = await s.delete_tasks(
+    out = await s.delete_tasks.direct(
         "Удаляю 1", [{"taskId": "t1", "title": "Купить молоко"}])
 
     assert len(seen) == 1

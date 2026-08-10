@@ -518,7 +518,7 @@ m["items"]]`), то есть сверяется значение само с с�
 | 🔴 2 | `delete_project`, `rename_tag` (только ветка слияния) | `_require_consent(tier=2)` + манифест на естественном ключе, `min_gap=0` (§4.3.1) |
 | 🔴 2 | `execute_declutter`, `resume_declutter`, `set_declutter_decision` | `_require_consent(tier=2)`; **инструменты отключены** (§6.4) |
 | 🟡 1 | `execute_task_creation` | `_require_consent(tier=1, tool="create_tasks")`, манифест от `plan_task_creation` |
-| 🟡 1 | `update_tasks`, `complete_tasks`, `move_tasks`, `set_task_parent`, `set_task_tags`, `restore_tasks`, `manual_triage` | `_gate_batch(...)` — 7 тулов |
+| 🟡 1 | `update_tasks`, `complete_tasks`, `move_tasks`, `set_task_parent`, `set_task_tags`, `restore_tasks`, `apply_task_changes` | `_gate_batch(...)` — 7 тулов |
 | 🟡 1 | `create_project`, `create_subtask`, `checkin_habit`, `create_habit`, `delete_habit`, `unset_task_parent`, `create_project_group`, `delete_project_group`, `move_project_to_group`, `add_task_comment`, `attach_file_to_task`, `create_attachment_upload_url`, `create_tag`, `delete_tag`, `delete_task_comment`, `abandon_task`, `duplicate_task`, `update_task_comment`, `update_project`, `archive_project`, `create_project_column` | `_gate_single(...)` — 21 тул |
 | — | `create_tasks` | текстового гейта нет: путь только для автоматики, требует `automation_key` (§6.3), иначе отказ |
 
@@ -531,7 +531,8 @@ m["items"]]`), то есть сверяется значение само с с�
 тестом `tests/test_tg_gate_all_tools.py::test_the_table_covers_every_gated_tool_in_the_code`,
 а не поддерживается вручную: `delete_tag` / `delete_task_comment` уже
 переезжали на `_gate_single`, не попав сюда, а 2026-08-06 к ним добавились
-`create_habit` / `delete_habit` (`_gate_single`) и `manual_triage`
+`create_habit` / `delete_habit` (`_gate_single`) и `apply_task_changes`
+(тогда — `manual_triage`)
 (`_gate_batch`). Последние две прибавки пришли РАЗНЫМИ ветками от одной
 базы, и каждая насчитала свой итог — верна только сумма после слияния.
 

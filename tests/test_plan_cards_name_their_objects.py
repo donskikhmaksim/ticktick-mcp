@@ -47,7 +47,7 @@ def _assert_named(text: str, name: str, *raw_ids: str):
 # тихо перестаёт быть проверкой.
 
 async def test_complete_tasks_card_names_the_task():
-    text = await stand.call(
+    text = await stand.call_direct(
         "complete_tasks", summary="Закрываю задачи",
         tasks=[{"taskId": stand.TASK_ROOT},
                {"taskId": stand.TASK_MID, "title": "Записаться к врачу"}])
@@ -56,7 +56,7 @@ async def test_complete_tasks_card_names_the_task():
 
 
 async def test_update_tasks_card_names_the_task():
-    text = await stand.call(
+    text = await stand.call_direct(
         "update_tasks", summary="Правлю задачи",
         tasks=[{"taskId": stand.TASK_ROOT, "priority": 5},
                {"taskId": stand.TASK_MID, "title": "Записаться к врачу",
@@ -66,7 +66,7 @@ async def test_update_tasks_card_names_the_task():
 
 
 async def test_move_tasks_card_names_both_the_task_and_the_destination():
-    text = await stand.call(
+    text = await stand.call_direct(
         "move_tasks", summary="Переношу задачи",
         tasks=[{"taskId": stand.TASK_ROOT},
                {"taskId": stand.TASK_MID, "title": "Записаться к врачу"}],
@@ -78,7 +78,7 @@ async def test_move_tasks_card_names_both_the_task_and_the_destination():
 
 
 async def test_set_task_tags_card_names_the_task():
-    text = await stand.call(
+    text = await stand.call_direct(
         "set_task_tags", summary="Проставляю теги",
         tasks=[{"taskId": stand.TASK_ROOT, "tags": ["тег01"]},
                {"taskId": stand.TASK_MID, "title": "Записаться к врачу",
@@ -90,7 +90,7 @@ async def test_set_task_tags_card_names_the_task():
 async def test_set_task_parent_card_names_the_parent():
     """Живое название родителя здесь УЖЕ прочитано identity-guard'ом строкой
     выше — и выбрасывалось, а печатался id."""
-    text = await stand.call(
+    text = await stand.call_direct(
         "set_task_parent", summary="Вкладываю задачи",
         tasks=[{"taskId": stand.TASK_MID, "title": "Записаться к врачу"},
                {"taskId": stand.TASK_HIGH, "title": "Оплатить страховку"}],
@@ -100,7 +100,7 @@ async def test_set_task_parent_card_names_the_parent():
 
 
 async def test_restore_tasks_card_names_the_task_from_the_trash():
-    text = await stand.call(
+    text = await stand.call_direct(
         "restore_tasks", summary="Восстанавливаю",
         tasks=[{"taskId": stand.TASK_TRASHED},
                {"taskId": "6a49trash", "title": "Черновик письма"}])
@@ -111,14 +111,14 @@ async def test_restore_tasks_card_names_the_task_from_the_trash():
 # ───────────────── одиночные инструменты (_gate_single) ─────────────────
 
 async def test_abandon_task_card_names_the_task():
-    text = await stand.call("abandon_task", summary="",
+    text = await stand.call_direct("abandon_task", summary="",
                             task_id=stand.TASK_ROOT)
 
     _assert_named(text, "Собрать отчёт", stand.TASK_ROOT)
 
 
 async def test_duplicate_task_card_names_the_task():
-    text = await stand.call("duplicate_task", summary="",
+    text = await stand.call_direct("duplicate_task", summary="",
                             task_id=stand.TASK_ROOT)
 
     _assert_named(text, "Собрать отчёт", stand.TASK_ROOT)
@@ -127,7 +127,7 @@ async def test_duplicate_task_card_names_the_task():
 # ────────── имя установить не удалось — сказать ВСЛУХ, не молчать ──────────
 
 async def test_unknown_task_name_is_stated_out_loud_not_shown_as_an_id():
-    text = await stand.call(
+    text = await stand.call_direct(
         "complete_tasks", summary="Закрываю задачи",
         tasks=[{"taskId": GHOST},
                {"taskId": stand.TASK_MID, "title": "Записаться к врачу"}])
@@ -139,7 +139,7 @@ async def test_unknown_task_name_is_stated_out_loud_not_shown_as_an_id():
 
 
 async def test_unknown_destination_project_is_stated_out_loud(monkeypatch):
-    text = await stand.call(
+    text = await stand.call_direct(
         "move_tasks", summary="Переношу задачи",
         tasks=[{"taskId": stand.TASK_ROOT, "title": "Собрать отчёт"},
                {"taskId": stand.TASK_MID, "title": "Записаться к врачу"}],

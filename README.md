@@ -259,7 +259,8 @@ maintaining a second codebase that covers a fraction of the functionality.
 | `TG_APPROVAL_WEBHOOK_SECRET` | if `TG_BOT_TOKEN_OVERRIDE` is set | random string checked against Telegram's `X-Telegram-Bot-Api-Secret-Token` on `/tg/webhook` — generate with `openssl rand -hex 24` |
 | `TG_OWNER_CHAT_ID` | if `TG_APPROVAL_ENABLED=true` | your personal Telegram chat id — where the plan with buttons is sent |
 | `TG_REPORTS_CHAT_ID` | optional (default: `TG_OWNER_CHAT_ID`) | group chat id for the auto-execution report archive (e.g. the real "MCP Отчёты" group: `-1004357150083`); unset sends reports to your DM instead |
-| `TG_APPROVAL_TOOLS` | optional | comma-separated tool names to gate with TG approval; empty (default) = all gated tools |
+| `TG_APPROVAL_TOOLS` | optional | comma-separated tool names to gate with TG approval; empty (default) = all gated tools. Checked against the tool registry at startup: an unknown name aborts the boot instead of silently dropping the button. The old name `manual_triage` is accepted and resolved to `apply_task_changes` |
+| `MCP_HIDDEN_TOOLS` | optional | comma-separated tool names hidden from `tools/list`. Unset = the built-in default (the thirteen direct task-mutating tools plus the `manual_triage` alias — every one of them still callable BY NAME with a valid `automation_key`). Set it to an EMPTY string to roll the hiding back without touching the code; the refusal-without-key layer, the alias and the reports keep working either way |
 | `TG_APPROVAL_TTL_S` | optional (default `3600`) | seconds an approval request stays alive; on expiry the plan message is deleted entirely, not just its buttons |
 | `TG_AUTO_EXECUTE_INTERVAL_S` | optional (default `10`) | poll interval, in seconds, for the background poller that executes button-approved actions |
 | `TG_REAP_INTERVAL_S` | optional (default `60`) | poll interval, in seconds, for the reaper that cleans up expired approval requests |

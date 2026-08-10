@@ -5,6 +5,7 @@ import contextvars
 import functools
 import hashlib
 import hmac
+import inspect
 import json
 import mimetypes
 import os
@@ -129,6 +130,166 @@ def _automation_key_matches(provided: str) -> bool:
         hashlib.sha256(provided.encode("utf-8")).digest(),
         hashlib.sha256(SECRET.encode("utf-8")).digest(),
     )
+
+
+# ───────────── ТАБЛИЦА ПОКРЫТИЯ: закрытое имя → замена в агрегаторе ─────────
+# 2026-08-10 (заход 1, §1.3.4 Б). Соответствие живёт В КОДЕ, а не в документе:
+# правило приёмки «метод не закрывается, пока в агрегаторе нет ПРОВЕРЕННОЙ
+# замены» обязано быть тестом, а не обещанием. Тест
+# tests/test_hidden_tools_coverage.py утверждает три вещи: имя есть в этой
+# таблице; каждый указанный тип есть в `_TRIAGE_OPS`; для каждого типа
+# существует ПОМЕЧЕННЫЙ сквозной тест (`@pytest.mark.triage_e2e("<тип>")`) и
+# он СОБРАН в текущем прогоне. Строка в таблице сама по себе ничего не
+# доказывает — ровно так выглядит второй способ подделки: тип объявлен,
+# таблица заполнена, а через агрегатор действие ни разу не совершалось.
+#
+# Эта же таблица — источник текста обучающего отказа (`_direct_path_refusal`):
+# отказ называет тип операции, которым закрытое действие делается теперь.
+# Значит таблица не декоративная: разойдясь с реальностью, она немедленно
+# начнёт врать модели в лицо, а не тихо устареет в документе.
+class _Replacement(NamedTuple):
+    ops: Tuple[str, ...]   # типы операций агрегатора, закрывающие инструмент
+    hint: str              # как именно заменить (пусто = собрать по `ops`)
+    note: str              # чем заменён, если типов агрегатора нет вовсе
+
+
+_HIDDEN_TOOL_REPLACEMENT: Dict[str, _Replacement] = {
+    "create_tasks": _Replacement(("create",), "", ""),
+    "update_tasks": _Replacement(("update",), "", ""),
+    "complete_tasks": _Replacement(("complete",), "", ""),
+    # `merge` ведёт в тот же прямой метод, что и `delete` (слияние дублей —
+    # это удаление лишнего), поэтому обе замены названы у одного имени. Для
+    # вызывающего это АЛЬТЕРНАТИВЫ, а не пара — так и написано в подсказке.
+    "delete_tasks": _Replacement(
+        ("delete", "merge"),
+        '{"op": "delete", …}; для слияния дублей — {"op": "merge", …}', ""),
+    # Единственная строка без типа агрегатора — и это осознанно: агрегатор
+    # НЕ разворачивает поддерево (план не имеет права разрастаться сверх
+    # названного человеком), а этот инструмент только для того и звали.
+    "delete_task_with_subtasks": _Replacement(
+        (), "", 'plan_task_deletion({"taskId": …, "title": …, '
+                '"with_subtasks": true}) → execute_task_deletion(manifest_id, '
+                'user_reply)'),
+    # Создать подзадачу = создать задачу И вложить её под родителя: здесь два
+    # типа — это ДВЕ операции в одном плане, а не выбор из двух.
+    "create_subtask": _Replacement(
+        ("create", "parent"),
+        'ДВЕ операции в одном плане: {"op": "create", …} для самой подзадачи '
+        'и {"op": "parent", …}, чтобы вложить её под родителя', ""),
+    "move_tasks": _Replacement(("move",), "", ""),
+    "set_task_parent": _Replacement(("parent",), "", ""),
+    "unset_task_parent": _Replacement(("unparent",), "", ""),
+    "set_task_tags": _Replacement(("tags",), "", ""),
+    "restore_tasks": _Replacement(("restore",), "", ""),
+    "abandon_task": _Replacement(("abandon",), "", ""),
+    "duplicate_task": _Replacement(("duplicate",), "", ""),
+}
+
+_TRIAGE_TAIL = ('→ покажи план пользователю ДОСЛОВНО → его явное «да» → '
+                'apply_task_changes(manifest_id="…", user_reply="<реплика '
+                'пользователя>") → operation_report. Ничего не сделано.')
+
+
+def _direct_path_refusal(tool_name: str) -> str:
+    """Обучающий отказ прямого пути: называет агрегатор, показывает форму
+    вызова и говорит, что это единственный путь.
+
+    Почему отказ обязан УЧИТЬ, а не просто отказывать. Клиент кэширует список
+    инструментов на сессию: после выката модель какое-то время продолжает
+    «знать» закрытые имена и будет их звать. Отказ, который не показывает,
+    куда идти, оставляет её перебирать остальные двенадцать прямых путей."""
+    repl = _HIDDEN_TOOL_REPLACEMENT.get(tool_name)
+    if repl and not repl.ops:
+        # Действие, которого у агрегатора нет вовсе: врать «иди в
+        # apply_task_changes» нельзя — там для него типа не существует. И про
+        # ключ здесь говорить тоже нельзя: этот вход не открывает НИКОМУ,
+        # включая автоматику, — он только перенаправляет.
+        return (f"🛑 «{tool_name}» не делает ничего и ни при каких аргументах: "
+                "он существует только чтобы поймать старых вызывающих и "
+                f"перенаправить. Путь для этого действия — {repl.note}: она "
+                "одна разворачивает ВСЁ поддерево (включая под-подзадачи) и "
+                "показывает его на подтверждение целиком. Изменения самих "
+                "задач, без поддеревьев, идут через apply_task_changes. "
+                "Ничего не удалено.")
+    head = (f"🛑 «{tool_name}» напрямую не вызывается: это вход только для "
+            "автоматики, у которой есть ключ (угадывать его — нарушение "
+            "протокола, а не попытка).")
+    if repl and repl.hint:
+        how = f"apply_task_changes(summary=\"…\", operations=[…]) — {repl.hint}"
+    elif repl:
+        how = (f'apply_task_changes(summary="…", operations=[{{"op": '
+               f'"{repl.ops[0]}", "task_id": "…", "title": "<живое название>", '
+               '"said": "<дословная фраза человека>"}])')
+    else:
+        how = 'apply_task_changes(summary="…", operations=[…])'
+    return (f"{head} Единственный путь изменить задачи — apply_task_changes.\n"
+            f"Как: {how} {_TRIAGE_TAIL}")
+
+
+def _require_automation_key(tool_name: str, automation_key: str) -> Optional[str]:
+    """None — ключ верный, работать можно; строка — готовый ответ-отказ.
+
+    ОДИН помощник на все закрытые инструменты, а не тринадцать копий проверки:
+    копии разъезжаются, и разъехавшаяся копия — это ровно способ подделки
+    «спрятать, не закрыв» (метод невидим и потому не зовётся, а дыра
+    открывается, когда имя всплывает из старого контекста).
+
+    Ключ снимает РОВНО ОДИН вопрос — «человек согласен?». Он НЕ снимает ни
+    сверку личности объекта, ни потолки, ни запись в журнал, ни независимую
+    перепроверку результата: всё это стоит ниже по течению и к ключу
+    отношения не имеет."""
+    if _automation_key_matches(automation_key):
+        return None
+    return _direct_path_refusal(tool_name)
+
+
+def _automation_only(tool_name: str, extra_tail: str = ""):
+    """Слой 1 закрытия прямого пути, оформленный ОДНИМ декоратором.
+
+    Ставится ПОД `@mcp.tool()` / `@_shared_notes(...)`, ближе всех к функции,
+    поэтому проверка ключа случается раньше первой строки её тела — раньше
+    чтения живого состояния, раньше построения плана, раньше любой мутации.
+    Это и есть требование «сверка обязана быть первым шагом внутри кода, а не
+    пунктом инструкции»: обойти её, не тронув исходник, нельзя.
+
+    Почему декоратор, а не тринадцать проверок в телах. Копии разъезжаются, и
+    разъехавшаяся копия — ровно способ подделки «спрятать, не закрыв»: метод
+    невидим и потому не зовётся, а дыра открывается, когда имя всплывает из
+    старого контекста или из документации. Одна точка входа делает «забыл
+    поставить» видимым в diff как отсутствие строки декоратора.
+
+    `.direct` — исходная функция БЕЗ проверки ключа. Публичного пути к ней
+    нет: в реестре MCP лежит обёртка, отдельного `@mcp.tool()` у исходной
+    функции не существует, снаружи сервера её не позвать. Нужна она тестам:
+    фаза плана этих инструментов — живой код, которым по-прежнему пользуется
+    автоматика, и её поведение (сверка личности объекта, политика корзины,
+    пометка неприменимых строк) обязано оставаться под проверкой. Сам слой 1
+    при этом проверяется отдельно и по КАЖДОМУ из тринадцати имён —
+    tests/test_hidden_tools.py.
+
+    `extra_tail` — хвост к тексту отказа для инструмента, у которого кроме
+    агрегатора остался ещё один законный маршрут (`create_tasks`: двухфазная
+    пара plan_task_creation → execute_task_creation не закрывается)."""
+    def decorator(fn):
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            # Ключ могли передать и позиционно — разбираем по сигнатуре, а не
+            # только по `kwargs`: позиционный вызов иначе прошёл бы как «ключа
+            # нет», и автоматика получила бы отказ на верном ключе.
+            bound = sig.bind_partial(*args, **kwargs)
+            refusal = _require_automation_key(
+                tool_name, bound.arguments.get("automation_key") or "")
+            if refusal:
+                return refusal + extra_tail
+            return await fn(*args, **kwargs)
+
+        wrapper.direct = fn
+        return wrapper
+
+    return decorator
+
 
 # Create FastMCP server
 mcp = FastMCP("ticktick", host=HOST, port=PORT, streamable_http_path=STREAMABLE_PATH)
@@ -3200,6 +3361,15 @@ _PARENT_UNVERIFIED_NOTE = (
 
 @mcp.tool()
 @_shared_notes(automation=True)
+@_automation_only(
+    "create_tasks",
+    # Двухфазная пара plan_task_creation → execute_task_creation остаётся
+    # ОТКРЫТОЙ и остаётся законным путём создания, поэтому отказ обязан
+    # назвать оба маршрута, а не уводить всех в агрегатор молча.
+    extra_tail="\nСоздание можно вести и прежней двухфазной парой: "
+               "plan_task_creation (покажи эхо пользователю дословно) → явное "
+               "«да» → execute_task_creation(manifest_id, user_reply=<реплика>) "
+               "→ operation_report. Ничего не создано.")
 async def create_tasks(
     summary: str = "",
     tasks: List[Dict[str, Any]] = None,
@@ -3319,11 +3489,6 @@ async def create_tasks(
     part of that flow: `automation_key` bypasses the interactive gate
     entirely, so no button and no `user_reply` are involved here.
     """
-    if not _automation_key_matches(automation_key):
-        return ("🛑 Прямое создание — только для автоматики. Интерактивный флоу: "
-                "plan_task_creation (покажи эхо пользователю дословно) → явное "
-                "«да» → execute_task_creation(manifest_id, user_reply=<реплика>) "
-                "→ operation_report. Ничего не создано.")
     # `summary`/`tasks` необязательны В СХЕМЕ (2026-08-07): интерактивный
     # вызывающий всё равно получает отказ выше, и требовать от него поля,
     # которые ни на что не влияют, значило отдавать ему `1 validation error`
@@ -4282,6 +4447,7 @@ async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
 
 @mcp.tool()
 @_shared_notes(tg=True, automation=True, gate_args=True)
+@_automation_only("update_tasks")
 async def update_tasks(
     summary: str,
     tasks: List[Dict[str, Any]] = None,
@@ -4974,6 +5140,7 @@ async def _update_tasks_impl(
         return _tool_error("updating tasks", e)
 @mcp.tool()
 @_shared_notes(tg=True, automation=True, gate_args=True)
+@_automation_only("complete_tasks")
 async def complete_tasks(summary: str, tasks: List[Dict[str, str]] = None,
                          manifest_id: str = "", user_reply: str = "",
                          automation_key: str = "") -> str:
@@ -5153,6 +5320,7 @@ async def _complete_tasks_impl(summary: str, tasks: List[Dict[str, str]]) -> str
         return _tool_error("completing tasks", e)
 @mcp.tool()
 @_shared_notes(automation=True, gate_args=True)
+@_automation_only("delete_tasks")
 async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = None,
                        manifest_id: str = "", user_reply: str = "",
                        automation_key: str = "") -> str:
@@ -6546,18 +6714,16 @@ async def delete_task_with_subtasks(
         task_title: unused — has no effect, kept for backward-compatible calls
         project_name: unused — has no effect, kept for backward-compatible calls
     """
-    err = _ensure_ready()
-    if err:
-        return err
-    # A parent + its subtasks is inherently a BULK delete → manifest ONLY.
-    # (The former ALLOW_DIRECT_SUBTREE_DELETE escape hatch is removed: it had
-    # no journal, no post-verify and an unhandled 'missing' guard — one env
-    # var away from being the only unguarded destructive path in the cluster.)
-    return ("🛑 Удаление дерева — только через манифест. Используй "
-            "plan_task_deletion с {\"taskId\": ..., \"title\": ..., "
-            "\"with_subtasks\": true} — план сам развернёт ВСЁ поддерево "
-            "(включая под-подзадачи), покажет полный список на аппрув, а "
-            "operation_report подтвердит результат.")
+    # СЛОЙ 1 ЗАКРЫТИЯ ПРЯМОГО ПУТИ (2026-08-10, §1.3.4). Этот вход и раньше
+    # отказывал ВСЕМ — ключ его не открывает и открывать не должен: поддерево
+    # разворачивает только plan_task_deletion. Изменилось одно: отказ теперь
+    # приходит из общего помощника и называет ОБА живых маршрута, включая
+    # агрегатор, — иначе модель, наткнувшись на закрытый прямой путь, узнаёт
+    # про удаление дерева, но не про то, что все прочие изменения задач тоже
+    # переехали. Проверка готовности клиента снята намеренно: ответ этого
+    # инструмента не зависит от того, поднят ли TickTick, — он ничего не
+    # трогает, а отказ «клиент не готов» увёл бы вызывающего от маршрута.
+    return _direct_path_refusal("delete_task_with_subtasks")
 
 
 def _describe_create_project(p: Dict) -> str:
@@ -7769,6 +7935,7 @@ def _describe_create_subtask(p: Dict) -> str:
 
 @mcp.tool()
 @_shared_notes(tg=True, automation=True, gate_args=True)
+@_automation_only("create_subtask")
 async def create_subtask(
     parent_task_title: str,
     subtask_title: str,
@@ -8116,6 +8283,7 @@ async def get_inbox_tasks(limit: int = _TREE_PAGE, offset: int = 0) -> str:
 
 @mcp.tool()
 @_shared_notes(tg=True, automation=True, gate_args=True)
+@_automation_only("move_tasks")
 async def move_tasks(summary: str, tasks: List[Dict[str, str]] = None,
                      to_project_id: str = "", to_project_name: str = None,
                      manifest_id: str = "", user_reply: str = "",
@@ -8893,6 +9061,7 @@ async def list_filters() -> str:
 
 @mcp.tool()
 @_shared_notes(tg=True, automation=True, gate_args=True)
+@_automation_only("set_task_parent")
 async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
                           parent_task_id: str = "", project_id: str = "",
                           parent_task_title: str = None,
@@ -9171,6 +9340,7 @@ def _describe_unset_task_parent(p: Dict) -> str:
 
 @mcp.tool()
 @_shared_notes(tg=True, automation=True, gate_args=True)
+@_automation_only("unset_task_parent")
 async def unset_task_parent(task_title: str, parent_task_title: str, task_id: str,
                             parent_task_id: str, project_id: str,
                             manifest_id: str = "", user_reply: str = "",
@@ -9385,6 +9555,7 @@ async def _unset_task_parent_impl(task_title: str, parent_task_title: str,
 
 @mcp.tool()
 @_shared_notes(tg=True, automation=True, gate_args=True)
+@_automation_only("set_task_tags")
 async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
                         manifest_id: str = "", user_reply: str = "",
                         automation_key: str = "") -> str:
@@ -10775,6 +10946,7 @@ async def get_trash(limit: int = 50) -> str:
 
 @mcp.tool()
 @_shared_notes(tg=True, automation=True, gate_args=True)
+@_automation_only("restore_tasks")
 async def restore_tasks(summary: str, tasks: List[Dict[str, str]] = None,
                         to_project_id: str = None,
                         manifest_id: str = "", user_reply: str = "",
@@ -12307,6 +12479,7 @@ def _describe_abandon_task(p: Dict, live_title: Optional[str] = None) -> str:
 
 @mcp.tool()
 @_shared_notes(automation=True, gate_args=True)
+@_automation_only("abandon_task")
 async def abandon_task(summary: str, task_id: str, task_title: str = None,
                        manifest_id: str = "", user_reply: str = "",
                        automation_key: str = "") -> str:
@@ -12443,6 +12616,7 @@ def _describe_duplicate_task(p: Dict, live_title: Optional[str] = None) -> str:
 
 @mcp.tool()
 @_shared_notes(tg=True, automation=True, gate_args=True)
+@_automation_only("duplicate_task")
 async def duplicate_task(summary: str, task_id: str, task_title: str = None,
                          manifest_id: str = "", user_reply: str = "",
                          automation_key: str = "") -> str:
@@ -17043,9 +17217,9 @@ _TRIAGE_VERB = {t.op: t.verb for t in _TRIAGE_REGISTRY}
 
 @mcp.tool()
 @_shared_notes(tg=True, automation=True, gate_args=True)
-async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
-                        max_items: int = 50, manifest_id: str = "",
-                        user_reply: str = "", automation_key: str = "") -> str:
+async def apply_task_changes(summary: str, operations: List[Dict[str, Any]] = None,
+                             max_items: int = 50, manifest_id: str = "",
+                             user_reply: str = "", automation_key: str = "") -> str:
     """
     Apply a MIXED batch of triage decisions the HUMAN has ALREADY MADE AND
     SAID OUT LOUD — delete / complete / update / move / merge-duplicates — in
@@ -17340,7 +17514,13 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         # планом в Postgres и возвращается исполнителю и после перезапуска.
         extra = {"not_planned": not_planned} if not_planned else None
 
-    outcome = await _gate_batch("manual_triage", "manual_triage", enriched, summary,
+    # ПЕРВЫЙ аргумент — `kind` манифеста, ВТОРОЙ — имя инструмента. Они
+    # РАЗОШЛИСЬ при переименовании 2026-08-10 (§1.3.4) намеренно: `kind`
+    # входит в binding-хэш плана, и его смена обесценила бы хэши всех уже
+    # показанных планов; имя же инструмента обязано стать новым, потому что
+    # по нему ищут исполнителя (`_<tool>_impl`) и сверяют `TG_APPROVAL_TOOLS`.
+    # Старое имя доезжает сюда через `consent.resolve_tool_alias`.
+    outcome = await _gate_batch("manual_triage", "apply_task_changes", enriched, summary,
                                 manifest_id, user_reply, _describe_triage_op,
                                 extra=extra, items_arg="operations", notes=notes,
                                 automation_key=automation_key)
@@ -17349,16 +17529,47 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
     # `**extra` — тот же путь, которым план доезжает до исполнителя после
     # кнопки (`_generic_gate_auto_execute` зовёт impl(summary, tasks, **extra)):
     # чат-«да», кнопка и headless-ключ обязаны давать ОДИН отчёт, а не три.
-    return await _manual_triage_impl(outcome.summary, outcome.tasks,
-                                     **(outcome.extra or {}))
+    return await _apply_task_changes_impl(outcome.summary, outcome.tasks,
+                                          **(outcome.extra or {}))
 
 
-async def _manual_triage_impl(summary: str, tasks: List[Dict],
-                              not_planned: Optional[List[Dict]] = None) -> str:
-    """Pure mutation logic for manual_triage — NO consent gate (the gate lives
-    in the public manual_triage() above; this is also what the Telegram button
-    replays via _generic_gate_auto_execute, which calls impl(summary, tasks,
-    **extra)).
+@mcp.tool()
+async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
+                        max_items: int = 50, manifest_id: str = "",
+                        user_reply: str = "", automation_key: str = "") -> str:
+    """DEPRECATED ALIAS of apply_task_changes — same tool, old name.
+
+    Kept registered (and therefore callable) on purpose: an external caller
+    that still knows only the old name keeps working, and so does a manifest
+    built before the rename. It is hidden from tools/list, so the model sees
+    exactly one name — the new one. Every argument is forwarded verbatim;
+    there is no second implementation here.
+
+    Args:
+        summary: forwarded to apply_task_changes unchanged
+        operations: forwarded to apply_task_changes unchanged
+        max_items: forwarded to apply_task_changes unchanged
+        manifest_id: forwarded to apply_task_changes unchanged
+        user_reply: forwarded to apply_task_changes unchanged
+        automation_key: forwarded to apply_task_changes unchanged
+    """
+    # Условие снятия псевдонима — проверяемое, а не «когда-нибудь» (П18):
+    # каждый вызов старого имени пишется в лог с пометкой и признаком, был ли
+    # предъявлен ключ автоматики. Ноль таких строк за оговорённый срок — и
+    # обёртку можно убирать; пока они есть, убирать нельзя.
+    logger.info("устаревшее имя инструмента: вызван manual_triage "
+                "(канонич. apply_task_changes), ключ автоматики "
+                f"{'предъявлен' if automation_key else 'НЕ предъявлен'}")
+    return await apply_task_changes(summary, operations, max_items,
+                                    manifest_id, user_reply, automation_key)
+
+
+async def _apply_task_changes_impl(summary: str, tasks: List[Dict],
+                                   not_planned: Optional[List[Dict]] = None) -> str:
+    """Pure mutation logic for apply_task_changes — NO consent gate (the gate
+    lives in the public apply_task_changes() above; this is also what the
+    Telegram button replays via _generic_gate_auto_execute, which calls
+    impl(summary, tasks, **extra)).
 
     Two hard rules here:
       1. Every operation is re-checked against LIVE state immediately before
@@ -17689,8 +17900,137 @@ from .tg_auto_execute import (  # noqa: E402,F401
     _verdict_from_totals, _verified_auto_execute_report)
 
 
+# ───────────────────── СОКРЫТИЕ ИНСТРУМЕНТОВ ИЗ ЛИСТИНГА ─────────────────────
+# 2026-08-10 (заход 1, §1.3.4, слой 2 из двух).
+#
+# Что это. Инструмент исключается из ответа на `tools/list`, но ОСТАЁТСЯ в
+# реестре сервера и остаётся вызываемым по имени. Модель видит один правильный
+# путь изменения задач — агрегатор; автоматика, знающая имя и ключ, работает
+# как работала; фоновое исполнение по кнопке Telegram не замечает разницы.
+#
+# Почему именно фильтрация листинга, а не удаление из реестра и не
+# комментирование `@mcp.tool()`. Проверено по установленной версии SDK
+# (`mcp` 1.27.0): список отдаёт `FastMCP.list_tools()`, которая на КАЖДЫЙ
+# запрос заново читает `self._tool_manager.list_tools()`; вызов идёт другим
+# путём — `self._tool_manager.call_tool(name, …)` → `get_tool(name)`, список
+# при этом не используется вовсе. Комментирование декоратора выбрасывает
+# инструмент из реестра, а на реестр смотрит `_tool_registration_status`: не
+# найдя инструмент, фоновое исполнение по кнопке ОТКАЗЫВАЕТСЯ исполнять план
+# (дыра П6, её уже чинили). Фильтрация листинга этой проблемы не создаёт —
+# `get_tool` продолжает находить инструмент.
+#
+# Почему подменяется `mcp._tool_manager.list_tools`, а НЕ `mcp.list_tools`.
+# Обработчик запроса привязывается к СВЯЗАННОМУ методу в момент создания
+# сервера (`FastMCP._setup_handlers`), поэтому переприсваивание атрибута
+# `mcp.list_tools` позже ни на что не влияет — запрос всё равно уйдёт в
+# оригинал. Это не рассуждение на словах: проверяется тестом
+# `tests/test_hidden_tools.py::test_patching_fastmcp_list_tools_would_not_work`.
+#
+# Риск осознан: `_tool_manager` — приватный атрибут SDK. Поэтому тесты
+# проверяют ОДНОВРЕМЕННО «нет в листинге» и «есть в реестре» — при
+# несовместимом обновлении библиотеки они обязаны упасть, а не тихо перестать
+# скрывать.
+_HIDDEN_TOOLS_ENV = "MCP_HIDDEN_TOOLS"
+
+# ТОЧКА ОТКАТА ОДНА — переменная окружения `MCP_HIDDEN_TOOLS`, а не правка
+# кода: возвращать инструменты в момент сбоя придётся быстро, и оператор
+# должен уметь прочитать список, не читая исходник. Значение ниже — умолчание,
+# работающее, когда переменная НЕ ЗАДАНА вовсе. Заданная пустой строкой
+# переменная означает «не скрывать ничего» (это и есть откат), и от
+# незаданной она отличима: `os.environ.get` вернёт "" против None.
+_DEFAULT_HIDDEN_TOOLS: Tuple[str, ...] = (
+    # Тринадцать прямых путей изменения задачи. Порядок — как в ТЗ (порядок
+    # появления в этом файле). У каждого есть проверенная замена в агрегаторе,
+    # объявленная в `_HIDDEN_TOOL_REPLACEMENT` выше и подтверждённая зелёным
+    # сквозным тестом (tests/test_hidden_tools_coverage.py). Ни одно имя не
+    # попало сюда раньше, чем у его типа появилась такая замена.
+    "create_tasks", "update_tasks", "complete_tasks", "delete_tasks",
+    "delete_task_with_subtasks", "create_subtask", "move_tasks",
+    "set_task_parent", "unset_task_parent", "set_task_tags", "restore_tasks",
+    "abandon_task", "duplicate_task",
+    # Четырнадцатое имя прячется по ДРУГОЙ причине: `manual_triage` — живой
+    # псевдоним агрегатора, звать его можно и нужно тем, кто знает только
+    # старое имя. Модель же обязана видеть ровно одно имя — новое.
+    "manual_triage",
+)
+
+
+def _hidden_tool_names() -> set:
+    """Имена, которые НЕ показываются в `tools/list`. Читается на каждый
+    листинг — чтобы откат не требовал перезапуска сервера (перезапуск
+    MCP-КЛИЕНТА нужен всё равно: список инструментов он кэширует на сессию)."""
+    raw = os.environ.get(_HIDDEN_TOOLS_ENV)
+    if raw is None:
+        return set(_DEFAULT_HIDDEN_TOOLS)
+    return {n.strip() for n in raw.split(",") if n.strip()}
+
+
+def _install_tool_listing_filter() -> None:
+    """Подменяет `mcp._tool_manager.list_tools` на отфильтрованную версию.
+
+    Идемпотентна: повторный вызов (перезагрузка модуля в тестах) не наслаивает
+    обёртку на обёртку — иначе цепочка росла бы с каждым импортом."""
+    manager = mcp._tool_manager
+    original = getattr(manager, "_unfiltered_list_tools", None) or manager.list_tools
+
+    def _filtered_list_tools():
+        hidden = _hidden_tool_names()
+        return [t for t in original() if t.name not in hidden]
+
+    manager._unfiltered_list_tools = original
+    manager.list_tools = _filtered_list_tools
+
+
+_install_tool_listing_filter()
+
+
+def _canonicalize_tg_approval_tools(cfg) -> None:
+    """Сверить `TG_APPROVAL_TOOLS` с реестром инструментов и канонизировать
+    старые имена. 2026-08-10 (§1.3.4, место 1 из пяти).
+
+    Зачем именно падать, а не логировать. Этот список — ИМЕНА инструментов,
+    и он разъезжается с кодом тихо: имя, которого в сервере нет (переименовали
+    инструмент, опечатались в переменной окружения), не даёт ни ошибки, ни
+    предупреждения — просто план этого инструмента перестаёт уходить в
+    Telegram. Текстовый путь при этом остаётся живым, то есть внешне всё
+    работает, а второй фактор подтверждения молча исчезает. Единственный
+    честный исход — не подняться вовсе и назвать имя.
+
+    Псевдоним разрешается ПЕРЕД сверкой: оператор, оставивший в конфиге
+    `manual_triage`, получает работающую кнопку под новым именем, а не отказ
+    старта, — старое имя есть в `consent.TOOL_ALIASES`, значит оно известно.
+
+    Зовётся из `main()` — то есть после того, как отработали ВСЕ декораторы
+    `@mcp.tool()` в этом модуле; на импорт вешать нельзя, реестр в этот момент
+    ещё неполон."""
+    allow = getattr(cfg, "tools_allowlist", None)
+    if not allow:
+        return
+    known = set(mcp._tool_manager._tools)
+    canonical, unknown = set(), []
+    for name in sorted(allow):
+        resolved = consent.resolve_tool_alias(name)
+        if resolved in known:
+            canonical.add(resolved)
+        else:
+            unknown.append(name)
+    if unknown:
+        raise RuntimeError(
+            "TG_APPROVAL_TOOLS содержит имена, которых нет среди инструментов "
+            f"сервера: {', '.join(unknown)}. Сервер НЕ поднят намеренно: с "
+            "неизвестным именем план такого инструмента молча перестал бы "
+            "уходить в Telegram (второй фактор подтверждения исчезает без "
+            "единой ошибки). Проверь написание — известные имена: "
+            f"{', '.join(sorted(known))}.")
+    cfg.tools_allowlist = canonical
+
+
 def main():
     """Main entry point for the MCP server."""
+    # Сверка TG_APPROVAL_TOOLS с реестром — ДО всего прочего (§1.3.4):
+    # подниматься с разъехавшимся списком имён нельзя, а узнать об этом позже
+    # неоткуда — расхождение не даёт ошибки, только исчезнувшую кнопку.
+    _canonicalize_tg_approval_tools(_TG_CFG)
     # ПЕРВЫМ ДЕЛОМ, до любой строки лога (#119): секрет доступа лежит в пути
     # (`/mcp/<SECRET>`), а uvicorn печатает путь в каждой access-строке —
     # без этого фильтра секрет открытым текстом оседает в логах Railway

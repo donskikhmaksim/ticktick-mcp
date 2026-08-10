@@ -178,7 +178,7 @@ def _wire(monkeypatch, live, names=None, trash=None, ensure="official", tags=Non
 async def test_update_tasks_call1_previews_nothing_mutated(monkeypatch):
     live = {"t1": {"id": "t1", "title": "A", "projectId": "p1"}}
     fake, official = _wire(monkeypatch, live)
-    preview = await s.update_tasks("тест", [
+    preview = await s.update_tasks.direct("тест", [
         {"taskId": "t1", "projectId": "p1", "title": "A", "new_title": "B"}])
     assert fake.calls == [] and official.calls == []
     assert live["t1"]["title"] == "A"
@@ -189,17 +189,17 @@ async def test_update_tasks_call1_previews_nothing_mutated(monkeypatch):
 async def test_update_tasks_call2_without_reply_is_refused_and_retryable(monkeypatch):
     live = {"t1": {"id": "t1", "title": "A", "projectId": "p1"}}
     fake, official = _wire(monkeypatch, live)
-    preview = await s.update_tasks("тест", [
+    preview = await s.update_tasks.direct("тест", [
         {"taskId": "t1", "projectId": "p1", "title": "A", "new_title": "B"}])
     mid = _extract_manifest_id(preview)
 
-    refused = await s.update_tasks("тест", manifest_id=mid, user_reply="")
+    refused = await s.update_tasks.direct("тест", manifest_id=mid, user_reply="")
     assert "🛑" in refused
     assert fake.calls == [] and official.calls == []
     assert live["t1"]["title"] == "A"
 
     # manifest survives an empty (not explicitly negative) reply — retryable
-    result = await s.update_tasks("тест", manifest_id=mid, user_reply="да, обновляй")
+    result = await s.update_tasks.direct("тест", manifest_id=mid, user_reply="да, обновляй")
     assert official.calls  # single-task path went through the official client
     assert live["t1"]["title"] == "B"
     assert "🛑" not in result
@@ -208,16 +208,16 @@ async def test_update_tasks_call2_without_reply_is_refused_and_retryable(monkeyp
 async def test_update_tasks_explicit_no_burns_the_manifest(monkeypatch):
     live = {"t1": {"id": "t1", "title": "A", "projectId": "p1"}}
     fake, official = _wire(monkeypatch, live)
-    preview = await s.update_tasks("тест", [
+    preview = await s.update_tasks.direct("тест", [
         {"taskId": "t1", "projectId": "p1", "title": "A", "new_title": "B"}])
     mid = _extract_manifest_id(preview)
 
-    refused = await s.update_tasks("тест", manifest_id=mid, user_reply="нет, погоди")
+    refused = await s.update_tasks.direct("тест", manifest_id=mid, user_reply="нет, погоди")
     assert "🛑" in refused
     assert live["t1"]["title"] == "A"
 
     # the manifest is now dead — even a genuine "yes" afterwards must fail
-    dead = await s.update_tasks("тест", manifest_id=mid, user_reply="да")
+    dead = await s.update_tasks.direct("тест", manifest_id=mid, user_reply="да")
     assert "🛑" in dead
     assert live["t1"]["title"] == "A"
 
@@ -225,13 +225,13 @@ async def test_update_tasks_explicit_no_burns_the_manifest(monkeypatch):
 async def test_update_tasks_manifest_is_one_shot(monkeypatch):
     live = {"t1": {"id": "t1", "title": "A", "projectId": "p1"}}
     fake, official = _wire(monkeypatch, live)
-    preview = await s.update_tasks("тест", [
+    preview = await s.update_tasks.direct("тест", [
         {"taskId": "t1", "projectId": "p1", "title": "A", "new_title": "B"}])
     mid = _extract_manifest_id(preview)
-    await s.update_tasks("тест", manifest_id=mid, user_reply="да")
+    await s.update_tasks.direct("тест", manifest_id=mid, user_reply="да")
     calls_after_first = len(official.calls)
 
-    second = await s.update_tasks("тест", manifest_id=mid, user_reply="да")
+    second = await s.update_tasks.direct("тест", manifest_id=mid, user_reply="да")
     assert "🛑" in second
     assert len(official.calls) == calls_after_first  # nothing new happened
 
@@ -240,11 +240,11 @@ async def test_update_tasks_batch_path_uses_v2(monkeypatch):
     live = {"t1": {"id": "t1", "title": "A", "projectId": "p1"},
             "t2": {"id": "t2", "title": "B", "projectId": "p1"}}
     fake, official = _wire(monkeypatch, live)
-    preview = await s.update_tasks("тест", [
+    preview = await s.update_tasks.direct("тест", [
         {"taskId": "t1", "projectId": "p1", "title": "A", "priority": 3},
         {"taskId": "t2", "projectId": "p1", "title": "B", "priority": 5}])
     mid = _extract_manifest_id(preview)
-    result = await s.update_tasks("тест", manifest_id=mid, user_reply="да")
+    result = await s.update_tasks.direct("тест", manifest_id=mid, user_reply="да")
     assert fake.calls  # v2 batch_update_tasks ran, not the official client
     assert live["t1"]["priority"] == 3 and live["t2"]["priority"] == 5
     assert "🛑" not in result
@@ -268,17 +268,17 @@ async def test_update_tasks_one_shot_holds_without_identity_guard(monkeypatch):
     v2 batch -> fake.calls)."""
     live = {"t1": {"id": "t1", "title": "A", "projectId": "p1", "priority": 0}}
     fake, official = _wire(monkeypatch, live)
-    preview = await s.update_tasks("тест", [
+    preview = await s.update_tasks.direct("тест", [
         {"taskId": "t1", "projectId": "p1", "title": "A", "priority": 3}])
     mid = _extract_manifest_id(preview)
 
-    first = await s.update_tasks("тест", manifest_id=mid, user_reply="да")
+    first = await s.update_tasks.direct("тест", manifest_id=mid, user_reply="да")
     assert "🛑" not in first
     assert live["t1"]["priority"] == 3
     calls_after_first = len(official.calls)
     assert fake.calls == []  # confirms this went through the official path
 
-    second = await s.update_tasks("тест", manifest_id=mid, user_reply="да")
+    second = await s.update_tasks.direct("тест", manifest_id=mid, user_reply="да")
     assert "🛑" in second
     # The real assertion: no NEW mutation happened on the replay. On the old
     # buggy _gate_batch (never sets consumed=True on success), the identity
@@ -294,17 +294,17 @@ async def test_complete_tasks_full_gate_cycle(monkeypatch):
     live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
     fake, official = _wire(monkeypatch, live)
 
-    preview = await s.complete_tasks(
+    preview = await s.complete_tasks.direct(
         "Завершаю", [{"taskId": "t1", "title": "Купить молоко", "projectId": "p1"}])
     assert fake.calls == [] and official.calls == []
     assert "t1" in live
 
     mid = _extract_manifest_id(preview)
-    refused = await s.complete_tasks("Завершаю", manifest_id=mid, user_reply="")
+    refused = await s.complete_tasks.direct("Завершаю", manifest_id=mid, user_reply="")
     assert "🛑" in refused
     assert "t1" in live
 
-    result = await s.complete_tasks("Завершаю", manifest_id=mid, user_reply="да")
+    result = await s.complete_tasks.direct("Завершаю", manifest_id=mid, user_reply="да")
     assert "t1" not in live
     assert "🛑" not in result
 
@@ -317,18 +317,18 @@ async def test_move_tasks_full_gate_cycle(monkeypatch):
     live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
     fake, official = _wire(monkeypatch, live, names={"p1": "Inbox", "p2": "Покупки"})
 
-    preview = await s.move_tasks(
+    preview = await s.move_tasks.direct(
         "Перемещаю", [{"taskId": "t1", "title": "Купить молоко"}],
         to_project_id="p2", to_project_name="Покупки")
     assert fake.calls == []
     assert live["t1"]["projectId"] == "p1"
 
     mid = _extract_manifest_id(preview)
-    refused = await s.move_tasks("Перемещаю", manifest_id=mid, user_reply="")
+    refused = await s.move_tasks.direct("Перемещаю", manifest_id=mid, user_reply="")
     assert "🛑" in refused
     assert live["t1"]["projectId"] == "p1"
 
-    result = await s.move_tasks("Перемещаю", manifest_id=mid, user_reply="да, давай")
+    result = await s.move_tasks.direct("Перемещаю", manifest_id=mid, user_reply="да, давай")
     assert live["t1"]["projectId"] == "p2"
     assert "🛑" not in result
 
@@ -344,18 +344,18 @@ async def test_set_task_parent_full_gate_cycle(monkeypatch):
     }
     fake, official = _wire(monkeypatch, live)
 
-    preview = await s.set_task_parent(
+    preview = await s.set_task_parent.direct(
         "Вкладываю", [{"taskId": "c", "title": "Шаг 1"}],
         parent_task_id="p", project_id="p1", parent_task_title="Большой проект")
     assert fake.calls == []
     assert "parentId" not in live["c"]
 
     mid = _extract_manifest_id(preview)
-    refused = await s.set_task_parent("Вкладываю", manifest_id=mid, user_reply="")
+    refused = await s.set_task_parent.direct("Вкладываю", manifest_id=mid, user_reply="")
     assert "🛑" in refused
     assert "parentId" not in live["c"]
 
-    result = await s.set_task_parent("Вкладываю", manifest_id=mid, user_reply="да")
+    result = await s.set_task_parent.direct("Вкладываю", manifest_id=mid, user_reply="да")
     assert live["c"]["parentId"] == "p"
     assert "🛑" not in result
 
@@ -384,7 +384,7 @@ async def test_set_task_parent_plan_identity_guard_blocks_wrong_parent_title(mon
     }
     fake, official = _wire(monkeypatch, live)
 
-    result = await s.set_task_parent(
+    result = await s.set_task_parent.direct(
         "Вкладываю", [{"taskId": "c", "title": "Шаг 1"}],
         parent_task_id="p", project_id="p1", parent_task_title="Другой проект")
 
@@ -402,7 +402,7 @@ async def test_set_task_parent_plan_identity_guard_blocks_missing_parent(monkeyp
     live = {"c": {"id": "c", "title": "Шаг 1", "projectId": "p1"}}
     fake, official = _wire(monkeypatch, live)
 
-    result = await s.set_task_parent(
+    result = await s.set_task_parent.direct(
         "Вкладываю", [{"taskId": "c", "title": "Шаг 1"}],
         parent_task_id="p-нет-такой", project_id="p1", parent_task_title="Большой проект")
 
@@ -434,14 +434,14 @@ async def test_set_task_parent_plan_read_failure_does_not_block_but_warns(monkey
         return real_open_by_id(fresh=fresh)
     monkeypatch.setattr(s, "_open_by_id", _flaky)
 
-    preview = await s.set_task_parent(
+    preview = await s.set_task_parent.direct(
         "Вкладываю", [{"taskId": "c", "title": "Шаг 1"}],
         parent_task_id="p", project_id="p1", parent_task_title="Большой проект")
     assert "🛑" not in preview, "временный сбой чтения не должен блокировать план"
     assert "НЕ удалось сверить" in preview
     mid = _extract_manifest_id(preview)
 
-    result = await s.set_task_parent("Вкладываю", manifest_id=mid, user_reply="да")
+    result = await s.set_task_parent.direct("Вкладываю", manifest_id=mid, user_reply="да")
     assert live["c"]["parentId"] == "p"
     assert "🛑" not in result
 
@@ -469,13 +469,13 @@ async def test_set_task_parent_plan_read_failure_still_lets_execution_catch_a_re
         return real_open_by_id(fresh=fresh)
     monkeypatch.setattr(s, "_open_by_id", _flaky)
 
-    preview = await s.set_task_parent(
+    preview = await s.set_task_parent.direct(
         "Вкладываю", [{"taskId": "c", "title": "Шаг 1"}],
         parent_task_id="p", project_id="p1", parent_task_title="Другой проект")
     assert "🛑" not in preview
     mid = _extract_manifest_id(preview)
 
-    result = await s.set_task_parent("Вкладываю", manifest_id=mid, user_reply="да")
+    result = await s.set_task_parent.direct("Вкладываю", manifest_id=mid, user_reply="да")
     assert result.startswith("🛑")
     assert "«Большой проект»" in result
     assert fake.calls == []
@@ -495,7 +495,7 @@ async def test_set_task_parent_automation_key_mismatch_is_refused_before_plan(mo
     fake, official = _wire(monkeypatch, live)
     monkeypatch.setattr(s, "SECRET", "test-secret")
 
-    result = await s.set_task_parent(
+    result = await s.set_task_parent.direct(
         "Вкладываю", [{"taskId": "c", "title": "Шаг 1"}],
         parent_task_id="p", project_id="p1", parent_task_title="Другой проект",
         automation_key="test-secret")
@@ -514,17 +514,17 @@ async def test_set_task_tags_full_gate_cycle(monkeypatch):
     live = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1", "tags": []}}
     fake, official = _wire(monkeypatch, live)
 
-    preview = await s.set_task_tags(
+    preview = await s.set_task_tags.direct(
         "Ставлю тег", [{"taskId": "t1", "title": "Купить молоко", "tags": ["дом"]}])
     assert fake.calls == []
     assert live["t1"]["tags"] == []
 
     mid = _extract_manifest_id(preview)
-    refused = await s.set_task_tags("Ставлю тег", manifest_id=mid, user_reply="")
+    refused = await s.set_task_tags.direct("Ставлю тег", manifest_id=mid, user_reply="")
     assert "🛑" in refused
     assert live["t1"]["tags"] == []
 
-    result = await s.set_task_tags("Ставлю тег", manifest_id=mid, user_reply="да")
+    result = await s.set_task_tags.direct("Ставлю тег", manifest_id=mid, user_reply="да")
     assert live["t1"]["tags"] == ["дом"]
     assert "🛑" not in result
 
@@ -538,17 +538,17 @@ async def test_restore_tasks_full_gate_cycle(monkeypatch):
     trash = {"t1": {"id": "t1", "title": "Купить молоко", "projectId": "p1"}}
     fake, official = _wire(monkeypatch, live, trash=trash)
 
-    preview = await s.restore_tasks(
+    preview = await s.restore_tasks.direct(
         "Восстанавливаю", [{"taskId": "t1", "title": "Купить молоко"}])
     assert fake.calls == []
     assert "t1" not in live
 
     mid = _extract_manifest_id(preview)
-    refused = await s.restore_tasks("Восстанавливаю", manifest_id=mid, user_reply="")
+    refused = await s.restore_tasks.direct("Восстанавливаю", manifest_id=mid, user_reply="")
     assert "🛑" in refused
     assert "t1" not in live
 
-    result = await s.restore_tasks("Восстанавливаю", manifest_id=mid, user_reply="да")
+    result = await s.restore_tasks.direct("Восстанавливаю", manifest_id=mid, user_reply="да")
     assert "t1" in live
     assert "🛑" not in result
 

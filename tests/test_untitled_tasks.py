@@ -321,7 +321,7 @@ async def test_update_preview_of_an_untitled_task_says_identified_by_id(
     live = {"t_receipt": _receipt_task()}
     _wire(monkeypatch, live)
 
-    preview = await s.update_tasks("назвать чек", [
+    preview = await s.update_tasks.direct("назвать чек", [
         {"taskId": "t_receipt", "projectId": "p_inbox",
          "new_title": "Чек Home Depot — возврат $374.92"}])
 
@@ -357,11 +357,11 @@ async def test_untitled_task_is_renamed_normally(monkeypatch):
     live = {"t_receipt": _receipt_task()}
     fake, official = _wire(monkeypatch, live)
 
-    preview = await s.update_tasks("назвать чек", [
+    preview = await s.update_tasks.direct("назвать чек", [
         {"taskId": "t_receipt", "projectId": "p_inbox",
          "new_title": "Чек Home Depot — возврат $374.92"}])
     mid = _extract_manifest_id(preview)
-    out = await s.update_tasks("назвать чек", manifest_id=mid,
+    out = await s.update_tasks.direct("назвать чек", manifest_id=mid,
                                user_reply="да")
 
     assert live["t_receipt"]["title"] == "Чек Home Depot — возврат $374.92"
@@ -582,11 +582,11 @@ async def test_untitled_task_with_attachment_goes_through_show_rename_delete(
     assert "(без названия: 📎 1 файл)" in shown
 
     # переименование
-    preview = await s.update_tasks("назвать", [
+    preview = await s.update_tasks.direct("назвать", [
         {"taskId": "t_receipt", "projectId": "p_inbox",
          "new_title": "Чек Home Depot"}])
     mid = _extract_manifest_id(preview)
-    await s.update_tasks("назвать", manifest_id=mid, user_reply="да")
+    await s.update_tasks.direct("назвать", manifest_id=mid, user_reply="да")
     assert live["t_receipt"]["title"] == "Чек Home Depot"
 
     # удаление — уже по НОВОМУ имени, обычным путём

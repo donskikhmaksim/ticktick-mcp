@@ -89,7 +89,7 @@ async def test_promise_of_the_card_is_kept_on_a_completed_task(monkeypatch):
     исполнитель доводит операцию до конца."""
     _v2, _v1, _tr = _wire(monkeypatch)
 
-    plan = await rs.call("duplicate_task", task_id=rs.TASK_COMPLETED,
+    plan = await rs.call_direct("duplicate_task", task_id=rs.TASK_COMPLETED,
                          task_title=DONE_TITLE, summary="как шаблон")
     assert "🛑" not in plan, plan
 

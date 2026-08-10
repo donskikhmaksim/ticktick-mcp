@@ -217,7 +217,7 @@ async def test_flood_wait_on_plan_send_does_not_freeze_other_tools(monkeypatch):
     hb = asyncio.create_task(_beat())
     started = time.monotonic()
     plan = asyncio.create_task(
-        s.complete_tasks("Завершаю 30 задач", _long_plan_tasks()))
+        s.complete_tasks.direct("Завершаю 30 задач", _long_plan_tasks()))
     try:
         # ждём, пока отправка реально началась (первый поход в Telegram)
         await _wait_until(lambda: fake_tg.sends >= 1)
@@ -270,7 +270,7 @@ async def test_row_is_written_before_the_first_message_and_updated_after_the_las
     _fake_store(monkeypatch, log)
     monkeypatch.setattr(s, "_ensure_official", lambda: None)
 
-    out = await s.complete_tasks("Завершаю 30 задач", _long_plan_tasks())
+    out = await s.complete_tasks.direct("Завершаю 30 задач", _long_plan_tasks())
 
     kinds = [k for k, _ in log]
     assert kinds[0] == "create_row", f"строка создана не первой: {kinds}"
@@ -324,12 +324,12 @@ async def test_text_yes_is_refused_while_the_plan_is_still_being_sent(monkeypatc
     monkeypatch.setattr(s, "_complete_tasks_impl", _never)
 
     plan = asyncio.create_task(
-        s.complete_tasks("Завершаю 30 задач", _long_plan_tasks()))
+        s.complete_tasks.direct("Завершаю 30 задач", _long_plan_tasks()))
     try:
         await _wait_until(lambda: fake_tg.sent_texts)
         mid = _plan_id_from(fake_tg.sent_texts[0])
 
-        verdict = await s.complete_tasks("Завершаю 30 задач", _long_plan_tasks(),
+        verdict = await s.complete_tasks.direct("Завершаю 30 задач", _long_plan_tasks(),
                                          manifest_id=mid, user_reply="да, давай")
 
         assert executed["n"] == 0, (
@@ -360,7 +360,7 @@ async def test_failed_send_leaves_no_stale_button_requirement(monkeypatch):
     _fake_store(monkeypatch, log)
     monkeypatch.setattr(s, "_ensure_official", lambda: None)
 
-    out = await s.complete_tasks("Завершаю 30 задач", _long_plan_tasks())
+    out = await s.complete_tasks.direct("Завершаю 30 задач", _long_plan_tasks())
 
     assert "🛑" in out and "Не смог отправить" in out
     manifests = list(s._MANIFESTS.values())

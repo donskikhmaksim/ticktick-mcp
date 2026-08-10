@@ -45,6 +45,7 @@ import pytest
 
 import ticktick_mcp.src.server as s
 import ticktick_mcp.src.tg_approval as tg
+from tests import read_stand as rs
 
 
 # ───────────────────────── обвязка ─────────────────────────
@@ -167,11 +168,11 @@ def _case(family, monkeypatch, tmp_path):
     monkeypatch.setattr(s, f"_{tool}_impl", _impl)
 
     async def _plan():
-        out = await getattr(s, tool)(**kwargs)
+        out = await rs.direct(tool)(**kwargs)
         return out, _mid_of(out)
 
     async def _execute(mid, reply="да", **kw):
-        return await getattr(s, tool)(**kwargs, manifest_id=mid,
+        return await rs.direct(tool)(**kwargs, manifest_id=mid,
                                       user_reply=reply, **kw)
 
     return _Case(tool, _plan, _execute, lambda: list(rec))

@@ -140,7 +140,7 @@ def test_wrong_title_on_a_trashed_task_is_still_a_mismatch(monkeypatch):
 async def test_plan_on_a_trashed_task_is_refused(tool, monkeypatch):
     _wire(monkeypatch)
 
-    answer = await rs.call(tool, **_args(tool, rs.TASK_TRASHED, TRASH_TITLE))
+    answer = await rs.call_direct(tool, **_args(tool, rs.TASK_TRASHED, TRASH_TITLE))
 
     assert "🛑" in answer, f"{tool} строит план на УДАЛЁННУЮ задачу:\n{answer}"
     assert "manifest_id" not in answer, answer
@@ -184,7 +184,7 @@ async def test_completed_task_still_works_for_the_whole_class(monkeypatch):
     for tool in CLASS_TOOLS:
         args = _args(tool, rs.TASK_COMPLETED, DONE_TITLE)
         args = {**args, "project_id": rs.P_WORK} if "project_id" in args else args
-        answer = await rs.call(tool, **args)
+        answer = await rs.call_direct(tool, **args)
         assert "🛑" not in answer, f"{tool} на завершённой задаче:\n{answer}"
         assert "manifest_id" in answer, f"{tool}:\n{answer}"
 

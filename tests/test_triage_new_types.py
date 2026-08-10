@@ -220,6 +220,7 @@ async def _run(ops, summary="Разбираю"):
 
 # ═══════════════════════════════ parent ════════════════════════════════════
 
+@pytest.mark.triage_e2e("parent")
 async def test_parent_attaches_and_verifies(monkeypatch, tmp_path):
     """Вложение существующей задачи под существующего родителя: судим по
     ЖИВОМУ `parentId`, а не по строке отчёта."""
@@ -338,6 +339,7 @@ async def test_parent_renamed_between_plan_and_yes_is_skipped(
 
 # ══════════════════════════════ unparent ══════════════════════════════════
 
+@pytest.mark.triage_e2e("unparent")
 async def test_unparent_detaches_and_verifies(monkeypatch, tmp_path):
     """Отцепление подзадачи: судим по ЖИВОМУ `parentId` — его не должно
     остаться, а сама задача обязана остаться среди открытых."""
@@ -421,6 +423,7 @@ async def test_unparent_rejects_fields_of_other_types(monkeypatch, tmp_path):
 
 # ════════════════════════════════ tags ════════════════════════════════════
 
+@pytest.mark.triage_e2e("tags")
 async def test_tags_replaces_set_and_registers_tag(monkeypatch, tmp_path):
     """Набор тегов ЗАМЕНЯЕТСЯ целиком, а незнакомый тег заводится в аккаунте.
     Оба факта проверяются по живому состоянию: `tags` на задаче и список
@@ -521,6 +524,7 @@ async def test_tags_plan_survives_unreadable_account_tag_list(
 
 # ══════════════════════════════ abandon ═══════════════════════════════════
 
+@pytest.mark.triage_e2e("abandon")
 async def test_abandon_marks_wont_do(monkeypatch, tmp_path):
     """Задача уходит из открытых со статусом «не буду делать» — и это видно
     по ЖИВОМУ состоянию, а не по строке отчёта.
@@ -606,6 +610,7 @@ async def test_abandon_warns_about_orphaned_children(monkeypatch, tmp_path):
 
 # ═════════════════════════════ duplicate ══════════════════════════════════
 
+@pytest.mark.triage_e2e("duplicate")
 async def test_duplicate_creates_copy_in_same_project(monkeypatch, tmp_path):
     """Копия существует, лежит в ТОМ ЖЕ проекте и названа как оригинал —
     судим по живому состоянию, не по строке ответа."""
@@ -694,6 +699,7 @@ async def test_duplicate_rejects_changes(monkeypatch, tmp_path):
 
 # ══════════════════════════════ restore ═══════════════════════════════════
 
+@pytest.mark.triage_e2e("restore")
 async def test_restore_returns_task_from_trash(monkeypatch, tmp_path):
     """Запись уходит из корзины и появляется среди открытых В СВОЁМ списке —
     судим по обеим лентам живого состояния."""
@@ -802,6 +808,7 @@ async def test_restore_reads_the_trash_once_per_pass(monkeypatch, tmp_path):
 
 # ═══════════════════════════════ create ═══════════════════════════════════
 
+@pytest.mark.triage_e2e("create")
 async def test_create_makes_task_and_verifies_project(monkeypatch, tmp_path):
     """Задача появляется в ЖИВОМ состоянии и именно в названном проекте."""
     live = {}

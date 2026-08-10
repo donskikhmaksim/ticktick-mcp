@@ -74,7 +74,7 @@ async def _run_as_the_button_does(tool: str, **args):
     Это и есть проверяемый стык: `entry.execute` — тот самый вызов из
     `_tg_auto_execute_tick`, а `_verified_auto_execute_report` — тот самый,
     что решает, какой значок увидит человек."""
-    plan = await rs.call(tool, **args)
+    plan = await rs.call_direct(tool, **args)
     mid = re.search(r'manifest_id="([0-9a-f]+)"', plan)
     assert mid, f"{tool} не построил план:\n{plan}"
     mid = mid.group(1)
