@@ -14079,6 +14079,9 @@ def _describe_triage_op(op: Dict) -> str:
         pname = op.get("_parent_label") or op.get("_parent_live_title") \
             or op.get("to_title") or "?"
         return f"⤵ Вложить {title}{where} под «{pname}»{tail}"
+    if kind == "unparent":
+        pname = op.get("_parent_label") or op.get("_parent_live_title") or "?"
+        return f"⤴ Отцепить {title}{where} от «{pname}»{tail}"
     if kind == "merge":
         keep_title = op.get("_keep_live_title") or op.get("keep_title") or "?"
         keep_proj = op.get("_keep_project_name") or ""
@@ -15044,6 +15047,77 @@ async def _op_parent_execute(summary: str, ops: List[Dict],
     return out
 
 
+# ────────────────────────────── unparent ───────────────────────────────────
+
+def _op_unparent_validate(i: int, op: Dict, shown: str) -> Optional[str]:
+    refusal = _triage_no_changes_refusal(
+        i, op, shown, "unparent",
+        "Правка полей задачи — это отдельная операция op=\"update\".")
+    if refusal:
+        return refusal
+    alien = [k for k in ("to_task_id", "to_title", "to_untitled",
+                         "to_project_id", "to_project", "parent_ref")
+             if op.get(k) is not None]
+    if alien:
+        # Родитель здесь НЕ задаётся вызывающим и не сверяется по имени: от
+        # кого именно отцеплять — вопрос к живому состоянию, а не к плану, и
+        # ответ на него берётся ровно там. Принять эти поля и молча их
+        # проигнорировать значило бы показать в превью одно, а сделать другое.
+        return (f"🛑 Отказ: операция #{i} («{shown}») — у op=\"unparent\" "
+                f"полей {alien} нет: от кого отцеплять, сервер читает из "
+                "живого состояния задачи, а не из плана. Ничего не сделано.")
+    return None
+
+
+def _op_unparent_plan(e: Dict, ctx: _TriagePlanCtx) -> str:
+    live = ctx.by_id.get(e["task_id"]) or {}
+    parent_id = live.get("parentId") or ""
+    if not parent_id:
+        return "и так не подзадача — отцеплять нечего"
+    parent_live = ctx.by_id.get(parent_id) or {}
+    parent_title = parent_live.get("title") or ""
+    e["_parent_id"] = parent_id
+    e["_parent_live_title"] = parent_title
+    e["_parent_label"] = (_untitled_label(parent_live)
+                          if _looks_untitled(parent_title) else parent_title)
+    return ""
+
+
+def _op_unparent_drift(op: Dict, by_id: Dict[str, Dict], names: Dict) -> str:
+    # Опустевший между планом и «да» `parentId` — это НЕ успех: отцеплять уже
+    # нечего, и отчёт обязан сказать именно это, а не отрапортовать про
+    # операцию, которой не было.
+    if not (by_id.get(op.get("task_id")) or {}).get("parentId"):
+        return "уже не подзадача — между планом и подтверждением её отцепили"
+    return ""
+
+
+def _op_unparent_verify(op: Dict, item: Dict, live_map: Dict[str, Dict],
+                        names: Dict) -> Tuple[str, str]:
+    # `expect={"parentId": None}`: «ok» ровно тогда, когда живое поле ПУСТО.
+    # Строка вердикта печатает наблюдаемый факт («родитель: нет»), а не
+    # название операции — по образцу ветки `tags`.
+    item["expect"] = {"parentId": None}
+    return _verify_item("parent", item, live_map, names)
+
+
+async def _op_unparent_execute(summary: str, ops: List[Dict],
+                               ctx: _TriageExecCtx) -> List[Tuple[str, str]]:
+    """По одной операции за вызов: `_unset_task_parent_impl` отцепляет ровно
+    одну задачу и сам ещё раз сверяет и её, и её живого родителя."""
+    out: List[Tuple[str, str]] = []
+    for o in ops:
+        live = ctx.by_id.get(o["task_id"]) or {}
+        parent_id = live.get("parentId") or o.get("_parent_id") or ""
+        parent_title = (ctx.by_id.get(parent_id) or {}).get("title") \
+            or o.get("_parent_live_title") or ""
+        text = await _unset_task_parent_impl(
+            o.get("_live_title") or o.get("title") or "", parent_title,
+            o["task_id"], parent_id, o.get("_project_id") or "")
+        out.append((f"⤴ Отцепление «{_triage_task_label(o)}»", text))
+    return out
+
+
 # ─────────────────────────────── update ────────────────────────────────────
 
 def _op_update_validate(i: int, op: Dict, shown: str) -> Optional[str]:
@@ -15346,6 +15420,11 @@ def _triage_registry() -> Tuple[_TriageType, ...]:
             drift=_op_parent_drift, verify=_op_parent_verify,
             execute=_op_parent_execute),
         _TriageType(
+            op="unparent", emoji="⤴", verb="отцепить",
+            validate=_op_unparent_validate, plan=_op_unparent_plan,
+            drift=_op_unparent_drift, verify=_op_unparent_verify,
+            execute=_op_unparent_execute),
+        _TriageType(
             op="update", emoji="✏️", verb="изменить",
             validate=_op_update_validate, plan=_op_update_plan,
             drift=_op_update_drift, verify=_op_update_verify,
@@ -15479,7 +15558,7 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
     Each element of `operations`:
       {
         "op":      "delete" | "complete" | "update" | "move" | "merge"
-                   | "parent",
+                   | "parent" | "unparent",
         "task_id": "<task id>",                      # required, non-empty
         "title":   "<the task's exact CURRENT title>",  # required — identity guard
         "untitled": true,   # INSTEAD of "title", ONLY for a task that really
@@ -15506,6 +15585,8 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         "to_task_id": "<id of the parent task>",
         "to_title":   "<the parent's exact CURRENT title>",
         "to_untitled": true   # INSTEAD of "to_title", same rule as "untitled"
+        # op="unparent" takes NO extra fields at all: which parent to detach
+        # from is read from LIVE state, not taken from the plan.
       }
 
     `untitled` — the ONLY way to name a task that has no name. Some tasks

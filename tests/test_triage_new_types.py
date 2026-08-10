@@ -234,5 +234,88 @@ async def test_parent_renamed_between_plan_and_yes_is_skipped(
     assert "переименовали" in out
 
 
+# ══════════════════════════════ unparent ══════════════════════════════════
+
+async def test_unparent_detaches_and_verifies(monkeypatch, tmp_path):
+    """Отцепление подзадачи: судим по ЖИВОМУ `parentId` — его не должно
+    остаться, а сама задача обязана остаться среди открытых."""
+    live = {
+        "kid": {"id": "kid", "title": "Позвонить в банк", "projectId": "p_in",
+                "parentId": "par"},
+        "par": {"id": "par", "title": "Ипотека", "projectId": "p_in"},
+        "sib": {"id": "sib", "title": "Собрать документы", "projectId": "p_in",
+                "parentId": "par"},
+    }
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    preview, out = await _run([
+        {"op": "unparent", "task_id": "kid", "title": "Позвонить в банк",
+         "said": "это не про ипотеку, вынеси отдельно"}])
+
+    assert "parentId" not in live["kid"], "родитель обязан быть снят"
+    assert "kid" in live, "отцепление не удаляет задачу"
+    assert live["sib"]["parentId"] == "par", "соседняя подзадача не тронута"
+    assert ("unparent", "kid", "par") in v2.calls
+    assert "«Ипотека»" in preview
+    assert "✅ Выполнено 1 из 1" in out
+
+
+async def test_unparent_of_a_root_task_never_reaches_the_plan(
+        monkeypatch, tmp_path):
+    """У задачи нет родителя → строка не входит в план: «и так не подзадача».
+    Без этой ветки отчёт отрапортовал бы про операцию, которой не было."""
+    live = {"solo": {"id": "solo", "title": "Позвонить в банк",
+                     "projectId": "p_in"}}
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "unparent", "task_id": "solo", "title": "Позвонить в банк",
+         "said": "вынеси отдельно"}])
+
+    assert "🛑" in out and "и так не подзадача" in out
+    assert v2.calls == []
+
+
+async def test_unparent_detached_between_plan_and_yes_is_skipped(
+        monkeypatch, tmp_path):
+    """Родителя сняли руками между планом и «да» — это НЕ успех операции."""
+    live = {
+        "kid": {"id": "kid", "title": "Позвонить в банк", "projectId": "p_in",
+                "parentId": "par"},
+        "par": {"id": "par", "title": "Ипотека", "projectId": "p_in"},
+    }
+    v2 = _wire(monkeypatch, live, tmp_path)
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "unparent", "task_id": "kid", "title": "Позвонить в банк",
+         "said": "вынеси отдельно"}])
+
+    live["kid"].pop("parentId")
+    out = await s.manual_triage("Разбираю", manifest_id=_mid(preview),
+                                user_reply="да")
+
+    assert v2.calls == [], "второй раз отцеплять нечего — канал не дёргается"
+    assert "уже не подзадача" in out
+    assert "✅ Выполнено" not in out
+
+
+async def test_unparent_rejects_fields_of_other_types(monkeypatch, tmp_path):
+    """Поля чужого типа отвергаются, а не игнорируются молча: превью
+    показывало бы одно, а исполнялось бы другое."""
+    live = {
+        "kid": {"id": "kid", "title": "Позвонить в банк", "projectId": "p_in",
+                "parentId": "par"},
+        "par": {"id": "par", "title": "Ипотека", "projectId": "p_in"},
+    }
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "unparent", "task_id": "kid", "title": "Позвонить в банк",
+         "to_project_id": "p_work", "said": "вынеси отдельно"}])
+
+    assert "🛑" in out and "to_project_id" in out
+    assert s._MANIFESTS == {} and v2.calls == []
+    assert live["kid"]["parentId"] == "par"
+
+
 def _plan_lines(preview: str):
     return [ln for ln in preview.splitlines() if re.match(r"^\d+\. ", ln)]
