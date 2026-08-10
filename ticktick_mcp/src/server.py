@@ -14187,6 +14187,11 @@ def _describe_triage_op(op: Dict) -> str:
         # id вместо названия задачи).
         pname = op.get("_parent_label") or op.get("_parent_live_title") \
             or op.get("to_title") or "?"
+        # «под новой задачей …» — потому что её ещё нет: без этого слова
+        # строка выглядит как привязка к чему-то уже существующему.
+        kind_word = "новой задачей" if op.get("_parent_is_future") else None
+        if kind_word:
+            return f"⤵ Вложить {title}{where} под {kind_word} «{pname}»{tail}"
         return f"⤵ Вложить {title}{where} под «{pname}»{tail}"
     if kind == "unparent":
         pname = op.get("_parent_label") or op.get("_parent_live_title") or "?"
@@ -14391,7 +14396,23 @@ def _validate_triage_ops(operations: List[Dict], max_items: int) -> Optional[str
             return (f"🛑 Отказ: операция #{i} — неизвестный op={op.get('op')!r}. "
                     f"Допустимо: {', '.join(_TRIAGE_OPS)}. Ничего не сделано.")
         tid = str(op.get("task_id") or "").strip()
-        if not reg.needs_task_id and tid:
+        ref = _triage_ref_of(op, "ref")
+        if ref and tid:
+            return (f"🛑 Отказ: операция #{i} ({kind}) — заданы и task_id, и "
+                    "ref: это два разных утверждения о том, ЧТО менять "
+                    "(существующий объект или созданный этим же планом), и "
+                    "сервер не выбирает за тебя. Ничего не сделано.")
+        if ref and not reg.needs_task_id:
+            return (f"🛑 Отказ: операция #{i} ({kind}) — у op=\"{kind}\" поля "
+                    "ref нет: она сама создаёт объект, ссылаться ей не на "
+                    "что. Ничего не сделано.")
+        if ref:
+            # Метка ЗАМЕНЯЕТ идентификатор: объекта ещё нет, и сверка личности
+            # не отменяется, а переносится на исполнение — после подстановки
+            # настоящего id проверяется, что объект существует и назван
+            # ожидаемо (дизайн, раздел 3).
+            tid = ""
+        elif not reg.needs_task_id and tid:
             # У создания объекта ещё нет — присланный за него id мог прийти
             # только выдуманным, а выдуманный id, принятый молча, увёл бы
             # сверку на ЧУЖУЮ живую задачу.
@@ -14464,6 +14485,19 @@ def _validate_triage_ops(operations: List[Dict], max_items: int) -> Optional[str
                     f"({keep[:8]}…), в этом же плане удаляется/закрывается "
                     "другой операцией. Так пропали бы обе копии. Ничего не "
                     "сделано.")
+    # ВРЕМЕННЫЕ МЕТКИ И ЗАВИСИМОСТИ (1.3.3/изм-10) — последним проходом, когда
+    # каждая строка уже признана осмысленной сама по себе: сообщение «ссылка
+    # на метку, которой нет» поверх операции с неизвестным op читалось бы как
+    # претензия не по адресу.
+    refusal, labels = _triage_refs_resolve(operations)
+    if refusal:
+        return refusal
+    if _triage_topo_levels(
+            operations, _triage_dependency_edges(operations, labels)) is None:
+        return ("🛑 Отказ: в ссылках плана ЦИКЛ — операции ждут друг друга по "
+                "кругу (ref/parent_ref/after), и начать нечем. План не "
+                "строится: исполнить его частично значит сделать половину "
+                "того, что человек назвал одним решением. Ничего не сделано.")
     return None
 
 
@@ -14541,6 +14575,18 @@ def _resolve_triage_ops(operations: List[Dict], by_id: Dict[str, Dict],
         e["task_id"] = str(op.get("task_id") or "").strip()
         reg = _TRIAGE_BY_OP[e["op"]]
         ctx = _TriagePlanCtx(by_id=by_id, names=names, kids=kids)
+        if _triage_ref_of(e, "ref"):
+            # ОБЪЕКТ СОЗДАЁТСЯ ЭТИМ ЖЕ ПЛАНОМ (1.3.3/изм-10). Сверять с живым
+            # состоянием нечего — его там нет и быть не должно. Сверка
+            # личности не отменяется, а ПЕРЕНОСИТСЯ на исполнение: после
+            # подстановки настоящего id проверяется, что объект существует и
+            # назван ожидаемо (`_triage_substitute_refs`).
+            e["_deferred_identity"] = True
+            e["_live_title"] = e.get("title") or ""
+            e["_label"] = e.get("title") or ""
+            e["_untitled"] = False
+            resolved.append(e)
+            continue
         if not reg.needs_live:
             # Тип, чей объект в снимке ОТКРЫТЫХ задач не лежит по определению
             # (дублирование завершённой как шаблона — законно; восстановление
@@ -15111,6 +15157,297 @@ def _triage_no_changes_refusal(i: int, op: Dict, shown: str,
             f"бы «выполнено». {instead} Ничего не сделано.")
 
 
+# ═══════════════ ВРЕМЕННЫЕ МЕТКИ, ЗАВИСИМОСТИ, ПОРЯДОК ══════════════════════
+#
+# 1.3.3/изм-10 (2026-08-10). Сценарий, ради которого всё это: «создай общую
+# задачу „Workers' Compensation" и привяжи к ней вот эти три» — ОДНИМ планом и
+# ОДНИМ подтверждением. Сегодня это невозможно: id новой задачи не существует
+# в момент, когда план показывают человеку, а выдумывать его нельзя.
+#
+# `new_ref` объявляет метку ШАГА. У создающих операций (`create`, `duplicate`)
+# метка несёт ещё и идентификатор созданного объекта — только на такие метки и
+# ссылаются `ref` (вместо `task_id`) и `parent_ref` (вместо `to_task_id`).
+# При исполнении метка подменяется настоящим id от исполнителя.
+#
+# МЕТКА НЕ ПОКАЗЫВАЕТСЯ В ПРЕВЬЮ (дизайн, раздел 3): человек читает «привязать
+# 3 задачи к новой задаче „Workers' Compensation…"», а не «привязать к
+# parent_wc». Служебный токен в превью создаёт иллюзию, что читатель что-то
+# проверил, — а проверить его он не может ничем.
+
+def _triage_ref_of(op: Dict, field: str) -> str:
+    return str(op.get(field) or "").strip()
+
+
+def _triage_refs_resolve(operations: List[Dict]) -> Tuple[Optional[str],
+                                                          Dict[str, int]]:
+    """Разбор меток плана → (текст отказа, {метка: индекс операции}).
+
+    План НЕ СТРОИТСЯ ВОВСЕ (а не «эту строку пропустим») при: повторном
+    объявлении метки, ссылке на несуществующую метку, ссылке `ref`/
+    `parent_ref` на операцию, которая ничего не создаёт, и ссылке на саму
+    себя. Причина та же, по которой fail-closed вся валидация: план с
+    неразрешимой ссылкой исполнится наполовину, и человек узнает об этом
+    после — по половине сделанного."""
+    labels: Dict[str, int] = {}
+    creating: Dict[str, bool] = {}
+    for i, op in enumerate(operations):
+        nr = _triage_ref_of(op, "new_ref")
+        if not nr:
+            continue
+        if nr in labels:
+            return (f"🛑 Отказ: метка new_ref=«{nr}» объявлена дважды "
+                    f"(операции #{labels[nr] + 1} и #{i + 1}) — ссылка на неё "
+                    "означала бы то одну операцию, то другую, и выбирал бы "
+                    "порядок объявления. Ничего не сделано."), {}
+        labels[nr] = i
+        kind = str(op.get("op") or "").strip().lower()
+        creating[nr] = bool((_TRIAGE_BY_OP.get(kind) or _TriageType("", "", "")).creates)
+    for i, op in enumerate(operations):
+        for field in ("ref", "parent_ref"):
+            v = _triage_ref_of(op, field)
+            if not v:
+                continue
+            if v not in labels:
+                return (f"🛑 Отказ: операция #{i + 1} ссылается ({field}) на "
+                        f"метку «{v}», которой в плане нет. Метка объявляется "
+                        "полем new_ref у той операции, которая создаёт объект. "
+                        "Ничего не сделано."), {}
+            if not creating.get(v):
+                return (f"🛑 Отказ: операция #{i + 1} ссылается ({field}) на "
+                        f"метку «{v}», а операция #{labels[v] + 1} ничего не "
+                        "создаёт — подставлять на её место нечего. Ссылаться "
+                        "можно только на create и duplicate. Ничего не "
+                        "сделано."), {}
+            if labels[v] == i:
+                return (f"🛑 Отказ: операция #{i + 1} ссылается ({field}) на "
+                        "собственную метку — объекта в этот момент ещё нет. "
+                        "Ничего не сделано."), {}
+        after = op.get("after")
+        if after is None:
+            continue
+        if not isinstance(after, list):
+            return (f"🛑 Отказ: операция #{i + 1} — поле after должно быть "
+                    f"списком меток, а пришло {type(after).__name__}. "
+                    "Ничего не сделано."), {}
+        for a in after:
+            if not isinstance(a, str) or not a.strip():
+                return (f"🛑 Отказ: операция #{i + 1} — в after ожидаются "
+                        f"метки строками, а внутри {a!r}. Ничего не "
+                        "сделано."), {}
+            if a.strip() not in labels:
+                return (f"🛑 Отказ: операция #{i + 1} — after ссылается на "
+                        f"метку «{a.strip()}», которой в плане нет. Ничего не "
+                        "сделано."), {}
+            if labels[a.strip()] == i:
+                return (f"🛑 Отказ: операция #{i + 1} — after ссылается на "
+                        "собственную метку. Ничего не сделано."), {}
+    return None, labels
+
+
+def _triage_labels_of(ops: List[Dict]) -> Dict[str, int]:
+    """{метка: индекс операции} по УЖЕ ОТОБРАННОМУ списку. Уникальность метки
+    гарантирована валидацией, здесь она уже не проверяется."""
+    return {_triage_ref_of(o, "new_ref"): i for i, o in enumerate(ops)
+            if _triage_ref_of(o, "new_ref")}
+
+
+def _triage_cascade_lost_refs(ops: List[Dict]) -> None:
+    """Помечает `_skip` всё, что ссылается на операцию, которой в плане уже
+    нет (она сама не прошла сверку). Каскадом: выпасть может и тот, кто был
+    чьей-то опорой."""
+    while True:
+        alive = _triage_labels_of([o for o in ops if not o.get("_skip")])
+        changed = False
+        for o in ops:
+            if o.get("_skip"):
+                continue
+            for field, what in (("ref", "объект"), ("parent_ref", "родитель")):
+                v = _triage_ref_of(o, field)
+                if v and v not in alive:
+                    o["_skip"] = (f"{what} не создаётся — операция, которая "
+                                  "его создавала, сама не прошла сверку и в "
+                                  "план не вошла")
+                    changed = True
+                    break
+            if o.get("_skip"):
+                continue
+            for a in (o.get("after") or []):
+                if str(a).strip() not in alive:
+                    o["_skip"] = ("шаг, от которого она зависела, в план не "
+                                  "вошёл (не прошёл сверку)")
+                    changed = True
+                    break
+        if not changed:
+            return
+
+
+def _triage_ordered(ops: List[Dict]) -> List[Dict]:
+    """Топологический порядок по рёбрам зависимостей; при равенстве уровня —
+    статический ранг типа. Цикл сюда не доходит (его отвергает валидация), но
+    если бы дошёл — порядок остаётся прежним, ранговым, а не теряется."""
+    levels = _triage_topo_levels(
+        ops, _triage_dependency_edges(ops, _triage_labels_of(ops)))
+    if levels is None:
+        return sorted(ops, key=lambda o: _TRIAGE_ORDER[o["op"]])
+    return [ops[i] for level in levels for i in level]
+
+
+def _triage_name_future_objects(ops: List[Dict]) -> None:
+    """ЧЕМ НАЗВАТЬ В ПРЕВЬЮ объект, которого ещё нет (1.3.3/изм-10, дизайн
+    раздел 3).
+
+    Метка в превью не показывается НИКОГДА: «привязать к parent_wc» — это
+    служебный токен, который человек не может проверить ничем, но который
+    создаёт ощущение, будто он что-то проверил. Вместо метки печатается
+    ЖЕЛАЕМОЕ ИМЯ из создающей операции — то самое, которое человек и назвал:
+    «привязать 3 задачи к новой задаче „Workers' Compensation"»."""
+    by_label = {_triage_ref_of(o, "new_ref"): o for o in ops
+                if _triage_ref_of(o, "new_ref")}
+    for o in ops:
+        src = by_label.get(_triage_ref_of(o, "parent_ref"))
+        if src is not None:
+            name = str(src.get("title") or "")
+            o["_parent_live_title"] = name
+            o["_parent_label"] = name
+            o["_parent_is_future"] = True
+        src = by_label.get(_triage_ref_of(o, "ref"))
+        if src is not None:
+            o["_label"] = str(src.get("title") or o.get("title") or "")
+            o["_live_title"] = o["_label"]
+
+
+def _triage_label_id(op: Dict) -> str:
+    """Настоящий id объекта, созданного этой операцией, — из ответа
+    исполнителя (`sink`), а не из текста отчёта."""
+    return str(op.get("_created_id") or op.get("_copy_id") or "")
+
+
+def _triage_substitute_refs(op: Dict, label_ids: Dict[str, str],
+                            by_id: Dict[str, Dict], names: Dict) -> str:
+    """Подставляет настоящие id вместо меток и ДОСВЕРЯЕТ личность по свежему
+    живому состоянию → причина пропуска или "".
+
+    Здесь и происходит то, что дизайн (раздел 3) называет «сверка личности не
+    исчезает, а переносится на исполнение»: объекта не было в момент плана,
+    но к этому моменту он создан — значит спросить с него можно то же самое,
+    что с любого другого: существует ли и назван ли ожидаемо."""
+    ref = _triage_ref_of(op, "ref")
+    if ref:
+        tid = label_ids.get(ref) or ""
+        if not tid:
+            return "объект не создан — операции, создавшей его, не случилось"
+        op["task_id"] = tid
+        live = by_id.get(tid)
+        if not live:
+            return ("созданный этим же планом объект не найден среди открытых "
+                    "задач — работать с ним вслепую нельзя")
+        if not _names_agree(op.get("title") or "", live.get("title") or ""):
+            return (f"созданный объект называется «{live.get('title')}», а в "
+                    f"плане «{op.get('title')}» — это не он")
+        _triage_bind_live(op, live, names)
+        op.pop("_deferred_identity", None)
+    pref = _triage_ref_of(op, "parent_ref")
+    if pref:
+        pid = label_ids.get(pref) or ""
+        if not pid:
+            return "родитель не создан — операции, создавшей его, не случилось"
+        live = by_id.get(pid)
+        if not live:
+            return ("созданный этим же планом родитель не найден среди "
+                    "открытых — вложение под мёртвого родителя осиротит задачу")
+        op["to_task_id"] = pid
+        op["to_title"] = live.get("title") or ""
+        op["_parent_id"] = pid
+        op["_parent_live_title"] = live.get("title") or ""
+        op["_parent_label"] = op["_parent_live_title"]
+        op["_parent_project_id"] = live.get("projectId") or ""
+        op.pop("_deferred_parent", None)
+    return ""
+
+
+def _triage_batches_of_level(level_ops: List[Dict]) -> List[List[Dict]]:
+    """Уровень → ПАРТИИ ПАКЕТНЫХ ИСПОЛНИТЕЛЕЙ (дизайн, раздел 5).
+
+    Внутри уровня операции идут рангом типа; подряд идущие операции одного
+    ключа исполнителя (`exec_group`) собираются в одну партию. Партия целиком
+    исполняется до перехода к следующей и никогда не пересекает границу
+    волны — иначе топологический порядок ничего бы не значил.
+
+    Следствие, обязательное к проверке тестом: план без единой ссылки даёт
+    ровно один уровень, то есть в точности сегодняшние партии и ни одного
+    лишнего сетевого вызова."""
+    batches: List[List[Dict]] = []
+    keys: List[str] = []
+    for o in sorted(level_ops, key=lambda x: _TRIAGE_ORDER[x["op"]]):
+        key = _TRIAGE_BY_OP[o["op"]].exec_group or o["op"]
+        if batches and keys[-1] == key:
+            batches[-1].append(o)
+        else:
+            batches.append([o])
+            keys.append(key)
+    return batches
+
+
+def _triage_dependency_edges(operations: List[Dict],
+                             labels: Dict[str, int]) -> Dict[int, set]:
+    """Кто от кого зависит: {индекс операции: множество индексов, которые
+    обязаны отработать раньше}. Объявлять зависимость отдельно не нужно, она
+    ВЫВОДИТСЯ (дизайн, раздел 4):
+
+      1. из `ref`/`parent_ref` — от создающей операции: объекта до неё нет;
+      2. из `after` — от ШАГА, а не от объекта: так выражается «дописать
+         деталь в А, потом удалить Б, откуда её взяли» (сегодня типы уходят
+         пакетами в свои исполнители, и неудача одного не блокирует
+         следующий — деталь терялась);
+      3. у `merge` — автоматически от `update` этого же плана, чей `task_id`
+         равен `keep_task_id`: правка оставляемой копии обязана пройти до
+         того, как дубль исчезнет."""
+    edges: Dict[int, set] = {i: set() for i in range(len(operations))}
+    by_task_update: Dict[str, int] = {}
+    for i, op in enumerate(operations):
+        if str(op.get("op") or "").strip().lower() == "update":
+            tid = str(op.get("task_id") or "").strip()
+            if tid:
+                by_task_update[tid] = i
+    for i, op in enumerate(operations):
+        for field in ("ref", "parent_ref"):
+            v = _triage_ref_of(op, field)
+            if v and v in labels:
+                edges[i].add(labels[v])
+        for a in (op.get("after") or []):
+            key = str(a).strip()
+            if key in labels:
+                edges[i].add(labels[key])
+        if str(op.get("op") or "").strip().lower() == "merge":
+            keep = str(op.get("keep_task_id") or "").strip()
+            if keep and keep in by_task_update and by_task_update[keep] != i:
+                edges[i].add(by_task_update[keep])
+    return edges
+
+
+def _triage_topo_levels(operations: List[Dict],
+                        edges: Dict[int, set]) -> Optional[List[List[int]]]:
+    """Уровни зависимости (волны) — или None, если в рёбрах есть ЦИКЛ.
+
+    Уровень 0 — операции, которые ни от кого не зависят; уровень N — те, чьи
+    зависимости все на уровнях меньше N. Внутри уровня порядок задаётся
+    рангом типа, а не этой функцией."""
+    remaining = {i: set(deps) for i, deps in edges.items()}
+    levels: List[List[int]] = []
+    done: set = set()
+    while remaining:
+        ready = [i for i, deps in remaining.items() if deps <= done]
+        if not ready:
+            return None          # цикл: никто больше не может стать готовым
+        ready.sort(key=lambda i: (_TRIAGE_ORDER.get(
+            str(operations[i].get("op") or "").strip().lower(), 99), i))
+        levels.append(ready)
+        for i in ready:
+            done.add(i)
+            remaining.pop(i)
+    return levels
+
+
 # ─────────────────────────────── create ────────────────────────────────────
 
 # Близость названий — СУЩЕСТВУЮЩИЙ алгоритм и СУЩЕСТВУЮЩИЙ порог, перенесён
@@ -15428,10 +15765,6 @@ def _op_create_validate(i: int, op: Dict, shown: str) -> Optional[str]:
         return (f"🛑 Отказ: операция #{i} («{shown}») — create без "
                 "to_project_id и без to_project: сервер не выбирает список за "
                 "человека, а молчаливый Inbox — это не выбор. Ничего не сделано.")
-    ref = str(op.get("parent_ref") or "").strip()
-    if ref:
-        return (f"🛑 Отказ: операция #{i} («{shown}») — {_TRIAGE_REF_NOT_YET} "
-                "Ничего не сделано.")
     repeat = op.get("confirmed_repeat")
     if repeat is not None and repeat is not True and repeat is not False:
         # Тип строго булев по той же причине, что у `untitled`: "true"
@@ -15483,6 +15816,9 @@ def _op_create_plan(e: Dict, ctx: _TriagePlanCtx) -> str:
     e["_live_title"] = e.get("title") or ""
     e["_label"] = e.get("title") or ""
     e["_untitled"] = False
+    if _triage_ref_of(e, "parent_ref"):
+        e["_deferred_parent"] = True
+        return ""
     parent_id = str(e.get("to_task_id") or "").strip()
     if parent_id:
         parent_live = ctx.by_id.get(parent_id)
@@ -15581,18 +15917,6 @@ async def _op_create_execute(summary: str, ops: List[Dict],
 
 # ─────────────────────────────── parent ────────────────────────────────────
 
-# Временные метки (`parent_ref`, `ref`, `new_ref`) — отдельное изменение
-# (изм-10): пока разрешать метку нечем, операция с ней не имеет права ни
-# строить план, ни тем более исполняться. Поле ЗАРЕЗЕРВИРОВАНО (валидатор
-# знает его имя и отвечает по существу), а не проигнорировано: молча
-# выброшенный `parent_ref` дал бы «parent без родителя» — отказ, из текста
-# которого нельзя понять, что поле вообще прочитали.
-_TRIAGE_REF_NOT_YET = (
-    "ссылки на объекты, создаваемые этим же планом (parent_ref/ref/new_ref), "
-    "появятся отдельным изменением; пока родитель задаётся живым "
-    "to_task_id + to_title.")
-
-
 def _op_parent_validate(i: int, op: Dict, shown: str) -> Optional[str]:
     refusal = _triage_no_changes_refusal(
         i, op, shown, "parent",
@@ -15606,9 +15930,11 @@ def _op_parent_validate(i: int, op: Dict, shown: str) -> Optional[str]:
                 "способами сразу (to_task_id и parent_ref). Это два разных "
                 "утверждения о том, подо что вкладывать, и сервер не выбирает "
                 "за тебя. Ничего не сделано.")
-    if ref and not to_id:
-        return (f"🛑 Отказ: операция #{i} («{shown}») — {_TRIAGE_REF_NOT_YET} "
-                "Ничего не сделано.")
+    if ref:
+        # Родитель создаётся ЭТИМ ЖЕ планом. Его личность на фазе плана
+        # сверять не с чем — объекта ещё нет; сверка переносится на
+        # исполнение, после подстановки настоящего id (дизайн, раздел 3).
+        return None
     if not to_id:
         return (f"🛑 Отказ: операция #{i} («{shown}») — parent без родителя: "
                 "нужен to_task_id и его точное текущее название to_title "
@@ -15645,6 +15971,12 @@ def _op_parent_plan(e: Dict, ctx: _TriagePlanCtx) -> str:
     Всё это повторяет проверки `_set_task_parent_impl` НАМЕРЕННО: там они
     отвечают отказом уже после «да», а здесь — причиной «не вошло в план», то
     есть до того, как человек подтвердил заведомо невыполнимую строку."""
+    if _triage_ref_of(e, "parent_ref"):
+        # Родителя ещё нет — он появится раньше этой волны (изм-10). Живое про
+        # него не спрашивается, потому что спрашивать не о чем; всё, что можно
+        # проверить, проверяется на исполнении, после подстановки id.
+        e["_deferred_parent"] = True
+        return ""
     parent_id = str(e.get("to_task_id") or "").strip()
     parent_live = ctx.by_id.get(parent_id)
     if not parent_live:
@@ -16754,7 +17086,27 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         "confirmed_repeat": true   # "yes, create it AGAIN on purpose" — only
                    # needed after the server refused this exact creation as an
                    # already-existing one and printed this very line back
+        # ANY op — temporary LABELS, so ONE plan can create an object and then
+        # work with it (the new task has no id while the plan is being shown,
+        # and inventing one is forbidden):
+        "new_ref": "<label>",      # declare a label on THIS step
+        "ref": "<label>",          # INSTEAD of task_id — act on the object
+                                   # created by the labelled step
+        "parent_ref": "<label>",   # INSTEAD of to_task_id — nest under it
+        "after": ["<label>", ...]  # run only after those steps SUCCEEDED
       }
+
+    Labels are resolved to real ids at execution time and are NEVER shown to
+    the human — the preview says «под новой задачей „Workers' Compensation"»,
+    not «под parent_wc». Only `create` and `duplicate` may be referenced by
+    `ref`/`parent_ref` (nothing else produces an object). The plan is REFUSED
+    OUTRIGHT on a duplicate label, a reference to a label that does not exist,
+    a reference to a step that creates nothing, or a cycle. Execution order is
+    a topological sort of those dependencies, with the least-destructive-first
+    type rank breaking ties — so an object is always created before anything
+    points at it, and deletions still go last. If a labelled step does NOT
+    succeed (judged by INDEPENDENT re-read, not by "we sent it"), everything
+    depending on it is reported as skipped and NOT executed.
 
     `untitled` — the ONLY way to name a task that has no name. Some tasks
     genuinely carry an EMPTY title (a photo of a receipt, a screenshot of a
@@ -16873,10 +17225,21 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         # законным. Рубеж 3 живёт в `_manual_triage_impl`, при исполнении.
         if dedup_refusal:
             return dedup_refusal
+        # КАСКАД ПО ВЫПАВШИМ МЕТКАМ (1.3.3/изм-10). Операция-объявитель могла
+        # не пройти сверку и вылететь из плана — тогда все, кто на неё
+        # ссылался, неисполнимы по построению, и оставлять их в плане значило
+        # бы просить «да» на строку, которая заведомо не сделается. Цикл, а не
+        # один проход: выпасть может и тот, кто сам был чьей-то опорой.
+        _triage_cascade_lost_refs(checked)
         blocked = [o for o in checked if o.get("_skip")]
         enriched = [o for o in checked if not o.get("_skip")]
-        # list.sort устойчива: внутри одного типа исходный порядок сохраняется.
-        enriched.sort(key=lambda o: _TRIAGE_ORDER[o["op"]])
+        # ПОРЯДОК = ТОПОЛОГИЧЕСКАЯ СОРТИРОВКА, тай-брейк — ранг типа (дизайн,
+        # раздел 5). Без ссылок уровень ровно один, и порядок получается
+        # прежний: обратимое раньше необратимого. Он же порядок ПОКАЗА: список,
+        # в котором привязка стоит выше создания родителя, человек прочитал бы
+        # как ошибку.
+        enriched = _triage_ordered(enriched)
+        _triage_name_future_objects(enriched)
         not_planned = _triage_not_planned_records(blocked)
         if not enriched:
             # Просить «да» на план, где исполнять нечего, — это выпрашивать
@@ -16988,6 +17351,14 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict],
                 # плане» нельзя ни при каких условиях.
                 blocked.append((op, op["_skip"]))
                 continue
+            if op.get("_deferred_identity") or op.get("_deferred_parent"):
+                # Объект (или его будущий родитель) создаётся ЭТИМ ЖЕ планом
+                # (изм-10): сверять с живым состоянием сейчас не с чем — его
+                # там нет и быть не должно. Сверка не пропускается, а делается
+                # в своей волне, после подстановки настоящего id
+                # (`_triage_substitute_refs` + обычный дрейф следом).
+                ready.append(op)
+                continue
             why = _triage_drift_reason(op, by_id, names)
             if why:
                 blocked.append((op, why))
@@ -17071,17 +17442,83 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict],
     # один вызов `_execute_task_deletion_impl` с одним синтетическим
     # манифестом. Порядок партий — по рангу типа, то есть прежний: обратимое
     # раньше необратимого.
+    # ВОЛНЫ (1.3.3/изм-10). Топологический порядок задаёт УРОВНИ, партии
+    # собираются ВНУТРИ уровня и никогда его не пересекают. План без единой
+    # ссылки даёт ровно один уровень — то есть в точности прежнее поведение и
+    # ни одного лишнего сетевого вызова; ссылка дробит партию, но не меняет
+    # состав операций внутри уровня; необратимая волна всегда последняя,
+    # потому что ранг типа не может поднять её выше её собственного уровня.
     ctx = _TriageExecCtx(by_id=by_id, names=names)
-    batches: List[Tuple[str, List[Dict]]] = []
-    for o in sorted(ready, key=lambda x: _TRIAGE_ORDER[x["op"]]):
-        key = _TRIAGE_BY_OP[o["op"]].exec_group or o["op"]
-        if batches and batches[-1][0] == key:
-            batches[-1][1].append(o)
-        else:
-            batches.append((key, [o]))
-    for _key, group in batches:
-        sections += await _TRIAGE_BY_OP[group[0]["op"]].execute(
-            summary, group, ctx)
+    levels_idx = _triage_topo_levels(
+        ready, _triage_dependency_edges(ready, _triage_labels_of(ready))) \
+        or [list(range(len(ready)))]
+    label_ids: Dict[str, str] = {}
+    failed_idx: set = set()
+    idx_of = {id(o): i for i, o in enumerate(ready)}
+    edges = _triage_dependency_edges(ready, _triage_labels_of(ready))
+    executed: List[Dict] = []
+    wave_state = by_id
+    for wave_no, level in enumerate(levels_idx):
+        runnable: List[Dict] = []
+        for i in level:
+            o = ready[i]
+            lost = [j for j in edges.get(i, set()) if j in failed_idx]
+            if lost:
+                why = ("объект не создан — операция, от которой она зависела, "
+                       "не выполнилась")
+                if not (_triage_ref_of(o, "ref") or _triage_ref_of(o, "parent_ref")):
+                    why = "шаг, от которого она зависела, не выполнен"
+                blocked.append((o, why))
+                failed_idx.add(i)
+                continue
+            deferred = bool(_triage_ref_of(o, "ref")
+                            or _triage_ref_of(o, "parent_ref"))
+            why = _triage_substitute_refs(o, label_ids, wave_state, names)
+            if not why and deferred:
+                # Подстановка состоялась — теперь операция сверяется как любая
+                # другая, тем же дрейфом, но уже по СВЕЖЕМУ состоянию своей
+                # волны: сверка личности не пропущена, а сделана позже.
+                why = _triage_drift_reason(o, wave_state, names)
+            if why:
+                blocked.append((o, why))
+                failed_idx.add(i)
+                continue
+            runnable.append(o)
+        for group in _triage_batches_of_level(runnable):
+            sections += await _TRIAGE_BY_OP[group[0]["op"]].execute(
+                summary, group, ctx)
+        executed += runnable
+        if wave_no == len(levels_idx) - 1:
+            break
+        # ПРОМЕЖУТОЧНАЯ СВЕРКА между волнами. Метка разрешается в настоящий id
+        # ТОЛЬКО когда независимое чтение подтвердило, что объект создан:
+        # «отправлено» выполненным не считается (дизайн, раздел 4). Её нет
+        # вовсе, когда уровень один, — то есть у сегодняшних планов не
+        # появляется ни одного лишнего запроса.
+        wave_state = _open_by_id(fresh=True)
+        if wave_state is None:
+            # Читать нечем — продолжать волнами вслепую нельзя: зависимые
+            # операции работают по подставленным id, а подтвердить их нечем.
+            wave_state = {}
+        wave_names = _v2_project_names() if wave_state else names
+        ctx = _TriageExecCtx(by_id=wave_state, names=wave_names)
+        names = wave_names
+        for i in level:
+            o = ready[i]
+            if o not in runnable:
+                continue
+            st, _line = _verify_triage_op(o, wave_state, wave_names)
+            if st != "ok":
+                failed_idx.add(i)
+                continue
+            nr = _triage_ref_of(o, "new_ref")
+            if nr and _TRIAGE_BY_OP[o["op"]].creates:
+                new_id = _triage_label_id(o)
+                if new_id:
+                    label_ids[nr] = new_id
+                else:
+                    failed_idx.add(i)
+    ready = executed
 
     # ── Независимая сверка: своё свежее чтение, а НЕ разбор текстов выше ──
     #
