@@ -240,7 +240,7 @@ async def _assert_refused_outright(monkeypatch, live, ops, needle, max_items=50)
     calls = _stub_sub_impls(monkeypatch, live)
     before = {k: dict(v) for k, v in live.items()}
 
-    out = await s.manual_triage("Разбираю", ops, max_items=max_items)
+    out = await s.apply_task_changes("Разбираю", ops, max_items=max_items)
 
     assert "🛑" in out and needle in out, out
     assert "Манифест" not in out, "отказ не имеет права строить план"
@@ -257,7 +257,7 @@ async def test_call1_previews_and_mutates_nothing(monkeypatch, tmp_path):
     before = {k: dict(v) for k, v in live.items()}
     v2, official = _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю входящие", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю входящие", _mixed_ops())
 
     assert v2.calls == [] and official.calls == []
     assert live == before, "call #1 не имеет права ничего менять"
@@ -278,7 +278,7 @@ async def test_preview_orders_least_destructive_first(monkeypatch, tmp_path):
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю входящие", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю входящие", _mixed_ops())
 
     order = [preview.index(x) for x in ("✏️ Изменить", "↪ Перенести",
                                         "✅ Закрыть", "🔗 Объединить",
@@ -292,10 +292,10 @@ async def test_manifest_holds_exactly_the_given_operations(monkeypatch, tmp_path
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю входящие", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю входящие", _mixed_ops())
     m = s._MANIFESTS[_mid(preview)]
 
-    assert m["kind"] == "manual_triage" and m["tool"] == "manual_triage"
+    assert m["kind"] == "manual_triage" and m["tool"] == "apply_task_changes"
     assert m["_gate"] == "batch"
     assert [o["task_id"] for o in m["tasks"]] == ["b2", "c3", "d4", "e5", "a1"]
     # Ни «zz», ни keep-копия «e6» не превратились в СВОЮ операцию: keep только
@@ -309,7 +309,7 @@ async def test_summary_gets_the_per_type_counts(monkeypatch, tmp_path):
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю входящие", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю входящие", _mixed_ops())
 
     assert ("Разбираю входящие — изменить 1, перенести 1, закрыть 1, "
             "объединить 1, удалить 1") in preview
@@ -321,10 +321,10 @@ async def test_call2_without_reply_is_refused(monkeypatch, tmp_path):
     live = _live_inbox()
     before = {k: dict(v) for k, v in live.items()}
     v2, official = _wire(monkeypatch, live, tmp_path)
-    preview = await s.manual_triage("Разбираю входящие", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю входящие", _mixed_ops())
     mid = _mid(preview)
 
-    refused = await s.manual_triage("Разбираю входящие", manifest_id=mid,
+    refused = await s.apply_task_changes("Разбираю входящие", manifest_id=mid,
                                     user_reply="")
 
     assert "🛑" in refused
@@ -336,12 +336,12 @@ async def test_call2_without_reply_is_refused(monkeypatch, tmp_path):
 async def test_explicit_no_burns_the_plan(monkeypatch, tmp_path):
     live = _live_inbox()
     v2, official = _wire(monkeypatch, live, tmp_path)
-    preview = await s.manual_triage("Разбираю входящие", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю входящие", _mixed_ops())
     mid = _mid(preview)
 
-    assert "🛑" in await s.manual_triage("Разбираю", manifest_id=mid,
+    assert "🛑" in await s.apply_task_changes("Разбираю", manifest_id=mid,
                                          user_reply="нет, стоп")
-    dead = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    dead = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert "🛑" in dead
     assert v2.calls == [] and official.calls == []
@@ -424,7 +424,7 @@ async def test_empty_operations_list_is_refused(monkeypatch, tmp_path):
     await _assert_refused_outright(monkeypatch, live, [],
                                    "Пустой список операций")
     calls = _stub_sub_impls(monkeypatch, live)
-    out = await s.manual_triage("Разбираю")           # operations вообще не передан
+    out = await s.apply_task_changes("Разбираю")           # operations вообще не передан
     assert "🛑" in out and "Пустой список операций" in out
     assert s._MANIFESTS == {} and calls == []
 
@@ -524,7 +524,7 @@ async def test_tool_has_no_filter_or_scope_parameter():
     """Главный инвариант после declutter-инцидента: у тула физически нет
     входа, через который он мог бы «просканировать и предложить»."""
     import inspect
-    params = set(inspect.signature(s.manual_triage).parameters)
+    params = set(inspect.signature(s.apply_task_changes).parameters)
     # `automation_key` добавлен 2026-08-06 (#118): headless-клиент с верным
     # ключом исполняет батч сразу, без плана и без кнопки владельцу. Ко входу
     # «просканируй и предложи» это отношения не имеет — набор всё равно
@@ -538,10 +538,10 @@ async def test_tool_has_no_filter_or_scope_parameter():
 async def test_full_cycle_applies_every_operation_once(monkeypatch, tmp_path):
     live = _live_inbox()
     v2, official = _wire(monkeypatch, live, tmp_path)
-    preview = await s.manual_triage("Разбираю входящие", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю входящие", _mixed_ops())
     mid = _mid(preview)
 
-    out = await s.manual_triage("Разбираю входящие", manifest_id=mid,
+    out = await s.apply_task_changes("Разбираю входящие", manifest_id=mid,
                                 user_reply="да, давай")
 
     assert "a1" not in live                       # delete
@@ -558,12 +558,12 @@ async def test_full_cycle_applies_every_operation_once(monkeypatch, tmp_path):
 async def test_manifest_is_one_shot(monkeypatch, tmp_path):
     live = _live_inbox()
     v2, official = _wire(monkeypatch, live, tmp_path)
-    preview = await s.manual_triage("Разбираю", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю", _mixed_ops())
     mid = _mid(preview)
-    await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
     calls_after = (len(v2.calls), len(official.calls))
 
-    second = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    second = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert "🛑" in second
     assert (len(v2.calls), len(official.calls)) == calls_after
@@ -574,7 +574,7 @@ async def test_drifted_task_is_skipped_not_applied(monkeypatch, tmp_path):
     ней НЕ исполняется, а честно уходит в «пропущено»."""
     live = _live_inbox()
     v2, official = _wire(monkeypatch, live, tmp_path)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "a1", "title": "Купить молоко",
          "said": "не нужно"},
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
@@ -583,7 +583,7 @@ async def test_drifted_task_is_skipped_not_applied(monkeypatch, tmp_path):
 
     live["a1"]["title"] = "Купить молоко и хлеб"
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert "a1" in live, "сдрейфовавшая задача не должна быть удалена"
     assert "d4" not in live
@@ -601,7 +601,7 @@ async def test_operation_on_a_vanished_task_is_dropped_from_the_plan(
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "ghost", "title": "Старая задача",
          "said": "давно неактуально"},
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
@@ -620,7 +620,7 @@ async def test_plan_where_everything_is_skipped_is_not_built(monkeypatch, tmp_pa
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
 
-    out = await s.manual_triage("Разбираю", [
+    out = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "ghost", "title": "Старая задача",
          "said": "неактуально"}])
 
@@ -632,7 +632,7 @@ async def test_state_unavailable_refuses_fail_closed(monkeypatch, tmp_path):
     _wire(monkeypatch, live, tmp_path)
     monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
 
-    out = await s.manual_triage("Разбираю", _mixed_ops())
+    out = await s.apply_task_changes("Разбираю", _mixed_ops())
 
     assert out == s._STATE_UNAVAILABLE_MSG
 
@@ -643,7 +643,7 @@ async def test_move_to_a_name_that_matches_nothing_is_skipped(monkeypatch, tmp_p
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "move", "task_id": "c3", "title": "Позвонить Ивану",
          "to_project": "Раб", "said": "это рабочее"},
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
@@ -671,7 +671,7 @@ async def test_huge_live_state_yields_exactly_the_two_named_operations(
     assert len(live) > 100
     _wire(monkeypatch, live, tmp_path, names=_NOISY_NAMES)
 
-    preview = await s.manual_triage("Разбираю входящие", [
+    preview = await s.apply_task_changes("Разбираю входящие", [
         {"op": "delete", "task_id": "a1", "title": "Купить молоко",
          "said": "это уже неактуально"},
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
@@ -693,10 +693,10 @@ async def test_sub_executors_receive_exactly_the_planned_ids(monkeypatch, tmp_pa
     live = _noisy(_live_inbox(), n=120)
     _wire(monkeypatch, live, tmp_path, names=_NOISY_NAMES)
     calls = _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю входящие", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю входящие", _mixed_ops())
     mid = _mid(preview)
 
-    await s.manual_triage("Разбираю входящие", manifest_id=mid, user_reply="да")
+    await s.apply_task_changes("Разбираю входящие", manifest_id=mid, user_reply="да")
 
     assert [c[0] for c in calls] == ["update", "move", "complete", "delete"]
     got = [tid for c in calls for tid in c[1]]
@@ -714,7 +714,7 @@ async def test_published_tool_schema_exposes_no_filter_or_scope_parameter():
     было бы попросить «сам найди, что почистить» — ни query, ни filter, ни
     project_id, ни limit-по-возрасту."""
     tools = await s.mcp.list_tools()
-    tool = next(t for t in tools if t.name == "manual_triage")
+    tool = next(t for t in tools if t.name == "apply_task_changes")
     props = set((tool.inputSchema.get("properties") or {}))
 
     assert props == {"summary", "operations", "max_items", "manifest_id",
@@ -733,7 +733,7 @@ async def test_call1_calls_no_sub_executor_at_all(monkeypatch, tmp_path):
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
 
-    preview = await s.manual_triage("Разбираю входящие", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю входящие", _mixed_ops())
 
     assert calls == []
     assert s._MANIFESTS[_mid(preview)]["consumed"] is False
@@ -745,10 +745,10 @@ async def test_negative_reply_refuses_and_burns_the_plan(reply, monkeypatch, tmp
     before = {k: dict(v) for k, v in live.items()}
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю", _mixed_ops())
     mid = _mid(preview)
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply=reply)
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply=reply)
 
     assert "🛑" in out and "НЕ подтвердил" in out
     assert calls == [] and live == before
@@ -762,12 +762,12 @@ async def test_call2_ignores_a_swapped_operations_list(monkeypatch, tmp_path):
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "a1", "title": "Купить молоко",
          "said": "не нужно"}])
     mid = _mid(preview)
 
-    out = await s.manual_triage("Разбираю", [
+    out = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "zz", "title": "Посторонняя задача",
          "said": "подменённая строка"}], manifest_id=mid, user_reply="да")
 
@@ -784,12 +784,12 @@ async def test_expired_manifest_is_refused(monkeypatch, tmp_path):
     before = {k: dict(v) for k, v in live.items()}
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю", _mixed_ops())
     mid = _mid(preview)
 
     s._MANIFESTS[mid]["created"] -= s._MANIFEST_TTL + 60
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert "🛑" in out
     assert calls == [] and live == before
@@ -802,12 +802,12 @@ async def test_telegram_button_path_replays_the_same_plan(monkeypatch, tmp_path)
     работает без привязки к показанному плану."""
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
-    preview = await s.manual_triage("Разбираю", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю", _mixed_ops())
     mid = _mid(preview)
     m = s._MANIFESTS[mid]
 
-    assert m["tool"] == "manual_triage" and m["_gate"] == "batch"
-    assert s._auto_execute_tool_of(m) == "manual_triage"
+    assert m["tool"] == "apply_task_changes" and m["_gate"] == "batch"
+    assert s._auto_execute_tool_of(m) == "apply_task_changes"
     assert s._resolve_auto_executor("manual_triage", m) is s._GENERIC_GATE_ENTRY
     assert s._generic_gate_rehash(m) == m["object_hash"]
 
@@ -815,9 +815,9 @@ async def test_telegram_button_path_replays_the_same_plan(monkeypatch, tmp_path)
 
     async def _impl(summary, tasks):
         rec.append((summary, tasks))
-        return "### заглушка _manual_triage_impl"
+        return "### заглушка _apply_task_changes_impl"
 
-    monkeypatch.setattr(s, "_manual_triage_impl", _impl)
+    monkeypatch.setattr(s, "_apply_task_changes_impl", _impl)
 
     await s._generic_gate_auto_execute(mid, m)
 
@@ -832,7 +832,7 @@ async def test_rehash_changes_when_the_stored_operations_are_swapped(
     и нажатием, пересчитанный хэш обязан разойтись с сохранённым."""
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
-    preview = await s.manual_triage("Разбираю", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю", _mixed_ops())
     m = s._MANIFESTS[_mid(preview)]
 
     m["tasks"] = [dict(m["tasks"][0], task_id="ДРУГАЯ-ЗАДАЧА")]
@@ -852,7 +852,7 @@ async def test_title_mismatch_is_skipped_and_never_executed(monkeypatch, tmp_pat
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "a1", "title": "Купить хлеб",
          "said": "молоко больше не нужно"},
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
@@ -864,7 +864,7 @@ async def test_title_mismatch_is_skipped_and_never_executed(monkeypatch, tmp_pat
     assert "«Купить молоко»" in preview   # видно, как задача называется НА САМОМ ДЕЛЕ
     assert [o["task_id"] for o in s._MANIFESTS[mid]["tasks"]] == ["d4"]
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert [c[0] for c in calls] == ["complete"]
     assert calls[0][1] == ["d4"]
@@ -876,14 +876,14 @@ async def test_vanished_task_never_reaches_an_executor(monkeypatch, tmp_path):
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "ghost", "title": "Старая задача",
          "said": "давно неактуально"},
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
          "said": "сделал"}])
     mid = _mid(preview)
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert [c[0] for c in calls] == ["complete"]
     assert "ghost" not in [tid for c in calls for tid in c[1]]
@@ -900,7 +900,7 @@ async def test_merge_is_refused_when_the_kept_copy_is_missing_at_plan_time(
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "merge", "task_id": "e5", "title": "Позвонить в банк",
          "keep_task_id": "e6", "keep_title": "Позвонить в банк",
          "said": "это дубли, оставь одну"},
@@ -912,7 +912,7 @@ async def test_merge_is_refused_when_the_kept_copy_is_missing_at_plan_time(
     assert "❌ Не вошло: 1" in preview and "дубль НЕ удаляю" in preview
     assert [o["task_id"] for o in s._MANIFESTS[mid]["tasks"]] == ["d4"]
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert "e5" in live, "снесли единственную оставшуюся копию"
     assert "e5" not in [tid for c in calls for tid in c[1]]
@@ -926,7 +926,7 @@ async def test_merge_is_refused_when_the_kept_copy_vanishes_after_the_plan(
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "merge", "task_id": "e5", "title": "Позвонить в банк",
          "keep_task_id": "e6", "keep_title": "Позвонить в банк",
          "said": "это дубли, оставь одну"},
@@ -936,7 +936,7 @@ async def test_merge_is_refused_when_the_kept_copy_vanishes_after_the_plan(
 
     live.pop("e6")
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert "e5" in live
     assert "e5" not in [tid for c in calls for tid in c[1]]
@@ -948,7 +948,7 @@ async def test_kept_copy_renamed_after_the_plan_blocks_the_merge(monkeypatch, tm
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "merge", "task_id": "e5", "title": "Позвонить в банк",
          "keep_task_id": "e6", "keep_title": "Позвонить в банк",
          "said": "это дубли, оставь одну"},
@@ -958,7 +958,7 @@ async def test_kept_copy_renamed_after_the_plan_blocks_the_merge(monkeypatch, tm
 
     live["e6"]["title"] = "Позвонить в банк по ипотеке"
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert "e5" in live and "e6" in live
     assert calls == [] or "e5" not in [tid for c in calls for tid in c[1]]
@@ -973,7 +973,7 @@ async def test_drift_between_plan_and_execution_is_reported_honestly(
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "update", "task_id": "b2", "title": "Отчёт",
          "changes": {"new_title": "Сдать отчёт за июль"},
          "said": "переименуй"},
@@ -985,7 +985,7 @@ async def test_drift_between_plan_and_execution_is_reported_honestly(
 
     live["a1"]["title"] = "Купить молоко и хлеб"   # человек поправил руками
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert [c[0] for c in calls] == ["update", "move"]
     assert "a1" not in [tid for c in calls for tid in c[1]]
@@ -1000,7 +1000,7 @@ async def test_everything_drifted_calls_no_executor_at_all(monkeypatch, tmp_path
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "a1", "title": "Купить молоко",
          "said": "не нужно"},
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
@@ -1010,7 +1010,7 @@ async def test_everything_drifted_calls_no_executor_at_all(monkeypatch, tmp_path
     live["a1"]["title"] = "Купить молоко и хлеб"
     live.pop("d4")
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert calls == []
     assert "НИЧЕГО НЕ ВЫПОЛНЕНО" in out
@@ -1036,13 +1036,13 @@ async def test_nothing_done_report_is_classified_as_failure(monkeypatch, tmp_pat
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "a1", "title": "Купить молоко",
          "said": "не нужно"}])
     mid = _mid(preview)
     live.pop("a1")                      # исчезла между планом и подтверждением
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert calls == []
     assert "НИЧЕГО НЕ ВЫПОЛНЕНО" in out
@@ -1060,12 +1060,12 @@ async def test_successful_triage_report_is_not_classified_as_failure(
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
          "said": "уже сделал"}])
     mid = _mid(preview)
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert "✅ Выполнено 1 из 1" in out
     assert not s._auto_execute_report_is_failure(out), out
@@ -1078,14 +1078,14 @@ async def test_executor_ran_but_verification_did_not_confirm(monkeypatch, tmp_pa
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live=None)   # заглушки НИЧЕГО не меняют
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
          "said": "сделал"},
         {"op": "delete", "task_id": "a1", "title": "Купить молоко",
          "said": "не нужно"}])
     mid = _mid(preview)
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert [c[0] for c in calls] == ["complete", "delete"]
     assert "❌ Выполнено 0 из 2" in out, "галочка рядом с нулём (побочный пункт Д7)"
@@ -1100,7 +1100,7 @@ async def test_unreadable_state_at_final_verification_says_unverified(
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
          "said": "сделал"}])
     mid = _mid(preview)
@@ -1113,7 +1113,7 @@ async def test_unreadable_state_at_final_verification_says_unverified(
 
     monkeypatch.setattr(s, "_open_by_id", _flaky_state)
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert [c[0] for c in calls] == ["complete"]
     assert "Исход НЕ ПОДТВЕРЖДЁН" in out
@@ -1131,7 +1131,7 @@ async def test_moves_to_several_projects_are_one_call_per_destination(
     names = {"p_in": "Входящие", "p_work": "Работа", "p_home": "Дом"}
     _wire(monkeypatch, live, tmp_path, names=names)
     calls = _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "move", "task_id": "c3", "title": "Позвонить Ивану",
          "to_project_id": "p_work", "said": "это рабочее"},
         {"op": "move", "task_id": "d4", "title": "Оплатить интернет",
@@ -1140,7 +1140,7 @@ async def test_moves_to_several_projects_are_one_call_per_destination(
          "to_project": "Дом", "said": "а это домашнее"}])
     mid = _mid(preview)
 
-    await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     moves = [(c[2], c[1]) for c in calls if c[0] == "move"]
     assert len(calls) == len(moves) == 2, calls
@@ -1159,10 +1159,10 @@ async def test_execution_order_is_least_destructive_first(monkeypatch, tmp_path)
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю", _mixed_ops())
     mid = _mid(preview)
 
-    await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert [c[0] for c in calls] == ["update", "move", "complete", "delete"]
     # merge и delete идут ОДНИМ вызовом того же проверенного движка удаления,
@@ -1182,13 +1182,13 @@ async def test_gate_hands_back_the_stored_operations_not_call2_arguments():
     передавать на call #2 свой список, исполнить обязано сохранённое."""
     planned = [{"op": "delete", "task_id": "a1", "title": "Купить молоко",
                 "said": "не нужно"}]
-    plan = await s._gate_batch("manual_triage", "manual_triage", planned, "Разбираю",
+    plan = await s._gate_batch("manual_triage", "apply_task_changes", planned, "Разбираю",
                                "", "", s._describe_triage_op, items_arg="operations")
     mid = _mid(plan.message)
 
     swapped = [{"op": "delete", "task_id": "zz", "title": "Посторонняя задача",
                 "said": "подмена"}]
-    out = await s._gate_batch("manual_triage", "manual_triage", swapped, "Разбираю",
+    out = await s._gate_batch("manual_triage", "apply_task_changes", swapped, "Разбираю",
                               mid, "да", s._describe_triage_op, items_arg="operations")
 
     assert out.proceed is True
@@ -1203,12 +1203,12 @@ async def test_call2_does_not_even_look_at_the_operations_argument(
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "a1", "title": "Купить молоко",
          "said": "не нужно"}])
     mid = _mid(preview)
 
-    out = await s.manual_triage("Разбираю", [{"op": "чушь", "task_id": "",
+    out = await s.apply_task_changes("Разбираю", [{"op": "чушь", "task_id": "",
                                               "title": "", "said": ""}],
                                 manifest_id=mid, user_reply="да")
 
@@ -1227,10 +1227,10 @@ async def test_synthetic_deletion_manifest_does_not_survive_the_call(
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю", _mixed_ops())
     mid = _mid(preview)
 
-    await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert not [k for k in s._MANIFESTS if k.startswith("triage-")]
 
@@ -1245,13 +1245,13 @@ async def test_synthetic_manifest_is_cleaned_up_even_if_deletion_raises(
         raise RuntimeError("TickTick упал на удалении")
 
     monkeypatch.setattr(s, "_execute_task_deletion_impl", _boom)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "a1", "title": "Купить молоко",
          "said": "не нужно"}])
     mid = _mid(preview)
 
     with pytest.raises(RuntimeError):
-        await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+        await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert not [k for k in s._MANIFESTS if k.startswith("triage-")]
 
@@ -1264,13 +1264,13 @@ async def test_changes_invisible_in_the_open_list_are_reported_as_unchecked(
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "update", "task_id": "b2", "title": "Отчёт",
          "changes": {"reminders": ["09:00"]},
          "said": "напомни утром"}])
     mid = _mid(preview)
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert [c[0] for c in calls] == ["update"]
     assert "⚠️ не проверяется автоматически: 1" in out
@@ -1347,13 +1347,13 @@ async def test_long_plan_reaches_telegram_whole_instead_of_being_refused(
     _tg_on(monkeypatch)
     seen = _notify_recorder(monkeypatch)
 
-    preview = await s.manual_triage("Разбираю входящие", ops)
+    preview = await s.apply_task_changes("Разбираю входящие", ops)
 
     assert "🛑" not in preview
     assert "не помещается" not in preview
     m = s._MANIFESTS[_mid(preview)]
     assert len(m["tasks"]) == 50
-    assert len(seen) == 1 and seen[0]["tool"] == "manual_triage"
+    assert len(seen) == 1 and seen[0]["tool"] == "apply_task_changes"
     # Превью длиннее ОДНОГО телеграмного сообщения — и всё равно уходит
     # целиком: разбиение на части живёт в слое отправки, а не в обрезке.
     assert len(preview) > tg.TELEGRAM_TEXT_LIMIT, len(preview)
@@ -1375,7 +1375,7 @@ async def test_the_same_long_plan_is_fine_when_telegram_layer_is_off(
     _wire(monkeypatch, live, tmp_path)
     _tg_off(monkeypatch)
 
-    preview = await s.manual_triage("Разбираю входящие", ops)
+    preview = await s.apply_task_changes("Разбираю входящие", ops)
 
     assert "🛑" not in preview
     m = s._MANIFESTS[_mid(preview)]
@@ -1391,9 +1391,9 @@ async def test_short_plan_still_goes_to_telegram_untouched(monkeypatch, tmp_path
     _tg_on(monkeypatch)
     seen = _notify_recorder(monkeypatch)
 
-    preview = await s.manual_triage("Разбираю входящие", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю входящие", _mixed_ops())
 
-    assert len(seen) == 1 and seen[0]["tool"] == "manual_triage"
+    assert len(seen) == 1 and seen[0]["tool"] == "apply_task_changes"
     assert len(seen[0]["preview"]) <= tg.TELEGRAM_TEXT_LIMIT
     assert s._MANIFESTS[_mid(preview)]["tg_notified"] is True
 
@@ -1498,7 +1498,7 @@ async def test_reminders_and_repeat_are_named_in_the_preview(monkeypatch, tmp_pa
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "update", "task_id": "b2", "title": "Отчёт",
          "changes": {"reminders": ["09:00"], "repeat_flag": "RRULE:FREQ=WEEKLY"},
          "said": "напоминай раз в неделю утром"}])
@@ -1517,7 +1517,7 @@ async def test_verification_crash_still_reports_that_mutations_were_sent(
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     calls = _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
          "said": "сделал"},
         {"op": "delete", "task_id": "a1", "title": "Купить молоко",
@@ -1529,7 +1529,7 @@ async def test_verification_crash_still_reports_that_mutations_were_sent(
 
     monkeypatch.setattr(s, "_verify_triage_op", _boom)
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert [c[0] for c in calls] == ["complete", "delete"]
     assert "МУТАЦИИ УЖЕ ОТПРАВЛЕНЫ" in out
@@ -1553,10 +1553,10 @@ async def test_manifest_gone_message_names_the_operations_argument(
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
 
-    out = await s.manual_triage("Разбираю", _mixed_ops(),
+    out = await s.apply_task_changes("Разбираю", _mixed_ops(),
                                 manifest_id="deadbeef1234", user_reply="да")
 
-    assert "manual_triage(summary, operations, ...)" in out
+    assert "apply_task_changes(summary, operations, ...)" in out
     assert "tasks" not in out
 
 
@@ -1582,12 +1582,12 @@ async def test_synthetic_deletion_manifest_is_never_put_into_the_registry(
         return "### заглушка удаления"
 
     monkeypatch.setattr(s, "_execute_task_deletion_impl", _del)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "a1", "title": "Купить молоко",
          "said": "не нужно"}])
     mid = _mid(preview)
 
-    await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert dele == [["a1"]], "удаление всё-таки должно было произойти"
     synth_id, registry_during = seen_ids[0]
@@ -1625,7 +1625,7 @@ async def test_deleting_a_parent_warns_about_its_open_subtasks(monkeypatch, tmp_
     live = _live_with_subtasks()
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "P1", "title": "Ремонт квартиры",
          "said": "ремонт отменился"}])
 
@@ -1639,7 +1639,7 @@ async def test_completing_a_parent_warns_about_one_subtask(monkeypatch, tmp_path
     live = _live_with_subtasks()
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "complete", "task_id": "P2", "title": "Отпуск",
          "said": "съездил уже"}])
 
@@ -1650,7 +1650,7 @@ async def test_a_childless_task_gets_no_subtask_note(monkeypatch, tmp_path):
     live = _live_with_subtasks()
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "d4", "title": "Оплатить интернет",
          "said": "не нужно"}])
 
@@ -1666,7 +1666,7 @@ async def test_merge_warns_about_the_duplicates_subtasks_too(monkeypatch, tmp_pa
                   "parentId": "P1b"}
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "merge", "task_id": "P1b", "title": "Ремонт квартиры",
          "keep_task_id": "P1", "keep_title": "Ремонт квартиры",
          "said": "это одно и то же"}])
@@ -1716,7 +1716,7 @@ async def test_repeated_said_adds_a_visible_warning_to_the_preview(
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "a1", "title": "Купить молоко",
          "said": "разобрать инбокс"},
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
@@ -1739,7 +1739,7 @@ async def test_the_repeated_said_warning_also_reaches_telegram(monkeypatch, tmp_
     _tg_on(monkeypatch)
     seen = _notify_recorder(monkeypatch)
 
-    await s.manual_triage("Разбираю", [
+    await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "a1", "title": "Купить молоко",
          "said": "эти две мне не нужны"},
         {"op": "delete", "task_id": "e5", "title": "Позвонить в банк",
@@ -1753,7 +1753,7 @@ async def test_distinct_said_produces_no_warning(monkeypatch, tmp_path):
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю входящие", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю входящие", _mixed_ops())
 
     assert "Одно и то же обоснование" not in preview
 
@@ -1765,7 +1765,7 @@ async def test_the_warning_sits_before_the_call2_instruction(monkeypatch, tmp_pa
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "a1", "title": "Купить молоко",
          "said": "обе не нужны"},
         {"op": "delete", "task_id": "e5", "title": "Позвонить в банк",
@@ -1783,14 +1783,14 @@ async def test_nothing_executed_says_the_plan_is_already_burned(monkeypatch, tmp
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
     _stub_sub_impls(monkeypatch, live)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "a1", "title": "Купить молоко",
          "said": "не нужно"}])
     mid = _mid(preview)
 
     live["a1"]["title"] = "Купить молоко и хлеб"
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert "НИЧЕГО НЕ ВЫПОЛНЕНО" in out
     assert "уже погашен" in out and "заново" in out
@@ -1802,7 +1802,7 @@ async def test_move_from_an_unknown_project_says_so(monkeypatch, tmp_path):
     live = {"c3": {"id": "c3", "title": "Позвонить Ивану", "projectId": "p_ghost"}}
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "move", "task_id": "c3", "title": "Позвонить Ивану",
          "to_project_id": "p_work", "said": "это рабочее"}])
 
@@ -1820,7 +1820,7 @@ async def test_merge_preview_admits_the_duplicates_fields_are_lost(
     live["e5"]["dueDate"] = "2026-08-10T12:00:00.000+0000"
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "merge", "task_id": "e5", "title": "Позвонить в банк",
          "keep_task_id": "e6", "keep_title": "Позвонить в банк",
          "said": "это одно и то же, оставь одну"}])
@@ -1833,7 +1833,7 @@ async def test_merge_preview_admits_the_duplicates_fields_are_lost(
 def test_docstring_matches_the_runtime_instruction_about_call2():
     """Докстринг говорил «Do NOT re-send operations», а рантайм-текст гейта —
     «список можно повторить как есть». Модель не должна выбирать, кому верить."""
-    doc = s.manual_triage.__doc__
+    doc = s.apply_task_changes.__doc__
     assert "IGNORED on call #2" in doc
     assert "Do NOT re-send" not in doc
     assert "may be repeated verbatim" in doc
@@ -1871,7 +1871,7 @@ async def test_one_renamed_task_out_of_twenty_leaves_the_plan_but_is_reported(
     _wire(monkeypatch, live, tmp_path)
     live["P007"]["title"] = "Позвонить по объявлению №7 (уже созвонились)"
 
-    preview = await s.manual_triage("Разбираю входящие", ops)
+    preview = await s.apply_task_changes("Разбираю входящие", ops)
 
     m = s._MANIFESTS[_mid(preview)]
     assert len(m["tasks"]) == 19
@@ -1895,7 +1895,7 @@ async def test_the_only_dead_task_creates_no_manifest_and_no_telegram_message(
     seen = _notify_recorder(monkeypatch)
     before = dict(s._MANIFESTS)
 
-    out = await s.manual_triage("Разбираю", [
+    out = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "ghost", "title": "Старая задача",
          "said": "неактуально"}])
 
@@ -1912,7 +1912,7 @@ async def test_a_plan_where_everything_matches_shows_no_reference_block(
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю", _mixed_ops())
 
     assert "Не вошло" not in preview
     assert "В план вошло" not in preview
@@ -1929,7 +1929,7 @@ async def test_the_reference_block_reaches_telegram_below_the_plan(
     _tg_on(monkeypatch)
     seen = _notify_recorder(monkeypatch)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "ghost", "title": "Старая задача",
          "said": "неактуально"},
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
@@ -1955,7 +1955,7 @@ async def test_no_argument_of_the_tool_can_switch_the_precheck_off():
     — он обходит ПОДТВЕРЖДЕНИЕ, а не сверку (см. тест ниже)."""
     import inspect
 
-    got = set(inspect.signature(s.manual_triage).parameters)
+    got = set(inspect.signature(s.apply_task_changes).parameters)
 
     assert got == {"summary", "operations", "max_items", "manifest_id",
                    "user_reply", "automation_key"}, got
@@ -1973,7 +1973,7 @@ async def test_automation_key_executes_without_a_button_but_never_without_the_ch
     _tg_on(monkeypatch)
     seen = _notify_recorder(monkeypatch)
 
-    out = await s.manual_triage("Разбираю", [
+    out = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "a1", "title": "Купить хлеб",
          "said": "не нужно"},
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
@@ -2014,14 +2014,14 @@ async def test_the_execution_report_names_what_did_not_make_the_plan(
     невошедшее — id, задачу и причину, а не только посчитать его в шапке."""
     live, calls = _plan_with_one_rename(monkeypatch, tmp_path)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "a1", "title": "Купить хлеб",
          "said": "не нужно"},
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
          "said": "сделал"}])
     mid = _mid(preview)
 
-    out = await s.manual_triage("Разбираю", manifest_id=mid, user_reply="да")
+    out = await s.apply_task_changes("Разбираю", manifest_id=mid, user_reply="да")
 
     assert "❌ не вошло в план 1" in out, "шапка отчёта молчит о невошедшем"
     assert "#### ❌ Не вошло в план" in out
@@ -2041,7 +2041,7 @@ async def test_the_reference_survives_the_button_path_through_the_manifest(
     что доедет до отчёта, обязано лежать В МАНИФЕСТЕ, а не в памяти вызова."""
     live, calls = _plan_with_one_rename(monkeypatch, tmp_path)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "a1", "title": "Купить хлеб",
          "said": "не нужно"},
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
@@ -2073,7 +2073,7 @@ async def test_the_reference_survives_a_server_restart(monkeypatch, tmp_path):
     import json
 
     live, _calls = _plan_with_one_rename(monkeypatch, tmp_path)
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "a1", "title": "Купить хлеб",
          "said": "не нужно"},
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
@@ -2093,7 +2093,7 @@ async def test_a_clean_plan_stores_no_reference_field_at_all(monkeypatch, tmp_pa
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю", _mixed_ops())
+    preview = await s.apply_task_changes("Разбираю", _mixed_ops())
 
     assert s._MANIFESTS[_mid(preview)]["extra"] == {}
 
@@ -2126,7 +2126,7 @@ async def test_every_single_mismatch_is_printed_not_just_the_first(
     live = _live_inbox()
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю", _three_bad_ops())
+    preview = await s.apply_task_changes("Разбираю", _three_bad_ops())
 
     assert "❌ Не вошло: 3" in preview
     printed = [ln for ln in preview.splitlines() if ln.startswith("• id ")]
@@ -2157,7 +2157,7 @@ async def test_a_failed_update_is_reported_like_any_other_kind(
         _wire(monkeypatch, live, tmp_path)
         s._MANIFESTS.clear()
 
-        preview = await s.manual_triage("Разбираю", [
+        preview = await s.apply_task_changes("Разбираю", [
             op, {"op": "complete", "task_id": "d4",
                  "title": "Оплатить интернет", "said": "сделал"}])
 
@@ -2168,7 +2168,7 @@ async def test_a_failed_update_is_reported_like_any_other_kind(
 
 async def test_a_skip_mark_vetoes_execution_even_without_a_drift_reason(
         monkeypatch, tmp_path):
-    """Порча №3: `if False and op.get("_skip")` в `_manual_triage_impl`.
+    """Порча №3: `if False and op.get("_skip")` в `_apply_task_changes_impl`.
 
     Сейчас её прячет то, что `_triage_drift_reason` дублирует все пять причин
     `_skip`, — но это совпадение, а не гарантия: появится причина без
@@ -2189,7 +2189,7 @@ async def test_a_skip_mark_vetoes_execution_even_without_a_drift_reason(
     assert s._triage_drift_reason(old_manifest_task, live, _NAMES) == "", \
         "фикстура сломана: drift сам её ловит, порча снова невидима"
 
-    out = await s._manual_triage_impl("Старый план", [
+    out = await s._apply_task_changes_impl("Старый план", [
         old_manifest_task,
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
          "said": "сделал", "_project_id": "p_in",
@@ -2208,13 +2208,13 @@ async def test_the_report_quotes_the_summary_with_its_counts(
     out» исчезла вместе со старым поведением, а замены не появилось."""
     live, _calls = _plan_with_one_rename(monkeypatch, tmp_path)
 
-    preview = await s.manual_triage("Разбираю входящие после созвона", [
+    preview = await s.apply_task_changes("Разбираю входящие после созвона", [
         {"op": "delete", "task_id": "a1", "title": "Купить хлеб",
          "said": "не нужно"},
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
          "said": "сделал"}])
 
-    out = await s.manual_triage("Разбираю", manifest_id=_mid(preview),
+    out = await s.apply_task_changes("Разбираю", manifest_id=_mid(preview),
                                 user_reply="да")
 
     assert "_Разбираю входящие после созвона — закрыть 1; " \
@@ -2235,7 +2235,7 @@ async def test_the_cap_counts_the_plan_not_the_rejected_input(
     _wire(monkeypatch, live, tmp_path)
     live.pop("gone")                       # исчезла к моменту построения плана
 
-    preview = await s.manual_triage("Разбираю входящие", ops)
+    preview = await s.apply_task_changes("Разбираю входящие", ops)
 
     assert "больше капа" not in preview
     assert len(s._MANIFESTS[_mid(preview)]["tasks"]) == s._TRIAGE_PLAN_DAMAGE_CAP
@@ -2286,7 +2286,7 @@ async def test_the_reference_names_an_untitled_task_it_actually_read(
     _wire(monkeypatch, live, tmp_path)
     _stub_sub_impls(monkeypatch, live)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "move", "task_id": "u1", "title": "​",
          "to_project": "Проект, которого нет", "said": "это в работу"},
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
@@ -2309,7 +2309,7 @@ async def test_the_label_reaches_the_archived_report_through_the_manifest(
     _wire(monkeypatch, live, tmp_path)
     _stub_sub_impls(monkeypatch, live)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "move", "task_id": "u1", "title": "​",
          "to_project": "Проект, которого нет", "said": "это в работу"},
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
@@ -2402,7 +2402,7 @@ async def test_the_state_unavailable_exit_still_names_what_did_not_make_it(
     _wire(monkeypatch, live, tmp_path)
     monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
 
-    out = await s._manual_triage_impl(
+    out = await s._apply_task_changes_impl(
         "Разбираю",
         [{"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
           "said": "сделал", "_project_id": "p_in",
@@ -2422,7 +2422,7 @@ async def test_the_not_ready_exit_still_names_what_did_not_make_it(
     _wire(monkeypatch, live, tmp_path)
     monkeypatch.setattr(s, "_ensure_ready", lambda: "🛑 Сервер не настроен.")
 
-    out = await s._manual_triage_impl(
+    out = await s._apply_task_changes_impl(
         "Разбираю",
         [{"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
           "said": "сделал", "_project_id": "p_in",
@@ -2441,7 +2441,7 @@ async def test_an_early_exit_without_a_reference_is_byte_for_byte_the_old_text(
     _wire(monkeypatch, live, tmp_path)
     monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: None)
 
-    out = await s._manual_triage_impl(
+    out = await s._apply_task_changes_impl(
         "Разбираю",
         [{"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
           "said": "сделал", "_project_id": "p_in",
@@ -2457,7 +2457,7 @@ async def test_the_reference_survives_the_button_path_into_a_dead_state(
     который увидит человек, и он обязан назвать невошедшее."""
     live, _calls = _plan_with_one_rename(monkeypatch, tmp_path)
 
-    preview = await s.manual_triage("Разбираю", [
+    preview = await s.apply_task_changes("Разбираю", [
         {"op": "delete", "task_id": "a1", "title": "Купить хлеб",
          "said": "не нужно"},
         {"op": "complete", "task_id": "d4", "title": "Оплатить интернет",
@@ -2549,7 +2549,7 @@ async def test_a_plan_at_the_damage_cap_still_builds(monkeypatch, tmp_path):
     live, ops = _long_plan(s._TRIAGE_PLAN_DAMAGE_CAP)
     _wire(monkeypatch, live, tmp_path)
 
-    preview = await s.manual_triage("Разбираю входящие", ops)
+    preview = await s.apply_task_changes("Разбираю входящие", ops)
 
     assert "🛑" not in preview
     assert len(s._MANIFESTS[_mid(preview)]["tasks"]) == s._TRIAGE_PLAN_DAMAGE_CAP

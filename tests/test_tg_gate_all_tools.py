@@ -64,11 +64,12 @@ BATCH_TOOLS = {
     "restore_tasks": dict(
         summary="Восстанавливаю 1", tasks=[{"taskId": "t1", "title": "A"}],
         to_project_id="p2"),
-    # manual_triage — единственный в таблице, чей call #1 читает ЖИВОЕ
-    # состояние ещё до гейта (identity guard по каждому переданному id),
-    # поэтому `_no_client_checks` ниже подменяет `_open_by_id` /
-    # `_v2_project_names` детерминированным состоянием ровно с этой задачей.
-    "manual_triage": dict(
+    # apply_task_changes (до 2026-08-10 звался manual_triage) — единственный
+    # в таблице, чей call #1 читает ЖИВОЕ состояние ещё до гейта (identity
+    # guard по каждому переданному id), поэтому `_no_client_checks` ниже
+    # подменяет `_open_by_id` / `_v2_project_names` детерминированным
+    # состоянием ровно с этой задачей.
+    "apply_task_changes": dict(
         summary="Разбираю 1",
         operations=[{"op": "complete", "task_id": "t1", "title": "A",
                      "said": "уже сделал"}]),
@@ -222,7 +223,7 @@ def _tg_off(monkeypatch):
 
 # Детерминированное «живое состояние» для тулов, которые сверяют переданные
 # id ДО гейта. Раньше (до def-116 follow-up, group B, 2026-08-07) это был
-# только manual_triage — его identity guard обязан работать на фазе плана,
+# только apply_task_changes (тогда — manual_triage) — его identity guard обязан работать на фазе плана,
 # иначе человек увидел бы план по несуществующим задачам. Group B добавила
 # ТУ ЖЕ фазу плана к ещё шести тулам (create_subtask, unset_task_parent,
 # delete_project_group, move_project_to_group, add_task_comment,

@@ -3,8 +3,9 @@
 Проектный документ, **кода нет**: стыки продуманы до первой строки реализации, реализация идёт по
 разделу 10 и только по нему. Функции адресуются по именам и сверены с текущим деревом
 (`ticktick_mcp/src/server.py`, `consent.py`, `manifest_store.py`, `attic/declutter_disabled.py`);
-номера строк из ТЗ устарели и не воспроизводятся. Инструмент пока зовётся `manual_triage`,
-переименование — предмет 1.3.4.
+номера строк из ТЗ устарели и не воспроизводятся. Инструмент переименован в `apply_task_changes`
+пунктом 1.3.4 (2026-08-10); старое имя `apply_task_changes` осталось живым псевдонимом, а `kind`
+манифеста намеренно НЕ переименован — он входит в binding-хэш уже показанных планов.
 
 ## 1. Модель операции
 
@@ -348,13 +349,13 @@ fail-closed: молча исполненная половина хуже чес�
 
 ### изм-10. Метки, зависимости, топологический порядок
 Файлы: `ticktick_mcp/src/server.py`.
-Функции: `_triage_refs_resolve`, `_triage_dependency_edges`, `_triage_topo_levels`, `_triage_batches_of_level`, `_manual_triage_impl`.
+Функции: `_triage_refs_resolve`, `_triage_dependency_edges`, `_triage_topo_levels`, `_triage_batches_of_level`, `_apply_task_changes_impl`.
 Зависит от: изм-8.
 Тесты: `tests/test_triage_refs.py`, `tests/test_triage_refs.py::test_ref_label_absent_from_preview`, `tests/test_triage_refs.py::test_failed_create_skips_dependent_ops`.
 
 ### изм-11. Группировка превью
 Файлы: `ticktick_mcp/src/server.py`.
-Функции: `_triage_group_key`, `_triage_grouped_preview`, `manual_triage`.
+Функции: `_triage_group_key`, `_triage_grouped_preview`, `apply_task_changes`.
 Зависит от: изм-1.
 Тесты: `tests/test_triage_preview_grouping.py`.
 
@@ -365,10 +366,10 @@ fail-closed: молча исполненная половина хуже чес�
 Тесты: `tests/test_triage_said_scope.py`.
 
 **Параллельно: изм-11 ∥ изм-12.**
-Функции изм-11: `_triage_group_key`, `_triage_grouped_preview`, `manual_triage`.
+Функции изм-11: `_triage_group_key`, `_triage_grouped_preview`, `apply_task_changes`.
 Функции изм-12: `_validate_triage_ops`, `_triage_plan_notes`, `_triage_batch_approval_note`.
-Пересечение пустое: группировка входит в превью подменой описателя операций в теле `manual_triage`,
-а `said_scope` целиком живёт в валидации и в общеплановых примечаниях и тела `manual_triage` не
+Пересечение пустое: группировка входит в превью подменой описателя операций в теле `apply_task_changes`,
+а `said_scope` целиком живёт в валидации и в общеплановых примечаниях и тела `apply_task_changes` не
 касается.
 
 Других параллельных пар нет, хотя после изм-1 наборы функций у изм-2 … изм-7 тоже не пересекаются:

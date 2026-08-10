@@ -69,13 +69,20 @@ def test_explicit_registry_tool_refuses_when_decorator_disabled(monkeypatch):
 # ───────────────────── generic _gate_batch/_gate_single путь ──────────────
 
 def test_generic_gate_tool_refuses_when_decorator_disabled(monkeypatch):
-    """manual_triage не в `_AUTO_EXECUTORS` — резолвится generic-путём по
-    наличию `_manual_triage_impl` в globals(). Тот же сценарий: тул снят из
-    реестра FastMCP, `_impl` остался — отказ, а не тихий пропуск."""
-    _undeclare_tool(monkeypatch, "manual_triage")
-    m = {"_gate": "batch", "tool": "manual_triage"}
+    """apply_task_changes не в `_AUTO_EXECUTORS` — резолвится generic-путём по
+    наличию `_apply_task_changes_impl` в globals(). Тот же сценарий: тул снят
+    из реестра FastMCP, `_impl` остался — отказ, а не тихий пропуск.
 
-    entry = s._resolve_auto_executor("manual_triage", m)
+    2026-08-10: раньше здесь стояло старое имя `manual_triage`. После §1.3.4
+    оно псевдоним, и снятие ОДНОГО его декоратора уже не делает инструмент
+    недоступным — реестр честно находит каноническое имя (см.
+    `_tool_registration_status`). Проверять «декоратор сняли» надо на том
+    имени, за которым стоит сама функция, иначе тест доказывал бы обратное
+    тому, что называется в его заголовке."""
+    _undeclare_tool(monkeypatch, "apply_task_changes")
+    m = {"_gate": "batch", "tool": "apply_task_changes"}
+
+    entry = s._resolve_auto_executor("apply_task_changes", m)
 
     assert entry is not None
     assert entry is not s._GENERIC_GATE_ENTRY
@@ -83,7 +90,7 @@ def test_generic_gate_tool_refuses_when_decorator_disabled(monkeypatch):
 
     out = asyncio.run(entry.execute("mid-generic", m))
     assert out.startswith("🛑")
-    assert "manual_triage" in out
+    assert "apply_task_changes" in out
     assert "отсутств" in out.lower()
 
 

@@ -28,13 +28,26 @@ from ticktick_mcp.src import server
 # тронут и остаётся собственным тулом.
 # Обе прибавки — РАЗНЫМИ ветками от одной базы (77, как выше 75→77), поэтому
 # верный после слияния только их суммарный итог: 77 + 1 + 1 = 79.
-_EXPECTED_TOOLS = 79
+# 79 → 80 (2026-08-10, §1.3.4 шаг 1): +1 = `manual_triage` остаётся
+# зарегистрированным ПСЕВДОНИМОМ переименованного `apply_task_changes`.
+# Инструмент по-прежнему один, имён у него два: старое живо для внешнего
+# вызывающего и для манифестов, построенных до выката.
+_EXPECTED_TOOLS = 80
+
+
+def _registry_names() -> set:
+    """Имена ВСЕХ зарегистрированных `@mcp.tool()` — из реестра FastMCP, а не
+    из `list_tools()`. С 2026-08-10 (§1.3.4, шаг 4) листинг фильтруется: часть
+    инструментов из него намеренно исключена, оставаясь вызываемыми по имени.
+    Этот файл сторожит РЕГИСТРАЦИЮ (склеенный декоратор), а не видимость, —
+    поэтому спрашивает реестр напрямую."""
+    return set(server.mcp._tool_manager._tools)
 
 
 def test_all_expected_tools_registered():
-    tools = asyncio.run(server.mcp.list_tools())
-    assert len(tools) == _EXPECTED_TOOLS, (
-        f"expected {_EXPECTED_TOOLS} registered @mcp.tool()s, got {len(tools)} — "
+    names = _registry_names()
+    assert len(names) == _EXPECTED_TOOLS, (
+        f"expected {_EXPECTED_TOOLS} registered @mcp.tool()s, got {len(names)} — "
         "a decorator likely got glued to the previous line (grep for "
         "'[^ ]@mcp\\.tool' in server.py), or a tool was added/removed without "
         "updating _EXPECTED_TOOLS"
@@ -48,10 +61,16 @@ def test_attach_file_to_task_is_registered():
 
 
 def test_manual_triage_is_registered_and_declutter_is_not():
-    """`manual_triage` — ручная замена отключённого автоматического
-    declutter'а: он обязан быть опубликован, а все четыре declutter-тула —
-    оставаться снятыми с регистрации (владелец отключил их навсегда)."""
-    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    """Агрегатор — ручная замена отключённого автоматического declutter'а: он
+    обязан быть зарегистрирован под ОБОИМИ именами (новое `apply_task_changes`
+    и псевдоним `manual_triage`, живой для старых вызывающих), а все четыре
+    declutter-тула — оставаться снятыми с регистрации (владелец отключил их
+    навсегда).
+
+    Проверка идёт по реестру, а не по листингу: с §1.3.4 псевдоним намеренно
+    спрятан из `list_tools()` — модель обязана видеть ровно одно имя."""
+    names = _registry_names()
+    assert "apply_task_changes" in names
     assert "manual_triage" in names
     assert names.isdisjoint({"plan_declutter", "execute_declutter",
                              "resume_declutter", "set_declutter_decision"})

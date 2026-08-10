@@ -1,4 +1,4 @@
-"""Что докстринг manual_triage обещает про подставное `said` — то код и делает.
+"""Что докстринг apply_task_changes обещает про подставное `said` — то код и делает.
 
 Дефект (живая приёмка 2026-08-07): расхождение обещанного и фактического.
 Поле `said` обязано нести дословные слова человека про КОНКРЕТНУЮ задачу.
@@ -55,7 +55,7 @@ def _sentences_about_repeated_said() -> list:
     строках. Ищутся по смыслу («blanket», «reused», «same … said»), а не по
     одной заученной формулировке, чтобы переписанный текст всё равно попал
     под проверку."""
-    doc = " ".join((s.manual_triage.__doc__ or "").split())
+    doc = " ".join((s.apply_task_changes.__doc__ or "").split())
     hits = []
     for sentence in re.split(r"(?<=[.!?])\s+", doc):
         low = sentence.lower()
@@ -72,7 +72,7 @@ def _doc_promises_refusal_for_repeated_said() -> bool:
 
 async def _plan_with_one_phrase_for_two_tasks() -> str:
     return await call(
-        "manual_triage", summary="Закрываю по одной фразе",
+        "apply_task_changes", summary="Закрываю по одной фразе",
         operations=[
             {"op": "complete", "task_id": TASK_ROOT, "title": "Собрать отчёт",
              "said": "эти две уже сделаны"},
@@ -84,7 +84,7 @@ def test_the_docstring_still_talks_about_the_repeated_phrase_at_all():
     """Страж разбора: если абзац про фразу-заглушку исчезнет из докстринга,
     сравнение ниже пойдёт по пустой строке и станет проходить впустую."""
     assert _sentences_about_repeated_said(), (
-        "в докстринге manual_triage больше нет ни слова про одну и ту же "
+        "в докстринге apply_task_changes больше нет ни слова про одну и ту же "
         "фразу на нескольких строках — сравнение обещания с кодом обесценено")
 
 
@@ -125,7 +125,7 @@ async def test_empty_said_is_still_refused_outright():
     """Контроль границы: то, что докстринг обещает отвергать, отвергается.
     Без этой стороны «согласие» можно было бы получить, разрешив всё."""
     out = await call(
-        "manual_triage", summary="Закрываю",
+        "apply_task_changes", summary="Закрываю",
         operations=[{"op": "complete", "task_id": TASK_ROOT,
                      "title": "Собрать отчёт", "said": "  "}])
 

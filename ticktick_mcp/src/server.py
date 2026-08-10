@@ -16983,9 +16983,9 @@ _TRIAGE_VERB = {t.op: t.verb for t in _TRIAGE_REGISTRY}
 
 @mcp.tool()
 @_shared_notes(tg=True, automation=True, gate_args=True)
-async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
-                        max_items: int = 50, manifest_id: str = "",
-                        user_reply: str = "", automation_key: str = "") -> str:
+async def apply_task_changes(summary: str, operations: List[Dict[str, Any]] = None,
+                             max_items: int = 50, manifest_id: str = "",
+                             user_reply: str = "", automation_key: str = "") -> str:
     """
     Apply a MIXED batch of triage decisions the HUMAN has ALREADY MADE AND
     SAID OUT LOUD — delete / complete / update / move / merge-duplicates — in
@@ -17280,7 +17280,13 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         # планом в Postgres и возвращается исполнителю и после перезапуска.
         extra = {"not_planned": not_planned} if not_planned else None
 
-    outcome = await _gate_batch("manual_triage", "manual_triage", enriched, summary,
+    # ПЕРВЫЙ аргумент — `kind` манифеста, ВТОРОЙ — имя инструмента. Они
+    # РАЗОШЛИСЬ при переименовании 2026-08-10 (§1.3.4) намеренно: `kind`
+    # входит в binding-хэш плана, и его смена обесценила бы хэши всех уже
+    # показанных планов; имя же инструмента обязано стать новым, потому что
+    # по нему ищут исполнителя (`_<tool>_impl`) и сверяют `TG_APPROVAL_TOOLS`.
+    # Старое имя доезжает сюда через `consent.resolve_tool_alias`.
+    outcome = await _gate_batch("manual_triage", "apply_task_changes", enriched, summary,
                                 manifest_id, user_reply, _describe_triage_op,
                                 extra=extra, items_arg="operations", notes=notes,
                                 automation_key=automation_key)
@@ -17289,16 +17295,47 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
     # `**extra` — тот же путь, которым план доезжает до исполнителя после
     # кнопки (`_generic_gate_auto_execute` зовёт impl(summary, tasks, **extra)):
     # чат-«да», кнопка и headless-ключ обязаны давать ОДИН отчёт, а не три.
-    return await _manual_triage_impl(outcome.summary, outcome.tasks,
-                                     **(outcome.extra or {}))
+    return await _apply_task_changes_impl(outcome.summary, outcome.tasks,
+                                          **(outcome.extra or {}))
 
 
-async def _manual_triage_impl(summary: str, tasks: List[Dict],
-                              not_planned: Optional[List[Dict]] = None) -> str:
-    """Pure mutation logic for manual_triage — NO consent gate (the gate lives
-    in the public manual_triage() above; this is also what the Telegram button
-    replays via _generic_gate_auto_execute, which calls impl(summary, tasks,
-    **extra)).
+@mcp.tool()
+async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
+                        max_items: int = 50, manifest_id: str = "",
+                        user_reply: str = "", automation_key: str = "") -> str:
+    """DEPRECATED ALIAS of apply_task_changes — same tool, old name.
+
+    Kept registered (and therefore callable) on purpose: an external caller
+    that still knows only the old name keeps working, and so does a manifest
+    built before the rename. It is hidden from tools/list, so the model sees
+    exactly one name — the new one. Every argument is forwarded verbatim;
+    there is no second implementation here.
+
+    Args:
+        summary: forwarded to apply_task_changes unchanged
+        operations: forwarded to apply_task_changes unchanged
+        max_items: forwarded to apply_task_changes unchanged
+        manifest_id: forwarded to apply_task_changes unchanged
+        user_reply: forwarded to apply_task_changes unchanged
+        automation_key: forwarded to apply_task_changes unchanged
+    """
+    # Условие снятия псевдонима — проверяемое, а не «когда-нибудь» (П18):
+    # каждый вызов старого имени пишется в лог с пометкой и признаком, был ли
+    # предъявлен ключ автоматики. Ноль таких строк за оговорённый срок — и
+    # обёртку можно убирать; пока они есть, убирать нельзя.
+    logger.info("устаревшее имя инструмента: вызван manual_triage "
+                "(канонич. apply_task_changes), ключ автоматики "
+                f"{'предъявлен' if automation_key else 'НЕ предъявлен'}")
+    return await apply_task_changes(summary, operations, max_items,
+                                    manifest_id, user_reply, automation_key)
+
+
+async def _apply_task_changes_impl(summary: str, tasks: List[Dict],
+                                   not_planned: Optional[List[Dict]] = None) -> str:
+    """Pure mutation logic for apply_task_changes — NO consent gate (the gate
+    lives in the public apply_task_changes() above; this is also what the
+    Telegram button replays via _generic_gate_auto_execute, which calls
+    impl(summary, tasks, **extra)).
 
     Two hard rules here:
       1. Every operation is re-checked against LIVE state immediately before
@@ -17629,8 +17666,53 @@ from .tg_auto_execute import (  # noqa: E402,F401
     _verdict_from_totals, _verified_auto_execute_report)
 
 
+def _canonicalize_tg_approval_tools(cfg) -> None:
+    """Сверить `TG_APPROVAL_TOOLS` с реестром инструментов и канонизировать
+    старые имена. 2026-08-10 (§1.3.4, место 1 из пяти).
+
+    Зачем именно падать, а не логировать. Этот список — ИМЕНА инструментов,
+    и он разъезжается с кодом тихо: имя, которого в сервере нет (переименовали
+    инструмент, опечатались в переменной окружения), не даёт ни ошибки, ни
+    предупреждения — просто план этого инструмента перестаёт уходить в
+    Telegram. Текстовый путь при этом остаётся живым, то есть внешне всё
+    работает, а второй фактор подтверждения молча исчезает. Единственный
+    честный исход — не подняться вовсе и назвать имя.
+
+    Псевдоним разрешается ПЕРЕД сверкой: оператор, оставивший в конфиге
+    `manual_triage`, получает работающую кнопку под новым именем, а не отказ
+    старта, — старое имя есть в `consent.TOOL_ALIASES`, значит оно известно.
+
+    Зовётся из `main()` — то есть после того, как отработали ВСЕ декораторы
+    `@mcp.tool()` в этом модуле; на импорт вешать нельзя, реестр в этот момент
+    ещё неполон."""
+    allow = getattr(cfg, "tools_allowlist", None)
+    if not allow:
+        return
+    known = set(mcp._tool_manager._tools)
+    canonical, unknown = set(), []
+    for name in sorted(allow):
+        resolved = consent.resolve_tool_alias(name)
+        if resolved in known:
+            canonical.add(resolved)
+        else:
+            unknown.append(name)
+    if unknown:
+        raise RuntimeError(
+            "TG_APPROVAL_TOOLS содержит имена, которых нет среди инструментов "
+            f"сервера: {', '.join(unknown)}. Сервер НЕ поднят намеренно: с "
+            "неизвестным именем план такого инструмента молча перестал бы "
+            "уходить в Telegram (второй фактор подтверждения исчезает без "
+            "единой ошибки). Проверь написание — известные имена: "
+            f"{', '.join(sorted(known))}.")
+    cfg.tools_allowlist = canonical
+
+
 def main():
     """Main entry point for the MCP server."""
+    # Сверка TG_APPROVAL_TOOLS с реестром — ДО всего прочего (§1.3.4):
+    # подниматься с разъехавшимся списком имён нельзя, а узнать об этом позже
+    # неоткуда — расхождение не даёт ошибки, только исчезнувшую кнопку.
+    _canonicalize_tg_approval_tools(_TG_CFG)
     # ПЕРВЫМ ДЕЛОМ, до любой строки лога (#119): секрет доступа лежит в пути
     # (`/mcp/<SECRET>`), а uvicorn печатает путь в каждой access-строке —
     # без этого фильтра секрет открытым текстом оседает в логах Railway
