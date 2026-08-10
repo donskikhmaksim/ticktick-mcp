@@ -22,6 +22,7 @@ import re
 import time
 from typing import Dict, List, Optional, Tuple
 
+from . import consent
 from . import manifest_store
 from . import tg_approval
 # Пространство имён главного файла целиком — НЕ для удобства, а
@@ -1941,3 +1942,13 @@ async def _tg_auto_execute_poller_loop() -> None:
 
 
 # === MOVED-BLOCK END ===
+
+
+# --- Обратная связь с гейтом (перенос точки регистрации, 2026-08-09) ---
+# Гейт спрашивает, есть ли для команды исполнитель: если есть, план
+# уходит владельцу С КНОПКОЙ. Импортировать эти две функции ОТТУДА
+# нельзя — гейт грузится раньше и сам ничего про кнопку не знает,
+# кольцо. Поэтому связь ставится с этой стороны, при загрузке модуля:
+# тот же приём, что и `_register_auto_executor` для самих исполнителей.
+consent.register_auto_execute_lookup(_resolve_auto_executor,
+                                     _auto_execute_tool_of)
