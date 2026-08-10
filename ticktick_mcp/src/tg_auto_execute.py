@@ -220,10 +220,17 @@ def _generic_gate_rehash(m: Dict) -> str:
     at plan time (_gate_batch: _manifest_object_hash(kind, ids) over the same
     id-extraction expression; _gate_single: _manifest_params_hash(kind,
     params)) — a mismatch here silently disables the binding check, i.e. the
-    button's protection against the plan drifting between show and press."""
+    button's protection against the plan drifting between show and press.
+
+    2026-08-09 (П20, заход 1 §1.3.6): id-формула вынесена в
+    `consent._gate_item_id` — ОБЩУЮ с `_gate_batch` функцию, а не собственную
+    копию `t.get("taskId") or t.get("task_id") or ""`. Та копия отдавала ""
+    для КАЖДОГО элемента без `taskId`/`task_id` (тегов delete_tags, у
+    которых есть только `name`) — object_hash переставал различать планы.
+    См. докстринг `_gate_item_id` в consent.py."""
     if m.get("_gate") == "single":
         return _manifest_params_hash(m.get("kind") or "", m.get("params") or {})
-    ids = [str(t.get("taskId") or t.get("task_id") or "") for t in (m.get("tasks") or [])]
+    ids = [consent._gate_item_id(t) for t in (m.get("tasks") or [])]
     return _manifest_object_hash(m.get("kind") or "", ids)
 
 

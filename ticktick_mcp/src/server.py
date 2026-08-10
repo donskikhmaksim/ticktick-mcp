@@ -5313,7 +5313,7 @@ ConsentResult, _CONSENT_MAX_TOKENS, _JOURNAL_DIR, _MANIFESTS,
     _TOMBSTONE_CLAIMED, _TOMBSTONE_EXECUTED, _TOMBSTONE_FAILED,
     _TOMBSTONE_UNCONFIRMED, _classify_consent_reply,
     _consent_refusal_reason, _durable_payload, _duration_ru, _gate_batch,
-    _gate_single, _is_affirmative_reply, _is_negative_reply,
+    _gate_item_id, _gate_single, _is_affirmative_reply, _is_negative_reply,
     _journal_write, _manifest_from_payload, _manifest_gone_msg,
     _manifest_object_hash, _manifest_params_hash, _manifest_ttl_phrase,
     _mark_manifest_consumed, _maybe_tg_notify_plan, _op_journal,
@@ -7571,7 +7571,18 @@ async def get_completed_tasks(limit: int = 100) -> str:
 
 @mcp.tool(annotations=READONLY)
 async def list_tags() -> str:
-    """List all tags in the account (requires v2 API)."""
+    """List all tags in the account (requires v2 API).
+
+    2026-08-09 (П20, docs/TZ/ZAHOD1.md §1.3.6, пункт 5г) — ⚠️ РАСХОЖДЕНИЕ
+    ЗАМОРОЖЕННОГО ФОРМАТА, ТРЕБУЕТ ОТДЕЛЬНОГО ПОДТВЕРЖДЕНИЯ ВЛАДЕЛЬЦА ПЕРЕД
+    ВЫКЛАДКОЙ (Д13): вывод этого тула бот разбирает построчно, и раньше
+    последней строкой всегда был последний тег. Теперь, когда сверка живых
+    задач доступна, добавлена ЕЩЁ ОДНА строка в конце — число тегов-СИРОТ
+    (меток на открытых задачах, которых нет в этом самом списке; см.
+    `delete_tags`). Владелец должен явно согласиться на этот формат ДО
+    выката — правка НЕ самопровозглашает совместимость с существующим
+    парсером бота.
+    """
     err = _ensure_ready()
     if err:
         return err
@@ -7580,7 +7591,32 @@ async def list_tags() -> str:
         if not tags:
             return "No tags found."
         lines = [f"- {t.get('label', t.get('name', '?'))}" for t in tags]
-        return f"Tags ({len(tags)}):\n\n" + "\n".join(lines)
+        out = f"Tags ({len(tags)}):\n\n" + "\n".join(lines)
+        # Сироты — метки на ОТКРЫТЫХ задачах, отсутствующие среди тегов
+        # аккаунта (та же разность, что строит `delete_tags`, здесь — только
+        # число, без имён). Завершённые/корзинные задачи не охвачены — то же
+        # ограничение, что у `delete_tags`, и оно должно быть названо, а не
+        # умолчано (П17).
+        open_tasks = _open_by_id(fresh=True)
+        if open_tasks is None:
+            out += ("\n\n(Число тегов-сирот не посчитано — открытые задачи "
+                    "недоступны для сверки.)")
+        else:
+            live_keys = {(t.get("name") or "").lower() for t in tags}
+            orphan_keys = set()
+            for task in open_tasks.values():
+                for raw_tag in (task.get("tags") or []):
+                    key = (raw_tag or "").lower()
+                    if key and key not in live_keys:
+                        orphan_keys.add(key)
+            word = _ru_plural(len(orphan_keys), "метка-сирота", "метки-сироты",
+                              "меток-сирот")
+            out += (f"\n\n({len(orphan_keys)} {word} на открытых задачах не "
+                    "входят в этот список — заведены на задачах, но не в "
+                    "аккаунте; list_tags их не покажет и delete_tag/"
+                    "delete_tags не удалит; снимать через агрегатор типом "
+                    "`tags`. Не считает завершённые и корзинные задачи.)")
+        return out
     except Exception as e:
         logger.exception("Error in list_tags")
         return _tool_error("fetching tags", e)
@@ -11331,6 +11367,31 @@ async def _live_tag_names(force: bool = True) -> List[str]:
     return [(t.get("name") or "").lower() for t in tags]
 
 
+def _live_tag_records(force: bool = True) -> Optional[List[Dict]]:
+    """Полные live-записи тегов аккаунта (2026-08-09, П20, заход 1 §1.3.6) —
+    в отличие от `_live_tag_names` выше, ничего не теряет: каждая запись
+    целиком, включая `parent` (нужен `delete_tags`, чтобы отказывать по
+    родительским тегам — см. её докстринг). None, а не [] — когда состояние
+    недоступно (v2 не настроен/упал), симметрично `_open_by_id`.
+
+    Sync-функция, а не корутина через `_run_blocking` (как `_live_tag_names`)
+    — НАМЕРЕННО: фаза плана у остальных batch-тулов (`complete_tasks` и
+    соседей) читает живое состояние ТОЛЬКО через такие же sync-хелперы
+    (`_open_by_id`, `_v2_project_names`), и именно это позволяет
+    `tests/test_tg_gate_all_tools.py`'s общему стенду (`_no_client_checks`)
+    подменить чтение одной строкой без сети для ЛЮБОГО тула в таблице —
+    `delete_tags` подключается к тому же стенду, только если следует той же
+    форме."""
+    if not ticktick_v2:
+        return None
+    try:
+        if force:
+            ticktick_v2.get_state(force=True)
+        return list(ticktick_v2.get_tags())
+    except Exception:
+        return None
+
+
 @mcp.tool()
 async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
                      user_reply: str = "") -> str:
@@ -11550,6 +11611,257 @@ async def _delete_tag_impl(name: str) -> str:
         return _tool_error("deleting tag", e)
 
 
+# ---------------------------------------------------------------------------
+# delete_tags — массовое удаление тегов ОДНИМ подтверждением (2026-08-09,
+# docs/TZ/ZAHOD1.md §1.3.6, П20). Зачем: `delete_tag` выше берёт один тег за
+# вызов — к удалению обычно идёт несколько десятков сразу, а несколько
+# десятков подряд нажатых подтверждений обесценивают саму кнопку для ВСЕГО
+# сервера (человек перестаёт читать, что на ней написано), включая удаление
+# задач. Одиночный `delete_tag` НЕ трогается этой правкой — он остаётся
+# рабочим для разовых удалений и для автоматики.
+# ---------------------------------------------------------------------------
+
+def _tags_orphan_note(orphans: List[Tuple[str, int]]) -> str:
+    """Строка плана про теги-сироты (П20, пункт 5): метка стоит на открытой
+    задаче, но не заведена в аккаунте — её не покажет `list_tags`, и
+    `delete_tag` ответит «не существует», потому что ищет имя среди тегов
+    аккаунта (`_live_tag_names`), а не среди меток на задачах. Снять такую
+    метку штатным удалением тега нельзя — только правкой самих задач
+    (агрегатор `manual_triage` типом `tags`)."""
+    body = ", ".join(f"«{name}» (носителей: {n})" for name, n in orphans)
+    return ("🧩 Сироты — есть на открытых задачах, но НЕ заведены в аккаунте "
+            "(list_tags их не покажет, delete_tag ответит «не существует»); "
+            f"в пачку НЕ включены — снимать через агрегатор типом `tags`: {body}")
+
+
+def _tags_nonexistent_note(names: List[str]) -> str:
+    """Строка плана про имена, которых нет вообще нигде (ни в тегах
+    аккаунта, ни на одной открытой задаче) — вероятная опечатка."""
+    body = ", ".join(f"«{n}»" for n in names)
+    return f"❔ Не существуют вовсе (ни в тегах аккаунта, ни на задачах): {body}"
+
+
+def _describe_delete_tags_item(t: Dict) -> str:
+    """Строка плана на ОДИН тег — «радиус поражения» (П20, пункт 3):
+    сколько открытых задач теряет метку. Ноль печатается явно («снимется с 0
+    открытых задач»), а не пропускается — это отличает мусорный тег от
+    рабочего ещё ДО удаления."""
+    n = t.get("blast_radius")
+    radius = f"снимется с {n} открытых задач" if n is not None else "радиус неизвестен"
+    return f'«{t.get("name")}» — {radius}'
+
+
+@mcp.tool()
+@_shared_notes(automation=True, gate_args=True)
+async def delete_tags(summary: str, tags: Optional[List[str]] = None,
+                      manifest_id: str = "", user_reply: str = "",
+                      automation_key: str = "") -> str:
+    """
+    Delete MANY tags in ONE call, with ONE confirmation for the whole batch
+    (requires v2 API). Gated 🟡 (docs/DESIGN_approval_gate.md): two calls,
+    same tool name — nothing is deleted on call #1.
+
+    Use this instead of calling delete_tag() N times to clear out a lot of
+    tags at once: N separate confirmations train a human to stop reading the
+    button, which weakens the confirmation mechanism for the WHOLE server,
+    not just tags (docs/TZ/ZAHOD1.md §1.3.6 / П20). The single delete_tag
+    stays exactly as it was — for one-off deletions and for automation.
+
+    Call #1 (manifest_id omitted): classifies every requested name as
+    "зарегистрирован" (in the account's own tag list), "сирота" (sits on an
+    open task, but the account's tag list doesn't know it — list_tags and
+    delete_tag can't see it either), or "не существует вовсе" (neither), and
+    builds ONE plan covering only the registered names — each with its blast
+    radius (how many open tasks lose the tag; a tag with none still prints
+    "0", not silence). Orphans and unknown names are reported SEPARATELY and
+    are NEVER put in the delete batch (no ordinary deletion path exists for
+    an orphan — see the note). Nothing is deleted on call #1.
+
+    If ANY requested name is itself the PARENT of other live tags, the WHOLE
+    call is refused outright — no plan is built at all, for any of the names
+    — and the children are named in the refusal: TickTick's behaviour when a
+    parent tag is deleted (what happens to its children) is unverified, so
+    this is a blanket safety refusal, not a silent per-tag skip. Drop the
+    parent (or the whole tree) from the list and call again.
+
+    Call #2 (after the user actually replied): repeat the call with
+    manifest_id=<id from call #1> and user_reply=<the user's literal last
+    message> — tags is ignored on this call (the manifest's own stored value
+    is used). Do NOT make call #2 in the same turn as call #1.
+
+    {{AUTOMATION_KEY_NOTE}}
+
+    Args:
+        summary: Human-readable confirmation line, e.g. «Удаляю 40 тегов»
+        tags: Tag names — required on call #1, ignored on call #2
+        manifest_id: from call #1's response — pass on call #2 to actually delete
+        {{GATE_ARGS_TAIL}}
+    """
+    err = _ensure_ready()
+    if err:
+        return err
+
+    items: Optional[List[Dict]] = None
+    notes: Optional[List[str]] = None
+
+    if not manifest_id:
+        if not tags:
+            return "Пустой список — нечего делать."
+        # Живое состояние ДВАЖДЫ (2026-08-09): полные записи тегов (для
+        # регистрации/parent) и открытые задачи (для сирот/радиуса поражения)
+        # — оба свежие (force=True/fresh=True), иначе тег, заведённый минуту
+        # назад, читался бы как «не существует».
+        live = _live_tag_records(force=True)
+        if live is None:
+            return _STATE_UNAVAILABLE_MSG
+        open_tasks = _open_by_id(fresh=True)
+        if open_tasks is None:
+            return _STATE_UNAVAILABLE_MSG
+
+        live_by_key = {(t.get("name") or "").lower(): t for t in live}
+        # Тег несёт `parent` = имя РОДИТЕЛЯ (lowercase, создаётся так же в
+        # create_tag выше); строим обратную карту родитель → [дети], чтобы
+        # для каждого запрошенного имени узнать, есть ли у НЕГО дети.
+        children_by_parent: Dict[str, List[str]] = {}
+        for t in live:
+            parent = (t.get("parent") or "").strip()
+            if parent:
+                children_by_parent.setdefault(parent.lower(), []).append(
+                    t.get("name") or t.get("label") or "?")
+        # Радиус поражения и сироты — из ОДНОГО и того же свежего снимка
+        # открытых задач (а не N отдельных ticktick_v2.get_tasks_by_tag(...)
+        # вызовов, как в одиночном _delete_tag_impl): снимок уже нужен для
+        # сирот, а «сколько задач несёт тег X» — та же самая группировка по
+        # task["tags"], посчитанная один раз для всех тегов сразу.
+        carriers_by_key: Dict[str, int] = {}
+        for task in open_tasks.values():
+            for raw_tag in (task.get("tags") or []):
+                key = (raw_tag or "").lower()
+                if key:
+                    carriers_by_key[key] = carriers_by_key.get(key, 0) + 1
+
+        seen: set = set()
+        accepted: List[Dict] = []
+        parent_blocked: List[Tuple[str, List[str]]] = []
+        orphans: List[Tuple[str, int]] = []
+        nonexistent: List[str] = []
+        for raw in tags:
+            name = (raw or "").strip()
+            if not name:
+                continue
+            key = name.lstrip("#").lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            live_t = live_by_key.get(key)
+            if live_t is not None:
+                children = children_by_parent.get(key)
+                if children:
+                    parent_blocked.append(
+                        (live_t.get("name") or name, sorted(children)))
+                else:
+                    accepted.append({
+                        "name": live_t.get("name") or name,
+                        "blast_radius": carriers_by_key.get(key, 0)})
+            elif key in carriers_by_key:
+                orphans.append((name, carriers_by_key[key]))
+            else:
+                nonexistent.append(name)
+
+        # Родительский тег → отказ ВСЕМУ вызову, план не строится вовсе
+        # (П20, пункт 4: «отклоняется с перечислением детей» — а приёмочный
+        # тест требует именно «план не построен», не частичное исключение).
+        if parent_blocked:
+            lines = ["🛑 План НЕ построен — среди тегов есть РОДИТЕЛЬСКИЕ: "
+                    "поведение TickTick при удалении родителя (что станет с "
+                    "детьми) не выяснено, поэтому такие теги в пачку не "
+                    "принимаются вовсе:"]
+            for pname, children in parent_blocked:
+                lines.append(f"  - «{pname}» — дети: "
+                            + ", ".join(f"«{c}»" for c in children))
+            lines.append("Убери родительские теги из списка (или разберись "
+                        "сперва с детьми — вручную, через delete_tag/"
+                        "rename_tag) и повтори вызов.")
+            return "\n".join(lines)
+
+        if not accepted:
+            lines = ["Нечего удалять штатным путём — ни один тег из списка "
+                     "не зарегистрирован в аккаунте."]
+            if orphans:
+                lines.append(_tags_orphan_note(orphans))
+            if nonexistent:
+                lines.append(_tags_nonexistent_note(nonexistent))
+            return "\n".join(lines)
+
+        items = accepted
+        notes = []
+        if orphans:
+            notes.append(_tags_orphan_note(orphans))
+        if nonexistent:
+            notes.append(_tags_nonexistent_note(nonexistent))
+        notes = notes or None
+
+    outcome = await _gate_batch(
+        "delete_tags", "delete_tags", items, summary, manifest_id, user_reply,
+        _describe_delete_tags_item, items_arg="tags", notes=notes,
+        automation_key=automation_key)
+    if not outcome.proceed:
+        return outcome.message
+    return await _delete_tags_impl(outcome.summary, outcome.tasks)
+
+
+async def _delete_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
+    """Pure mutation logic for delete_tags — no consent gate. Called only by
+    the gated delete_tags() above once the plan is approved (chat «да» or
+    the Telegram button via `_generic_gate_auto_execute`, which finds this
+    function by the tool name «delete_tags» — no separate _AUTO_EXECUTORS
+    registration needed, см. докстринг `_gate_batch`).
+
+    `tasks` — элементы {"name", "blast_radius"}, построенные на фазе плана
+    delete_tags(): `blast_radius` тут ТОЛЬКО для отчёта (решение уже принято
+    на фазе плана) — чтобы не гонять по каждому тегу ещё один живой запрос
+    здесь же."""
+    try:
+        names = [(t.get("name") or "") for t in tasks]
+        names = [n for n in names if n]
+        if not names:
+            return "Пустой список — нечего делать."
+        for name in names:
+            try:
+                await _run_blocking(lambda n=name: ticktick_v2.delete_tag(n))
+            except Exception:
+                # Не прерываем пачку из-за одного сбоя — частичный исход
+                # всё равно будет назван поимённо ниже, свежим чтением.
+                logger.exception(f"Error deleting tag «{name}» (batch)")
+        # Перепроверка — СВОИМ свежим чтением списка тегов (force=True), а
+        # НЕ разбором ответа API (П20, пункт 6): ответ DELETE /tag может
+        # прийти успешным, даже когда тег на самом деле не удалился (тот же
+        # случай, что уже ловит одиночный _delete_tag_impl выше) — разбор
+        # ответа объявил бы удалённым тег, которого сервер не тронул.
+        after = set(await _live_tag_names(force=True))
+        deleted, failed = [], []
+        for t in tasks:
+            name = t.get("name") or ""
+            if not name:
+                continue
+            (failed if name.lower() in after else deleted).append(t)
+        lines = [f"### Итог — {summary}"]
+        if deleted:
+            lines.append(f"✅ Удалено {len(deleted)} из {len(names)} "
+                        "(проверено свежим списком тегов):")
+            for t in deleted:
+                n = t.get("blast_radius")
+                radius = f", снят с {n} открытых задач" if n is not None else ""
+                lines.append(f"  - «{t.get('name')}»{radius}")
+        if failed:
+            lines.append(f"❌ НЕ удалилось {len(failed)} — всё ещё в живом "
+                        "списке тегов:")
+            for t in failed:
+                lines.append(f"  - «{t.get('name')}»")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.exception("Error in delete_tags")
+        return _tool_error("deleting tags", e)
 
 
 # ---------------------------------------------------------------------------

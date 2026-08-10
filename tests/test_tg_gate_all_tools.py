@@ -72,6 +72,12 @@ BATCH_TOOLS = {
         summary="Разбираю 1",
         operations=[{"op": "complete", "task_id": "t1", "title": "A",
                      "said": "уже сделал"}]),
+    # delete_tags (2026-08-09, П20/ZAHOD1.md §1.3.6) — его call #1 читает
+    # ЖИВЫЕ теги (не только задачи), поэтому `_no_client_checks` ниже ТАКЖЕ
+    # подменяет `_live_tag_records`; "раз" в этом фикстурном списке — тег
+    # без родителя и без носителей (радиус 0), чтобы попасть в план без
+    # отказов/рубрик сирот — те разобраны отдельно в test_delete_tags.py.
+    "delete_tags": dict(summary="Удаляю 1", tags=["раз"]),
 }
 
 SINGLE_TOOLS = {
@@ -234,6 +240,11 @@ _LIVE_TASKS = {
     "par1": {"id": "par1", "title": "Родитель", "projectId": "p1"},
 }
 _LIVE_PROJECTS = {"p1": "Проект", "p2": "Проект-2"}
+# delete_tags (2026-08-09) — единственный тул в этой таблице, чей call #1
+# дополнительно читает живые ТЕГИ аккаунта (`_live_tag_records`), не только
+# задачи/проекты: "раз" без `parent`, чтобы фикстурный вызов из BATCH_TOOLS
+# ("раз") прошёл классификацию как обычный зарегистрированный тег.
+_LIVE_TAGS = [{"name": "раз", "label": "раз", "parent": None}]
 
 
 def _no_client_checks(monkeypatch):
@@ -244,6 +255,8 @@ def _no_client_checks(monkeypatch):
     monkeypatch.setattr(s, "_open_by_id",
                         lambda fresh=False: {k: dict(v) for k, v in _LIVE_TASKS.items()})
     monkeypatch.setattr(s, "_v2_project_names", lambda: dict(_LIVE_PROJECTS))
+    monkeypatch.setattr(s, "_live_tag_records",
+                        lambda force=True: [dict(t) for t in _LIVE_TAGS])
 
 
 def _stub_impl(monkeypatch, tool, recorder):
