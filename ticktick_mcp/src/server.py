@@ -16566,6 +16566,41 @@ def _op_duplicate_validate(i: int, op: Dict, shown: str) -> Optional[str]:
     return refusal or _triage_no_destination_refusal(i, op, shown, "duplicate")
 
 
+# РЕГРЕСС 1.3.3 (найден повторным аудитом захода 1, ZAHOD1.md 1.2.3, П11):
+# `_op_duplicate_plan`/`_op_duplicate_drift` были дописаны ПОСЛЕ свёртки П11 и
+# завели СВОЮ ручную цепочку веток по каждому статусу охранника (mismatch,
+# trashed и т.п.) в обход уже существующего `_guard_or_refuse` — ровно тот
+# узор, ради которого П11 делался. Подтверждено мутационно: сними ветку
+# отказа для КОРЗИНЫ в `_guard_or_refuse` — эти две площадки её потери не
+# заметят.
+#
+# Прямого вызова `_guard_or_refuse` тут недостаточно: он возвращает ГОТОВЫЙ
+# ответ инструмента («🛑 {глагол} — … Ничего не …»), а площадки агрегатора
+# отдают ГОЛУЮ причину — обвязка сама собирает строку
+# «• id X — ⧉ продублировать «Y»: {причина}» (`_triage_not_planned_line`).
+# Поэтому решение и текст берутся ИЗ `_guard_or_refuse` (единый источник, тот
+# же самый, что и у прямого тула `duplicate_task`), а рамку однотульного
+# ответа («🛑 {глагол} — » спереди) снимает `_triage_guard_reason` — она не
+# ветвит `g.status` заново, только распаковывает готовый ответ.
+_TRIAGE_GUARD_MARK = "личность"  # произвольный глагол-маркер, тут же срезается
+
+
+def _triage_guard_reason(g: "_Guard", *, expected: str) -> str:
+    """Голая причина отказа охранника личности для строки агрегатора.
+
+    Пусто — сверка пройдена (`ok`/`completed`), площадка продолжает работу.
+    Иначе — тот же текст, что получил бы прямой инструмент, без рамки
+    «🛑 {глагол} — … Ничего не …», которая в бегущей строке агрегатора не
+    нужна (эту рамку собирает сама обвязка своим форматом)."""
+    if g.status not in ("unavailable", "trashed", "mismatch", "missing"):
+        return ""
+    refusal, _warn = _guard_or_refuse(
+        g, stage="пакет-строка", verb=_TRIAGE_GUARD_MARK, expected=expected,
+        says="message", missing_says="message")
+    prefix = f"🛑 {_TRIAGE_GUARD_MARK} — "
+    return refusal[len(prefix):] if refusal.startswith(prefix) else refusal
+
+
 def _op_duplicate_plan(e: Dict, ctx: _TriagePlanCtx) -> str:
     """Сверка личности по ДВУМ лентам: открытые и завершённые.
 
@@ -16592,17 +16627,9 @@ def _op_duplicate_plan(e: Dict, ctx: _TriagePlanCtx) -> str:
         return ""
     g = _guard_task_incl_completed(e["task_id"], e.get("title") or "",
                                    by_id=ctx.by_id)
-    if g.status == "unavailable":
-        return "живое состояние не прочиталось — сказать, та ли это задача, не могу"
-    if g.status == "trashed":
-        return ("лежит В КОРЗИНЕ — «дубликат удалённого» почти всегда значит, "
-                "что нужен возврат (op=\"restore\"), а не копия")
-    if g.status == "mismatch":
-        return (f"название не совпало — по этому id сейчас «{g.title}», а в "
-                f"плане «{e.get('title')}»")
-    if g.status == "missing":
-        return ("не найдена ни среди открытых, ни среди завершённых задач "
-                "(кто-то удалил её вручную?)")
+    refusal = _triage_guard_reason(g, expected=e.get("title") or "")
+    if refusal:
+        return refusal
     pid = g.project_id or ""
     e["_project_id"] = pid
     e["_project_name"] = ctx.names.get(pid, "")
@@ -16630,13 +16657,8 @@ def _op_duplicate_drift(op: Dict, by_id: Dict[str, Dict], names: Dict) -> str:
                                    by_id=by_id)
     if g.status == "completed":
         return ""
-    if g.status == "mismatch":
-        return f"название изменилось после плана (сейчас «{g.title}»)"
-    if g.status == "trashed":
-        return "после плана уехала в КОРЗИНУ — копию с удалённого не делаю"
-    if g.status == "unavailable":
-        return "живое состояние не прочиталось — не дублирую вслепую"
-    return "исчезла и из открытых, и из завершённых между планом и исполнением"
+    return (_triage_guard_reason(g, expected=op.get("title") or "")
+            or "исчезла и из открытых, и из завершённых между планом и исполнением")
 
 
 def _op_duplicate_verify(op: Dict, item: Dict, live_map: Dict[str, Dict],
