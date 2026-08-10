@@ -8,6 +8,10 @@ delete manifests carried one)."""
 import time
 
 import ticktick_mcp.src.server as s
+# Автоуборка вынесена за пределы пакета (attic/declutter_disabled.py,
+# пункт 1.2.4 захода 1, 2026-08-09) — загрузчик возвращает её определения
+# в пространство имён `s`, где их ищут тесты ниже. См. tests/attic_loader.py.
+from tests import attic_loader as _attic  # noqa: F401
 
 
 class _FakeV2Delete:

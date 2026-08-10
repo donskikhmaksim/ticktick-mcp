@@ -224,7 +224,23 @@ _ALLOWED_EXTERNAL_NAMES = {"re", "Optional", "List"}
 
 def _classifier_block_source() -> str:
     """Исходник блока между маркерами — РОВНО то, что скопируют в другой репо."""
-    lines = inspect.getsource(s).splitlines()
+    # Разнос главного файла (1.2.4 захода 1, 2026-08-09) увёл классификатор
+    # вместе с гейтом в consent.py. Тест читал исходник ОДНОГО модуля server
+    # и после переезда не находил рамку вообще. Теперь рамка ищется по ВСЕМУ
+    # пакету, и требование «ровно один блок на весь пакет» стало сильнее
+    # прежнего «ровно один блок в одном файле»: копию классификатора теперь
+    # нельзя завести и в соседнем модуле.
+    import pathlib
+    root = pathlib.Path(s.__file__).resolve().parents[2]
+    lines, found_in = [], []
+    for path in sorted((root / "ticktick_mcp" / "src").glob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if any(ln.startswith(_BEGIN) for ln in text.splitlines()):
+            found_in.append(path.name)
+            lines = text.splitlines()
+    assert len(found_in) == 1, (
+        f"рамка классификатора найдена в {found_in} — она обязана быть ровно "
+        "в одном файле пакета")
     starts = [i for i, ln in enumerate(lines) if ln.startswith(_BEGIN)]
     ends = [i for i, ln in enumerate(lines) if ln.startswith(_END)]
     assert len(starts) == 1, "маркер BEGIN должен быть ровно один"

@@ -551,19 +551,27 @@ def test_the_production_default_of_the_consent_gap_is_not_zero():
     import ast
     import pathlib
 
-    src = pathlib.Path(s.__file__).read_text(encoding="utf-8")
+    # Разнос главного файла (1.2.4 захода 1, 2026-08-09) увёл гейт согласия
+    # в consent.py — вместе с ним уехал и этот дефолт. Пока тест читал ОДИН
+    # server.py, он переставал находить хоть что-нибудь и падал на «не нашёл»,
+    # хотя проверять надо было ровно то же самое. Теперь обходится ВЕСЬ
+    # пакет плюс attic/: область проверки расширилась, а не сузилась.
+    root = pathlib.Path(s.__file__).resolve().parents[2]
+    sources = sorted((root / "ticktick_mcp" / "src").glob("*.py"))
+    sources += sorted((root / "attic").glob("*.py"))
     defaults = []
-    for node in ast.walk(ast.parse(src)):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "get"):
-            continue
-        args = node.args
-        if len(args) == 2 and isinstance(args[0], ast.Constant) \
-                and args[0].value == "MIN_CONSENT_GAP" \
-                and isinstance(args[1], ast.Constant):
-            defaults.append(args[1].value)
+    for path in sources:
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "get"):
+                continue
+            args = node.args
+            if len(args) == 2 and isinstance(args[0], ast.Constant) \
+                    and args[0].value == "MIN_CONSENT_GAP" \
+                    and isinstance(args[1], ast.Constant):
+                defaults.append(args[1].value)
 
-    assert defaults, "не нашёл дефолт MIN_CONSENT_GAP в server.py"
+    assert defaults, "не нашёл дефолт MIN_CONSENT_GAP ни в одном файле пакета"
     for value in defaults:
         assert float(value) > 0, (
             f"боевой дефолт паузы согласия равен {value!r} — самоподтверждение "
