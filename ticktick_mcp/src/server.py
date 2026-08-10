@@ -15219,6 +15219,204 @@ def _dedup_stage1_live(ops: List[Dict], by_id: Dict[str, Dict],
     return notes
 
 
+def _dedup_stage2_manifests(ops: List[Dict]) -> List[str]:
+    """РУБЕЖ 2 — против ЧУЖИХ ЖИВЫХ ПЛАНОВ. Только предупреждения.
+
+    Именно этого не было в живом инциденте: второй план строился, не зная
+    ничего о первом, который висел неисполненным. Предупреждение НАЗЫВАЕТ
+    ИДЕНТИФИКАТОР того плана — чтобы человек мог его отменить или подтвердить
+    осознанно, а не гадать, где второй.
+
+    Недоступное хранилище планов молчит (`list_live` вернёт []): рубеж —
+    предупреждение, и превращать сбой базы в отказ строить план нельзя."""
+    creating = [o for o in ops
+                if _TRIAGE_BY_OP[o["op"]].creates and not o.get("_skip")]
+    if not creating:
+        return []
+    try:
+        live_plans = _triage_cached(
+            "live_manifests",
+            lambda: manifest_store.list_live("manual_triage",
+                                             _MANIFEST_TTL * 1000))
+    except Exception:
+        logger.exception("manual_triage: перечень живых планов не прочитался")
+        return []
+    notes: List[str] = []
+    for o in creating:
+        dest = str(o.get("_to_project_id") or "")
+        want = _norm_name(o.get("title") or "")
+        want_toks = _dc_tokens(o.get("title") or "")
+        if not want:
+            continue
+        for plan in live_plans or []:
+            payload = plan.get("payload") or {}
+            for other in (payload.get("tasks") or []):
+                if str(other.get("op") or "") != "create":
+                    continue
+                if str(other.get("_to_project_id") or "") != dest:
+                    continue
+                other_title = str(other.get("title") or "")
+                exact = _norm_name(other_title) == want
+                near = _dc_jaccard(want_toks, _dc_tokens(other_title)) \
+                    >= _DC_FUZZY_THRESHOLD
+                if not (exact or near):
+                    continue
+                notes.append(
+                    f"⚠️ {'Такое же' if exact else 'Похожее'} создание "
+                    f"(«{other_title}») уже ждёт подтверждения в другом плане "
+                    f"— манифест `{plan.get('manifest_id')}`. Подтвердив оба, "
+                    "получите два объекта: отмените лишний или подтвердите "
+                    "осознанно.")
+                break
+    return notes
+
+
+def _dedup_journal_creates(window_h: int = 24) -> List[Dict]:
+    """Созданное ЗА ОКНО по журналу операций → плоские записи
+    {task_id, title, project_id, when, record}.
+
+    Журнал нужен рядом с живой выборкой потому, что живая выборка ОТСТАЁТ:
+    только что созданная задача может в ней ещё не появиться — а это ровно тот
+    момент, когда второй похожий план и подтверждают."""
+    since = datetime.now(timezone.utc) - timedelta(hours=window_h)
+    path = os.path.join(_JOURNAL_DIR, "deletion_journal.jsonl")
+    out: List[Dict] = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if (rec.get("op") or "") != "create":
+                    continue
+                try:
+                    ts = datetime.fromisoformat(str(rec.get("ts") or ""))
+                except ValueError:
+                    continue
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if ts < since:
+                    continue
+                for it in (rec.get("items") or []):
+                    out.append({
+                        "task_id": str(it.get("taskId") or ""),
+                        "title": str(it.get("title") or ""),
+                        "project_id": str((it.get("expect") or {})
+                                          .get("projectId") or ""),
+                        "when": ts, "record": str(rec.get("record") or ""),
+                    })
+    except FileNotFoundError:
+        return []
+    except Exception:
+        logger.exception("manual_triage: журнал созданий не прочитался")
+        return []
+    return out
+
+
+def _dedup_stage3_execution(ops: List[Dict], by_id: Dict[str, Dict],
+                            names: Dict) -> Tuple[List[Dict], List[str]]:
+    """РУБЕЖ 3 — ПРИ ИСПОЛНЕНИИ. → (исключённые пары [op, причина], заметки).
+
+    🔴 ПОЛИТИКА ВЛАДЕЛЬЦА (2026-08-10), меняет исходное предложение
+    архитектора: точное совпадение нормализованного названия в проекте
+    назначения НЕ ГЛУШИТ МАНИФЕСТ ЦЕЛИКОМ. Оно исключает ТОЛЬКО ЭТУ ОДНУ
+    ПОЗИЦИЮ из волны исполнения — тем же путём, каким 1.3.1 обрабатывает любой
+    другой пропуск; остальные позиции исполняются как обычно. Полная остановка
+    осталась ровно на один случай: совпали ВСЕ позиции (его формулирует
+    вызывающий, см. «манифест, похоже, уже исполнен»).
+
+    ДВА ИСТОЧНИКА, и оба обязательны: свежее живое состояние и журнал
+    операций за 24 часа. Живая выборка отстаёт, и только что созданная задача
+    может в ней ещё не появиться — а это ровно тот момент, когда второй
+    похожий план и подтверждают.
+
+    СОВПАДЕНИЕ ПО ЖУРНАЛУ ЗАСЧИТЫВАЕТСЯ ТОЛЬКО ПРИ ЖИВОМ ПОДТВЕРЖДЕНИИ.
+    Запись сама по себе не блокирует: объект, который она называет, обязан
+    существовать в текущем снимке. Задачу из журнала могли с тех пор удалить —
+    мёртвая запись не имеет права остановить живую операцию.
+
+    БЛИЗКОЕ совпадение не исключает и не останавливает ничего — только
+    печатается: иначе законное «сделай ещё раз то же самое» стало бы
+    невозможным."""
+    creating = [o for o in ops if _TRIAGE_BY_OP[o["op"]].creates]
+    if not creating:
+        return [], []
+    by_project: Dict[str, List[Dict]] = {}
+    for live in by_id.values():
+        by_project.setdefault(live.get("projectId") or "", []).append(live)
+    journal = _dedup_journal_creates()
+    excluded: List[Dict] = []
+    notes: List[str] = []
+    for o in creating:
+        if o.get("confirmed_repeat") is True:
+            # ДЕШЁВЫЙ ЗАКОННЫЙ ПОВТОР (условие 2 владельца): человек уже
+            # прочитал «уже создана» и сказал «всё равно создай». Пересобирать
+            # ради этого весь манифест — цена, из-за которой люди перестают
+            # читать предупреждения вовсе.
+            notes.append(f"ℹ️ «{o.get('title')}» создаётся ПОВТОРНО осознанно "
+                         "(confirmed_repeat) — рубеж против дублей для этой "
+                         "строки снят вами явно.")
+            continue
+        dest = str(o.get("_to_project_id") or "")
+        want = _norm_name(o.get("title") or "")
+        if not want:
+            continue
+        exact = [t for t in by_project.get(dest, [])
+                 if _norm_name(t.get("title") or "") == want]
+        if exact:
+            excluded.append({
+                "op": o,
+                "why": ("уже создана — совпадение с живым состоянием: "
+                        f"в «{names.get(dest, dest)}» уже открыта задача "
+                        f"«{exact[0].get('title')}» "
+                        f"(id {_short_task_id(exact[0].get('id') or '')})"),
+            })
+            continue
+        # Журнал — второй источник, и только с ЖИВЫМ подтверждением.
+        hit = None
+        for rec in journal:
+            if _norm_name(rec["title"]) != want:
+                continue
+            if rec["project_id"] and dest and rec["project_id"] != dest:
+                continue
+            if rec["task_id"] and rec["task_id"] in by_id:
+                hit = rec
+                break
+        if hit:
+            excluded.append({
+                "op": o,
+                "why": ("уже создана — совпадение с записью журнала "
+                        f"{hit['record']} (задача «{hit['title']}», id "
+                        f"{_short_task_id(hit['task_id'])}), и она жива в "
+                        "текущем состоянии"),
+            })
+            continue
+        near = [t for t in by_project.get(dest, [])
+                if _dc_jaccard(_dc_tokens(o.get("title") or ""),
+                               _dc_tokens(t.get("title") or ""))
+                >= _DC_FUZZY_THRESHOLD]
+        if near:
+            notes.append(
+                f"⚠️ «{o.get('title')}» похоже на уже открытую "
+                f"«{near[0].get('title')}» — создано ВСЁ РАВНО (близкое "
+                "совпадение ничего не блокирует).")
+    return excluded, notes
+
+
+def _triage_repeat_hint(op: Dict) -> str:
+    """Короткая копируемая фраза-подтверждение для позиции, исключённой
+    рубежом 3 (условие 2 владельца, 2026-08-10).
+
+    Это ОДНА операция с явным флагом, а не новый план и не новый манифест:
+    цена «пересобери всё заново» — то, из-за чего люди перестают читать
+    предупреждения и начинают жать «да» на всё подряд."""
+    return ('повторить осознанно: {"op": "create", "title": '
+            f'"{op.get("title")}", "to_project_id": '
+            f'"{op.get("_to_project_id")}", "confirmed_repeat": true, '
+            '"said": "<слова человека>"}')
+
+
 def _op_create_validate(i: int, op: Dict, shown: str) -> Optional[str]:
     if op.get("untitled") is True:
         return (f"🛑 Отказ: операция #{i} (create) — маркер untitled=true у "
@@ -15234,6 +15432,13 @@ def _op_create_validate(i: int, op: Dict, shown: str) -> Optional[str]:
     if ref:
         return (f"🛑 Отказ: операция #{i} («{shown}») — {_TRIAGE_REF_NOT_YET} "
                 "Ничего не сделано.")
+    repeat = op.get("confirmed_repeat")
+    if repeat is not None and repeat is not True and repeat is not False:
+        # Тип строго булев по той же причине, что у `untitled`: "true"
+        # строкой молча прочиталось бы как «флага нет», и рубеж против дублей
+        # сработал бы снова — а вызывающий считал бы, что снял его.
+        return (f"🛑 Отказ: операция #{i} («{shown}») — confirmed_repeat "
+                f"должен быть булевым true, а не {repeat!r}. Ничего не сделано.")
     changes = op.get("changes")
     if changes is not None:
         if not isinstance(changes, dict):
@@ -16542,6 +16747,13 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         # undeletable by delete_tag). op="tags" registers unknown tags first
         # and refuses fail-closed if it cannot:
         "changes": {"tags": ["дом", "звонки"]},
+        # op="create" only — NO task_id (there is no task yet; an id sent for
+        # one could only have been invented). `title` is the WANTED name, the
+        # destination is required, and every other field of the new task
+        # travels in `changes` (same keys as update, except new_title):
+        "confirmed_repeat": true   # "yes, create it AGAIN on purpose" — only
+                   # needed after the server refused this exact creation as an
+                   # already-existing one and printed this very line back
       }
 
     `untitled` — the ONLY way to name a task that has no name. Some tasks
@@ -16640,6 +16852,10 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         _cache_token = _TRIAGE_READ_CACHE.set({})
         try:
             checked = _resolve_triage_ops(list(operations), by_id, names)
+            dedup_refusal, dedup_notes = _dedup_stage0_plan(checked)
+            if not dedup_refusal:
+                dedup_notes += _dedup_stage1_live(checked, by_id, names)
+                dedup_notes += _dedup_stage2_manifests(checked)
         finally:
             _TRIAGE_READ_CACHE.reset(_cache_token)
         # 2026-08-09 (П19). Не прошедшее сверку В ПЛАН НЕ ПОПАДАЕТ ВОВСЕ.
@@ -16649,15 +16865,14 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         # внимания, решение принималось по большинству. Теперь результат
         # делится надвое: выполнимое → манифест и кнопки, невыполнимое →
         # справка человеку (ниже черты, без кнопок) и в ответ модели.
-        # РУБЕЖИ ПРОТИВ ДУБЛЕЙ (1.3.3/изм-8, дизайн раздел 8). Живой случай:
-        # владелец подтвердил два похожих манифеста подряд и получил пять
-        # задач дважды. Рубеж 0 — внутри плана, единственный, кто ОТКАЗЫВАЕТ;
-        # рубеж 1 — против живого состояния, только предупреждает, потому что
-        # «сделать ещё раз то же» бывает законным.
-        dedup_refusal, dedup_notes = _dedup_stage0_plan(checked)
+        # РУБЕЖИ ПРОТИВ ДУБЛЕЙ (1.3.3/изм-8 и изм-9, дизайн раздел 8). Живой
+        # случай: владелец подтвердил два похожих манифеста подряд и получил
+        # пять задач дважды. Рубеж 0 — внутри плана, единственный, кто
+        # ОТКАЗЫВАЕТ; рубежи 1 и 2 (живое состояние и чужие живые планы) —
+        # только предупреждают, потому что «сделать ещё раз то же» бывает
+        # законным. Рубеж 3 живёт в `_manual_triage_impl`, при исполнении.
         if dedup_refusal:
             return dedup_refusal
-        dedup_notes += _dedup_stage1_live(checked, by_id, names)
         blocked = [o for o in checked if o.get("_skip")]
         enriched = [o for o in checked if not o.get("_skip")]
         # list.sort устойчива: внутри одного типа исходный порядок сохраняется.
@@ -16778,8 +16993,23 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict],
                 blocked.append((op, why))
                 continue
             ready.append(op)
+        # РУБЕЖ 3 — ПРИ ИСПОЛНЕНИИ (1.3.3/изм-9, дизайн раздел 8, ПОЛИТИКА
+        # ВЛАДЕЛЬЦА 2026-08-10). Совпавшая позиция ИСКЛЮЧАЕТСЯ из волны —
+        # манифест целиком НЕ глушится, остальные строки исполняются как
+        # обычно. Причина названа всегда, и рядом с ней — копируемая фраза
+        # для законного повтора: молчаливого исключения не бывает.
+        dedup_excluded, dedup_exec_notes = _dedup_stage3_execution(
+            ready, by_id, names)
     finally:
         _TRIAGE_READ_CACHE.reset(_cache_token)
+
+    was_ready = len(ready)
+    if dedup_excluded:
+        gone_ids = {id(x["op"]) for x in dedup_excluded}
+        ready = [o for o in ready if id(o) not in gone_ids]
+        not_planned = list(not_planned or []) + _triage_not_planned_records(
+            [{**x["op"], "_skip": x["why"] + ". Если повтор нужен — "
+              + _triage_repeat_hint(x["op"])} for x in dedup_excluded])
 
     # СПРАВКА О НЕПОШЕДШЕМ — В ЖУРНАЛ, ДО ЛЮБОГО ВЫХОДА (1.3.1, 2026-08-09).
     # Отчёт после нажатия кнопки собирает `_build_operation_report` по
@@ -16789,6 +17019,23 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict],
     # исполнение упадёт на середине, перечень непошедшего уже в журнале.
     _journal_not_executed(_triage_skipped_records(blocked), not_planned,
                           summary)
+
+    if not ready and dedup_excluded and len(dedup_excluded) == was_ready:
+        # ОСОБЫЙ СЛУЧАЙ: рубеж 3 исключил АБСОЛЮТНО ВСЕ позиции волны
+        # (дизайн раздел 8, политика владельца 2026-08-10). Это не «частичный
+        # успех с пустым остатком» и не безмолвный провал: формулировка
+        # называет ВЕРОЯТНУЮ ПРИЧИНУ — совпадение целиком, — иначе «выполнено
+        # 0 из N» читается как поломка там, где всё уже сделано.
+        return "\n".join(
+            [f"### 🛑 Ручной разбор — {summary}",
+             "🛑 МАНИФЕСТ, ПОХОЖЕ, УЖЕ ИСПОЛНЕН: каждая из "
+             f"{_ops_plural(was_ready)} этого плана совпала с тем, что УЖЕ "
+             "есть — по живому состоянию или по журналу созданий за сутки. "
+             "Ничего не создано повторно, ни одна задача не тронута. Если "
+             "повтор всё-таки нужен, пришлите нужные строки заново с "
+             "confirmed_repeat=true (готовые строки — ниже).", ""]
+            + _triage_blocked_lines(blocked)
+            + _triage_not_planned_report_lines(not_planned))
 
     if not ready:
         # Маркер 🛑 стоит В ЗАГОЛОВКЕ, а не только во второй строке, и это не
@@ -16901,6 +17148,12 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict],
         lines += ["", "#### 🔍 Независимая сверка по каждой операции"] + verdicts
     for title, text in sections:
         lines += ["", f"#### {title}", text]
+    if dedup_exec_notes:
+        # Близкие совпадения и осознанные повторы: НИЧЕГО не заблокировали, но
+        # сказать про них надо — иначе «создалось похожее» человек обнаружит
+        # только в списке задач.
+        lines += ["", "#### 👀 Похожее рядом — создано всё равно"] \
+            + [f"- {n}" for n in dedup_exec_notes]
     if blocked:
         lines += [""] + _triage_blocked_lines(blocked)
     lines += _triage_not_planned_report_lines(not_planned)

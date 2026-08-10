@@ -222,3 +222,196 @@ async def test_stage1_reads_fresh_state_never_cache(monkeypatch, tmp_path):
     await s.manual_triage("Заношу дела", [_create("Позвонить в страховую")])
 
     assert seen == [True], f"фаза плана читает живое состояние один раз, свежим: {seen}"
+
+
+# ════════════════════════════ рубеж 2 ═════════════════════════════════════
+
+async def test_stage2_names_the_other_live_plan(monkeypatch, tmp_path):
+    """Чужой ЖИВОЙ план с таким же созданием → предупреждение, НАЗЫВАЮЩЕЕ его
+    идентификатор: иначе человек знает, что где-то есть второй план, но не
+    знает какой, и отменить его не может."""
+    live = {}
+    _wire(monkeypatch, live, tmp_path)
+    monkeypatch.setattr(s.manifest_store, "list_live", lambda tool="", window_ms=0: [
+        {"manifest_id": "deadbeef01", "tool": "manual_triage",
+         "payload": {"tasks": [{"op": "create", "title": "Позвонить в страховую",
+                                "_to_project_id": "p_work"}]}}])
+
+    preview = await s.manual_triage("Заношу дела",
+                                    [_create("Позвонить в страховую")])
+
+    assert "Манифест" in preview, "рубеж 2 предупреждает, а не блокирует"
+    assert "deadbeef01" in preview, preview
+    assert "уже ждёт подтверждения" in preview
+
+
+async def test_stage2_survives_an_unreadable_manifest_store(monkeypatch, tmp_path):
+    """Сбой хранилища планов не имеет права превратиться в отказ строить
+    план: рубеж 2 — предупреждение."""
+    live = {}
+    _wire(monkeypatch, live, tmp_path)
+
+    def _boom(tool="", window_ms=0):
+        raise RuntimeError("база недоступна")
+
+    monkeypatch.setattr(s.manifest_store, "list_live", _boom)
+
+    preview = await s.manual_triage("Заношу дела",
+                                    [_create("Позвонить в страховую")])
+
+    assert "Манифест" in preview
+
+
+# ════════════════════════════ рубеж 3 ═════════════════════════════════════
+
+async def _plan_and_execute(ops, summary="Заношу дела"):
+    preview = await s.manual_triage(summary, ops)
+    assert "Манифест" in preview, preview
+    return await s.manual_triage(summary, manifest_id=_mid(preview),
+                                 user_reply="да")
+
+
+async def test_incident_two_plans_five_creations_each(monkeypatch, tmp_path):
+    """ВОСПРОИЗВЕДЕНИЕ РЕАЛЬНОГО ИНЦИДЕНТА.
+
+    Владелец подтвердил два похожих манифеста подряд и получил пять задач
+    дважды. Здесь: оба плана строятся ДО исполнения любого из них (как и было
+    — второй план уже висел, когда исполнялся первый), исполняется первый,
+    затем второй. Итог судится ПО ФАКТУ: в проекте ровно пять задач, а не
+    десять.
+
+    По НОВОЙ политике владельца (2026-08-10) второй манифест не глохнет
+    молча: раз совпали ВСЕ его позиции, отчёт говорит «манифест, похоже, уже
+    исполнен» — формулировка называет вероятную причину, а не выглядит
+    безмолвным провалом «выполнено 0 из 5»."""
+    live = {}
+    v2, official = _wire(monkeypatch, live, tmp_path)
+    titles = [f"Дело {i}" for i in range(1, 6)]
+
+    first = await s.manual_triage("Заношу дела", [_create(t) for t in titles])
+    second = await s.manual_triage("Заношу дела", [_create(t) for t in titles])
+
+    await s.manual_triage("Заношу дела", manifest_id=_mid(first),
+                          user_reply="да")
+    assert len(live) == 5, "первый план создал пять"
+
+    out = await s.manual_triage("Заношу дела", manifest_id=_mid(second),
+                                user_reply="да")
+
+    assert len(live) == 5, f"в проекте должно остаться РОВНО 5 задач: {live}"
+    assert len(official.calls) == 5, "второй план не дёргал канал создания"
+    assert "УЖЕ ИСПОЛНЕН" in out.upper(), out
+    assert "Выполнено 0 из" not in out, "это не безмолвный провал"
+    # Дешёвый законный повтор назван прямо в отчёте.
+    assert "confirmed_repeat" in out
+
+
+async def test_partial_overlap_executes_the_rest(monkeypatch, tmp_path):
+    """НОВАЯ ПОЛИТИКА, главное её следствие: совпавшая позиция исключается
+    ОДНА, остальные исполняются. Старая («полная остановка манифеста») здесь
+    не создала бы ничего."""
+    live = {}
+    v2, official = _wire(monkeypatch, live, tmp_path)
+
+    first = await s.manual_triage("Заношу", [_create("Дело A")])
+    await s.manual_triage("Заношу", manifest_id=_mid(first), user_reply="да")
+    assert len(live) == 1
+
+    out = await _plan_and_execute([_create("Дело A"), _create("Дело B"),
+                                   _create("Дело C")])
+
+    titles = sorted(t["title"] for t in live.values())
+    assert titles == ["Дело A", "Дело B", "Дело C"], titles
+    assert "УЖЕ ИСПОЛНЕН" not in out.upper(), "остановки манифеста быть не должно"
+    assert "✅ Выполнено 2 из" in out
+    assert "уже создана" in out
+
+
+async def test_confirmed_repeat_passes_stage3(monkeypatch, tmp_path):
+    """Дешёвый законный повтор: одна операция с явным флагом, без пересборки
+    манифеста. Рубеж 3 для неё не срабатывает повторно."""
+    live = {}
+    v2, official = _wire(monkeypatch, live, tmp_path)
+    first = await s.manual_triage("Заношу", [_create("Дело A")])
+    await s.manual_triage("Заношу", manifest_id=_mid(first), user_reply="да")
+
+    op = _create("Дело A")
+    op["confirmed_repeat"] = True
+    out = await _plan_and_execute([op])
+
+    assert len([t for t in live.values() if t["title"] == "Дело A"]) == 2, \
+        "осознанный повтор обязан создать вторую"
+    assert "✅ Выполнено 1 из 1" in out
+
+
+async def test_confirmed_repeat_must_be_a_real_boolean(monkeypatch, tmp_path):
+    """«true» строкой молча прочиталось бы как «флага нет», и рубеж сработал
+    бы снова — а вызывающий считал бы, что снял его."""
+    live = {}
+    v2, official = _wire(monkeypatch, live, tmp_path)
+    op = _create("Дело A")
+    op["confirmed_repeat"] = "true"
+
+    out = await s.manual_triage("Заношу", [op])
+
+    assert "🛑" in out and "confirmed_repeat" in out
+    assert s._MANIFESTS == {} and official.calls == []
+
+
+async def test_incident_via_journal_only(monkeypatch, tmp_path):
+    """Тот же инцидент, но вторая партия видна ТОЛЬКО в журнале: живая
+    выборка отстаёт и только что созданную задачу ещё не отдаёт. Без чтения
+    журнала рубеж 3 пропустил бы дубль."""
+    live = {}
+    v2, official = _wire(monkeypatch, live, tmp_path)
+
+    first = await s.manual_triage("Заношу", [_create("Дело A")])
+    await s.manual_triage("Заношу", manifest_id=_mid(first), user_reply="да")
+    created_id = next(iter(live))
+    assert live[created_id]["title"] == "Дело A"
+
+    second = await s.manual_triage("Заношу", [_create("Дело A")])
+
+    # ЖИВАЯ ВЫБОРКА ОТСТАЁТ: задача есть в состоянии под своим id, но НЕ под
+    # своим названием (так выглядит незасинхронизировавшийся снимок для
+    # сравнения по имени). Единственный, кто ещё помнит создание, — журнал.
+    live[created_id]["title"] = ""
+
+    out = await s.manual_triage("Заношу", manifest_id=_mid(second),
+                                user_reply="да")
+
+    assert len(official.calls) == 1, "по журналу дубль обязан быть исключён"
+    assert "журнала" in out, out
+    assert "УЖЕ ИСПОЛНЕН" in out.upper()
+
+
+async def test_journal_hit_without_a_live_object_does_not_block(
+        monkeypatch, tmp_path):
+    """Условие 1 владельца: совпадение по журналу засчитывается ТОЛЬКО при
+    живом подтверждении. Задачу из журнала с тех пор удалили — мёртвая запись
+    не имеет права остановить живую операцию."""
+    live = {}
+    v2, official = _wire(monkeypatch, live, tmp_path)
+
+    first = await s.manual_triage("Заношу", [_create("Дело A")])
+    await s.manual_triage("Заношу", manifest_id=_mid(first), user_reply="да")
+    live.clear()          # задачу удалили — в журнале запись осталась
+
+    out = await _plan_and_execute([_create("Дело A")])
+
+    assert len(live) == 1, "создание обязано пройти: объекта из журнала нет"
+    assert "✅ Выполнено 1 из 1" in out
+
+
+async def test_stage3_near_match_does_not_block(monkeypatch, tmp_path):
+    """Близкое совпадение на рубеже 3 не исключает и не останавливает —
+    только печатается: иначе законное «сделай ещё раз то же самое» стало бы
+    невозможным."""
+    live = {"old": {"id": "old", "title": "Купить молоко и хлеб",
+                    "projectId": "p_work"}}
+    v2, official = _wire(monkeypatch, live, tmp_path)
+
+    out = await _plan_and_execute([_create("Купить молоко, хлеб")])
+
+    assert len(live) == 2, "близкое совпадение ничего не блокирует"
+    assert "Похожее рядом" in out

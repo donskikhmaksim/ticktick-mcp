@@ -317,6 +317,50 @@ def load_live(manifest_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
     return {r[0]: _row_to_dict(r) for r in rows}
 
 
+def list_live(tool: str = "", window_ms: int = 0) -> List[Dict[str, Any]]:
+    """ВСЕ живые планы сервера за окно времени — в отличие от `load_live`
+    выше, которому список id надо знать заранее (1.3.3/изм-9, дизайн раздел 8,
+    рубеж 2).
+
+    Зачем это вообще нужно. Живой случай: владелец подтвердил ДВА похожих
+    манифеста подряд и получил пять задач дважды. Защита «один манифест — одно
+    исполнение» такого не ловит: манифестов было два, каждый исполнился ровно
+    один раз. Единственное место, где второй план можно было увидеть ДО
+    подтверждения, — перечень ещё не исполненных чужих планов, а получить его
+    было нечем: `load_live` принимает готовые идентификаторы, а тот, кто
+    строит новый план, идентификаторов чужих планов не знает по определению.
+
+    ОДИН запрос с тем же условием живости, что у `load_live`
+    (`consumed_at IS NULL AND expires_at > now`), и тем же способом, каким она
+    бережёт десятисекундный тик поллера.
+
+    `tool` — сузить до планов одного инструмента (пусто = любые).
+    `window_ms` — не старше стольких миллисекунд по `created_at` (0 = без
+    ограничения снизу; сверху и так режет `expires_at`)."""
+    if not store_ready():
+        return []
+    now = _now_ms()
+    sql = ("SELECT manifest_id, tool, payload, created_at, expires_at, "
+           "consumed_at FROM mcp_manifests "
+           "WHERE server = %s AND consumed_at IS NULL AND expires_at > %s")
+    args: List[Any] = [SERVER, now]
+    if tool:
+        sql += " AND tool = %s"
+        args.append(tool)
+    if window_ms:
+        sql += " AND created_at >= %s"
+        args.append(now - int(window_ms))
+    sql += " ORDER BY created_at"
+    try:
+        with _conn() as cur:
+            cur.execute(sql, tuple(args))
+            rows: List[tuple] = cur.fetchall()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"manifest_store: перечень живых планов не удался: {e}")
+        return []
+    return [_row_to_dict(r) for r in rows]
+
+
 # Исходы попытки захвата. Три, а не два, потому что «этой строки в базе нет»
 # и «строка есть, но её уже забрали» требуют РАЗНОГО поведения у вызывающего:
 # в первом случае план виден только текущему процессу и одноразовость обязана
