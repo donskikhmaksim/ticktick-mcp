@@ -3796,8 +3796,9 @@ async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
     poller) and write the report back into that same message — you do not
     have to call this tool again for it to happen. For such a plan the text
     path is CLOSED: this call is refused whatever `user_reply` says, both
-    before the press ("⏳ ждём кнопку", plan stays alive) and after it
-    ("✅ сервер уже исполняет"). Calling it again changes nothing.
+    before the press (plan stays alive; refusal message tells the user to
+    press the button) and after it (refusal message tells the user the
+    server is already executing). Calling it again changes nothing.
 
     Args:
         manifest_id: id from plan_task_creation
@@ -8823,9 +8824,9 @@ async def delete_task_with_subtasks(
     """
     DEPRECATED / always refuses. Subtree deletion is NOT performed here —
     this tool exists only to catch old callers and redirect them. It always
-    returns a refusal pointing to plan_task_deletion with {"taskId", "title",
-    "with_subtasks": true}, which expands the ENTIRE open subtree into a
-    manifest for approval (already gated 🔴 — plan_task_deletion →
+    returns a refusal pointing to plan_task_deletion with {"taskId": ...,
+    "title": ..., "with_subtasks": true}, which expands the ENTIRE open
+    subtree into a manifest for approval (already gated 🔴 — plan_task_deletion →
     execute_task_deletion(manifest_id, user_reply=...)). No argument below
     has any effect; nothing is ever deleted by THIS tool, regardless of what
     you pass. None of them is required either (2026-08-07): a tool whose whole
@@ -9852,8 +9853,9 @@ async def get_recurring_tasks(search_term: str = "") -> str:
     Do NOT call this in a loop — it already scans all open tasks at once.
 
     Args:
-        search_term: Optional text to further filter by title/content (case-insensitive).
-                     Leave empty to return all recurring tasks.
+        search_term: Optional text to further filter by title/content/subtask
+                     titles (case-insensitive). Leave empty to return all
+                     recurring tasks.
     """
     err = _ensure_official()
     if err:
@@ -9894,7 +9896,7 @@ async def get_recurring_tasks(search_term: str = "") -> str:
 @mcp.tool(annotations=READONLY)
 async def get_engaged_tasks() -> str:
     """
-    Get all tasks from TickTick that are "Engaged".
+    Get all tasks from TickTick that are 'engaged'.
     This includes tasks marked as high priority (5), due today or overdue.
     """
     err = _ensure_official()
@@ -11171,10 +11173,12 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
     the live read itself fails while building the plan, the plan still gets
     built (a read hiccup must not block every nesting), but its text says so
     honestly — the call #2 check is unconditional and still guards the
-    mutation either way. NOTE: this only covers the PARENT's identity — each
-    task in `tasks` is still resolved found/mismatch/missing only on
-    execution (see _set_task_parent_impl / _split_tasks_by_state), same as
-    before.
+    mutation either way. NOTE: each task in `tasks` is ALSO cross-checked
+    against the live task list while BUILDING the plan (call #1, via the
+    same _plan_live_check helper as the parent) — not just the parent's
+    identity — and each is resolved found/mismatch/missing again,
+    independently, on execution (see _set_task_parent_impl /
+    _split_tasks_by_state).
     """
     err = _ensure_ready()
     if err:
@@ -12040,7 +12044,7 @@ async def build_recurrence_rule(frequency: str, interval: int = 1,
                                 by_month: List[int] = None,
                                 by_set_pos: List[int] = None) -> str:
     """
-    Build an RRULE recurrence string to pass as repeat_flag in create_task/update_task.
+    Build an RRULE recurrence string to pass as repeat_flag in create_tasks/update_tasks.
 
     The FIRST line of the output is the rule itself — that is what goes into
     repeat_flag. Anything after it is a warning about a rule that is valid but
@@ -12149,7 +12153,7 @@ async def build_recurrence_rule(frequency: str, interval: int = 1,
 @mcp.tool(annotations=READONLY)
 async def build_reminder(minutes_before: int = 0) -> str:
     """
-    Build a reminder TRIGGER string to pass in the reminders list of create_task/update_task.
+    Build a reminder TRIGGER string to pass in the reminders list of create_tasks/update_tasks.
 
     Args:
         minutes_before: Minutes before the due time to remind. 0 = at the time
@@ -12869,8 +12873,10 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
     Works on a COMPLETED task too (attaching a receipt to a finished job,
     appending the outcome, duplicating it as a template are all normal): the
     check then runs against the source that still knows the task, so the
-    title IS verified, and the plan/result say the task is completed. Only
-    an id that no source knows at all is refused.
+    title IS verified, and the plan/result say the task is completed. A task
+    that a source DOES know but that sits in the TRASH is refused instead
+    (see restore_tasks) — trash gets its own refusal, separate from an id
+    that no source knows at all.
     """
     err = _ensure_ready()
     if err:
@@ -13480,8 +13486,10 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
     Works on a COMPLETED task too (attaching a receipt to a finished job,
     appending the outcome, duplicating it as a template are all normal): the
     check then runs against the source that still knows the task, so the
-    title IS verified, and the plan/result say the task is completed. Only
-    an id that no source knows at all is refused.
+    title IS verified, and the plan/result say the task is completed. A task
+    that a source DOES know but that sits in the TRASH is refused instead
+    (see restore_tasks) — trash gets its own refusal, separate from an id
+    that no source knows at all.
     """
     err = _ensure_ready()
     if err:
@@ -14642,8 +14650,10 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
     Works on a COMPLETED task too (attaching a receipt to a finished job,
     appending the outcome, duplicating it as a template are all normal): the
     check then runs against the source that still knows the task, so the
-    title IS verified, and the plan/result say the task is completed. Only
-    an id that no source knows at all is refused.
+    title IS verified, and the plan/result say the task is completed. A task
+    that a source DOES know but that sits in the TRASH is refused instead
+    (see restore_tasks) — trash gets its own refusal, separate from an id
+    that no source knows at all.
     """
     err = _ensure_ready()
     if err:
@@ -14823,8 +14833,10 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
     Works on a COMPLETED task too (attaching a receipt to a finished job,
     appending the outcome, duplicating it as a template are all normal): the
     check then runs against the source that still knows the task, so the
-    title IS verified, and the plan/result say the task is completed. Only
-    an id that no source knows at all is refused.
+    title IS verified, and the plan/result say the task is completed. A task
+    that a source DOES know but that sits in the TRASH is refused instead
+    (see restore_tasks) — trash gets its own refusal, separate from an id
+    that no source knows at all.
     """
     err = _ensure_ready()
     if err:
@@ -14958,8 +14970,10 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str,
     Works on a COMPLETED task too (attaching a receipt to a finished job,
     appending the outcome, duplicating it as a template are all normal): the
     check then runs against the source that still knows the task, so the
-    title IS verified, and the plan/result say the task is completed. Only
-    an id that no source knows at all is refused.
+    title IS verified, and the plan/result say the task is completed. A task
+    that a source DOES know but that sits in the TRASH is refused instead
+    (see restore_tasks) — trash gets its own refusal, separate from an id
+    that no source knows at all.
     """
     err = _ensure_ready()
     if err:
@@ -15370,7 +15384,7 @@ async def search_all_tasks(
     search_comments — also search task COMMENTS (default False). SLOW: TickTick
       has no bulk comment API, so comments are fetched one task at a time. To
       bound the cost we only fetch comments for tasks with commentCount > 0 (when
-      that field is present) and stop after 150 fetches (COMMENT_FETCH_CAP),
+      that field is present) and stop after 100 fetches (COMMENT_FETCH_CAP),
       noting in the output how many were scanned and whether the cap was hit.
       Comment hits are reported in their own group. Turn this on only when you
       specifically need to find a task by something written in its comments.
@@ -16107,7 +16121,7 @@ async def get_tasks_by_assignee(assignee: str, include_completed: bool = False) 
 async def list_project_columns(project_id: str) -> str:
     """
     List the kanban columns/sections of a project, with their IDs (uses the
-    official API). Use a column id as column_id in create_task/update_task.
+    official API). Use a column id as column_id in create_tasks/update_tasks.
 
     Args:
         project_id: ID of the project
@@ -16159,7 +16173,7 @@ async def create_project_column(project_id: str, name: str,
     """
     Create a kanban column/section inside a project (including the Inbox) and
     return its id (requires v2 API). Use the returned id as column_id in
-    create_task/update_task to route tasks into this section. Gated 🟡
+    create_tasks/update_tasks to route tasks into this section. Gated 🟡
     (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
     created on call #1.
 
@@ -16544,7 +16558,7 @@ def _triage_untitled_claim(op: Dict, field: str) -> Tuple[bool, str]:
     Почему отдельное булево поле, а не пустая строка в `title` и не текст
     заменителя. Пустая строка в поле названия неотличима от «модель забыла
     название» — а именно на это требование и опиралась вся сверка id↔задача.
-    Текст заменителя («(без названия · 📎 1 файл)») печатает САМ сервер для
+    Текст заменителя («(без названия: 📎 1 файл)») печатает САМ сервер для
     человека; принимать его обратно как имя значит объявить именем свою же
     подпись — и тогда любой объект, чью подпись видно в списке, «называется»
     ею. Маркер поэтому — признак, а не строка: его нельзя ни угадать по
@@ -17236,7 +17250,7 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
     `untitled` — the ONLY way to name a task that has no name. Some tasks
     genuinely carry an EMPTY title (a photo of a receipt, a screenshot of a
     bug) and the server prints them with a stand-in like
-    «(без названия · 📎 1 файл)». That stand-in is the SERVER's caption for a
+    «(без названия: 📎 1 файл)». That stand-in is the SERVER's caption for a
     human, NOT the task's name: sending it back as `title` is a mismatch and
     the operation gets dropped. Set `untitled: true` and OMIT `title`
     instead — then the identity guard checks that the live task really has no
