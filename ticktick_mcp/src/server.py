@@ -14168,6 +14168,12 @@ def _describe_triage_op(op: Dict) -> str:
         note = (" (задача завершена — копия будет шаблоном)"
                 if op.get("_source_completed") else "")
         return f"⧉ Продублировать {title}{where}{note}{tail}"
+    if kind == "restore":
+        to = op.get("_to_project_name") or op.get("_to_project_id") or ""
+        where_to = (f"«{to}» (её исходный список)"
+                    if op.get("_restore_to_original") and to
+                    else (f"«{to}»" if to else "её исходный список"))
+        return f"♻ Вернуть из корзины {title} → {where_to}{tail}"
     if kind == "tags":
         want = op.get("_tags_shown") or []
         now = op.get("_tags_now") or []
@@ -14997,6 +15003,55 @@ class _TriagePlanCtx(NamedTuple):
     kids: Dict[str, int]
 
 
+# ОДИН СНИМОК ДОРОГОГО ЧТЕНИЯ НА ОДИН ПРОХОД АГРЕГАТОРА (1.3.3/изм-7,
+# 2026-08-09). Корзина (`get_trash`) нужна и сверке плана, и сверке
+# исполнения типа `restore`, и обеим — по одной на КАЖДУЮ операцию: план из
+# двадцати возвратов читал бы корзину двадцать раз подряд.
+#
+# Почему contextvars, а не параметр функции: сигнатуры `plan`/`drift`
+# зафиксированы реестром и подменяются в тестах (см.
+# tests/test_plan_knows_the_rename_rule.py, где `_triage_drift_reason`
+# заменяется трёхаргументной функцией, чтобы поймать гонку). Добавить всем
+# четвёртый аргумент значит сломать такие подмены — то есть проверки, ради
+# которых они написаны.
+#
+# Кэш живёт РОВНО один вызов и снимается в `finally`: снимок, переживший
+# проход, был бы тем же «читаем несвежее», от которого стоит `fresh=True`.
+_TRIAGE_READ_CACHE: "contextvars.ContextVar[Optional[Dict]]" = \
+    contextvars.ContextVar("_triage_read_cache", default=None)
+
+
+def _triage_cached(key: str, produce: Callable):
+    """Значение `produce()` — один раз на проход агрегатора. Вне прохода
+    (кэш не заведён) просто зовёт `produce`: молчаливого долгоживущего
+    снимка не появляется ни при каких условиях."""
+    cache = _TRIAGE_READ_CACHE.get()
+    if cache is None:
+        return produce()
+    if key not in cache:
+        cache[key] = produce()
+    return cache[key]
+
+
+def _triage_trash_by_id() -> Optional[Dict[str, Dict]]:
+    """Снимок КОРЗИНЫ по id, или None — если прочитать не удалось.
+
+    None и {} различаются намеренно: пустая корзина — это факт («записи
+    там нет»), а непрочитанная — незнание, и объявлять по нему «записи в
+    корзине нет» значит выбросить законную операцию, сославшись на
+    собственный сбой."""
+    def _read():
+        if not ticktick_v2:
+            return None
+        try:
+            return {x.get("id"): x
+                    for x in (ticktick_v2.get_trash(500) or [])}
+        except Exception:
+            logger.exception("manual_triage: корзина не прочиталась")
+            return None
+    return _triage_cached("trash", _read)
+
+
 class _TriageExecCtx(NamedTuple):
     """Что исполнитель партии читает про мир: снимок живого состояния,
     сделанный СРАЗУ ПЕРЕД мутациями (тот же, по которому считался дрейф), и
@@ -15505,6 +15560,126 @@ async def _op_complete_execute(summary: str, ops: List[Dict],
     return [("✅ Закрытие", await _complete_tasks_impl(summary, items))]
 
 
+# ─────────────────────────────── restore ───────────────────────────────────
+
+def _op_restore_validate(i: int, op: Dict, shown: str) -> Optional[str]:
+    refusal = _triage_no_changes_refusal(
+        i, op, shown, "restore",
+        "Правка вернувшейся задачи — это отдельная операция op=\"update\" "
+        "(отдельным планом: пока она в корзине, менять в ней нечего).")
+    if refusal:
+        return refusal
+    alien = [k for k in ("to_task_id", "to_title", "to_untitled", "parent_ref")
+             if op.get(k) is not None]
+    if alien:
+        return (f"🛑 Отказ: операция #{i} («{shown}») — у op=\"restore\" полей "
+                f"{alien} нет: вернуть можно только в СПИСОК "
+                "(to_project_id/to_project, необязательно — по умолчанию "
+                "туда, откуда удалили). Вложение — отдельная операция "
+                "op=\"parent\". Ничего не сделано.")
+    if op.get("untitled") is True:
+        # Имя сверяется с записью В КОРЗИНЕ, и «названия нет» там означало бы
+        # ровно то же, что и у открытой задачи, — но заменителя для корзинной
+        # записи сервер не печатает нигде, значит вызывающему неоткуда узнать,
+        # что перед ним безымянная запись. Открывать эту дверь вслепую нельзя.
+        return (f"🛑 Отказ: операция #{i} — у op=\"restore\" маркер "
+                "untitled=true не поддерживается: title сверяется с записью "
+                "В КОРЗИНЕ (см. get_trash), и её имя видно там как есть. "
+                "Ничего не сделано.")
+    return None
+
+
+def _op_restore_plan(e: Dict, ctx: _TriagePlanCtx) -> str:
+    """ОТДЕЛЬНАЯ ветка сверки: `title` — имя записи В КОРЗИНЕ, а общая сверка
+    ищет среди открытых и не нашла бы там ничего никогда."""
+    trash = _triage_trash_by_id()
+    if trash is None:
+        return ("корзина не прочиталась — сказать, лежит ли там эта запись, "
+                "не могу (вслепую не восстанавливаю)")
+    entry = trash.get(e["task_id"])
+    if not entry:
+        return ("в корзине по этому id ничего нет (уже восстановлена, или "
+                "корзину очистили, или id не тот)")
+    real = entry.get("title") or ""
+    if not _names_agree(e.get("title") or "", real):
+        return (f"название не совпало — в корзине по этому id «{real}», а в "
+                f"плане «{e.get('title')}»")
+    orig_pid = (entry.get("projectId") or entry.get("projectID")
+                or entry.get("listId") or "")
+    if str(e.get("to_project_id") or "").strip() \
+            or str(e.get("to_project") or "").strip():
+        to_id, to_name, why = _resolve_triage_destination(e, ctx.names)
+        if why:
+            return why
+        e["_to_project_id"] = to_id
+        e["_to_project_name"] = to_name
+    else:
+        # По умолчанию — В СВОЙ СПИСОК, откуда удалили. Он же ожидаемый
+        # пункт назначения для независимой сверки: без него «вернулась, но
+        # не туда» (наблюдаемое поведение /trash/restore) читалось бы как
+        # чистый успех.
+        e["_to_project_id"] = orig_pid
+        e["_to_project_name"] = ctx.names.get(orig_pid, "")
+        e["_restore_to_original"] = True
+    e["_project_id"] = orig_pid
+    e["_project_name"] = ctx.names.get(orig_pid, "")
+    e["_live_title"] = real
+    e["_untitled"] = False
+    e["_label"] = real or f"[task {str(e['task_id'])[:8]}…]"
+    e["_snapshot"] = _snapshot_of(entry)
+    return ""
+
+
+def _op_restore_drift(op: Dict, by_id: Dict[str, Dict], names: Dict) -> str:
+    trash = _triage_trash_by_id()
+    if trash is None:
+        return "корзина не перечиталась перед исполнением — не восстанавливаю вслепую"
+    entry = trash.get(op.get("task_id"))
+    if not entry:
+        return ("записи уже нет в корзине между планом и исполнением "
+                "(восстановили вручную или корзину очистили)")
+    real = entry.get("title") or ""
+    if not _names_agree(op.get("title") or "", real):
+        return f"название в корзине изменилось после плана (сейчас «{real}»)"
+    to_id = op.get("_to_project_id") or ""
+    if to_id and to_id not in names:
+        return "проект возврата больше не существует"
+    return ""
+
+
+def _op_restore_verify(op: Dict, item: Dict, live_map: Dict[str, Dict],
+                       names: Dict) -> Tuple[str, str]:
+    # Ветка `restore` в `_verify_item` спрашивает все три ленты: «всё ещё в
+    # корзине» = провал, «вернулась ЗАВЕРШЁННОЙ в нужный список» = успех
+    # (завершённая до удаления задача иначе вернуться и не может).
+    item["expect"] = {"projectId": op.get("_to_project_id")}
+    return _verify_item("restore", item, live_map, names)
+
+
+async def _op_restore_execute(summary: str, ops: List[Dict],
+                              ctx: _TriageExecCtx) -> List[Tuple[str, str]]:
+    """Партия — по ПРОЕКТУ ВОЗВРАТА: `_restore_tasks_impl` принимает один
+    `to_project_id` на вызов. Возврат «в свой список» (назначение не задано)
+    идёт своей партией с to_project_id=None — подменять его на посчитанный
+    исходный проект нельзя: impl тогда ПЕРЕНЕСЁТ задачу туда явно, а это уже
+    другая операция, которой человек не подтверждал."""
+    by_dest: Dict[str, List[Dict]] = {}
+    for o in ops:
+        by_dest.setdefault("" if o.get("_restore_to_original")
+                           else (o.get("_to_project_id") or ""), []).append(o)
+    out: List[Tuple[str, str]] = []
+    for dest, group in by_dest.items():
+        text = await _restore_tasks_impl(
+            summary,
+            [{"taskId": o["task_id"], "title": o.get("title") or ""}
+             for o in group],
+            dest or None)
+        where = (f" → «{ctx.names.get(dest, dest)}»" if dest
+                 else " → в свои списки")
+        out.append((f"♻ Возврат из корзины{where}", text))
+    return out
+
+
 # ────────────────────────────── duplicate ──────────────────────────────────
 
 def _op_duplicate_validate(i: int, op: Dict, shown: str) -> Optional[str]:
@@ -15857,6 +16032,14 @@ def _triage_registry() -> Tuple[_TriageType, ...]:
             drift=_op_unparent_drift, verify=_op_unparent_verify,
             execute=_op_unparent_execute),
         _TriageType(
+            op="restore", emoji="♻", verb="восстановить",
+            validate=_op_restore_validate, plan=_op_restore_plan,
+            drift=_op_restore_drift, verify=_op_restore_verify,
+            execute=_op_restore_execute,
+            # Объект лежит В КОРЗИНЕ: среди открытых задач его нет по
+            # определению, сверка личности идёт по своей ленте.
+            needs_live=False),
+        _TriageType(
             op="duplicate", emoji="⧉", verb="продублировать",
             validate=_op_duplicate_validate, plan=_op_duplicate_plan,
             drift=_op_duplicate_drift, verify=_op_duplicate_verify,
@@ -16010,9 +16193,11 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
       {
         "op":      "delete" | "complete" | "update" | "move" | "merge"
                    | "parent" | "unparent" | "tags" | "abandon"
-                   | "duplicate",
+                   | "duplicate" | "restore",
         "task_id": "<task id>",                      # required, non-empty
-        "title":   "<the task's exact CURRENT title>",  # required — identity guard
+        "title":   "<the task's exact CURRENT title>",  # required — identity
+                   # guard. For op="restore" this is the title of the entry
+                   # IN THE TRASH (see get_trash), not of an open task.
         "untitled": true,   # INSTEAD of "title", ONLY for a task that really
                             # has NO title — see below
         "said":    "<what the HUMAN said about THIS task>",  # required
@@ -16020,7 +16205,8 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         "changes": {"new_title": "...", "due_date": "YYYY-MM-DD",
                     "start_date": "...", "priority": 0|1|3|5,
                     "content": "...", "tags": ["..."]},
-        # op="move" only — one of:
+        # op="move" (required) and op="restore" (OPTIONAL — defaults to the
+        # list the task was deleted from) — one of:
         "to_project_id": "<project id>",   # preferred
         "to_project":    "<exact project name>",   # EXACT match, not substring
         # op="merge" only. merge DELETES the duplicate and keeps the original;
@@ -16137,7 +16323,15 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         if by_id is None:
             return _STATE_UNAVAILABLE_MSG
         names = _v2_project_names()
-        checked = _resolve_triage_ops(list(operations), by_id, names)
+        # Кэш дорогих чтений — РОВНО на эту фазу и снимается сразу (см.
+        # `_TRIAGE_READ_CACHE`): корзину для двадцати возвратов надо
+        # прочитать один раз, но снимок, переживший фазу, был бы тем самым
+        # «читаем несвежее», от которого стоит fresh=True.
+        _cache_token = _TRIAGE_READ_CACHE.set({})
+        try:
+            checked = _resolve_triage_ops(list(operations), by_id, names)
+        finally:
+            _TRIAGE_READ_CACHE.reset(_cache_token)
         # 2026-08-09 (П19). Не прошедшее сверку В ПЛАН НЕ ПОПАДАЕТ ВОВСЕ.
         # Раньше оно оставалось строкой того же плана с пометкой ⚠️ ПРОПУЩЕНО,
         # и это была видимость честности: человеку показывали двадцать строк,
@@ -16246,20 +16440,27 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict],
 
     ready: List[Dict] = []
     blocked: List[Tuple[Dict, str]] = []
-    for op in ops:
-        if op.get("_skip"):
-            # С 2026-08-09 (П19) помеченные `_skip` в манифест не кладутся
-            # вовсе — эта ветка осталась ради манифестов, СОХРАНЁННЫХ старым
-            # кодом: они живут в базе и поднимаются `_rehydrate_manifest`
-            # после перезапуска. Исполнить такую операцию «раз уж она в
-            # плане» нельзя ни при каких условиях.
-            blocked.append((op, op["_skip"]))
-            continue
-        why = _triage_drift_reason(op, by_id, names)
-        if why:
-            blocked.append((op, why))
-            continue
-        ready.append(op)
+    # Кэш дорогих чтений — только на круг сверки дрейфа (см. пояснение у
+    # `_TRIAGE_READ_CACHE`), и снимается ДО первой мутации: после неё любой
+    # сохранённый снимок был бы устаревшим по построению.
+    _cache_token = _TRIAGE_READ_CACHE.set({})
+    try:
+        for op in ops:
+            if op.get("_skip"):
+                # С 2026-08-09 (П19) помеченные `_skip` в манифест не кладутся
+                # вовсе — эта ветка осталась ради манифестов, СОХРАНЁННЫХ старым
+                # кодом: они живут в базе и поднимаются `_rehydrate_manifest`
+                # после перезапуска. Исполнить такую операцию «раз уж она в
+                # плане» нельзя ни при каких условиях.
+                blocked.append((op, op["_skip"]))
+                continue
+            why = _triage_drift_reason(op, by_id, names)
+            if why:
+                blocked.append((op, why))
+                continue
+            ready.append(op)
+    finally:
+        _TRIAGE_READ_CACHE.reset(_cache_token)
 
     # СПРАВКА О НЕПОШЕДШЕМ — В ЖУРНАЛ, ДО ЛЮБОГО ВЫХОДА (1.3.1, 2026-08-09).
     # Отчёт после нажатия кнопки собирает `_build_operation_report` по

@@ -118,6 +118,23 @@ class _FakeV2:
             self.live[cid] = copy
         return dict(copy)
 
+    # ---- корзина ----
+    def get_trash(self, limit=500):
+        self.calls.append(("get_trash", limit))
+        return list(self.trash.values())
+
+    def batch_restore_tasks(self, task_ids, to_project_id=None):
+        self.calls.append(("restore", list(task_ids), to_project_id))
+        for tid in task_ids:
+            entry = self.trash.pop(tid, None)
+            if entry is None:
+                continue
+            back = dict(entry)
+            if to_project_id:
+                back["projectId"] = to_project_id
+            self.live[back["id"]] = back
+        return {}
+
     def find_task_any_state(self, task_id):
         if task_id in self.live:
             return self.live[task_id], "open"
@@ -664,6 +681,114 @@ async def test_duplicate_rejects_changes(monkeypatch, tmp_path):
 
     assert "🛑" in out and "changes" in out
     assert s._MANIFESTS == {} and v2.calls == []
+
+
+# ══════════════════════════════ restore ═══════════════════════════════════
+
+async def test_restore_returns_task_from_trash(monkeypatch, tmp_path):
+    """Запись уходит из корзины и появляется среди открытых В СВОЁМ списке —
+    судим по обеим лентам живого состояния."""
+    live = {}
+    trash = {"t1": {"id": "t1", "title": "Оплатить страховку",
+                    "projectId": "p_work"}}
+    v2 = _wire(monkeypatch, live, tmp_path, trash=trash)
+
+    preview, out = await _run([
+        {"op": "restore", "task_id": "t1", "title": "Оплатить страховку",
+         "said": "я её зря удалил, верни"}])
+
+    assert "t1" not in v2.trash, "запись обязана уйти из корзины"
+    assert live["t1"]["projectId"] == "p_work", "вернулась в свой список"
+    assert "не проверяется автоматически" not in out, out
+    assert "✅ Выполнено 1 из 1" in out
+    assert "исходный список" in preview
+
+
+async def test_restore_into_an_explicit_project(monkeypatch, tmp_path):
+    live = {}
+    trash = {"t1": {"id": "t1", "title": "Оплатить страховку",
+                    "projectId": "p_work"}}
+    v2 = _wire(monkeypatch, live, tmp_path, trash=trash)
+
+    _preview, out = await _run([
+        {"op": "restore", "task_id": "t1", "title": "Оплатить страховку",
+         "to_project_id": "p_in", "said": "верни, но во входящие"}])
+
+    assert live["t1"]["projectId"] == "p_in"
+    assert ("restore", ["t1"], "p_in") in v2.calls
+    assert "✅ Выполнено 1 из 1" in out
+
+
+async def test_restore_checks_the_title_against_the_trash_entry(
+        monkeypatch, tmp_path):
+    """`title` сверяется с записью В КОРЗИНЕ. Общая сверка ищет среди
+    открытых и не нашла бы там ничего никогда — без своей ветки ЛЮБОЙ возврат
+    выбрасывался бы из плана."""
+    live = {}
+    trash = {"t1": {"id": "t1", "title": "Оплатить страховку",
+                    "projectId": "p_work"}}
+    v2 = _wire(monkeypatch, live, tmp_path, trash=trash)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "restore", "task_id": "t1", "title": "Оплатить ипотеку",
+         "said": "верни"}])
+
+    assert "🛑" in out and "в корзине по этому id" in out
+    assert "t1" in v2.trash
+
+
+async def test_restore_of_an_entry_that_left_the_trash_is_skipped(
+        monkeypatch, tmp_path):
+    """Запись восстановили руками между планом и «да» — операция не идёт."""
+    live = {}
+    trash = {"t1": {"id": "t1", "title": "Оплатить страховку",
+                    "projectId": "p_work"}}
+    v2 = _wire(monkeypatch, live, tmp_path, trash=trash)
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "restore", "task_id": "t1", "title": "Оплатить страховку",
+         "said": "верни"}])
+
+    trash.pop("t1")
+    out = await s.manual_triage("Разбираю", manifest_id=_mid(preview),
+                                user_reply="да")
+
+    assert not any(c[0] == "restore" for c in v2.calls)
+    assert "уже нет в корзине" in out
+
+
+async def test_restore_refuses_when_the_trash_cannot_be_read(
+        monkeypatch, tmp_path):
+    """Непрочитанная корзина — это НЕЗНАНИЕ, а не «записи там нет»: вслепую
+    не восстанавливаем и не объявляем операцию невозможной по своей ошибке."""
+    live = {}
+    v2 = _wire(monkeypatch, live, tmp_path, trash={})
+
+    def _boom(limit=500):
+        raise RuntimeError("v2 недоступен")
+
+    monkeypatch.setattr(v2, "get_trash", _boom)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "restore", "task_id": "t1", "title": "Оплатить страховку",
+         "said": "верни"}])
+
+    assert "🛑" in out and "корзина не прочиталась" in out
+    assert "вслепую" in out
+
+
+async def test_restore_reads_the_trash_once_per_pass(monkeypatch, tmp_path):
+    """Кэш чтений: план из нескольких возвратов читает корзину ОДИН раз, а не
+    по разу на операцию."""
+    live = {}
+    trash = {f"t{i}": {"id": f"t{i}", "title": f"Задача {i}",
+                       "projectId": "p_work"} for i in range(4)}
+    v2 = _wire(monkeypatch, live, tmp_path, trash=trash)
+
+    await s.manual_triage("Разбираю", [
+        {"op": "restore", "task_id": f"t{i}", "title": f"Задача {i}",
+         "said": "верни"} for i in range(4)])
+
+    assert sum(1 for c in v2.calls if c[0] == "get_trash") == 1, v2.calls
 
 
 def _plan_lines(preview: str):
