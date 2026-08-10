@@ -133,6 +133,9 @@ _LIVE_TASKS = {
     "par1": {"id": "par1", "title": "Родитель", "projectId": "p1"},
 }
 _LIVE_PROJECTS = {"p1": "Проект", "p2": "Проект-2"}
+# delete_tags (2026-08-09, П20) — держать в синхроне с ТОЙ ЖЕ правкой в
+# tests/test_tg_gate_all_tools.py: её "раз" резолвится в тег без родителя.
+_LIVE_TAGS = [{"name": "раз", "label": "раз", "parent": None}]
 
 
 def _no_client_checks(monkeypatch):
@@ -142,6 +145,8 @@ def _no_client_checks(monkeypatch):
                         lambda fresh=False: {k: dict(v)
                                              for k, v in _LIVE_TASKS.items()})
     monkeypatch.setattr(s, "_v2_project_names", lambda: dict(_LIVE_PROJECTS))
+    monkeypatch.setattr(s, "_live_tag_records",
+                        lambda force=True: [dict(t) for t in _LIVE_TAGS])
 
 
 def _stub_impl(monkeypatch, tool):

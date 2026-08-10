@@ -21,7 +21,10 @@ from ticktick_mcp.src import server
 # 75 → 77 (2026-08-06, тот же день): +2 = `create_habit` / `delete_habit`.
 # Обе прибавки пришли РАЗНЫМИ ветками от одной базы (74), поэтому каждая
 # насчитала свой итог (75 и 76) — верный после слияния только их суммарный.
-_EXPECTED_TOOLS = 77
+# 77 → 78 (2026-08-09, П20/docs/TZ/ZAHOD1.md §1.3.6): +1 = `delete_tags` —
+# массовое удаление тегов ОДНИМ подтверждением; одиночный `delete_tag` не
+# тронут и остаётся собственным тулом.
+_EXPECTED_TOOLS = 78
 
 
 def test_all_expected_tools_registered():

@@ -755,6 +755,25 @@ def _is_affirmative_reply(reply: Optional[str]) -> bool:
 # вместе с классификатором.
 
 
+def _gate_item_id(item: Dict) -> str:
+    """Идентификатор ОДНОГО элемента плана `_gate_batch` (2026-08-09, П20,
+    заход 1 §1.3.6) — единственное место, которое решает, откуда брать id.
+
+    До этой функции формула `t.get("taskId") or t.get("task_id") or ""` была
+    продублирована В ДВУХ МЕСТАХ (`_gate_batch` здесь и `_generic_gate_rehash`
+    в tg_auto_execute.py) и НИЧЕГО не знала про элементы, у которых нет ни
+    `taskId`, ни `task_id` — например про теги (`delete_tags`): у тега есть
+    только `name`. Обе формулы молча возвращали "" для КАЖДОГО тега, из-за
+    чего `object_hash` двух РАЗНЫХ планов удаления тегов совпадал (пустой
+    список id, отсортированный, даёт тот же хэш независимо от содержимого) —
+    сверка «подтверждали ИМЕННО ЭТИ объекты» переставала различать планы.
+
+    Оба места обязаны звать ЭТУ функцию, а не копировать формулу: `taskId`/
+    `task_id` — для задач, `name` — для тегов (и для всего будущего, у чего
+    естественный идентификатор — имя, не id)."""
+    return str(item.get("taskId") or item.get("task_id") or item.get("name") or "")
+
+
 def _manifest_object_hash(action: str, ids: List[str]) -> str:
     """Binds a manifest to the exact object ids it was planned over (§4.3.2)
     — recomputed at consent-check time and compared to the value stored at
@@ -1570,7 +1589,7 @@ async def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
                 f"Начни заново: {tool_name}(summary, {items_arg}, ...) без "
                 "manifest_id.")))
         stored = m.get("tasks") or []
-        ids = [str(t.get("taskId") or t.get("task_id") or "") for t in stored]
+        ids = [_gate_item_id(t) for t in stored]
         # tier-🟡 per docs/DESIGN_approval_gate.md §5: no anti-duplet gap —
         # only 🔴 tools time-gate plan vs. execute.
         # `tool=` здесь НАМЕРЕННО не передаётся, хотя с 2026-08-06 план ЭТИХ
@@ -1596,7 +1615,7 @@ async def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
         return _GateOutcome(False, message="Пустой список — нечего делать.")
     mid = uuid.uuid4().hex[:12]
     now = time.monotonic()
-    ids = [str(t.get("taskId") or t.get("task_id") or "") for t in tasks]
+    ids = [_gate_item_id(t) for t in tasks]
     # `tool`/`_gate` (2026-08-06) — то, что нужно фоновому TG-поллеру, чтобы
     # ИСПОЛНИТЬ этот план по нажатию кнопки, не заводя по ручной регистрации
     # на каждый тул: `tool` даёт имя `_<tool>_impl`, `_gate` — форму вызова
