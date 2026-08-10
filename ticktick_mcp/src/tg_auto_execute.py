@@ -24,6 +24,18 @@ from typing import Dict, List, Optional, Tuple
 
 from . import manifest_store
 from . import tg_approval
+# Пространство имён главного файла целиком — НЕ для удобства, а
+# потому что все 32 функции `_<тул>_impl` остались в нём. До 1.2.4
+# generic-исполнитель искал их через `globals()`, и это работало,
+# пока код лежал в одном файле с ними. После переезда `globals()`
+# здесь — словарь ЭТОГО модуля: `_update_tasks_impl` в нём нет, и
+# поиск вернул бы None для КАЖДОЙ из 30 команд, проходящих через
+# `_gate_single`/`_gate_batch`. Симптом на живом сервере —
+# «нажал кнопку, ничего не произошло», без единой ошибки в журнале.
+# Поэтому обращение стало явным: `getattr(_server_module, ...)`.
+# Через модуль, а не `from .server import ...`, — чтобы подмена
+# `server._create_tasks_impl` в тестах доезжала сюда как раньше.
+from . import server as _server_module
 from .server import (  # noqa: E402,F401 — имена, которые кусок берёт снаружи
     _JOURNAL_DIR, _MANIFEST_TOMBSTONES, _MANIFESTS, _TG_AUTO_EXECUTE_MANIFEST,
     _TG_CFG, _TOMBSTONE_CLAIMED, _TOMBSTONE_EXECUTED, _TOMBSTONE_FAILED,
@@ -199,7 +211,7 @@ async def _generic_gate_auto_execute(manifest_id: str, m: Dict) -> str:
     """Replays a _gate_batch/_gate_single plan through the tool's own
     `_<tool>_impl`, exactly as the gated tool would have after a chat «да»."""
     tool = m.get("tool") or m.get("_tg_tool") or ""
-    impl = globals().get(f"_{tool}_impl")
+    impl = getattr(_server_module, f"_{tool}_impl", None)
     if not callable(impl):
         raise RuntimeError(f"нет исполнителя _{tool}_impl для манифеста {manifest_id}")
     if m.get("_gate") == "single":
@@ -326,7 +338,7 @@ def _resolve_auto_executor(tool: str, m: Dict) -> Optional[_AutoExecutorEntry]:
         return None
     entry = _AUTO_EXECUTORS.get(tool)
     if entry is None and m.get("_gate") in ("batch", "single") and callable(
-            globals().get(f"_{tool}_impl")):
+            getattr(_server_module, f"_{tool}_impl", None)):
         entry = _GENERIC_GATE_ENTRY
     if entry is None:
         return None

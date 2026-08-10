@@ -199,6 +199,14 @@ def initialize_client():
         ticktick = local_ticktick
         ticktick_v2 = local_v2
 
+        # Вынесенный модуль кнопки (1.2.4, 2026-08-09) держит СВОЮ ссылку на
+        # официальный клиент: строки перенесённого куска не менялись, а `global
+        # ticktick` выше пишет прямо в словарь этого модуля, минуя __setattr__
+        # (то есть мимо проброса в конце файла). Без явной строки ниже удаление
+        # ПРОЕКТА по кнопке молча отвечало бы отказом «не смог прочитать
+        # содержимое проекта» — клиент там остался бы None навсегда.
+        tg_auto_execute.ticktick = ticktick
+
         # Official-API writes must drop the v2 sync cache so v2 reads stay
         # consistent (e.g. create a task via the official API, then move it).
         TickTickClient.write_hook = lambda: (
@@ -16127,9 +16135,33 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict],
 # вырезанного куска — здесь уже определены все имена, которые модуль
 # берёт снаружи, поэтому двусторонняя связь разрешается позицией, а не
 # отложенным импортом внутри функции.
-from .tg_auto_execute import (_auto_execute_tool_of,  # noqa: E402
-                              _resolve_auto_executor,
-                              _tg_auto_execute_poller_loop)
+from . import tg_auto_execute  # noqa: E402
+from .tg_auto_execute import (  # noqa: E402,F401
+    # Три имени нужны самому server.py (_resolve_auto_executor,
+    # _auto_execute_tool_of зовёт гейт; _tg_auto_execute_poller_loop
+    # запускает main). Остальные — РЕЭКСПОРТ: снаружи (тесты,
+    # отладка) реестр исполнителей и разбор отчётов кнопки
+    # адресуются через `server.<имя>` с тех пор, как всё лежало в
+    # одном файле. Перенос кода — не повод менять этот адрес, и это
+    # ЯВНЫЙ список, а не `import *`: видно ровно то, что видно.
+    _AUTO_EXECUTE_TOOL_FOR_KIND, _AUTO_EXECUTORS, _AutoExecutorEntry,
+    _EXEC_WARN_MARKERS, _GENERIC_GATE_ENTRY, _OUTCOME_PUBLISHED_KEY,
+    _TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S, _TG_AUTO_EXECUTE_INTERVAL_S,
+    _TG_LOST_CLEARED, _TG_REAP_INTERVAL_S, _VERDICT_EMOJI,
+    _announce_lost_manifests, _auto_executable_tool,
+    _auto_execute_report_is_failure, _auto_execute_report_is_success,
+    _auto_execute_tool_of, _consume_manifest_for_auto_execute,
+    _find_tg_auto_execute_candidates, _generic_gate_auto_execute,
+    _generic_gate_rehash, _journal_mentions_manifests,
+    _manifest_affected_count, _parse_verify_totals,
+    _publish_auto_execute_outcome, _register_auto_executor,
+    _rehash_create_manifest, _resolve_auto_executor,
+    _short_auto_execute_summary, _strip_trailing_independent_report,
+    _tg_auto_execute_pending, _tg_auto_execute_poller_loop,
+    _tg_auto_execute_tick, _tg_lost_manifest_rows, _tg_manifest_is_known,
+    _verdict_from_totals, _verified_auto_execute_report)
+
+
 def main():
     """Main entry point for the MCP server."""
     # ПЕРВЫМ ДЕЛОМ, до любой строки лога (#119): секрет доступа лежит в пути
@@ -16247,6 +16279,41 @@ def _assert_shared_note_slots_expanded() -> None:
 
 
 _assert_shared_note_slots_expanded()
+
+
+# --- Проброс подмены атрибутов на вынесенные модули (2026-08-09, П12) -------
+# Разнос главного файла (1.2.4) увёл куски кода в отдельные модули, но точкой
+# ОБРАЩЕНИЯ снаружи остался `server`: тесты и отладка пишут
+# `setattr(server, "_TG_LOST_CLEARED", {})` или `setattr(server, "ticktick",
+# fake)` и ждут, что подменённое увидит код, который этим именем пользуется.
+# Пока всё лежало в одном файле, так и было. После переноса код читает глобал
+# СВОЕГО модуля, и подмена по `server` до него не доезжает — молча, без
+# ошибки: проверка зеленеет, ничего не проверив, либо падает на ровном месте.
+#
+# Поэтому присваивание атрибута модулю `server` проксируется в тот модуль, где
+# имя действительно живёт. Это НЕ обход разноса: связанность не возвращается
+# (модули по-прежнему отдельные файлы со своими импортами), просто у имени
+# остаётся один-единственный владелец состояния, как и было до переноса.
+#
+# Важно: `global ticktick` внутри `initialize_client()` пишет в словарь модуля
+# НАПРЯМУЮ, минуя `__setattr__`, — поэтому боевая инициализация клиента
+# синхронизируется отдельной строкой там же, а не здесь.
+import sys                          # noqa: E402 — нужен только здесь
+from types import ModuleType        # noqa: E402 — и только для проброса
+
+
+class _SplitModule(ModuleType):
+    """Модуль `server`, который проводит подмену своих атрибутов до модулей,
+    куда пункт 1.2.4 вынес соответствующий код."""
+
+    def __setattr__(self, name, value):
+        for mod in (tg_auto_execute,):
+            if name in mod.__dict__:
+                mod.__dict__[name] = value
+        ModuleType.__setattr__(self, name, value)
+
+
+sys.modules[__name__].__class__ = _SplitModule
 
 
 if __name__ == "__main__":
