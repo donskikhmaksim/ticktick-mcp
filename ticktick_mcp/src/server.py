@@ -14073,10 +14073,14 @@ def _describe_triage_op(op: Dict) -> str:
         return f"⚠️ ПРОПУЩЕНО — {shown}: {op['_skip']}"
     title = _triage_task_label(op)
     orphan = _triage_orphan_note(op.get("_open_children") or 0)
-    if kind in ("delete", "complete"):
+    if kind in ("delete", "complete", "abandon"):
         bits = ([f"проект «{proj}»"] if proj else []) + ([orphan] if orphan else [])
         note = f" ({'; '.join(bits)})" if bits else ""
-        verb = "🗑 Удалить" if kind == "delete" else "✅ Закрыть"
+        # У `abandon` глагол СВОЙ, а не общий с `complete`: «закрыть» и
+        # «отметить „не буду делать"» — разные решения человека, и строка,
+        # по которой он жмёт «да», не имеет права их смешивать.
+        verb = {"delete": "🗑 Удалить", "complete": "✅ Закрыть",
+                "abandon": "🚫 Не буду делать:"}[kind]
         return f"{verb} {title}{note}{tail}"
     if kind == "update":
         return (f"✏️ Изменить {title}{where}: "
@@ -15404,6 +15408,70 @@ async def _op_complete_execute(summary: str, ops: List[Dict],
     return [("✅ Закрытие", await _complete_tasks_impl(summary, items))]
 
 
+# ─────────────────────────────── abandon ───────────────────────────────────
+
+# Поля назначения у типа, который никуда не переносит и ни подо что не
+# вкладывает: принять их и не применить значит показать в превью одно, а
+# сделать другое.
+_TRIAGE_DESTINATION_KEYS = ("to_project_id", "to_project", "to_task_id",
+                            "to_title", "to_untitled", "parent_ref")
+
+
+def _triage_no_destination_refusal(i: int, op: Dict, shown: str,
+                                   kind: str) -> Optional[str]:
+    alien = [k for k in _TRIAGE_DESTINATION_KEYS if op.get(k) is not None]
+    if not alien:
+        return None
+    return (f"🛑 Отказ: операция #{i} («{shown}») — у op=\"{kind}\" полей "
+            f"{alien} нет: они молча не применились бы, а отчёт отрапортовал "
+            "бы «выполнено». Перенос — это op=\"move\", вложение — "
+            "op=\"parent\". Ничего не сделано.")
+
+
+def _op_abandon_validate(i: int, op: Dict, shown: str) -> Optional[str]:
+    refusal = _triage_no_changes_refusal(
+        i, op, shown, "abandon",
+        "Правка полей задачи — это отдельная операция op=\"update\".")
+    return refusal or _triage_no_destination_refusal(i, op, shown, "abandon")
+
+
+def _op_abandon_plan(e: Dict, ctx: _TriagePlanCtx) -> str:
+    # Дети в план НЕ добавляются (тул не имеет права разрастаться сверх
+    # названного человеком), но строка обязана сказать, что они осиротеют.
+    e["_open_children"] = ctx.kids.get(e["task_id"], 0)
+    return ""
+
+
+def _op_abandon_drift(op: Dict, by_id: Dict[str, Dict], names: Dict) -> str:
+    return ""
+
+
+def _op_abandon_verify(op: Dict, item: Dict, live_map: Dict[str, Dict],
+                       names: Dict) -> Tuple[str, str]:
+    """СВОЯ ветка вердикта, а не дефолтная «тип не проверяется автоматически»
+    (ТЗ 1.3.3, пункт 4 «Что сделать» и способ подделки №1).
+
+    Дефолтная ветка печатает «записана в журнал», что владелец читает как
+    «сделано», — то есть тип формально есть, а проверки нет вовсе. Здесь
+    судится ФАКТ: задача ушла из открытых; глагол вердикта свой («отмечена
+    „не буду делать"»), иначе отчёт врёт о характере закрытия — закрытая и
+    заброшенная задача это разные решения человека."""
+    return _verify_item("abandon", item, live_map, names)
+
+
+async def _op_abandon_execute(summary: str, ops: List[Dict],
+                              ctx: _TriageExecCtx) -> List[Tuple[str, str]]:
+    """По одной операции за вызов — так умеет `_abandon_task_impl`. Сбой
+    одной операции НЕ отменяет соседние того же уровня: каждая получает свою
+    секцию отчёта и свой независимый вердикт."""
+    out: List[Tuple[str, str]] = []
+    for o in ops:
+        text = await _abandon_task_impl(
+            summary, o["task_id"], o.get("_live_title") or o.get("title") or "")
+        out.append((f"🚫 Не буду делать: «{_triage_task_label(o)}»", text))
+    return out
+
+
 # ─────────────────────────── merge и delete ────────────────────────────────
 
 def _op_merge_validate(i: int, op: Dict, shown: str) -> Optional[str]:
@@ -15584,6 +15652,11 @@ def _triage_registry() -> Tuple[_TriageType, ...]:
             drift=_op_complete_drift, verify=_op_complete_verify,
             execute=_op_complete_execute),
         _TriageType(
+            op="abandon", emoji="🚫", verb="отменить",
+            validate=_op_abandon_validate, plan=_op_abandon_plan,
+            drift=_op_abandon_drift, verify=_op_abandon_verify,
+            execute=_op_abandon_execute),
+        _TriageType(
             op="merge", emoji="🔗", verb="объединить",
             validate=_op_merge_validate, plan=_op_merge_plan,
             drift=_op_merge_drift, verify=_op_merge_verify,
@@ -15702,7 +15775,7 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
     Each element of `operations`:
       {
         "op":      "delete" | "complete" | "update" | "move" | "merge"
-                   | "parent" | "unparent" | "tags",
+                   | "parent" | "unparent" | "tags" | "abandon",
         "task_id": "<task id>",                      # required, non-empty
         "title":   "<the task's exact CURRENT title>",  # required — identity guard
         "untitled": true,   # INSTEAD of "title", ONLY for a task that really
@@ -15762,8 +15835,11 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
     passed as a number, tags that are not strings — is refused OUTRIGHT: a key
     the server cannot apply would silently do nothing while the report claimed
     success.
-    delete/complete do NOT touch the task's subtasks (they stay, parentless) —
-    when the task has open children the preview line says how many.
+    delete/complete/abandon do NOT touch the task's subtasks (they stay,
+    parentless) — when the task has open children the preview line says how
+    many. `abandon` is NOT a synonym of `complete`: it marks the task "won't
+    do", and the verdict says so — the two are different human decisions and
+    the report must not blur them.
 
     Example (one call, five different decisions):
       operations=[

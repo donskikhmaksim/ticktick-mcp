@@ -49,6 +49,7 @@ class _FakeV2:
         self.live = live
         self.trash = trash if trash is not None else {}
         self.account_tags = list(tags or [])
+        self.abandoned = {}
         self.calls = []
 
     def invalidate_cache(self):
@@ -102,11 +103,46 @@ class _FakeV2:
             self.live.pop(tid, None)
         return {}
 
+    def abandon_task(self, task_id):
+        """«Не буду делать» — задача уходит из открытых и получает статус -1
+        (именно так её помечает TickTick), а не удаляется."""
+        self.calls.append(("abandon", task_id))
+        gone = self.live.pop(task_id, None)
+        if gone is not None:
+            gone["status"] = -1
+            self.abandoned[task_id] = gone
+        return {}
+
     def batch_delete_tasks(self, rows):
         self.calls.append(("delete", [r["taskId"] for r in rows]))
         for r in rows:
             self.live.pop(r["taskId"], None)
         return {}
+
+
+class _FakeOfficial:
+    """Официальный Open API — второй канал сервера. Нужен там, где ядро ходит
+    именно в него (закрытие задач, точечное чтение)."""
+
+    def __init__(self, live):
+        self.live = live
+        self.calls = []
+
+    def complete_task(self, project_id, task_id):
+        self.calls.append(("complete", task_id))
+        self.live.pop(task_id, None)
+        return {"id": task_id}
+
+    def update_task(self, task_id, project_id, title=None, content=None,
+                    start_date=None, due_date=None, priority=None,
+                    repeat_flag=None, reminders=None):
+        self.calls.append(("update", task_id))
+        t = self.live.setdefault(task_id, {"id": task_id})
+        if title is not None:
+            t["title"] = title
+        if priority is not None:
+            t["priority"] = priority
+        return {"id": task_id}
 
 
 def _wire(monkeypatch, live, tmp_path, names=None, trash=None, tags=None):
@@ -117,6 +153,7 @@ def _wire(monkeypatch, live, tmp_path, names=None, trash=None, tags=None):
     monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
     v2 = _FakeV2(live, trash=trash, tags=tags)
     monkeypatch.setattr(s, "ticktick_v2", v2)
+    monkeypatch.setattr(s, "ticktick", _FakeOfficial(live))
     return v2
 
 
@@ -429,6 +466,91 @@ async def test_tags_plan_survives_unreadable_account_tag_list(
 
     assert "Манифест" in preview, "план обязан строиться"
     assert "сказать не могу" in preview
+
+
+# ══════════════════════════════ abandon ═══════════════════════════════════
+
+async def test_abandon_marks_wont_do(monkeypatch, tmp_path):
+    """Задача уходит из открытых со статусом «не буду делать» — и это видно
+    по ЖИВОМУ состоянию, а не по строке отчёта.
+
+    Второй предмет теста — способ подделки №1 из ТЗ: тип, добавленный в
+    список и завёрнутый в существующие ветки, падает в дефолтную ветку
+    `_verify_item` «тип не проверяется автоматически», и отчёт печатает
+    «записана в журнал», что владелец читает как «сделано». Поэтому строка
+    проверяется явно."""
+    live = {
+        "a1": {"id": "a1", "title": "Учить испанский", "projectId": "p_in"},
+        "zz": {"id": "zz", "title": "Посторонняя", "projectId": "p_in"},
+    }
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    preview, out = await _run([
+        {"op": "abandon", "task_id": "a1", "title": "Учить испанский",
+         "said": "не буду я этим заниматься"}])
+
+    assert "a1" not in live, "заброшенная задача уходит из открытых"
+    assert v2.abandoned["a1"]["status"] == -1, "статус «не буду делать»"
+    assert ("abandon", "a1") in v2.calls
+    assert "zz" in live, "чужая задача не тронута"
+    # ГЛАВНОЕ: своя ветка проверки, а не дефолтная.
+    assert "не проверяется автоматически" not in out, out
+    assert "не буду делать" in out.lower()
+    assert "✅ Выполнено 1 из 1" in out
+    # …и в превью глагол свой, не «закрыть».
+    assert "🚫 Не буду делать:" in preview and "✅ Закрыть" not in preview
+
+
+async def test_abandon_is_not_reported_as_completed(monkeypatch, tmp_path):
+    """«Закрыть» и «не буду делать» — разные решения человека, и отчёт не
+    имеет права их смешивать: у abandon свой глагол вердикта."""
+    live = {"a1": {"id": "a1", "title": "Учить испанский", "projectId": "p_in"},
+            "c1": {"id": "c1", "title": "Оплатить интернет",
+                   "projectId": "p_in"}}
+    _wire(monkeypatch, live, tmp_path)
+
+    _preview, out = await _run([
+        {"op": "abandon", "task_id": "a1", "title": "Учить испанский",
+         "said": "не буду"},
+        {"op": "complete", "task_id": "c1", "title": "Оплатить интернет",
+         "said": "оплатил"}])
+
+    verdicts = [ln for ln in out.splitlines() if ln.startswith("- ")]
+    wont = [ln for ln in verdicts if "Учить испанский" in ln]
+    done = [ln for ln in verdicts if "Оплатить интернет" in ln]
+    assert wont and "не буду делать" in wont[0]
+    assert done and "закрыта" in done[0]
+    assert "не буду делать" not in done[0]
+
+
+async def test_abandon_rejects_changes_and_destinations(monkeypatch, tmp_path):
+    live = {"a1": {"id": "a1", "title": "Учить испанский", "projectId": "p_in"}}
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "abandon", "task_id": "a1", "title": "Учить испанский",
+         "to_project_id": "p_work", "said": "не буду"}])
+
+    assert "🛑" in out and "to_project_id" in out
+    assert s._MANIFESTS == {} and v2.calls == []
+    assert "a1" in live
+
+
+async def test_abandon_warns_about_orphaned_children(monkeypatch, tmp_path):
+    """Дети НЕ трогаются (план не имеет права разрастаться сверх названного),
+    но человек обязан видеть, что после «да» они осиротеют."""
+    live = {
+        "a1": {"id": "a1", "title": "Учить испанский", "projectId": "p_in"},
+        "k1": {"id": "k1", "title": "Купить учебник", "projectId": "p_in",
+               "parentId": "a1"},
+    }
+    _wire(monkeypatch, live, tmp_path)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "abandon", "task_id": "a1", "title": "Учить испанский",
+         "said": "не буду"}])
+
+    assert "останется без родителя" in preview
 
 
 def _plan_lines(preview: str):
