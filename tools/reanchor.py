@@ -48,8 +48,29 @@ def sh(*args: str) -> str:
     return subprocess.run(args, capture_output=True, text=True).stdout
 
 
-def base_file_lines(base: str, path: str):
-    """Строки файла `path` на ревизии `base`, или None если файла там нет."""
+def base_paths(base: str):
+    """Все пути репозитория на ревизии `base`, разложенные по basename.
+
+    Якорь в документах пишется коротким именем (`server.py:14528`), а в
+    репозитории файл лежит по пути `ticktick_mcp/src/server.py` — без этого
+    разрешения `git show BASE:server.py` не находит ничего и ВСЕ якоря
+    объявляются «не разрешёнными» (ложная тревога вместо работы)."""
+    out = sh("git", "ls-tree", "-r", "--name-only", base).split("\n")
+    by_name = {}
+    for p in out:
+        if p.endswith(".py"):
+            by_name.setdefault(p.rsplit("/", 1)[-1], []).append(p)
+    return by_name
+
+
+def base_file_lines(base: str, path: str, by_name):
+    """Строки файла `path` на ревизии `base`, или None если файла там нет
+    (либо короткое имя разрешается неоднозначно)."""
+    if "/" not in path:
+        candidates = by_name.get(path, [])
+        if len(candidates) != 1:
+            return None
+        path = candidates[0]
     out = subprocess.run(["git", "show", f"{base}:{path}"],
                          capture_output=True, text=True)
     if out.returncode != 0:
@@ -64,23 +85,50 @@ def current_tree_files(root: Path):
     return seen
 
 
-def find_unique(text: str, files, root: Path):
-    """Найти строку `text` во всём дереве. Возвращает (файл, номер) или None
-    при нуле/нескольких совпадениях."""
-    if not text.strip():
-        return None
-    hits = []
-    for f in files:
-        try:
-            lines = f.read_text(encoding="utf-8").split("\n")
-        except (UnicodeDecodeError, OSError):
+def _tree_lines(files, root: Path, _cache={}):
+    if not _cache:
+        for f in files:
+            try:
+                _cache[str(f.relative_to(root))] = \
+                    f.read_text(encoding="utf-8").split("\n")
+            except (UnicodeDecodeError, OSError):
+                continue
+    return _cache
+
+
+def find_unique(base_lines, lineno: int, files, root: Path):
+    """Найти строку `base_lines[lineno-1]` во всём дереве на текущей ревизии.
+
+    Голая строка сплошь и рядом не уникальна: `return err`, `except
+    Exception:`, пустая строка встречаются сотнями. Поэтому поиск идёт ОКНОМ:
+    сначала строка вместе с четырьмя соседями сверху и снизу, затем окно
+    сужается. Уникальным считается только точное совпадение всего окна ровно
+    в одном месте — иначе якорь не трогается и уходит в отчёт.
+
+    Возвращает (файл, номер строки) или None."""
+    tree = _tree_lines(files, root)
+    target = base_lines[lineno - 1]
+    for half in (4, 2, 1, 0):
+        lo = max(0, lineno - 1 - half)
+        hi = min(len(base_lines), lineno + half)
+        window = base_lines[lo:hi]
+        if not any(w.strip() for w in window):
             continue
-        for i, ln in enumerate(lines, 1):
-            if ln == text:
-                hits.append((str(f.relative_to(root)), i))
-                if len(hits) > 1:
-                    return None
-    return hits[0] if len(hits) == 1 else None
+        offset = (lineno - 1) - lo          # где целевая строка внутри окна
+        hits = []
+        n = len(window)
+        for path, lines in tree.items():
+            for i in range(len(lines) - n + 1):
+                if lines[i:i + n] == window:
+                    hits.append((path, i + 1 + offset))
+                    if len(hits) > 1:
+                        break
+            if len(hits) > 1:
+                break
+        if len(hits) == 1:
+            assert tree[hits[0][0]][hits[0][1] - 1] == target
+            return hits[0]
+    return None
 
 
 def collect_docs(targets):
@@ -110,6 +158,7 @@ def main() -> int:
     if args.verify:
         return verify(args, docs, root)
 
+    by_name = base_paths(args.base)
     base_cache = {}
     journal = {}
     total = resolved = unresolved = unchanged = 0
@@ -123,7 +172,8 @@ def main() -> int:
             total += 1
             path, lineno = m.group(1), int(m.group(2))
             if path not in base_cache:
-                base_cache[path] = base_file_lines(args.base, path)
+                base_cache[path] = base_file_lines(args.base, path,
+                                                   by_name)
             lines = base_cache[path]
             if lines is None or lineno < 1 or lineno > len(lines):
                 unresolved += 1
@@ -131,7 +181,7 @@ def main() -> int:
                                  "нет такой строки на BASE"))
                 continue
             src_line = lines[lineno - 1]
-            hit = find_unique(src_line, files, root)
+            hit = find_unique(lines, lineno, files, root)
             if hit is None:
                 unresolved += 1
                 problems.append((str(doc), m.group(0), src_line.strip()[:100]))

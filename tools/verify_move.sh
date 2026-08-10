@@ -6,16 +6,19 @@
 # контрольных сумм, а не глазами.
 #
 # Использование:
-#   tools/verify_move.sh <BASE_SHA> <N> <A> <B> <новый файл>
+#   tools/verify_move.sh <BASE_SHA> <N> <A> <B> <новый файл> [номер блока]
 #     BASE_SHA  — ревизия ДО переноса (кусок вырезается из неё)
 #     N         — номер куска (1/2/3), для имён временных файлов
 #     A, B      — границы куска в server.py НА РЕВИЗИИ BASE_SHA (включительно)
 #     новый файл — куда кусок переехал
+#     номер блока — какой по счёту MOVED-BLOCK в новом файле сверять (по
+#                 умолчанию 1); в одном файле их может быть несколько, если
+#                 вместе с куском уехали привязанные к нему хвосты
 #
 # Печатает восемь шагов; ненулевой выход — перенос НЕ чистый.
 set -uo pipefail
 
-BASE="$1"; N="$2"; A="$3"; B="$4"; NEWFILE="$5"
+BASE="$1"; N="$2"; A="$3"; B="$4"; NEWFILE="$5"; BLOCK="${6:-1}"
 SRC="ticktick_mcp/src/server.py"
 T="${TMPDIR:-/tmp}"
 rc=0
@@ -27,9 +30,11 @@ git show "$BASE:$SRC" | sed -n "${A},${B}p" > "$T/chunk$N-src.txt"
 echo "--- шаг 2: эталон вырезан, строк: $(wc -l < "$T/chunk$N-src.txt")"
 
 # 3. Перенесённый текст из нового файла — по маркерам MOVED-BLOCK
-sed -n '/^# === MOVED-BLOCK BEGIN/,/^# === MOVED-BLOCK END ===$/p' \
-    "$NEWFILE" | sed '/^# === MOVED-BLOCK BEGIN/d;/^# === MOVED-BLOCK END ===$/d' \
-    > "$T/chunk$N-new.txt"
+awk -v want="$BLOCK" '
+    /^# === MOVED-BLOCK BEGIN/ { n++; if (n == want) { inside = 1 }; next }
+    /^# === MOVED-BLOCK END ===$/ { if (inside) { inside = 0 }; next }
+    inside { print }
+' "$NEWFILE" > "$T/chunk$N-new.txt"
 echo "--- шаг 3: из нового файла вырезано строк: $(wc -l < "$T/chunk$N-new.txt")"
 
 # 4. ГЛАВНАЯ ПРОВЕРКА: разница обязана быть ПУСТОЙ
