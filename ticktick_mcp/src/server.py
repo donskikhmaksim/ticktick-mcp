@@ -5460,6 +5460,14 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
                        "summary": summary, "consumed": False}
     lines = [f"### 📋 План удаления — {len(items)}",
              _plan_id_line(mid, "ничего ещё не удалено"), ""]
+    # Д16 (1.1.8): строки БЕЗ with_subtasks не разворачивают детей в манифест
+    # — но `kids` (выше) уже построен из живого снимка ради разворачивания,
+    # и вопрос «сколько детей осиротеет» отвечается тем же индексом без
+    # единого лишнего сетевого чтения. `planned` — то, что уже попало в этот
+    # же план: ребёнок, развёрнутый по with_subtasks, удаляется вместе с
+    # родителем и сиротой не станет — считать его было бы ложью в другую
+    # сторону (см. критерий приёмки №3 в TZ).
+    planned = {it["taskId"] for it in items}
     for i, it in enumerate(items, 1):
         mark = "↳ " * it.get("depth", 0)
         # Строка про безымянную задачу говорит, ЧТО в ней лежит, и что её
@@ -5471,7 +5479,11 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
         shown = (f"**«{it['title']}»**" if not _looks_untitled(it["title"]) else
                  f"**«{_untitled_label(by_id.get(it['taskId']) or {})}»** "
                  f"— {_BY_ID_NOTE}")
-        lines.append(f"{i}. {mark}{shown} — {it['project']} (`{it['taskId']}`)")
+        n_orphans = len([k for k in kids.get(it["taskId"], [])
+                         if k.get("id") not in planned])
+        orphan_tail = f" ({_triage_orphan_note(n_orphans)})" if n_orphans else ""
+        lines.append(f"{i}. {mark}{shown} — {it['project']} "
+                     f"(`{it['taskId']}`){orphan_tail}")
     if mismatch:
         lines.append(_mismatch_report(mismatch, "включил в план"))
     if missing:
