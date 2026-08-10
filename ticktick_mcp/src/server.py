@@ -17878,7 +17878,21 @@ _HIDDEN_TOOLS_ENV = "MCP_HIDDEN_TOOLS"
 # работающее, когда переменная НЕ ЗАДАНА вовсе. Заданная пустой строкой
 # переменная означает «не скрывать ничего» (это и есть откат), и от
 # незаданной она отличима: `os.environ.get` вернёт "" против None.
-_DEFAULT_HIDDEN_TOOLS: Tuple[str, ...] = ()
+_DEFAULT_HIDDEN_TOOLS: Tuple[str, ...] = (
+    # Тринадцать прямых путей изменения задачи. Порядок — как в ТЗ (порядок
+    # появления в этом файле). У каждого есть проверенная замена в агрегаторе,
+    # объявленная в `_HIDDEN_TOOL_REPLACEMENT` выше и подтверждённая зелёным
+    # сквозным тестом (tests/test_hidden_tools_coverage.py). Ни одно имя не
+    # попало сюда раньше, чем у его типа появилась такая замена.
+    "create_tasks", "update_tasks", "complete_tasks", "delete_tasks",
+    "delete_task_with_subtasks", "create_subtask", "move_tasks",
+    "set_task_parent", "unset_task_parent", "set_task_tags", "restore_tasks",
+    "abandon_task", "duplicate_task",
+    # Четырнадцатое имя прячется по ДРУГОЙ причине: `manual_triage` — живой
+    # псевдоним агрегатора, звать его можно и нужно тем, кто знает только
+    # старое имя. Модель же обязана видеть ровно одно имя — новое.
+    "manual_triage",
+)
 
 
 def _hidden_tool_names() -> set:

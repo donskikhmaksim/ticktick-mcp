@@ -535,6 +535,11 @@ async def test_tool_has_no_filter_or_scope_parameter():
 
 # ═══════════════════ 5. Полный цикл одного подтверждения ════════════════════
 
+@pytest.mark.triage_e2e("update")
+@pytest.mark.triage_e2e("move")
+@pytest.mark.triage_e2e("complete")
+@pytest.mark.triage_e2e("merge")
+@pytest.mark.triage_e2e("delete")
 async def test_full_cycle_applies_every_operation_once(monkeypatch, tmp_path):
     live = _live_inbox()
     v2, official = _wire(monkeypatch, live, tmp_path)
