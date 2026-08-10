@@ -705,9 +705,23 @@ def format_task(task: Dict, trash_state: Optional[bool] = None) -> str:
     # списке (П15, 2026-08-09): карточка задачи с чеком Home Depot выглядела
     # так же, как карточка пустышки. Заглушка заменена на заменитель, который
     # говорит, ЧТО в задаче есть.
+    #
+    # 1.1.7, Д14 (2026-08-10). Тот же П15-заменитель убрал и МАШИННЫЙ признак:
+    # прежняя «No title» была текстом, который потребитель мог искать
+    # подстрокой, а «(без названия: 📎 1 файл)» — уже нет (три разных хвоста +
+    # форма без хвоста, все на русском). Строку `Title:` менять нельзя —
+    # ради неё и затевалась правка П15 (карточка чека обязана визуально
+    # отличаться от пустышки). Вместо этого — ОТДЕЛЬНАЯ строка `Untitled:
+    # true` сразу следом, ТОЛЬКО когда `_looks_untitled` истинно (тот же
+    # предикат, что уже решает судьбу `Title:`, — не разбор готового текста
+    # на подстроку «без названия», это ломается на задаче, чьё настоящее имя
+    # с этих слов и начинается).
+    is_untitled = _looks_untitled(task.get("title"))
     formatted = ("Title: " + (_untitled_label(task)
-                              if _looks_untitled(task.get("title"))
+                              if is_untitled
                               else task["title"]) + "\n")
+    if is_untitled:
+        formatted += "Untitled: true\n"
 
     # Dates are printed in the OWNER's zone (_local_datetime_str), never as the
     # raw UTC instant TickTick stores. A deadline near local midnight otherwise
