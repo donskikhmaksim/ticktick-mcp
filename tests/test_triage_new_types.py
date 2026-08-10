@@ -45,9 +45,10 @@ class _FakeV2:
     иначе независимая сверка агрегатора судила бы по пустоте и любой тест
     проходил бы на неработающем коде."""
 
-    def __init__(self, live, trash=None, tags=None):
+    def __init__(self, live, trash=None, tags=None, completed=None):
         self.live = live
         self.trash = trash if trash is not None else {}
+        self.completed = completed if completed is not None else {}
         self.account_tags = list(tags or [])
         self.abandoned = {}
         self.calls = []
@@ -103,6 +104,29 @@ class _FakeV2:
             self.live.pop(tid, None)
         return {}
 
+    def duplicate_task(self, task_id):
+        """Копия — новый объект в ТОМ ЖЕ проекте. Завершённый оригинал даёт
+        завершённую копию: среди открытых её нет никогда."""
+        src = self.live.get(task_id) or self.completed.get(task_id) or {}
+        cid = f"copy-{task_id}"
+        copy = {"id": cid, "title": src.get("title"),
+                "projectId": src.get("projectId")}
+        self.calls.append(("duplicate", task_id, cid))
+        if task_id in self.completed:
+            self.completed[cid] = copy
+        else:
+            self.live[cid] = copy
+        return dict(copy)
+
+    def find_task_any_state(self, task_id):
+        if task_id in self.live:
+            return self.live[task_id], "open"
+        if task_id in self.completed:
+            return self.completed[task_id], "completed"
+        if task_id in self.trash:
+            return self.trash[task_id], "trash"
+        return None, None
+
     def abandon_task(self, task_id):
         """«Не буду делать» — задача уходит из открытых и получает статус -1
         (именно так её помечает TickTick), а не удаляется."""
@@ -145,13 +169,14 @@ class _FakeOfficial:
         return {"id": task_id}
 
 
-def _wire(monkeypatch, live, tmp_path, names=None, trash=None, tags=None):
+def _wire(monkeypatch, live, tmp_path, names=None, trash=None, tags=None,
+          completed=None):
     monkeypatch.setattr(s, "_ensure_ready", lambda: None)
     monkeypatch.setattr(s, "_ensure_official", lambda: None)
     monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: dict(live))
     monkeypatch.setattr(s, "_v2_project_names", lambda: dict(names or _NAMES))
     monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
-    v2 = _FakeV2(live, trash=trash, tags=tags)
+    v2 = _FakeV2(live, trash=trash, tags=tags, completed=completed)
     monkeypatch.setattr(s, "ticktick_v2", v2)
     monkeypatch.setattr(s, "ticktick", _FakeOfficial(live))
     return v2
@@ -551,6 +576,94 @@ async def test_abandon_warns_about_orphaned_children(monkeypatch, tmp_path):
          "said": "не буду"}])
 
     assert "останется без родителя" in preview
+
+
+# ═════════════════════════════ duplicate ══════════════════════════════════
+
+async def test_duplicate_creates_copy_in_same_project(monkeypatch, tmp_path):
+    """Копия существует, лежит в ТОМ ЖЕ проекте и названа как оригинал —
+    судим по живому состоянию, не по строке ответа."""
+    live = {"t1": {"id": "t1", "title": "Чек-лист переезда",
+                   "projectId": "p_work"}}
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    preview, out = await _run([
+        {"op": "duplicate", "task_id": "t1", "title": "Чек-лист переезда",
+         "said": "сделай копию, буду править"}])
+
+    copies = [t for tid, t in live.items() if tid != "t1"]
+    assert len(copies) == 1, "ровно одна копия"
+    assert copies[0]["title"] == "Чек-лист переезда"
+    assert copies[0]["projectId"] == "p_work", "тот же проект"
+    assert live["t1"]["title"] == "Чек-лист переезда", "оригинал не тронут"
+    assert "не проверяется автоматически" not in out, out
+    assert "✅ Выполнено 1 из 1" in out
+
+
+async def test_duplicate_of_a_completed_task_is_legitimate(monkeypatch, tmp_path):
+    """Дублирование ЗАВЕРШЁННОЙ задачи как шаблона — законный сценарий.
+    Общая сверка ищет только среди открытых и выбросила бы эту строку ровно
+    на том основании, ради которого операцию и затевали."""
+    live = {}
+    done = {"t1": {"id": "t1", "title": "Чек-лист переезда",
+                   "projectId": "p_work", "status": 2}}
+    v2 = _wire(monkeypatch, live, tmp_path, completed=done)
+
+    preview, out = await _run([
+        {"op": "duplicate", "task_id": "t1", "title": "Чек-лист переезда",
+         "said": "сделай из неё шаблон"}])
+
+    assert "copy-t1" in v2.completed, "копия завершённой наследует её статус"
+    assert v2.completed["copy-t1"]["projectId"] == "p_work"
+    # Копии нет среди открытых — и это НЕ провал: вердикт обязан это назвать.
+    assert "не проверяется автоматически" not in out
+    assert "✅ Выполнено 1 из 1" in out
+    assert "копия завершённой" in out
+
+
+async def test_duplicate_of_a_vanished_task_never_reaches_the_plan(
+        monkeypatch, tmp_path):
+    """Исчезнувший из ОБЕИХ лент оригинал — отказ, а не «дублируем что
+    найдётся»."""
+    live = {}
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "duplicate", "task_id": "ghost", "title": "Чек-лист переезда",
+         "said": "сделай копию"}])
+
+    assert "🛑" in out and "ни среди завершённых" in out
+    assert v2.calls == []
+
+
+async def test_duplicate_from_trash_is_refused(monkeypatch, tmp_path):
+    """«Дубликат удалённого» почти всегда значит, что человек хотел возврат."""
+    live = {}
+    v2 = _wire(monkeypatch, live, tmp_path,
+               trash={"t1": {"id": "t1", "title": "Чек-лист переезда",
+                             "projectId": "p_work"}})
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "duplicate", "task_id": "t1", "title": "Чек-лист переезда",
+         "said": "сделай копию"}])
+
+    assert "🛑" in out and "КОРЗИН" in out.upper()
+    assert v2.calls == []
+
+
+async def test_duplicate_rejects_changes(monkeypatch, tmp_path):
+    """Правка копии — отдельная операция по НЕЙ, а не поле здесь: иначе
+    changes молча не применились бы, а отчёт сказал бы «выполнено»."""
+    live = {"t1": {"id": "t1", "title": "Чек-лист переезда",
+                   "projectId": "p_work"}}
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "duplicate", "task_id": "t1", "title": "Чек-лист переезда",
+         "changes": {"new_title": "Копия"}, "said": "скопируй и переименуй"}])
+
+    assert "🛑" in out and "changes" in out
+    assert s._MANIFESTS == {} and v2.calls == []
 
 
 def _plan_lines(preview: str):
