@@ -15,7 +15,7 @@ import urllib.parse
 import uuid
 import logging
 from datetime import date, datetime, timezone, timedelta
-from typing import Dict, List, Any, Literal, Optional, Tuple
+from typing import Dict, List, Any, Literal, NamedTuple, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import anyio
@@ -5684,8 +5684,91 @@ def _fmt_tag_set(tags) -> str:
     return joined if joined else "нет"
 
 
+class _ItemVerdict(tuple):
+    """Пара `(status, line)` — ровно то, что `_verify_item` возвращал всегда, —
+    но с ПРИЦЕПЛЕННЫМИ рядом данными (1.3.1 захода 1, 2026-08-09).
+
+    Почему подкласс кортежа, а не новый тип. Распаковка `status, line =
+    _verify_item(...)` стоит в двух десятках мест сервера и тестов, и её
+    контракт менять нечем — а данные о вердикте нужны РЯДОМ с текстом, а не
+    вместо него. Кортеж длины два распаковывается как прежде; `reason`,
+    `drift` и `display_name` живут атрибутами и никого старого не задевают.
+
+    `reason` — ПОЧЕМУ вердикт такой, короткой фразой, БЕЗ имени объекта и без
+    эмодзи (имя едет отдельным полем; склеивать их обратно — работа печати, а
+    не данных). Заполняется ТАМ ЖЕ, где принимается решение, то есть при
+    сравнении журнала с живым состоянием. Восстанавливать причину разбором
+    готовой строки `line` запрещено: строку сочиняет тот же код, но название
+    объекта в ней приходит ИЗВНЕ, и разбор собственного текста — ровно тот
+    способ подделки, от которого стоит якорь `^**Итог:` в `_VERIFY_TOTALS_RE`
+    (см. tests/test_verify_totals_antiforgery.py).
+
+    `drift` — план и факт разошлись, ХОТЯ вердикт формально «ok». Такой
+    вердикт не понижается (операция удалась), но общий значок отчёта обязан
+    стать жёлтым: «получилось не совсем то, что планировали» не имеет права
+    выглядеть как «получилось ровно то».
+
+    Без `__slots__` намеренно: у подтипов кортежа (переменная длина) Python их
+    не поддерживает вовсе — «nonempty __slots__ not supported for subtype of
+    tuple». Атрибуты живут в обычном `__dict__`.
+    """
+
+    def __new__(cls, status: str, line: str, reason: str = "",
+                drift: bool = False, display_name: str = ""):
+        out = super().__new__(cls, (status, line))
+        out.reason = reason
+        out.drift = drift
+        out.display_name = display_name
+        return out
+
+
+class _OpVerdict(NamedTuple):
+    """Один вердикт отчёта: статус, ГОТОВАЯ СТРОКА (дословно та же, что
+    печаталась и до 1.3.1) и данные рядом с ней — идентификатор объекта, чем
+    его звать человеку, какая это была операция, почему такой исход и
+    разошлись ли план с фактом.
+
+    Всё, кроме `line`, приходит ИЗ ДАННЫХ: `object_id` — из журнальной записи,
+    `display_name` — из журнала/снимка через `_untitled_label`, `op` — из
+    журнальной записи, `reason`/`drift` — из `_verify_item`, то есть из места
+    сравнения с живым состоянием. Ни одно поле не извлекается из `line`."""
+    status: str
+    line: str
+    object_id: str
+    display_name: str
+    op: str
+    reason: str
+    drift: bool = False
+
+
+def _verdict_display_name(item: Dict) -> str:
+    """КАК ЗОВУТ ОБЪЕКТ В ВЕРДИКТЕ (аудит 2026-08-09; вынесено отдельно
+    1.3.1, 2026-08-09). Раньше безымянная задача падала на последний фолбэк,
+    и отчёт печатал «- ✅ **«[task tB…]»** — удалена» — идентификатор в
+    кавычках, в позиции имени, ровно та форма, которую сервер осуждает везде
+    ещё. Причём строкой выше тот же объект уже был назван по-человечески
+    («🗑 Удалено 1/1: «(без названия: 📎 1 файл)»»), то есть один объект в
+    одном сообщении звался двумя разными способами. Снимок удалённой задачи
+    несёт её содержимое (включая метаданные вложений — см. `_mk_item`),
+    поэтому заменитель строится из него и совпадает с тем, что человек видел
+    в плане.
+
+    Отдельной функцией — потому что это же имя теперь едет ПОЛЕМ структуры
+    отчёта, а не только внутри готовой строки: у печати и у данных обязан
+    быть ОДИН источник имени, иначе они разойдутся молча."""
+    tid = item.get("taskId")
+    snap = item.get("snapshot") or {}
+    if not _looks_untitled(item.get("title")):
+        return item["title"]
+    if not _looks_untitled(snap.get("title")):
+        return snap["title"]
+    if snap:
+        return _untitled_label(snap)
+    return f"[task {str(tid)[:8]}…]"
+
+
 def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
-                 names: Dict) -> Tuple[str, str]:
+                 names: Dict) -> _ItemVerdict:
     """Один вердикт по одной записи из журнала, по ТЕКУЩЕМУ живому состоянию.
 
     Возвращает (status, line): status — строго одно из "ok"/"warn"/"bad", и
@@ -5694,33 +5777,33 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
     парсингом эмодзи в начале `line` — именно так раньше терялись расхождения
     с пометкой ⚠️ (баг «расхождений: 0» при 4 напечатанных пунктах). Каждый
     return ниже явно указывает статус рядом со строкой, к которой он относится.
-    """
+
+    С 1.3.1 (2026-08-09) возвращается `_ItemVerdict` — тот же кортеж длины
+    два (распаковка `status, line = …` работает как прежде) плюс `reason`,
+    `drift` и `display_name` атрибутами. Причина пишется РЯДОМ со строкой,
+    в том же return, — чтобы структура отчёта никогда не собиралась разбором
+    его собственного текста."""
+    title = _verdict_display_name(item)
+    out = _verify_item_core(op, item, live_map, names, title)
+    out.display_name = title
+    return out
+
+
+def _verify_item_core(op: str, item: Dict, live_map: Dict[str, Dict],
+                      names: Dict, title: str) -> _ItemVerdict:
+    """Тело `_verify_item` — все ветки решения. Имя объекта приходит уже
+    посчитанным (`_verdict_display_name`), чтобы у печати и у данных был один
+    источник."""
     tid = item.get("taskId")
-    # КАК ЗОВУТ ОБЪЕКТ В ВЕРДИКТЕ (аудит 2026-08-09). Раньше безымянная
-    # задача падала на последний фолбэк, и отчёт печатал «- ✅ **«[task
-    # tB…]»** — удалена» — идентификатор в кавычках, в позиции имени, ровно
-    # та форма, которую сервер осуждает везде ещё. Причём строкой выше тот же
-    # объект уже был назван по-человечески («🗑 Удалено 1/1: «(без названия:
-    # 📎 1 файл)»»), то есть один объект в одном сообщении звался двумя
-    # разными способами. Снимок удалённой задачи несёт её содержимое (включая
-    # метаданные вложений — см. `_mk_item`), поэтому заменитель строится из
-    # него и совпадает с тем, что человек видел в плане.
-    snap = item.get("snapshot") or {}
-    if not _looks_untitled(item.get("title")):
-        title = item["title"]
-    elif not _looks_untitled(snap.get("title")):
-        title = snap["title"]
-    elif snap:
-        title = _untitled_label(snap)
-    else:
-        title = f"[task {str(tid)[:8]}…]"
     live = live_map.get(tid)
     exp = item.get("expect") or {}
 
     if op == "delete":
-        return (("bad", f"- ❌ **«{title}»** — ВСЁ ЕЩЁ существует (удаление не "
-                 "состоялось или восстановлена)") if live else
-                ("ok", f"- ✅ **«{title}»** — удалена"))
+        return (_ItemVerdict("bad", f"- ❌ **«{title}»** — ВСЁ ЕЩЁ существует "
+                             "(удаление не состоялось или восстановлена)",
+                             "всё ещё существует: удаление не состоялось или "
+                             "задача восстановлена") if live else
+                _ItemVerdict("ok", f"- ✅ **«{title}»** — удалена", "удалена"))
     if op == "restore":
         # Сведение двух правок (fix/qa-c-report + fix/qa-e-restore):
         # C перевёл ВСЕ ветки на явный кортеж (status, line) — статус больше
@@ -5739,36 +5822,64 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
             # видно настоящий провал «так и не восстановилась».
             found, where, readable = _locate_task_any_state(tid)
             if not readable:
-                return ("warn", f"- ⚠️ **«{title}»** — среди открытых нет, а "
-                        "проверить остальные состояния не удалось (чтение не "
-                        "прошло): исход НЕ ПОДТВЕРЖДЁН")
+                return _ItemVerdict(
+                    "warn", f"- ⚠️ **«{title}»** — среди открытых нет, а "
+                    "проверить остальные состояния не удалось (чтение не "
+                    "прошло): исход НЕ ПОДТВЕРЖДЁН",
+                    "среди открытых нет, остальные состояния прочитать не "
+                    "удалось — исход не подтверждён")
             if where == "trash":
-                return ("bad", f"- ❌ **«{title}»** — ВСЁ ЕЩЁ В КОРЗИНЕ "
-                        "(восстановление не состоялось)")
+                return _ItemVerdict(
+                    "bad", f"- ❌ **«{title}»** — ВСЁ ЕЩЁ В КОРЗИНЕ "
+                    "(восстановление не состоялось)",
+                    "всё ещё в корзине: восстановление не состоялось")
             if where != "completed":
-                return ("bad", f"- ❌ **«{title}»** — не найдена нигде: ни "
-                        "среди открытых, ни среди завершённых, ни в корзине "
-                        "(восстановление не подтвердилось)")
+                return _ItemVerdict(
+                    "bad", f"- ❌ **«{title}»** — не найдена нигде: ни "
+                    "среди открытых, ни среди завершённых, ни в корзине "
+                    "(восстановление не подтвердилось)",
+                    "не найдена ни среди открытых, ни среди завершённых, ни в "
+                    "корзине — восстановление не подтвердилось")
             want_pid = exp.get("projectId")
             got_pid = (found or {}).get("projectId")
             if want_pid and got_pid != want_pid:
-                return ("warn", f"- ⚠️ **«{title}»** — восстановлена, но "
-                        "вернулась ЗАВЕРШЁННОЙ и лежит в «"
-                        f"{names.get(got_pid, got_pid)}», а не в «"
-                        f"{names.get(want_pid, want_pid)}» (не тот список)")
-            return ("ok", f"- ✅ **«{title}»** — восстановлена; вернулась "
-                    "ЗАВЕРШЁННОЙ (потому её и нет среди открытых), в нужном "
-                    "списке")
+                return _ItemVerdict(
+                    "warn", f"- ⚠️ **«{title}»** — восстановлена, но "
+                    "вернулась ЗАВЕРШЁННОЙ и лежит в «"
+                    f"{names.get(got_pid, got_pid)}», а не в «"
+                    f"{names.get(want_pid, want_pid)}» (не тот список)",
+                    f"вернулась завершённой и лежит в «"
+                    f"{names.get(got_pid, got_pid)}», а не в «"
+                    f"{names.get(want_pid, want_pid)}»", drift=True)
+            # БЕЗ `drift` НАМЕРЕННО (1.3.1, 2026-08-09). Соблазн пометить
+            # этот исход расхождением («просили в работу, а вернулась
+            # завершённой») — это возврат к дефекту, закрытому живой приёмкой
+            # 2026-08-07: задача, завершённая ДО удаления, ИНАЧЕ вернуться и
+            # не может, среди открытых её не будет никогда. Здесь restore
+            # отработал ровно так, как обязан, и понижать значок не за что —
+            # см. tests/test_restore_completed_task_verdict.py.
+            return _ItemVerdict(
+                "ok", f"- ✅ **«{title}»** — восстановлена; вернулась "
+                "ЗАВЕРШЁННОЙ (потому её и нет среди открытых), в нужном "
+                "списке",
+                "восстановлена; вернулась завершённой, в нужном списке")
         want_pid = exp.get("projectId")
         if want_pid and live.get("projectId") != want_pid:
-            return ("warn", f"- ⚠️ **«{title}»** — среди открытых, но в «"
-                    f"{names.get(live.get('projectId'), live.get('projectId'))}»"
-                    f", а не в «{names.get(want_pid, want_pid)}» (не тот список)")
-        return ("ok", f"- ✅ **«{title}»** — снова среди открытых, в нужном списке")
+            return _ItemVerdict(
+                "warn", f"- ⚠️ **«{title}»** — среди открытых, но в «"
+                f"{names.get(live.get('projectId'), live.get('projectId'))}»"
+                f", а не в «{names.get(want_pid, want_pid)}» (не тот список)",
+                f"среди открытых, но в «"
+                f"{names.get(live.get('projectId'), live.get('projectId'))}», "
+                f"а не в «{names.get(want_pid, want_pid)}»", drift=True)
+        return _ItemVerdict("ok", f"- ✅ **«{title}»** — снова среди открытых, "
+                            "в нужном списке", "снова среди открытых")
     if op in ("complete", "abandon"):
         verb = "закрыта" if op == "complete" else "отмечена «не буду делать»"
-        return (("bad", f"- ❌ **«{title}»** — всё ещё среди открытых") if live
-                else ("ok", f"- ✅ **«{title}»** — {verb} (ушла из открытых)"))
+        return (_ItemVerdict("bad", f"- ❌ **«{title}»** — всё ещё среди "
+                             "открытых", "всё ещё среди открытых") if live
+                else _ItemVerdict("ok", f"- ✅ **«{title}»** — {verb} (ушла из "
+                                  "открытых)", f"{verb} — ушла из открытых"))
     if op == "delete_project":
         # tid here is the PROJECT id, not a task id. Re-fetch fresh via the
         # None-distinguishing helper rather than trusting the `names` dict
@@ -5776,13 +5887,19 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         # "project confirmed deleted".
         fresh_names = _v2_project_names_or_none()
         if fresh_names is None:
-            return ("warn", f"- ⚠️ **«{title}»** — проект: проверка не удалась "
-                    "(не получилось перечитать список проектов), исход НЕ "
-                    "ПОДТВЕРЖДЁН")
+            return _ItemVerdict(
+                "warn", f"- ⚠️ **«{title}»** — проект: проверка не удалась "
+                "(не получилось перечитать список проектов), исход НЕ "
+                "ПОДТВЕРЖДЁН",
+                "не получилось перечитать список проектов — исход не "
+                "подтверждён")
         still = fresh_names.get(tid)
-        return (("bad", f"- ❌ **«{title}»** — проект ВСЁ ЕЩЁ существует "
-                 "(удаление не подтвердилось)") if still else
-                ("ok", f"- ✅ **«{title}»** — проект удалён"))
+        return (_ItemVerdict("bad", f"- ❌ **«{title}»** — проект ВСЁ ЕЩЁ "
+                             "существует (удаление не подтвердилось)",
+                             "проект всё ещё существует: удаление не "
+                             "подтвердилось") if still else
+                _ItemVerdict("ok", f"- ✅ **«{title}»** — проект удалён",
+                             "проект удалён"))
     if op == "delete_habit":
         # def-119 (2026-08-07), часть 2: `tid` — id ПРИВЫЧКИ, не задачи. Тот
         # же приём, что у delete_project чуть выше (CONFIRMED ABSENCE): фреш-
@@ -5790,16 +5907,23 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         # иначе неудачный фетч читался бы как подтверждённое удаление.
         fresh_habits = _v2_habits_or_none()
         if fresh_habits is None:
-            return ("warn", f"- ⚠️ **«{title}»** — привычка: проверка не "
-                    "удалась (не получилось перечитать список привычек), "
-                    "исход НЕ ПОДТВЕРЖДЁН")
+            return _ItemVerdict(
+                "warn", f"- ⚠️ **«{title}»** — привычка: проверка не "
+                "удалась (не получилось перечитать список привычек), "
+                "исход НЕ ПОДТВЕРЖДЁН",
+                "не получилось перечитать список привычек — исход не "
+                "подтверждён")
         still = any(h.get("id") == tid for h in fresh_habits)
-        return (("bad", f"- ❌ **«{title}»** — привычка ВСЁ ЕЩЁ существует "
-                 "(удаление не подтвердилось)") if still else
-                ("ok", f"- ✅ **«{title}»** — привычка удалена"))
+        return (_ItemVerdict("bad", f"- ❌ **«{title}»** — привычка ВСЁ ЕЩЁ "
+                             "существует (удаление не подтвердилось)",
+                             "привычка всё ещё существует: удаление не "
+                             "подтвердилось") if still else
+                _ItemVerdict("ok", f"- ✅ **«{title}»** — привычка удалена",
+                             "привычка удалена"))
     if live is None:
-        return ("bad", f"- ❌ **«{title}»** — не найдена среди открытых "
-                "(ожидалась живой)")
+        return _ItemVerdict("bad", f"- ❌ **«{title}»** — не найдена среди "
+                            "открытых (ожидалась живой)",
+                            "не найдена среди открытых, хотя ожидалась живой")
     if op == "create":
         probs = []
         want_pid = exp.get("projectId")
@@ -5840,8 +5964,9 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
                 f"исполнитель: {_person_label(live.get('assignee'), members)}, "
                 f"ожидался {_person_label(want_assignee, members)}")
         if probs:
-            return ("warn", f"- ⚠️ **«{title}»** — создана, но: "
-                    + "; ".join(probs))
+            return _ItemVerdict("warn", f"- ⚠️ **«{title}»** — создана, но: "
+                                + "; ".join(probs),
+                                "создана, но: " + "; ".join(probs))
         # State the FACTS, not agreement-with-intent: the reader must SEE where
         # it landed, so a wrong-but-consistent request is still visible.
         facts = [f"в «{names.get(live.get('projectId'), live.get('projectId'))}»"]
@@ -5856,30 +5981,56 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
             facts.append(f"срок {_local_date_str(live, 'dueDate')}")
         if live.get("priority"):
             facts.append(f"приоритет {PRIORITY_MAP.get(live['priority'], live['priority'])}")
-        return ("ok", f"- ✅ **«{title}»** — создана {', '.join(facts)}")
+        # РАСХОЖДЕНИЕ ПЛАНА И ФАКТА ПРИ ВЕРДИКТЕ «ok» (1.3.1, 2026-08-09).
+        # Задача создана и лежит там, где просили, — это успех, понижать его
+        # не за что. Но если она СЕЙЧАС зовётся не так, как её создавали,
+        # значит объект между мутацией и проверкой переименовали, и «✅ всё
+        # подтверждено» рядом с чужим именем — та самая картинка, по которой
+        # владелец решает, что всё в порядке. Значок жёлтый, статус строки —
+        # прежний.
+        renamed = not _names_agree(str(item.get("title") or ""),
+                                   str(live.get("title") or ""))
+        return _ItemVerdict("ok", f"- ✅ **«{title}»** — создана "
+                            f"{', '.join(facts)}",
+                            "создана " + ", ".join(facts), drift=renamed)
     if op == "move":
         want = exp.get("projectId")
-        return (("ok", f"- ✅ **«{title}»** — в **«{names.get(want, want)}»**")
+        return (_ItemVerdict("ok", f"- ✅ **«{title}»** — в "
+                             f"**«{names.get(want, want)}»**",
+                             f"перенесена в «{names.get(want, want)}»")
                 if live.get("projectId") == want else
-                ("bad", f"- ❌ **«{title}»** — осталась в «{names.get(live.get('projectId'), '?')}»"))
+                _ItemVerdict("bad", f"- ❌ **«{title}»** — осталась в "
+                             f"«{names.get(live.get('projectId'), '?')}»",
+                             "осталась в «"
+                             f"{names.get(live.get('projectId'), '?')}»"))
     if op == "tags":
         want = set(exp.get("tags") or [])
         got = set(live.get("tags") or [])
-        return (("ok", f"- ✅ **«{title}»** — теги: {_fmt_tag_set(got)}") if want == got
-                else ("bad", f"- ❌ **«{title}»** — теги: {_fmt_tag_set(got)}, "
-                      f"ожидались: {_fmt_tag_set(want)}"))
+        return (_ItemVerdict("ok", f"- ✅ **«{title}»** — теги: "
+                             f"{_fmt_tag_set(got)}",
+                             f"теги: {_fmt_tag_set(got)}") if want == got
+                else _ItemVerdict("bad", f"- ❌ **«{title}»** — теги: "
+                                  f"{_fmt_tag_set(got)}, ожидались: "
+                                  f"{_fmt_tag_set(want)}",
+                                  f"теги: {_fmt_tag_set(got)}, ожидались: "
+                                  f"{_fmt_tag_set(want)}"))
     if op == "parent":
         want = exp.get("parentId")  # None = detached
         got = live.get("parentId")
         # A parentId "applied" toward a parent that is NOT itself alive among
         # open tasks is an orphaning, not a success — check the parent too.
         if want and want not in live_map:
-            return ("bad", f"- ❌ **«{title}»** — родитель {str(want)[:8]}… НЕ "
-                    "среди открытых задач (вложение под несуществующего/"
-                    "закрытого родителя)")
+            return _ItemVerdict(
+                "bad", f"- ❌ **«{title}»** — родитель {str(want)[:8]}… НЕ "
+                "среди открытых задач (вложение под несуществующего/"
+                "закрытого родителя)",
+                f"родитель {str(want)[:8]}… не среди открытых задач — "
+                "вложение под несуществующего/закрытого родителя")
         ok = (got == want) if want else not got
         if not ok:
-            return ("bad", f"- ❌ **«{title}»** — parentId={got!r}, ожидался {want!r}")
+            return _ItemVerdict("bad", f"- ❌ **«{title}»** — parentId={got!r}, "
+                                f"ожидался {want!r}",
+                                f"parentId={got!r}, ожидался {want!r}")
         # def-110: «родитель применён» раньше был ОДНИМ литералом на обе
         # противоположные операции (вложить / отцепить) — set_task_parent и
         # unset_task_parent над одной и той же задачей давали посимвольно
@@ -5895,8 +6046,11 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
         if got:
             parent_title = (live_map.get(got) or {}).get("title") \
                 or f"{str(got)[:8]}…"
-            return ("ok", f"- ✅ **«{title}»** — родитель: «{parent_title}»")
-        return ("ok", f"- ✅ **«{title}»** — родитель: нет")
+            return _ItemVerdict("ok", f"- ✅ **«{title}»** — родитель: "
+                                f"«{parent_title}»",
+                                f"родитель: «{parent_title}»")
+        return _ItemVerdict("ok", f"- ✅ **«{title}»** — родитель: нет",
+                            "родитель: нет")
     if op == "update":
         changes = exp.get("changes") or {}
         diffs = []
@@ -5917,27 +6071,50 @@ def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
                     diffs.append(f"assignee: {got!r} ≠ {want!r}")
             elif got != want:
                 diffs.append(f"{field}: {got!r} ≠ {want!r}")
-        return (("bad", f"- ❌ **«{title}»** — не применилось: " + "; ".join(diffs))
-                if diffs else ("ok", f"- ✅ **«{title}»** — все изменения на месте"))
+        return (_ItemVerdict("bad", f"- ❌ **«{title}»** — не применилось: "
+                             + "; ".join(diffs),
+                             "не применилось: " + "; ".join(diffs))
+                if diffs else
+                _ItemVerdict("ok", f"- ✅ **«{title}»** — все изменения на "
+                             "месте", "все изменения на месте"))
     # Тип операции без выделенного проверятеля: автоматически НЕ проверяется —
     # это предупреждение, а не молчаливый успех, и должно считаться как такое.
     # Также: ASCII-символ "✓" запрещён как статусный маркер замороженной
     # легендой (output-format.md §7.2) — используем ⚠️, как и в остальных
     # случаях «не проверено».
-    return ("warn", f"- ⚠️ **«{title}»** — записана в журнал (тип {op} не "
-            "проверяется автоматически)")
+    return _ItemVerdict("warn", f"- ⚠️ **«{title}»** — записана в журнал (тип "
+                        f"{op} не проверяется автоматически)",
+                        f"тип операции «{op}» не проверяется автоматически — "
+                        "исход не доказан")
+
+
+# Журнальные записи, которые НЕ являются мутациями и не подлежат сверке:
+# справка о том, что в исполнение НЕ ПОШЛО (см. `_journal_not_executed`).
+# Они едут по тому же журналу — это и есть канал, по которому структура
+# непрошедшего доезжает до отчёта, минуя текст, — но `_verify_item` по ним
+# звать нечего: объектов-мутаций в них нет вовсе.
+_JOURNAL_NOT_EXECUTED_OP = "_not_executed"
 
 
 def _compute_op_verdicts(records: List[Dict], live: Dict[str, Dict],
-                         names: Dict) -> List[Tuple[str, str]]:
+                         names: Dict) -> List[_OpVerdict]:
     """Runs _verify_item over every item of every journal record against ONE
     given live snapshot. Factored out of _build_operation_report so the
     identity-changing-op retry there (_POSTVERIFY_RETRY_ATTEMPTS) can re-run
     the exact same computation against a freshly re-fetched snapshot without
-    duplicating the items-extraction logic."""
-    verdicts: List[Tuple[str, str]] = []
+    duplicating the items-extraction logic.
+
+    С 1.3.1 (2026-08-09) возвращает не пары строк, а `_OpVerdict` — статус,
+    ту же самую готовую строку и ДАННЫЕ рядом с ней. Все данные берутся из
+    журнальной записи и из `_verify_item` (то есть из сравнения с живым
+    состоянием); из готового текста строки не извлекается НИЧЕГО — в тексте
+    нет и не может быть идентификатора объекта, а название в нём приходит
+    извне и служит приманкой для подделки вердикта."""
+    verdicts: List[_OpVerdict] = []
     for rec in records:
         op = rec.get("op") or "delete"
+        if op == _JOURNAL_NOT_EXECUTED_OP:
+            continue
         if op == "delete_habit":
             # def-119 (2026-08-07), часть 2: журнальная запись delete_habit
             # (см. _delete_habit_impl) несёт ОДИНОЧНЫЙ "snapshot" — не
@@ -5955,7 +6132,15 @@ def _compute_op_verdicts(records: List[Dict], live: Dict[str, Dict],
                 for s in rec.get("deleted", [])
             ]
         for item in items:
-            verdicts.append(_verify_item(op, item, live, names))
+            v = _verify_item(op, item, live, names)
+            verdicts.append(_OpVerdict(
+                status=v[0], line=v[1],
+                object_id=str(item.get("taskId") or ""),
+                display_name=(getattr(v, "display_name", "")
+                              or _verdict_display_name(item)),
+                op=op,
+                reason=getattr(v, "reason", ""),
+                drift=bool(getattr(v, "drift", False))))
     return verdicts
 
 
@@ -5985,13 +6170,111 @@ async def operation_report(record_id: str) -> str:
     return _build_operation_report(record_id)
 
 
+class _ReportData(NamedTuple):
+    """ОТЧЁТ КАК ДАННЫЕ (1.3.1 захода 1, 2026-08-09) — то, что едет РЯДОМ с
+    текстом, а не извлекается из него.
+
+    `text` — тот же самый markdown, что `_build_operation_report` возвращала
+    всегда; печать не менялась. Остальные поля — источник для потребителей,
+    которым нужны не буквы, а факты: короткая сводка в личку владельца
+    (называет объекты поимённо), кнопочный путь Telegram (понижает вердикт при
+    расхождении), и любой будущий читатель.
+
+    `usable` — отчёт является НАСТОЯЩЕЙ перепроверкой (журнал найден, живое
+    состояние прочитано). False значит «мы не смотрели», и потребитель обязан
+    трактовать это как «не доказано», а не как успех.
+
+    `skipped` / `not_planned` — две РАЗНЫЕ рубрики невыполненного, склеивать
+    которые запрещено: «пропущено» было в плане и подтверждено кнопкой, но
+    сдрейфовало между «да» и мутацией; «не вошло в план» не подтверждалось
+    ВООБЩЕ. Обе приезжают журнальной записью `_not_executed` (см.
+    `_journal_not_executed`) — то есть по тому же каналу данных, что и сами
+    мутации, а не разбором чьего-то текста."""
+    record_id: str
+    text: str
+    verdicts: List[_OpVerdict]
+    totals: Tuple[int, int, int]
+    overall: str
+    skipped: List[Dict]
+    not_planned: List[Dict]
+    drift: bool
+    usable: bool
+
+
+# Потолок печати перечней в отчёте. Он ОБЯЗАН сопровождаться строкой
+# «показаны N из M» — молчаливое усечение (пункт 8 задания 1.3.1) читается как
+# полный результат, и остаток пропадает бесследно. Образец честной постраничной
+# выдачи — `get_all_tasks`, который печатает остаток и следующий сдвиг.
+_REPORT_LIST_CAP = 50
+
+
+def _capped_lines(records: List[Dict], render, cap: int = _REPORT_LIST_CAP,
+                  what: str = "записей") -> List[str]:
+    """Строки перечня с ЧЕСТНЫМ усечением: сначала строки, затем — если что-то
+    не поместилось — «показаны N из M», где N сосчитано по фактически
+    напечатанным строкам, а не взято из потолка. Число M — настоящая длина
+    списка, а не длина показанного куска."""
+    shown = list(records[:cap])
+    lines = [render(r) for r in shown]
+    if len(records) > len(lines):
+        lines.append(f"… показаны {len(lines)} из {len(records)} {what} — "
+                     "остальные не поместились в отчёт")
+    return lines
+
+
+def _report_not_executed_lines(data: "_ReportData") -> List[str]:
+    """Две рубрики невыполненного внизу отчёта — раздельно и поимённо.
+
+    Заголовки те же, что печатает агрегатор в своём тексте
+    (`_triage_blocked_lines` / `_triage_not_planned_report_lines`): человек и
+    так читает их рядом, и два разных набора слов про одно и то же были бы
+    хуже повторения. Склейка рубрик запрещена: владелец обязан отличать
+    «согласился, а не сделалось» от «этого не согласовывали»."""
+    out: List[str] = []
+    if data.skipped:
+        out += ["", "#### ⏭ Пропущено — было в плане, подтверждено, но "
+                "сдрейфовало между «да» и мутацией"]
+        out += _capped_lines(data.skipped, _triage_not_planned_line,
+                             what="пропущенных")
+    if data.not_planned:
+        out += ["", "#### ❌ Не вошло в план — сверка НА ЭТАПЕ ПЛАНА, "
+                "подтверждения по ним не было"]
+        out += _capped_lines(data.not_planned, _triage_not_planned_line,
+                             what="невошедших")
+    return out
+
+
 def _build_operation_report(record_id: str) -> str:
     """Shared engine behind operation_report — also appended by the execute_*
     tools DIRECTLY into their result, so the independent check reaches the user
-    even when the calling model never asks for it."""
+    even when the calling model never asks for it.
+
+    С 1.3.1 (2026-08-09) — ТОНКАЯ ОБЁРТКА над
+    `_build_operation_report_data()`: сигнатура и текст не менялись (у неё
+    полдюжины вызывающих по всему серверу, переписывать их незачем), а тем,
+    кому нужны данные, а не буквы, отвечает сама `_…_data`."""
+    return _build_operation_report_data(record_id).text
+
+
+def _build_operation_report_data(record_id: str) -> _ReportData:
+    """Тот же отчёт, но СТРУКТУРОЙ: текст плюс данные рядом с ним.
+
+    Ни одно поле структуры не извлекается из готового текста. Вердикты
+    приходят из `_compute_op_verdicts` (журнал ⇄ живое состояние), рубрики
+    невыполненного — из журнальных записей `_not_executed`, счётчики — из
+    статусов вердиктов. Это принципиально: названия объектов печатаются в
+    отчёте дословно и приходят ИЗВНЕ, поэтому разбор собственного текста
+    отдал бы структуру во власть того, кто сочиняет названия задач (см.
+    tests/test_verify_totals_antiforgery.py)."""
+    def _flat(text: str, usable: bool = False) -> _ReportData:
+        """Отчёт, у которого нет ни вердиктов, ни рубрик, — журнал не найден,
+        записей нет, живое состояние недоступно, внутренняя ошибка."""
+        return _ReportData(record_id, text, [], (0, 0, 0), "❓", [], [],
+                           False, usable)
     try:
         path = os.path.join(_JOURNAL_DIR, "deletion_journal.jsonl")
         records = []
+        for_report: List[Dict] = []
         try:
             with open(path, encoding="utf-8") as f:
                 for line in f:
@@ -6007,19 +6290,35 @@ def _build_operation_report(record_id: str) -> str:
                                      rec.get("tg_manifest")):
                         records.append(rec)
         except FileNotFoundError:
-            return (f"🧾 Журнал не найден ({path}) — операция {record_id} не "
-                    "записана, отчёт дать не могу.")
+            return _flat(f"🧾 Журнал не найден ({path}) — операция {record_id} "
+                         "не записана, отчёт дать не могу.")
         if not records:
-            return (f"🧾 В журнале нет записей по {record_id} — операция не "
-                    "исполнялась или журнал был недоступен в момент записи.")
+            return _flat(f"🧾 В журнале нет записей по {record_id} — операция "
+                         "не исполнялась или журнал был недоступен в момент "
+                         "записи.")
+        # Справка о НЕ ПОШЕДШЕМ в исполнение — не мутация и сверке не
+        # подлежит; она едет тем же журналом, потому что это единственный
+        # канал, который переживает и нажатие кнопки, и перезапуск сервера.
+        skipped: List[Dict] = []
+        not_planned: List[Dict] = []
+        for rec in records:
+            if (rec.get("op") or "") != _JOURNAL_NOT_EXECUTED_OP:
+                for_report.append(rec)
+                continue
+            skipped += list(rec.get("skipped") or [])
+            not_planned += list(rec.get("not_planned") or [])
         live = _open_by_id(fresh=True)
         if live is None:
-            return (f"### 🧾 Отчёт по `{record_id}` невозможен\n"
-                    "⚠️ Живое состояние TickTick недоступно — независимая "
-                    "проверка не выполнена, исход операции НЕ ПОДТВЕРЖДЁН. "
-                    "Повтори operation_report позже.")
+            return _flat(f"### 🧾 Отчёт по `{record_id}` невозможен\n"
+                         "⚠️ Живое состояние TickTick недоступно — независимая "
+                         "проверка не выполнена, исход операции НЕ ПОДТВЕРЖДЁН. "
+                         "Повтори operation_report позже.")
         names = _v2_project_names()
         when = records[-1].get("ts", "?")
+        # Сверке подлежат ТОЛЬКО записи о мутациях; справка `_not_executed`
+        # своё уже отдала (`skipped`/`not_planned` выше). Время отчёта при
+        # этом берётся по ВСЕМ записям — справка тоже часть этой операции.
+        records = for_report
         try:
             when_dt = datetime.fromisoformat(when)
             when = when_dt.astimezone(_USER_TZ).strftime("%d.%m %H:%M")
@@ -6047,11 +6346,11 @@ def _build_operation_report(record_id: str) -> str:
         # уже сегодня означает то, что означает, и без подтверждённой гонки
         # незачем добавлять им лишнюю задержку на настоящем провале.
         retryable_ops = {"move", "parent", "restore"}
-        if (any(status == "bad" for status, _ in verdicts)
+        if (any(v.status == "bad" for v in verdicts)
                 and any((rec.get("op") or "delete") in retryable_ops
                         for rec in records)):
             for delay in _POSTVERIFY_RETRY_DELAYS_S:
-                if not any(status == "bad" for status, _ in verdicts):
+                if not any(v.status == "bad" for v in verdicts):
                     break
                 time.sleep(delay)
                 live2 = _open_by_id(fresh=True)
@@ -6059,10 +6358,10 @@ def _build_operation_report(record_id: str) -> str:
                     break
                 live = live2
                 verdicts = _compute_op_verdicts(records, live, names)
-        lines.extend(line for _, line in verdicts)
-        ok = sum(1 for status, _ in verdicts if status == "ok")
-        warn = sum(1 for status, _ in verdicts if status == "warn")
-        bad = sum(1 for status, _ in verdicts if status == "bad")
+        lines.extend(v.line for v in verdicts)
+        ok = sum(1 for v in verdicts if v.status == "ok")
+        warn = sum(1 for v in verdicts if v.status == "warn")
+        bad = sum(1 for v in verdicts if v.status == "bad")
         lines.append("")
         lines.append(f"**Итог: ✅ {ok} подтверждено, ⚠️ {warn} не проверено, "
                       f"❌ {bad} расхождений.**")
@@ -6082,21 +6381,40 @@ def _build_operation_report(record_id: str) -> str:
         # delete_habit (см. часть 2 ниже) — заголовок «❓ НЕ подтверждено»
         # соседствовал с «Статус операции: ✅ — всё подтверждено» в одном
         # сообщении.
+        #
+        # ЖЁЛТЫЙ ЗНАЧОК ПРИ ЛЮБОМ РАСХОЖДЕНИИ (1.3.1, 2026-08-09). Формальный
+        # вердикт считается по журнальным строкам — а журнал знает только про
+        # то, что ИСПОЛНЯЛОСЬ. Живой случай: в плане было 14 объектов,
+        # подтверждено 11, а три сдрейфовали и в исполнение не пошли вовсе —
+        # все одиннадцать журнальных строк «ok», и отчёт ставил «✅ всё
+        # подтверждено» ровно там, где треть плана потерялась. Теперь любое
+        # расхождение плана и факта — непошедшие операции ИЛИ строка вердикта
+        # с признаком дрейфа (восстановлена, но вернулась завершённой) —
+        # делает общий значок жёлтым, не трогая ни статусы строк, ни счётчики.
+        drift = (bool(skipped) or bool(not_planned)
+                 or any(v.drift for v in verdicts))
         if bad:
             overall, tail = "❌", "есть расхождения — это НЕ успех."
         elif warn:
             overall, tail = "⚠️", "есть непроверенные пункты — это НЕ полный успех."
+        elif ok and drift:
+            overall, tail = "⚠️", ("подтверждённое подтвердилось, но план и "
+                                   "факт разошлись — см. разделы ниже; это НЕ "
+                                   "полный успех.")
         elif ok:
             overall, tail = "✅", "всё подтверждено."
         else:
             overall, tail = "❓", "проверять было нечего — исход НЕ подтверждён."
         lines.append(f"**Статус операции: {overall}** — {tail}")
+        data = _ReportData(record_id, "", verdicts, (ok, warn, bad), overall,
+                           skipped, not_planned, drift, True)
+        lines += _report_not_executed_lines(data)
         lines.append("[агенту: перепечатай этот отчёт пользователю ДОСЛОВНО — "
                      "это серверная проверка, не заменяй её своим пересказом]")
-        return "\n".join(lines)
+        return data._replace(text="\n".join(lines))
     except Exception as e:
         logger.exception("Error in operation_report")
-        return _tool_error("building operation report", e)
+        return _flat(_tool_error("building operation report", e))
 
 
 @mcp.tool()
@@ -14279,7 +14597,7 @@ def _triage_not_planned_lines(records: List[Dict]) -> List[str]:
     if not records:
         return []
     return [f"❌ Не вошло: {len(records)} — разберите с человеком в чате"] \
-        + [_triage_not_planned_line(r) for r in records]
+        + _capped_lines(records, _triage_not_planned_line, what="невошедших")
 
 
 def _triage_mismatch_block(doable: List[Dict], records: List[Dict]) -> List[str]:
@@ -14468,13 +14786,16 @@ def _verify_triage_op(op: Dict, live_map: Dict[str, Dict],
 
 
 def _triage_blocked_lines(blocked: List[Tuple[Dict, str]]) -> List[str]:
-    out = ["#### ⏭ Пропущено — НЕ выполнено"]
-    for op, why in blocked:
+    def _line(pair: Tuple[Dict, str]) -> str:
+        op, why = pair
         shown = _triage_task_label(op)
         emoji = _TRIAGE_EMOJI.get(op.get("op"), "•")
         verb = _TRIAGE_VERB.get(op.get("op"), op.get("op"))
-        out.append(f"- {emoji} {shown} ({verb}): {why}")
-    return out
+        return f"- {emoji} {shown} ({verb}): {why}"
+    # Усечение — только ГОВОРЯЩЕЕ (1.3.1, пункт 8): обрезанный молча перечень
+    # читается как полный, и остаток пропадает бесследно.
+    return ["#### ⏭ Пропущено — НЕ выполнено"] \
+        + _capped_lines(blocked, _line, what="пропущенных")
 
 
 def _triage_not_planned_report_lines(records: Optional[List[Dict]]) -> List[str]:
@@ -14493,7 +14814,46 @@ def _triage_not_planned_report_lines(records: Optional[List[Dict]]) -> List[str]
         return []
     return ["", "#### ❌ Не вошло в план — сверка НА ЭТАПЕ ПЛАНА, "
             "подтверждения по ним не было"] \
-        + [_triage_not_planned_line(r) for r in records]
+        + _capped_lines(records, _triage_not_planned_line, what="невошедших")
+
+
+def _triage_skipped_records(blocked: List[Tuple[Dict, str]]) -> List[Dict]:
+    """Пропущенное при исполнении → те же ПЛОСКИЕ справочные записи, что и у
+    невошедшего в план (`_triage_not_planned_records`): одна форма записи —
+    одна печать, одна структура в отчёте. РУБРИКИ при этом остаются разными
+    (см. `_report_not_executed_lines`): совпадение формы данных не повод
+    склеивать смыслы «согласился, а не сделалось» и «не согласовывалось»."""
+    return _triage_not_planned_records(
+        [{**op, "_skip": why} for op, why in blocked])
+
+
+def _journal_not_executed(skipped: Optional[List[Dict]],
+                          not_planned: Optional[List[Dict]],
+                          summary: str = "") -> str:
+    """Справка о НЕ ПОШЕДШЕМ в исполнение — в журнал операций (1.3.1,
+    2026-08-09). Возвращает id записи или '' (журнал недоступен).
+
+    Зачем в журнал, а не «передать в отчёт параметром». Отчёт после кнопки
+    строит `_build_operation_report` — по журналу, из другого процесса
+    относительно того, кто считал сверку, и порой уже после перезапуска
+    сервера. Журнал — единственный канал, который это переживает, и он же
+    единственный, который НЕ является текстом: структура непрошедшего обязана
+    течь из данных, иначе её пришлось бы выковыривать регуляркой из
+    собственного отчёта — а туда названия задач попадают дословно и извне.
+
+    Запись помечена `op="_not_executed"` и мутацией не является: сверять по
+    ней нечего, `_compute_op_verdicts` её пропускает явной веткой."""
+    skipped = list(skipped or [])
+    not_planned = list(not_planned or [])
+    if not skipped and not not_planned:
+        return ""
+    rid = f"{_JOURNAL_NOT_EXECUTED_OP}-{uuid.uuid4().hex[:8]}"
+    path = _journal_write({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "record": rid, "op": _JOURNAL_NOT_EXECUTED_OP, "summary": summary,
+        "skipped": skipped, "not_planned": not_planned,
+    })
+    return rid if path else ""
 
 
 @mcp.tool()
@@ -14759,10 +15119,12 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict],
     # недоступно» о ней молчали.
     err = _ensure_ready()
     if err:
+        _journal_not_executed([], not_planned, summary)
         return "\n".join([err] + _triage_not_planned_report_lines(not_planned))
     ops = list(tasks or [])
     by_id = _open_by_id(fresh=True)
     if by_id is None:
+        _journal_not_executed([], not_planned, summary)
         return "\n".join([_STATE_UNAVAILABLE_MSG]
                          + _triage_not_planned_report_lines(not_planned))
     names = _v2_project_names()
@@ -14783,6 +15145,15 @@ async def _manual_triage_impl(summary: str, tasks: List[Dict],
             blocked.append((op, why))
             continue
         ready.append(op)
+
+    # СПРАВКА О НЕПОШЕДШЕМ — В ЖУРНАЛ, ДО ЛЮБОГО ВЫХОДА (1.3.1, 2026-08-09).
+    # Отчёт после нажатия кнопки собирает `_build_operation_report` по
+    # ЖУРНАЛУ, а не по этому тексту: справка, оставшаяся только здесь, до
+    # владельца по кнопочному пути не доедет структурой — её пришлось бы
+    # выковыривать регуляркой из готового отчёта. Пишется РАНЬШЕ мутаций: если
+    # исполнение упадёт на середине, перечень непошедшего уже в журнале.
+    _journal_not_executed(_triage_skipped_records(blocked), not_planned,
+                          summary)
 
     if not ready:
         # Маркер 🛑 стоит В ЗАГОЛОВКЕ, а не только во второй строке, и это не
