@@ -21,7 +21,9 @@ from ticktick_mcp.src import server
 # 75 → 77 (2026-08-06, тот же день): +2 = `create_habit` / `delete_habit`.
 # Обе прибавки пришли РАЗНЫМИ ветками от одной базы (74), поэтому каждая
 # насчитала свой итог (75 и 76) — верный после слияния только их суммарный.
-_EXPECTED_TOOLS = 77
+# 77 → 78 (2026-08-09, П15 п.4 / 1.3.5): +1 = `find_untitled_tasks` — новый
+# READONLY-инструмент, разовая ревизия «сколько открытых задач без названия».
+_EXPECTED_TOOLS = 78
 
 
 def test_all_expected_tools_registered():

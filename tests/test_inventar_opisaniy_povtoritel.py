@@ -37,8 +37,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 TABLE_PATH = REPO_ROOT / "docs" / "TZ" / "inventar_opisaniy.md"
 
 # Контрольное число из задания (docs/TZ/ZAHOD1.md:901): результат
-# `rg -c "^@mcp\.tool\(" ticktick_mcp/src/server.py` обязан быть 77.
-_EXPECTED_TOOL_COUNT = 77
+# `rg -c "^@mcp\.tool\(" ticktick_mcp/src/server.py` был 77 на ревизии-якоре
+# этого документа. 2026-08-09 (П15 п.4, 1.3.5): добавлена 78-я команда,
+# `find_untitled_tasks` — разобрана отдельной строкой таблицы, число сверки
+# сдвинуто вместе с ней, а не подогнано мимо таблицы.
+_EXPECTED_TOOL_COUNT = 78
 
 _MISMATCH_MARKER = "⚠ РАСХОЖДЕНИЕ"
 _CLEAN_MARKER = "Проверено, чисто"

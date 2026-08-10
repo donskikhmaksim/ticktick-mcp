@@ -2717,6 +2717,11 @@ def format_task_tree(tasks: List[Dict], limit: int = 200) -> str:
 _ALL_TASKS_PAGE = 200
 _PROJECT_TASKS_PAGE = 50
 
+# Страница для find_untitled_tasks (П15 п.4, 2026-08-09) — та же величина, что
+# у get_all_tasks: разовая ревизия читает столько же задач, страница того же
+# порядка размера уместна.
+_UNTITLED_SCAN_PAGE = 200
+
 # Page size for the other two compact-tree readers (run_filter,
 # get_inbox_tasks). They print the SAME compact line as get_all_tasks
 # (format_task_tree), measured at 135 chars per task on a realistic task
@@ -6941,6 +6946,137 @@ async def get_all_tasks(limit: int = _ALL_TASKS_PAGE, offset: int = 0) -> str:
     except Exception as e:
         logger.exception("Error in get_all_tasks")
         return _tool_error("fetching tasks", e)
+
+
+# П15 п.4 (2026-08-09): при недоступном живом состоянии — «проверить не
+# удалось», НЕ «0». `None` из `_open_by_id` — это «сказать не могу», и текст
+# обязан отличаться от настоящего нуля дословно (тест проверяет отсутствие
+# символа «0» в ответе), а не только по смыслу.
+_UNTITLED_SCAN_UNAVAILABLE_MSG = (
+    "🛑 Число безымянных задач проверить не удалось — состояние TickTick "
+    "недоступно (v2 не отвечает или не настроен). Это НЕИЗВЕСТНО, а не «их "
+    "нет».")
+
+
+@mcp.tool(annotations=READONLY)
+async def find_untitled_tasks(limit: int = _UNTITLED_SCAN_PAGE, offset: int = 0) -> str:
+    """One-off audit (П15 п.4): how many OPEN tasks across the whole account
+    have no visible title, and where they sit.
+
+    A task with an empty title renders as a blank line in every list —
+    indistinguishable from clutter. In a live sweep, two of three such
+    "empty" tasks turned out to be real documents readable ONLY through their
+    attachment or note text — a photographed Home Depot return receipt
+    ($374.92) and a defect screenshot — and ordinary search finds neither of
+    them, because there is no title text to match against. This tool exists
+    to answer "how many, where, do any carry files" BEFORE anyone decides
+    what to do with them.
+
+    NOT a routine call. It force-refetches the full open-task state
+    (fresh=True, uncached) so a task created moments ago is not missed — that
+    is an expensive round-trip against every open task in the account. Use it
+    as an occasional review, not on every turn, and keep the page modest.
+
+    READ-ONLY and proposes nothing. Some of what it finds are legitimate
+    documents whose only content is a file or a note — do NOT turn this list
+    straight into a deletion plan without opening each task and looking at
+    what is actually inside it.
+
+    Coverage — what this call does NOT see: only OPEN tasks in projects
+    visible to the sync state are scanned. Closed/archived projects, the
+    trash, and completed tasks are NOT covered — an untitled task hiding in
+    any of those will not appear here even though it exists.
+
+    Args:
+        limit: maximum untitled tasks to print in one call (default 200)
+        offset: skip this many of the untitled tasks found — use it to read
+            the tail past `limit`
+    """
+    # Контракт _open_by_id обязателен: None — «сказать не могу», это НЕ 0.
+    # fresh=True — иначе задача, созданная минуты назад, не попадёт в кэш и
+    # выборка соврёт «безымянных нет» про объект, который есть.
+    by_id = await _run_blocking(lambda: _open_by_id(fresh=True))
+    if by_id is None:
+        return _UNTITLED_SCAN_UNAVAILABLE_MSG
+
+    # Фильтр показа (П15 п.3): _looks_untitled, а не _is_untitled — она же
+    # ловит названия из одних невидимых символов, которые человек видит как
+    # пустую строку. Здесь решается вопрос показа, а не строгой сверки.
+    found = [t for t in by_id.values() if _looks_untitled(t.get("title"))]
+    total = len(found)
+
+    coverage_note = (
+        "\n\nОхват (правило П17): просмотрены только ОТКРЫТЫЕ задачи из "
+        "проектов, видимых синхронизации. Закрытые и архивные проекты, "
+        "корзина и завершённые задачи этим вызовом НЕ просмотрены — "
+        "безымянная задача там останется невидимой.")
+
+    if total == 0:
+        return ("Безымянных задач среди открытых не найдено (найдено: 0)."
+                 + coverage_note)
+
+    names = _v2_project_names()
+
+    # Разбивка считается по ВСЕМ найденным, а не только по показанной
+    # странице — иначе «сколько всего» врало бы при постраничном вызове.
+    with_files = with_text = truly_empty = unknown = 0
+    by_project: Dict[str, int] = {}
+    for t in found:
+        n = _task_attachment_count(t)
+        if n:
+            with_files += 1
+        elif _task_has_text(t):
+            with_text += 1
+        elif n == 0:
+            truly_empty += 1
+        else:
+            # «Содержимое источник не показал» — ОТДЕЛЬНАЯ пятая категория,
+            # НЕ «пусто» (ловушка №2 задания). Свести её к «пусто» — ровно та
+            # путаница, из-за которой чек Home Depot попал в план на удаление.
+            unknown += 1
+        pid = t.get("projectId") or ""
+        pname = names.get(pid, pid or "Inbox")
+        by_project[pname] = by_project.get(pname, 0) + 1
+
+    offset = max(0, offset)
+    limit = max(1, limit)
+    page = found[offset:offset + limit]
+    if not page:
+        return (f"Безымянных задач: {total}, но offset={offset} уже за "
+                f"концом списка ({_valid_offset_range(total)})." + coverage_note)
+
+    shown_to = offset + len(page)
+    lines = []
+    for t in page:
+        pid = t.get("projectId") or ""
+        pname = names.get(pid, pid or "Inbox")
+        label = _untitled_label(t)
+        tid = t.get("id", "?")
+        # Человеческий формат, не сырой UTC-инстант (ИНВ-3) — та же функция,
+        # что get_changes/get_task_activity уже используют для той же строки.
+        created = _local_stamp_str(t.get("createdTime"), with_zone=False)
+        lines.append(f"- {label} · «{pname}» · id: {tid} · создана: {created}")
+
+    if offset or shown_to < total:
+        header = (f"Безымянных задач найдено: {total}, показаны "
+                  f"{len(page)} из {total}:\n\n")
+    else:
+        header = f"Безымянных задач найдено: {total}:\n\n"
+
+    breakdown = (
+        f"\n\nРазбивка по всем {total}: с вложениями — {with_files}, с "
+        f"текстом — {with_text}, действительно пустых — {truly_empty}, "
+        f"содержимое источник не показал — {unknown}.\n"
+        "По проектам: " + ", ".join(
+            f"«{p}» — {c}" for p, c in
+            sorted(by_project.items(), key=lambda kv: -kv[1])) + ".")
+
+    footer = ""
+    if shown_to < total:
+        footer = f"\n\n… ещё {total - shown_to} — вызови снова с offset={shown_to}."
+
+    return header + "\n".join(lines) + breakdown + footer + coverage_note
+
 
 @mcp.tool(annotations=READONLY)
 async def get_tasks_by_priority(priority_id: int, limit: int = 200, offset: int = 0) -> str:
