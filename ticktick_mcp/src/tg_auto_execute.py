@@ -32,13 +32,16 @@ from . import tg_approval
 # подмена `server._create_tasks_impl` в тестах доезжала сюда как раньше.
 from . import server as _server_module
 from .server import (  # noqa: E402,F401 — имена, которые кусок берёт снаружи
-    _JOURNAL_DIR, _MANIFEST_TOMBSTONES, _MANIFESTS, _TG_AUTO_EXECUTE_MANIFEST,
+    _JOURNAL_DIR, _MANIFEST_TOMBSTONES, _MANIFESTS, _ReportData,
+    _TG_AUTO_EXECUTE_MANIFEST,
     _TG_CFG, _TOMBSTONE_CLAIMED, _TOMBSTONE_EXECUTED, _TOMBSTONE_FAILED,
-    _build_operation_report, _create_object_hash, _create_tasks_impl,
+    _build_operation_report, _build_operation_report_data, _capped_lines,
+    _create_object_hash, _create_tasks_impl,
     _delete_project_impl, _execute_task_deletion_impl, _manifest_from_payload,
     _manifest_object_hash, _manifest_params_hash, _prune_manifests,
     _redact_for_user, _rename_tag_impl, _restore_manifests_from_db,
-    _run_blocking, _tombstone_manifest, _tombstone_reason_for_verdict, logger,
+    _run_blocking, _tombstone_manifest, _tombstone_reason_for_verdict,
+    _triage_not_planned_line, logger,
     mcp, ticktick)
 
 
@@ -744,14 +747,53 @@ def _verdict_from_totals(totals: Optional[Tuple[int, int, int]]) -> str:
     return "ok"
 
 
+class _ReportMarkdown(str):
+    """Полный markdown отчёта — обычная строка во всех отношениях, но с
+    прицепленной рядом СТРУКТУРОЙ (`data`), из которой он собран (1.3.1
+    захода 1, 2026-08-09).
+
+    Зачем так, а не третьим элементом возврата. `md, verdict =
+    _verified_auto_execute_report(...)` стоит в двух десятках мест сервера и
+    тестов; расширение кортежа сломало бы их все, а данные нужны ровно одному
+    вызывающему — публикации итога, которая по ним называет объекты в короткой
+    сводке владельцу. Строка остаётся строкой (её режет чанкер, ищет маркеры,
+    сравнивает тесты), а `getattr(md, "data", None)` даёт факты тому, кто про
+    них знает. `None` в `data` — законное состояние: отчёт старого формата,
+    собранный не структурным путём (см. `_parse_verify_totals` ниже — он для
+    таких и остался).
+
+    Без `__slots__`: у подтипов str (переменная длина) Python их не
+    поддерживает — атрибут живёт в обычном `__dict__`."""
+
+    def __new__(cls, text: str, data=None):
+        out = super().__new__(cls, text)
+        out.data = data
+        return out
+
+
 def _verified_auto_execute_report(manifest_id: str, tool: str,
-                                  exec_output: str) -> Tuple[str, str]:
+                                  exec_output: str,
+                                  manifest: Optional[Dict] = None
+                                  ) -> Tuple[str, str]:
     """Возвращает (полный_markdown_отчёта, verdict).
 
     verdict ∈ {"ok", "partial", "mismatch", "failed", "unverified"} — см.
     блок-комментарий выше. Ничего не обрезает: длину теперь держит чанкинг в
     tg_approval (`send_message_chunked`), а не молчаливое обрезание отчёта по
-    4096."""
+    4096.
+
+    С 1.3.1 (2026-08-09) перепроверка берётся СТРУКТУРОЙ
+    (`_build_operation_report_data`), а не только текстом: по ней вердикт
+    понижается при расхождении плана и факта (операции, не пошедшие в
+    исполнение, дают все-«ok» журнальные строки при потерянной трети плана), и
+    по ней же короткая сводка в личку называет объекты поимённо. Текстовый
+    путь (`_build_operation_report` + `_parse_verify_totals`) НЕ удалён и
+    остаётся рабочим для отчётов, собранных старым кодом, — и сохраняет
+    правило «не распознал → не подтверждено».
+
+    `manifest` — исполненный план (см. `try_auto_execute`): из него берётся
+    перечень невошедшего в план, если исполнитель не успел записать его в
+    журнал (ранний отказ до мутаций)."""
     exec_output = exec_output or ""
 
     # 1. Независимая перепроверка. Сама `_build_operation_report` ловит свои
@@ -760,16 +802,45 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
     #    «рассказать, что получилось».
     independent: Optional[str] = None
     independent_err: Optional[str] = None
+    data = None
     try:
-        independent = _build_operation_report(manifest_id)
+        data = _build_operation_report_data(manifest_id)
+        # Пустая структура — это НЕ «отчёт без данных», а «настоящей
+        # перепроверки не было» (журнала нет, живое состояние не прочиталось)
+        # ЛИБО отчёт собран не этим путём (подменённый в тестах и у старых
+        # вызывающих `_build_operation_report`). В обоих случаях идём прежней
+        # дорогой — через текст и его разбор.
+        if data is not None and data.usable:
+            independent = data.text
+        else:
+            data = None
+            independent = _build_operation_report(manifest_id)
     except Exception as e:
+        data = None
         independent_err = _redact_for_user(e)
         logger.exception(f"TG auto-execute: независимая перепроверка "
                      f"{manifest_id} упала: {e}")
 
+    # Невошедшее в план мог не успеть записать никто: ранний отказ агрегатора
+    # («сервер не готов», «живое состояние недоступно») случается ДО мутаций,
+    # журнальной записи по нему может не быть. План при этом уже погашен, и
+    # перечень живёт только в нём — достаём оттуда, это те же данные, что
+    # клал `manual_triage` на этапе плана, а не разбор текста.
+    from_manifest = list(((manifest or {}).get("extra") or {})
+                         .get("not_planned") or [])
+    # Список для случая «структуры нет вовсе»: тогда раздел печатается прямо
+    # здесь, а не приходит из отчёта.
+    orphan_not_planned: List[Dict] = []
+    if from_manifest:
+        if data is None:
+            orphan_not_planned = from_manifest
+        elif not data.not_planned:
+            data = data._replace(not_planned=from_manifest, drift=True)
+
     report_usable = bool(independent) and not any(
         mark in independent for mark in _REPORT_UNUSABLE_MARKERS)
-    totals = _parse_verify_totals(independent) if report_usable else None
+    totals = (data.totals if data is not None else
+              (_parse_verify_totals(independent) if report_usable else None))
 
     # 2. Явный провал по самоотчёту исполнителя перебивает всё: если он сам
     #    написал «🛑 / Ошибка / НЕ удалено» и при этом НИ ОДНОГО ✅ — это
@@ -824,6 +895,16 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
         # ничего).
         if verdict == "ok" and (exec_warn or report_doubt):
             verdict = "partial"
+        # РАСХОЖДЕНИЕ ПЛАНА И ФАКТА ПОНИЖАЕТ «ok» (1.3.1, 2026-08-09). Журнал
+        # знает только про исполненное: если из четырнадцати объектов до
+        # мутации доехали одиннадцать, все одиннадцать строк «ok» — и владелец
+        # получал зелёное «✅ подтверждено живым чтением» на плане, треть
+        # которого потерялась молча. Структура отчёта знает про обе рубрики
+        # невыполненного и про строки с признаком дрейфа, поэтому понижение
+        # берётся ИЗ НЕЁ, а не из пересчёта текста.
+        if verdict == "ok" and ((data is not None and data.drift)
+                                or orphan_not_planned):
+            verdict = "partial"
         if verdict == "unverified" and totals is None and self_proves_ok:
             # Журналу нечем подтвердить (нет записи для этого класса
             # тулов/недоступен/формат не распознан), но сам исполнитель уже
@@ -867,6 +948,23 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
             basis += (" В отчёте есть формулировки «не подтверждено» вне "
                       "счётчиков — по ним исход не доказан, поэтому вердикт "
                       "понижен.")
+        n_skipped = len(data.skipped) if data is not None else 0
+        n_not_planned = (len(data.not_planned) if data is not None
+                         else len(orphan_not_planned))
+        if n_skipped or n_not_planned:
+            # Числа названы отдельно от счётчиков перепроверки намеренно: те
+            # считают ИСПОЛНЕННОЕ, эти — не исполнявшееся. Сложить их в одно
+            # «объектов» значит снова спрятать разницу между «согласился и не
+            # сделалось» и «не согласовывалось».
+            parts = []
+            if n_skipped:
+                parts.append(f"⏭ {n_skipped} пропущено (подтверждали, но "
+                             "сдрейфовало между «да» и мутацией)")
+            if n_not_planned:
+                parts.append(f"❌ {n_not_planned} не вошло в план "
+                             "(подтверждения по ним не было)")
+            basis += (" Плюс к этому НЕ исполнялось: " + "; ".join(parts)
+                      + " — перечень поимённо в разделах ниже.")
     elif not report_usable:
         basis = ("Основание вердикта: независимую перепроверку выполнить НЕ "
                  "удалось (журнал/живое состояние недоступны), и собственный "
@@ -882,7 +980,7 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
         basis = ("Основание вердикта: исполнитель сам отрапортовал провал "
                  "(в его отчёте есть маркер ошибки и ни одного ✅). " + basis)
 
-    full_md = "\n".join([
+    parts_md = [
         f"### {_VERDICT_EMOJI.get(verdict, '❓')} Автоисполнение «{tool}» — "
         f"{_VERDICT_WORD.get(verdict, verdict)}",
         f"_manifest: `{manifest_id}`_",
@@ -892,9 +990,19 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
         "",
         "#### Независимая перепроверка (живое чтение)",
         independent_block.strip(),
-        "",
-        basis,
-    ])
+    ]
+    # Раздел «не вошло в план» ПРИ ОТСУТСТВИИ СТРУКТУРЫ отчёта: когда она
+    # есть, обе рубрики уже напечатаны внутри независимого отчёта (там их
+    # источник — журнал), и второй раз их печатать незачем. А когда журнала
+    # для этой операции нет вовсе (ранний отказ до мутаций), единственный
+    # носитель перечня — сам план, и промолчать про него нельзя.
+    if orphan_not_planned:
+        parts_md += ["", "#### ❌ Не вошло в план — сверка НА ЭТАПЕ ПЛАНА, "
+                     "подтверждения по ним не было"]
+        parts_md += _capped_lines(orphan_not_planned, _triage_not_planned_line,
+                                  what="невошедших")
+    parts_md += ["", basis]
+    full_md = "\n".join(parts_md)
     # РАЗВЕДЕНИЕ КАНАЛОВ (2026-08-06, fix/agent-tail-in-verify-report, тот же
     # принцип, что у `agent_tail` в `_maybe_tg_notify_plan`). `full_md` уходит
     # ТОЛЬКО в Telegram (`_publish_auto_execute_outcome` → post_report_to_group
@@ -908,7 +1016,15 @@ def _verified_auto_execute_report(manifest_id: str, tool: str,
     # `full_md`, а не только `independent_block`, — так же ловится случайная
     # инструкция, просочившаяся через `exec_self` (самоотчёт исполнителя).
     full_md = tg_approval.strip_agent_instructions(full_md)
-    return full_md, verdict
+    # Структура едет РЯДОМ с текстом (см. `_ReportMarkdown`): короткая сводка
+    # в личку называет объекты по ней, а не разбором этого же markdown.
+    if orphan_not_planned and data is None:
+        # Настоящей перепроверки не было (журнала для этой операции нет), но
+        # перечень невошедшего есть и он обязан доехать до сводки: структура
+        # с пустыми вердиктами и честным `usable=False`.
+        data = _ReportData(manifest_id, full_md, [], (0, 0, 0), "❓", [],
+                           orphan_not_planned, True, False)
+    return _ReportMarkdown(full_md, data), verdict
 
 
 def _manifest_affected_count(m: Optional[Dict]) -> Optional[int]:
@@ -950,13 +1066,56 @@ def _manifest_affected_count(m: Optional[Dict]) -> Optional[int]:
     return None
 
 
+_SUMMARY_NAME_CAP = 3        # сколько имён подтверждённого показывать
+_SUMMARY_FAILURE_CAP = 10    # сколько непрошедшего/непошедшего показывать
+
+
+def _summary_object_name(rec) -> str:
+    """Как объект зовётся в короткой сводке. Для вердикта отчёта —
+    отображаемое имя, посчитанное при сверке; для справочной записи о
+    непошедшем — её собственное название или заменитель.
+
+    Ни в одном случае имя не выковыривается из готовой строки отчёта: там оно
+    уже склеено с эмодзи, статусом и причиной, а разбор собственного текста —
+    ровно тот способ, которым подделывают вердикт (см.
+    tests/test_verify_totals_antiforgery.py)."""
+    if isinstance(rec, dict):
+        name = str(rec.get("label") or rec.get("title") or "").strip()
+        tid = str(rec.get("task_id") or "")
+        return name or (f"[task {tid[:8]}…]" if tid else "(без названия)")
+    return str(getattr(rec, "display_name", "") or "").strip() or "(без названия)"
+
+
+def _summary_named_line(head: str, items: List, cap: int,
+                        with_reason: bool = False) -> str:
+    """Строка сводки «что за объекты», с ЧЕСТНЫМ усечением.
+
+    Семь удалений подряд обязаны отличаться от одного, повторённого семь раз, —
+    поэтому объекты называются даже при полном успехе, а не только при
+    провале."""
+    shown = list(items[:cap])
+    parts = []
+    for it in shown:
+        name = _summary_object_name(it)
+        if with_reason:
+            reason = (str(it.get("why") or "").strip() if isinstance(it, dict)
+                      else str(getattr(it, "reason", "") or "").strip())
+            parts.append(f"«{name}» — {reason}" if reason else f"«{name}»")
+        else:
+            parts.append(f"«{name}»")
+    tail = (f" … показаны {len(shown)} из {len(items)}"
+            if len(items) > len(shown) else "")
+    return f"{head}: " + "; ".join(parts) + tail
+
+
 def _short_auto_execute_summary(tool: str, verdict: str,
                                 affected: Optional[int],
                                 group_delivered: bool,
                                 fallback_to_dm: bool = False,
                                 partial: Optional[Tuple[int, int]] = None,
                                 totals: Optional[Tuple[int, int, int]] = None,
-                                group_configured: bool = True) -> str:
+                                group_configured: bool = True,
+                                data=None) -> str:
     """2-4 строки в ЛИЧКУ владельца. Максим просил не захламлять личный чат
     1:1 простынями — подробности живут в группе «MCP Отчёты», сюда идёт
     только вердикт. Если в группу отчёт НЕ доставился, сводка обязана сказать
@@ -1001,6 +1160,30 @@ def _short_auto_execute_summary(tool: str, verdict: str,
                          f"перепроверкой: {totals[0]}.")
         else:
             lines.append(f"Объектов в плане: {affected}.")
+    # ЧТО ИМЕННО (1.3.1, 2026-08-09). До этой правки сводка сообщала об
+    # исходе ЧИСЛОМ: «Объектов в плане: 14. Подтверждено перепроверкой: 11».
+    # Какие три и почему — выяснялось четырьмя дополнительными запросами, а
+    # семь удалений подряд выглядели ровно как одно, повторённое семь раз.
+    # Теперь объект называется всегда, в том числе при полном успехе, и
+    # каждая рубрика невыполненного — своей строкой со своей причиной.
+    if data is not None:
+        confirmed = [v for v in data.verdicts if v.status == "ok"]
+        unconfirmed = [v for v in data.verdicts if v.status != "ok"]
+        if confirmed:
+            lines.append(_summary_named_line("✅ Подтверждено", confirmed,
+                                             _SUMMARY_NAME_CAP))
+        if unconfirmed:
+            lines.append(_summary_named_line("❌ Не подтверждено", unconfirmed,
+                                             _SUMMARY_FAILURE_CAP,
+                                             with_reason=True))
+        if data.skipped:
+            lines.append(_summary_named_line(
+                "⏭ Пропущено (подтверждали, сдрейфовало)", data.skipped,
+                _SUMMARY_FAILURE_CAP, with_reason=True))
+        if data.not_planned:
+            lines.append(_summary_named_line(
+                "❌ Не вошло в план (не подтверждалось)", data.not_planned,
+                _SUMMARY_FAILURE_CAP, with_reason=True))
     if partial is not None:
         got, total = partial
         lines.append(f"⚠️ отчёт доставлен в группу частично ({got} из {total} "
@@ -1157,11 +1340,19 @@ def _publish_auto_execute_outcome(candidate: Dict, tool: str, full_md: str,
     # неё единственный вызывающий, и раздувать её возврат ради одной строки
     # короткой сводки — лишнее): `_parse_verify_totals` уже по конструкции
     # безопасна (None на любую неоднозначность), так что риска путаницы нет.
-    totals = _parse_verify_totals(full_md)
+    #
+    # 1.3.1 (2026-08-09): структура отчёта, если она есть, едет ВМЕСТЕ с
+    # текстом (`_ReportMarkdown`) — из неё сводка берёт имена объектов и обе
+    # рубрики невыполненного. Счётчики при этом по-прежнему могут прийти
+    # разбором текста: у отчёта старого формата структуры нет, и терять
+    # числа из-за этого незачем.
+    data = getattr(full_md, "data", None)
+    totals = data.totals if data is not None else _parse_verify_totals(full_md)
     short_md = _short_auto_execute_summary(tool, verdict, affected,
                                            bool(delivery.ok), fallback_ok,
                                            partial, totals,
-                                           group_configured=group_configured)
+                                           group_configured=group_configured,
+                                           data=data)
     summary_ok = False
     try:
         summary_ok = bool(tg_approval.summarize_in_owner_chat(
@@ -1674,8 +1865,14 @@ async def _tg_auto_execute_tick() -> None:
             # значит зависший /health и заткнувшиеся MCP-сессии. Уносим их в
             # поток тем же `_run_blocking`, которым пользуются все остальные
             # блокирующие вызовы этого файла.
+            #
+            # `consumed` (исполненный план) передаётся четвёртым аргументом с
+            # 1.3.1: в нём лежит перечень невошедшего в план, и это
+            # единственный его носитель, когда исполнение отказалось ДО
+            # мутаций и журнальной записи не появилось вовсе.
             full_md, verdict = await _run_blocking(
-                _verified_auto_execute_report, mid, tool, report_text)
+                _verified_auto_execute_report, mid, tool, report_text,
+                consumed)
             # Надгробие манифеста — по ФАКТУ ИСХОДА, а не по факту нажатия
             # (вклад ветки silent-failures: до неё «исполнено» писалось при
             # ЗАХВАТЕ, и провалившаяся операция потом читалась как успех).
