@@ -34,6 +34,10 @@ import re
 import pytest
 
 import ticktick_mcp.src.server as s
+# Автоуборка вынесена за пределы пакета (attic/declutter_disabled.py,
+# пункт 1.2.4 захода 1, 2026-08-09) — загрузчик возвращает её определения
+# в пространство имён `s`, где их ищут тесты ниже. См. tests/attic_loader.py.
+from tests import attic_loader as _attic  # noqa: F401
 import ticktick_mcp.src.tg_approval as tg
 # Таблица гейтованных тулов живёт в соседнем файле и УЖЕ сверяется с кодом
 # (test_the_table_covers_every_gated_tool_in_the_code разбирает server.py и
@@ -431,8 +435,14 @@ def _plan_sites():
     сетевую часть в поток сам, одинаково для всех гейтованных тулов. Разбор
     формы 2 оставлен намеренно — как страховка на случай, если кто-то снова
     начнёт заказывать поток снаружи, — а не потому, что она где-то есть."""
-    src = pathlib.Path(s.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(src)
+    # Разнос главного файла (1.2.4 захода 1, 2026-08-09) развёл места сборки
+    # планов по трём файлам: часть осталась в server.py, гейт уехал в
+    # consent.py, автоуборка — в attic/declutter_disabled.py. Пока тест читал
+    # ОДИН server.py, он переставал видеть уехавшие точки и тихо сужал
+    # проверку до остатка. Теперь обходится ВЕСЬ пакет плюс attic/.
+    root = pathlib.Path(s.__file__).resolve().parents[2]
+    sources = sorted((root / "ticktick_mcp" / "src").glob("*.py"))
+    sources += sorted((root / "attic").glob("*.py"))
     const_tools, dynamic_in = set(), set()
 
     def _account(args, fn_name):
@@ -444,19 +454,21 @@ def _plan_sites():
         else:
             dynamic_in.add(fn_name)
 
-    for fn in ast.walk(tree):
-        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for node in ast.walk(fn):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+    for path in sources:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            if node.func.id == "_maybe_tg_notify_plan":
-                _account(node.args, fn.name)
-            elif (node.func.id == "_run_blocking" and node.args
-                  and isinstance(node.args[0], ast.Name)
-                  and node.args[0].id == "_maybe_tg_notify_plan"):
-                # `_run_blocking(fn, *args)` — имя тула здесь ВТОРОЙ аргумент.
-                _account(node.args[1:], fn.name)
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                    continue
+                if node.func.id == "_maybe_tg_notify_plan":
+                    _account(node.args, fn.name)
+                elif (node.func.id == "_run_blocking" and node.args
+                      and isinstance(node.args[0], ast.Name)
+                      and node.args[0].id == "_maybe_tg_notify_plan"):
+                    # `_run_blocking(fn, *args)` — имя тула здесь ВТОРОЙ аргумент.
+                    _account(node.args[1:], fn.name)
     return const_tools, dynamic_in
 
 
