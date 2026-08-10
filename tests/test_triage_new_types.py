@@ -1,0 +1,238 @@
+"""Новые типы операций агрегатора — по одному сквозному тесту на тип (1.3.3).
+
+Требование ТЗ 1.3.3, пункт 4 приёмки, дословно: «Каждый проверяет исход
+ЧТЕНИЕМ ЖИВОГО СОСТОЯНИЯ, а не текстом ответа». Поэтому здесь нет ни одной
+проверки вида «в ответе есть ✅»: живое состояние — обычный dict, который
+фейковые клиенты честно мутируют, и утверждения делаются про НЕГО. Текст
+ответа проверяется отдельно и только там, где сам текст и есть предмет
+требования (например запрет ветки «тип не проверяется автоматически»).
+
+Стенд общий для всех типов и повторяет настоящие каналы в том, что важно:
+v2 отвечает 200 с отказами ВНУТРИ тела, привязка/теги/статусы реально
+проставляются в живом состоянии, корзина — отдельная лента.
+"""
+import re
+
+import pytest
+
+import ticktick_mcp.src.server as s
+
+
+@pytest.fixture(autouse=True)
+def _isolate_manifests():
+    before = dict(s._MANIFESTS)
+    tombs = dict(s._MANIFEST_TOMBSTONES)
+    s._MANIFESTS.clear()
+    s._MANIFEST_TOMBSTONES.clear()
+    yield
+    s._MANIFESTS.clear()
+    s._MANIFESTS.update(before)
+    s._MANIFEST_TOMBSTONES.clear()
+    s._MANIFEST_TOMBSTONES.update(tombs)
+
+
+def _mid(preview: str) -> str:
+    m = re.search(r"Манифест `([0-9a-f]+)`", preview)
+    assert m, f"в превью нет id манифеста:\n{preview}"
+    return m.group(1)
+
+
+_NAMES = {"p_in": "Входящие", "p_work": "Работа"}
+
+
+class _FakeV2:
+    """Двойник v2-клиента. Каждый метод РЕАЛЬНО меняет живое состояние —
+    иначе независимая сверка агрегатора судила бы по пустоте и любой тест
+    проходил бы на неработающем коде."""
+
+    def __init__(self, live, trash=None, tags=None):
+        self.live = live
+        self.trash = trash if trash is not None else {}
+        self.account_tags = list(tags or [])
+        self.calls = []
+
+    def invalidate_cache(self):
+        pass
+
+    def get_open_tasks(self):
+        return list(self.live.values())
+
+    # ---- родитель ----
+    def set_task_parents(self, rows):
+        self.calls.append(("parent", [r["taskId"] for r in rows],
+                           rows[0]["parentId"] if rows else None))
+        for r in rows:
+            if r["taskId"] in self.live:
+                self.live[r["taskId"]]["parentId"] = r["parentId"]
+        return {}
+
+    def unset_task_parent(self, task_id, parent_id, project_id):
+        self.calls.append(("unparent", task_id, parent_id))
+        if task_id in self.live:
+            self.live[task_id].pop("parentId", None)
+        return {}
+
+    # ---- прочее ----
+    def batch_update_tasks(self, changes):
+        self.calls.append(("update", [c["taskId"] for c in changes]))
+        for c in changes:
+            t = self.live.setdefault(c["taskId"], {"id": c["taskId"]})
+            for k, v in c.items():
+                if k != "taskId":
+                    t[k] = v
+        return {}
+
+    def batch_complete_tasks(self, ids):
+        self.calls.append(("complete", list(ids)))
+        for tid in ids:
+            self.live.pop(tid, None)
+        return {}
+
+    def batch_delete_tasks(self, rows):
+        self.calls.append(("delete", [r["taskId"] for r in rows]))
+        for r in rows:
+            self.live.pop(r["taskId"], None)
+        return {}
+
+
+def _wire(monkeypatch, live, tmp_path, names=None, trash=None, tags=None):
+    monkeypatch.setattr(s, "_ensure_ready", lambda: None)
+    monkeypatch.setattr(s, "_ensure_official", lambda: None)
+    monkeypatch.setattr(s, "_open_by_id", lambda fresh=False: dict(live))
+    monkeypatch.setattr(s, "_v2_project_names", lambda: dict(names or _NAMES))
+    monkeypatch.setattr(s, "_JOURNAL_DIR", str(tmp_path))
+    v2 = _FakeV2(live, trash=trash, tags=tags)
+    monkeypatch.setattr(s, "ticktick_v2", v2)
+    return v2
+
+
+async def _run(ops, summary="Разбираю"):
+    """call #1 → call #2 одним помощником: предмет каждого теста — исход, а
+    не механика гейта (она закреплена в tests/test_manual_triage.py)."""
+    preview = await s.manual_triage(summary, ops)
+    assert "🛑" not in preview.splitlines()[0], preview
+    out = await s.manual_triage(summary, manifest_id=_mid(preview),
+                                user_reply="да, давай")
+    return preview, out
+
+
+# ═══════════════════════════════ parent ════════════════════════════════════
+
+async def test_parent_attaches_and_verifies(monkeypatch, tmp_path):
+    """Вложение существующей задачи под существующего родителя: судим по
+    ЖИВОМУ `parentId`, а не по строке отчёта."""
+    live = {
+        "kid": {"id": "kid", "title": "Позвонить в банк", "projectId": "p_in"},
+        "par": {"id": "par", "title": "Ипотека", "projectId": "p_in"},
+        "zz": {"id": "zz", "title": "Посторонняя", "projectId": "p_in"},
+    }
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    preview, out = await _run([
+        {"op": "parent", "task_id": "kid", "title": "Позвонить в банк",
+         "to_task_id": "par", "to_title": "Ипотека",
+         "said": "это часть ипотеки"}])
+
+    assert live["kid"]["parentId"] == "par"
+    assert "parentId" not in live["zz"], "чужая задача не тронута"
+    assert ("parent", ["kid"], "par") in v2.calls
+    # Превью называет родителя ЖИВЫМ ИМЕНЕМ, а не голым id.
+    assert "«Ипотека»" in preview and "par" not in _plan_lines(preview)[0]
+    assert "✅ Выполнено 1 из 1" in out
+
+
+async def test_parent_under_a_dead_parent_never_reaches_the_plan(
+        monkeypatch, tmp_path):
+    """Родитель мёртв → строка не входит в план вовсе: «вложение под мёртвого
+    родителя осиротит задачу»."""
+    live = {"kid": {"id": "kid", "title": "Позвонить в банк",
+                    "projectId": "p_in"}}
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "parent", "task_id": "kid", "title": "Позвонить в банк",
+         "to_task_id": "ghost", "to_title": "Ипотека", "said": "часть ипотеки"}])
+
+    assert "🛑" in out and "осиротит" in out
+    assert v2.calls == []
+    assert "parentId" not in live["kid"]
+
+
+async def test_parent_across_projects_never_reaches_the_plan(
+        monkeypatch, tmp_path):
+    """TickTick не вкладывает через проекты. Раньше такая строка дошла бы до
+    исполнителя и вернулась отказом уже ПОСЛЕ «да»."""
+    live = {
+        "kid": {"id": "kid", "title": "Позвонить в банк", "projectId": "p_in"},
+        "par": {"id": "par", "title": "Ипотека", "projectId": "p_work"},
+    }
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "parent", "task_id": "kid", "title": "Позвонить в банк",
+         "to_task_id": "par", "to_title": "Ипотека", "said": "часть ипотеки"}])
+
+    assert "🛑" in out and "через проекты" in out
+    assert v2.calls == [] and "parentId" not in live["kid"]
+
+
+async def test_parent_cycle_never_reaches_the_plan(monkeypatch, tmp_path):
+    """Вложить задачу под собственного потомка — порвать дерево."""
+    live = {
+        "top": {"id": "top", "title": "Ипотека", "projectId": "p_in"},
+        "kid": {"id": "kid", "title": "Позвонить в банк", "projectId": "p_in",
+                "parentId": "top"},
+    }
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "parent", "task_id": "top", "title": "Ипотека",
+         "to_task_id": "kid", "to_title": "Позвонить в банк",
+         "said": "вложи наоборот"}])
+
+    assert "🛑" in out and "цикл" in out
+    assert v2.calls == [] and live["top"].get("parentId") is None
+
+
+async def test_parent_without_parent_title_is_refused_outright(
+        monkeypatch, tmp_path):
+    """`to_task_id` без `to_title` — id, не подтверждённый ничем: задача уехала
+    бы под тот объект, на который id указывает СЕЙЧАС."""
+    live = {
+        "kid": {"id": "kid", "title": "Позвонить в банк", "projectId": "p_in"},
+        "par": {"id": "par", "title": "Ипотека", "projectId": "p_in"},
+    }
+    v2 = _wire(monkeypatch, live, tmp_path)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "parent", "task_id": "kid", "title": "Позвонить в банк",
+         "to_task_id": "par", "said": "часть ипотеки"}])
+
+    assert "🛑" in out and "to_title" in out
+    assert s._MANIFESTS == {}, "отказ не имеет права строить план"
+    assert v2.calls == []
+
+
+async def test_parent_renamed_between_plan_and_yes_is_skipped(
+        monkeypatch, tmp_path):
+    """Дрейф РОДИТЕЛЯ между планом и «да» — операция не исполняется."""
+    live = {
+        "kid": {"id": "kid", "title": "Позвонить в банк", "projectId": "p_in"},
+        "par": {"id": "par", "title": "Ипотека", "projectId": "p_in"},
+    }
+    v2 = _wire(monkeypatch, live, tmp_path)
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "parent", "task_id": "kid", "title": "Позвонить в банк",
+         "to_task_id": "par", "to_title": "Ипотека", "said": "часть ипотеки"}])
+
+    live["par"]["title"] = "Ипотека (закрыта)"
+    out = await s.manual_triage("Разбираю", manifest_id=_mid(preview),
+                                user_reply="да")
+
+    assert "parentId" not in live["kid"]
+    assert v2.calls == []
+    assert "переименовали" in out
+
+
+def _plan_lines(preview: str):
+    return [ln for ln in preview.splitlines() if re.match(r"^\d+\. ", ln)]

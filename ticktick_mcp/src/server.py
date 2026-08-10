@@ -14072,6 +14072,13 @@ def _describe_triage_op(op: Dict) -> str:
         # из которой человек не может понять, откуда задача переезжает.
         frm = proj or "неизвестный проект"
         return f"↪ Перенести {title}: «{frm}» → «{to}»{tail}"
+    if kind == "parent":
+        # Имя РОДИТЕЛЯ — живое, прочитанное на фазе плана: голый to_task_id в
+        # позиции имени человек проверить не может (тот же запрет, что и на
+        # id вместо названия задачи).
+        pname = op.get("_parent_label") or op.get("_parent_live_title") \
+            or op.get("to_title") or "?"
+        return f"⤵ Вложить {title}{where} под «{pname}»{tail}"
     if kind == "merge":
         keep_title = op.get("_keep_live_title") or op.get("keep_title") or "?"
         keep_proj = op.get("_keep_project_name") or ""
@@ -14863,6 +14870,180 @@ class _TriageExecCtx(NamedTuple):
     names: Dict
 
 
+# Общий отказ «сюда changes не кладут» (1.3.3, 2026-08-09). Ключ `changes` у
+# типа, который его не применяет, — это не безобидный лишний ключ: он молча
+# не сделался бы, а отчёт при этом сказал бы про операцию «выполнено».
+def _triage_no_changes_refusal(i: int, op: Dict, shown: str,
+                               kind: str, instead: str) -> Optional[str]:
+    if op.get("changes") is None:
+        return None
+    return (f"🛑 Отказ: операция #{i} («{shown}») — у op=\"{kind}\" поля "
+            f"changes нет: оно молча не применилось бы, а отчёт отрапортовал "
+            f"бы «выполнено». {instead} Ничего не сделано.")
+
+
+# ─────────────────────────────── parent ────────────────────────────────────
+
+# Временные метки (`parent_ref`, `ref`, `new_ref`) — отдельное изменение
+# (изм-10): пока разрешать метку нечем, операция с ней не имеет права ни
+# строить план, ни тем более исполняться. Поле ЗАРЕЗЕРВИРОВАНО (валидатор
+# знает его имя и отвечает по существу), а не проигнорировано: молча
+# выброшенный `parent_ref` дал бы «parent без родителя» — отказ, из текста
+# которого нельзя понять, что поле вообще прочитали.
+_TRIAGE_REF_NOT_YET = (
+    "ссылки на объекты, создаваемые этим же планом (parent_ref/ref/new_ref), "
+    "появятся отдельным изменением; пока родитель задаётся живым "
+    "to_task_id + to_title.")
+
+
+def _op_parent_validate(i: int, op: Dict, shown: str) -> Optional[str]:
+    refusal = _triage_no_changes_refusal(
+        i, op, shown, "parent",
+        "Правка полей задачи — это отдельная операция op=\"update\".")
+    if refusal:
+        return refusal
+    to_id = str(op.get("to_task_id") or "").strip()
+    ref = str(op.get("parent_ref") or "").strip()
+    if to_id and ref:
+        return (f"🛑 Отказ: операция #{i} («{shown}») — родитель задан ДВУМЯ "
+                "способами сразу (to_task_id и parent_ref). Это два разных "
+                "утверждения о том, подо что вкладывать, и сервер не выбирает "
+                "за тебя. Ничего не сделано.")
+    if ref and not to_id:
+        return (f"🛑 Отказ: операция #{i} («{shown}») — {_TRIAGE_REF_NOT_YET} "
+                "Ничего не сделано.")
+    if not to_id:
+        return (f"🛑 Отказ: операция #{i} («{shown}») — parent без родителя: "
+                "нужен to_task_id и его точное текущее название to_title "
+                "(либо to_untitled=true, если у родителя названия нет). "
+                "Ничего не сделано.")
+    if to_id == str(op.get("task_id") or "").strip():
+        return (f"🛑 Отказ: операция #{i} («{shown}») — to_task_id совпадает с "
+                "task_id: задача не может быть собственной подзадачей. "
+                "Ничего не сделано.")
+    to_untitled, bad_flag = _triage_untitled_claim(op, "to_untitled")
+    if bad_flag:
+        return (f"🛑 Отказ: операция #{i} (parent) — {bad_flag} "
+                "Ничего не сделано.")
+    to_title = str(op.get("to_title") or "").strip()
+    if to_untitled and to_title:
+        return (f"🛑 Отказ: операция #{i} («{shown}») — одновременно "
+                "to_untitled=true и непустой to_title. Ничего не сделано.")
+    if not to_title and not to_untitled:
+        # Та же дверь, что у `untitled` для самой задачи (Д1, 2026-08-09):
+        # без сверки ИМЕНИ родителя `to_task_id` ничем не подтверждён, и
+        # задача уехала бы под тот объект, на который id указывает СЕЙЧАС.
+        return (f"🛑 Отказ: операция #{i} («{shown}») — parent без to_title "
+                "(точное текущее название родителя). По нему сервер проверяет, "
+                "что to_task_id указывает на ТОГО родителя. Если у родителя "
+                "названия нет — to_untitled=true. Ничего не сделано.")
+    return None
+
+
+def _op_parent_plan(e: Dict, ctx: _TriagePlanCtx) -> str:
+    """Сверка плана для `parent`: родитель обязан быть ЖИВЫМ и названным так
+    же, вложение не должно создать цикл, пробить потолок глубины или
+    развести ребёнка с родителем по разным проектам.
+
+    Всё это повторяет проверки `_set_task_parent_impl` НАМЕРЕННО: там они
+    отвечают отказом уже после «да», а здесь — причиной «не вошло в план», то
+    есть до того, как человек подтвердил заведомо невыполнимую строку."""
+    parent_id = str(e.get("to_task_id") or "").strip()
+    parent_live = ctx.by_id.get(parent_id)
+    if not parent_live:
+        return ("родитель не найден среди открытых задач — вложение под "
+                "мёртвого родителя осиротит задачу")
+    parent_title = parent_live.get("title") or ""
+    if e.get("to_untitled") is True:
+        if not _looks_untitled(parent_title):
+            return ("для родителя стоит to_untitled=true («названия нет»), а "
+                    f"по этому id сейчас «{parent_title}» — это другой объект, "
+                    "чем имели в виду")
+    elif not _names_agree(e.get("to_title") or "", parent_title):
+        return (f"название родителя не совпало — по to_task_id сейчас "
+                f"«{parent_title}», а в плане «{e.get('to_title')}»")
+    # Цикл: подниматься по цепочке предков РОДИТЕЛЯ и встретить саму задачу —
+    # значит вложить её под собственного потомка и порвать дерево.
+    ancestors = set()
+    cur = parent_id
+    while cur and cur not in ancestors:
+        ancestors.add(cur)
+        cur = (ctx.by_id.get(cur) or {}).get("parentId")
+    if e["task_id"] in ancestors:
+        return ("задача не может стать подзадачей самой себя или своего "
+                "потомка (цикл)")
+    parent_pid = parent_live.get("projectId") or ""
+    if e.get("_project_id") and parent_pid and e["_project_id"] != parent_pid:
+        return (f"задача лежит в «{ctx.names.get(e['_project_id'], e['_project_id'])}», "
+                f"а родитель в «{ctx.names.get(parent_pid, parent_pid)}» — "
+                "TickTick не вкладывает через проекты, сначала перенос "
+                "(op=\"move\")")
+    height = _subtree_height(e["task_id"], _children_index(ctx.by_id))
+    resulting = len(ancestors) + height
+    if resulting > MAX_TASK_NEST_LEVELS:
+        extra = (f" (у неё уже есть свои подзадачи на {height - 1} "
+                 "уровень(ей) вниз)" if height > 1 else "")
+        return (f"вложенность глубже {MAX_TASK_NEST_LEVELS} уровней{extra}: "
+                f"получилось бы {resulting}")
+    e["_parent_id"] = parent_id
+    e["_parent_live_title"] = parent_title
+    e["_parent_untitled"] = _looks_untitled(parent_title)
+    e["_parent_label"] = (_untitled_label(parent_live)
+                          if _looks_untitled(parent_title) else parent_title)
+    e["_parent_project_id"] = parent_pid or e.get("_project_id") or ""
+    return ""
+
+
+def _op_parent_drift(op: Dict, by_id: Dict[str, Dict], names: Dict) -> str:
+    parent_id = op.get("_parent_id") or str(op.get("to_task_id") or "").strip()
+    parent_live = by_id.get(parent_id)
+    if not parent_live:
+        return ("родитель исчез из открытых задач между планом и исполнением "
+                "— вложение под мёртвого родителя осиротит задачу")
+    parent_title = parent_live.get("title") or ""
+    if op.get("to_untitled") is True:
+        if not _looks_untitled(parent_title):
+            return ("в плане у родителя «названия нет», а после плана ему дали "
+                    f"название («{parent_title}»)")
+    elif not _names_agree(op.get("to_title") or "", parent_title):
+        return (f"родителя переименовали после плана (сейчас «{parent_title}») "
+                "— НЕ вкладываю")
+    return ""
+
+
+def _op_parent_verify(op: Dict, item: Dict, live_map: Dict[str, Dict],
+                      names: Dict) -> Tuple[str, str]:
+    # Ветка `parent` в `_verify_item` сверяет и САМОГО родителя: `parentId`,
+    # указывающий на задачу вне открытых, судится как осиротение, а не успех.
+    item["expect"] = {"parentId": op.get("_parent_id")
+                      or str(op.get("to_task_id") or "").strip()}
+    return _verify_item("parent", item, live_map, names)
+
+
+async def _op_parent_execute(summary: str, ops: List[Dict],
+                             ctx: _TriageExecCtx) -> List[Tuple[str, str]]:
+    """Партия вложений — по ПАРЕ «родитель, проект»: `_set_task_parent_impl`
+    принимает один parent_task_id и один project_id за вызов и вкладывает под
+    него весь переданный список."""
+    by_parent: Dict[Tuple[str, str], List[Dict]] = {}
+    for o in ops:
+        key = (o.get("_parent_id") or str(o.get("to_task_id") or "").strip(),
+               o.get("_parent_project_id") or o.get("_project_id") or "")
+        by_parent.setdefault(key, []).append(o)
+    out: List[Tuple[str, str]] = []
+    for (parent_id, project_id), group in by_parent.items():
+        pname = group[0].get("_parent_live_title") or group[0].get("to_title") or ""
+        text = await _set_task_parent_impl(
+            summary,
+            [{"taskId": o["task_id"], "title": o.get("title") or "",
+              "projectId": o.get("_project_id") or project_id}
+             for o in group],
+            parent_id, project_id, pname or None)
+        shown = group[0].get("_parent_label") or pname or _short_task_id(parent_id)
+        out.append((f"⤵ Вложение под «{shown}»", text))
+    return out
+
+
 # ─────────────────────────────── update ────────────────────────────────────
 
 def _op_update_validate(i: int, op: Dict, shown: str) -> Optional[str]:
@@ -15160,6 +15341,11 @@ def _triage_registry() -> Tuple[_TriageType, ...]:
     чем её успели поправить."""
     return (
         _TriageType(
+            op="parent", emoji="⤵", verb="вложить",
+            validate=_op_parent_validate, plan=_op_parent_plan,
+            drift=_op_parent_drift, verify=_op_parent_verify,
+            execute=_op_parent_execute),
+        _TriageType(
             op="update", emoji="✏️", verb="изменить",
             validate=_op_update_validate, plan=_op_update_plan,
             drift=_op_update_drift, verify=_op_update_verify,
@@ -15292,7 +15478,8 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
 
     Each element of `operations`:
       {
-        "op":      "delete" | "complete" | "update" | "move" | "merge",
+        "op":      "delete" | "complete" | "update" | "move" | "merge"
+                   | "parent",
         "task_id": "<task id>",                      # required, non-empty
         "title":   "<the task's exact CURRENT title>",  # required — identity guard
         "untitled": true,   # INSTEAD of "title", ONLY for a task that really
@@ -15313,6 +15500,12 @@ async def manual_triage(summary: str, operations: List[Dict[str, Any]] = None,
         "keep_title":   "<its exact current title>",
         "keep_untitled": true   # INSTEAD of "keep_title", same rule as
                                 # "untitled" but for the copy that STAYS
+        # op="parent" only — nest THIS task under an existing one. The parent
+        # must be ALIVE, named exactly as you say and live in the SAME
+        # project (TickTick does not nest across projects — move first):
+        "to_task_id": "<id of the parent task>",
+        "to_title":   "<the parent's exact CURRENT title>",
+        "to_untitled": true   # INSTEAD of "to_title", same rule as "untitled"
       }
 
     `untitled` — the ONLY way to name a task that has no name. Some tasks
