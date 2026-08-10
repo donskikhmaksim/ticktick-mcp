@@ -158,7 +158,19 @@ async def test_find_untitled_tasks_reports_the_same_label_and_category(
     assert "действительно пустых — 0" in out
 
 
-# ═ 3. КОНТРОЛЬ — Н9 отказывает переименовать ИМЕНОВАННУЮ задачу вслепую ═
+# ═ 3. КОНТРОЛЬ — единый вход отказывает переименовать ИМЕНОВАННУЮ задачу
+#      вслепую ═
+#
+# 1.3.4 закрыл прямой `update_tasks` (13 инструментов теперь требуют
+# automation_key даже на плановом вызове) — единственный путь для модели
+# теперь `apply_task_changes`. Смысл теста (Н9: отказ ДО записи) сохранён,
+# но МЕХАНИЗМ другой: агрегатор проверяет «title ИЛИ untitled=true есть у
+# КАЖДОЙ операции» структурно, на входе, в `_validate_triage_ops` — ДО
+# `_open_by_id`, то есть до единого чтения живого состояния. Значит вместо
+# текста `_RENAME_UNARMED_REFUSAL` («НЕТ текущего названия», который печатает
+# `_rename_guard_refusal` внутри `_update_tasks_impl` на исполнении) отказ
+# приходит раньше и другими словами — «пустой title» — и манифест вообще не
+# строится (не только «строка не применена», а «плана не существует»).
 
 async def test_renaming_a_named_task_without_old_title_is_refused_before_write(
         monkeypatch):
@@ -166,52 +178,66 @@ async def test_renaming_a_named_task_without_old_title_is_refused_before_write(
                         "title": "Оплатить аренду"}}
     _wire(monkeypatch, live)
 
-    preview = await s.update_tasks("переименовать", [
-        {"taskId": "t_named", "projectId": "p_inbox",
-         "new_title": "Другое имя"}])
+    out = await s.apply_task_changes("переименовать", [
+        {"op": "update", "task_id": "t_named",
+         "changes": {"new_title": "Другое имя"},
+         "said": "переименуй, забыл как называлась"}])
 
-    assert "🛑" in preview
-    assert "НЕТ текущего названия" in preview
-    # Ничего не записано — отказ случился ДО обращения к TickTick.
+    assert "🛑" in out
+    assert "пустой title" in out
+    # Отказ структурный (Д1, `_validate_triage_ops`) — манифест не создаётся
+    # вовсе, живое состояние даже не читается.
+    assert "Манифест" not in out
     assert live["t_named"]["title"] == "Оплатить аренду"
 
 
-# ═ 4. Безымянная задача — Н9 её из этой сверки ИСКЛЮЧАЕТ (по id) ═
+# ═ 4. РАСХОЖДЕНИЕ С ИСХОДНЫМ ОЖИДАНИЕМ — «молчаливое опознание по id»
+#      (третья ветка `_title_check_armed`, см. докстринг файла выше) через
+#      единый вход БОЛЬШЕ НЕДОСТИЖИМА, даже для ДЕЙСТВИТЕЛЬНО безымянной
+#      задачи ═
 
-async def test_renaming_the_untitled_task_without_old_title_is_allowed_by_id(
+async def test_renaming_the_untitled_task_without_any_claim_is_refused_structurally(
         monkeypatch):
-    """Сверять нечего с обеих сторон (переданное имя пусто, живое тоже пусто)
-    — Н9 признаёт объект опознанным ПО id и переименование проходит штатно,
-    БЕЗ передачи title и БЕЗ маркера untitled=true (автоматический путь,
-    `_title_check_armed`, третья ветка)."""
+    """Раньше (прямой `update_tasks`, теперь закрытый 1.3.4) третья ветка
+    `_title_check_armed` разрешала переименовать ДЕЙСТВИТЕЛЬНО безымянную
+    задачу БЕЗ title и БЕЗ untitled=true — сверять было нечего с обеих
+    сторон (переданное имя пусто, живое тоже пусто).
+
+    Через `apply_task_changes` эта ветка НЕДОСТИЖИМА: `_validate_triage_ops`
+    требует title ИЛИ untitled=true у КАЖДОЙ операции ЧИСТО СТРУКТУРНО —
+    смотрит только на переданные поля, ещё до чтения живого состояния
+    (`if not title and not untitled: return "...пустой title..."`,
+    server.py). Она не знает и не спрашивает, что там на самом деле в
+    TickTick — поэтому отказывает ОДИНАКОВО что для именованной задачи
+    (тест 3 выше), что для по-настоящему безымянной (эта). «Опознание по id,
+    сверять нечего» для единого входа не существует: единственный законный
+    путь переименовать действительно безымянную задачу — явный
+    untitled=true (следующий тест)."""
     live = {"t_receipt": _untitled_receipt()}
-    fake, official = _wire(monkeypatch, live)
+    _wire(monkeypatch, live)
 
-    preview = await s.update_tasks("назвать чек", [
-        {"taskId": "t_receipt", "projectId": "p_inbox",
-         "new_title": "Чек Home Depot — возврат $374.92"}])
-    assert "🛑" not in preview
-    mid = _extract_manifest_id(preview)
+    out = await s.apply_task_changes("назвать чек", [
+        {"op": "update", "task_id": "t_receipt",
+         "changes": {"new_title": "Чек Home Depot — возврат $374.92"},
+         "said": "назови это чеком"}])
 
-    out = await s.update_tasks("назвать чек", manifest_id=mid, user_reply="да")
-
-    assert "🛑" not in out
-    assert live["t_receipt"]["title"] == "Чек Home Depot — возврат $374.92"
-
-    # Согласованность с 1.3.5: та же самая задача, только что переименованная,
-    # больше не безымянная — обзор её не находит.
-    out_scan = await s.find_untitled_tasks()
-    assert "Безымянных задач среди открытых не найдено (найдено: 0)" in out_scan
+    assert "🛑" in out
+    assert "пустой title" in out
+    assert "Манифест" not in out
+    assert live["t_receipt"]["title"] == ""
 
 
-# ═ 5. Тот же переход, но ЯВНЫМ untitled=true — второй предусмотренный путь ═
+# ═ 5. Тот же переход, но ЯВНЫМ untitled=true — ЕДИНСТВЕННЫЙ рабочий путь
+#      через единый вход ═
 
 async def test_legit_rename_via_explicit_untitled_marker_also_drops_out(
         monkeypatch):
-    """docstring `update_tasks`: "If the task GENUINELY has no name ... pass
-    'untitled': true INSTEAD of 'title'". Это ОТДЕЛЬНЫЙ от автоматического
-    by-id-пути механизм (структурный маркер, а не молчаливое совпадение
-    пустот) — и он обязан приводить к тому же результату для 1.3.5."""
+    """docstring `apply_task_changes`: "untitled": true — INSTEAD of "title",
+    ONLY for a task that really has NO title. Раз тест 4 показал, что
+    молчаливого by-id-пути у единого входа больше нет, этот структурный
+    маркер — ЕДИНСТВЕННЫЙ способ legitimately переименовать действительно
+    безымянную задачу, и он обязан приводить к тому же результату для
+    1.3.5 (find_untitled_tasks больше её не находит)."""
     live = {"t_screenshot": {"id": "t_screenshot", "projectId": "p_inbox",
                              "title": "", "content": "",
                              "attachments": [{"fileName": "defect.png",
@@ -221,13 +247,14 @@ async def test_legit_rename_via_explicit_untitled_marker_also_drops_out(
     before = await s.find_untitled_tasks()
     assert "Безымянных задач найдено: 1" in before
 
-    preview = await s.update_tasks("назвать скриншот", [
-        {"taskId": "t_screenshot", "projectId": "p_inbox", "untitled": True,
-         "new_title": "Скриншот дефекта — баг #482"}])
+    preview = await s.apply_task_changes("назвать скриншот", [
+        {"op": "update", "task_id": "t_screenshot", "untitled": True,
+         "changes": {"new_title": "Скриншот дефекта — баг #482"},
+         "said": "назови это скриншотом бага"}])
     assert "🛑" not in preview
     mid = _extract_manifest_id(preview)
-    out = await s.update_tasks("назвать скриншот", manifest_id=mid,
-                               user_reply="да")
+    out = await s.apply_task_changes("назвать скриншот", manifest_id=mid,
+                                     user_reply="да")
 
     assert "🛑" not in out
     assert live["t_screenshot"]["title"] == "Скриншот дефекта — баг #482"
@@ -256,13 +283,18 @@ async def test_full_cycle_find_show_rename_delete_stays_consistent(
     assert "(без названия: 📎 1 файл)" in shown
     assert s._untitled_label(live["t_receipt"]) in scan_before
 
-    # 3) ПЕРЕИМЕНОВАНИЕ — маркером untitled=true (Н9/1.1.1), без старого title
-    preview = await s.update_tasks("назвать", [
-        {"taskId": "t_receipt", "projectId": "p_inbox", "untitled": True,
-         "new_title": "Чек Home Depot"}])
+    # 3) ПЕРЕИМЕНОВАНИЕ — через единый вход apply_task_changes (1.3.4 закрыл
+    # прямой update_tasks), маркером untitled=true (Н9/1.1.1), без старого
+    # title. Это ЕДИНСТВЕННЫЙ рабочий путь для безымянной задачи через
+    # агрегатор — см. тесты 3/4/5 выше, молчаливое опознание по id там не
+    # проходит структурную сверку `_validate_triage_ops`.
+    preview = await s.apply_task_changes("назвать", [
+        {"op": "update", "task_id": "t_receipt", "untitled": True,
+         "changes": {"new_title": "Чек Home Depot"},
+         "said": "назови это чеком Home Depot"}])
     assert "🛑" not in preview
     mid = _extract_manifest_id(preview)
-    await s.update_tasks("назвать", manifest_id=mid, user_reply="да")
+    await s.apply_task_changes("назвать", manifest_id=mid, user_reply="да")
     assert live["t_receipt"]["title"] == "Чек Home Depot"
 
     # 4) Обзор 1.3.5 теперь честно не находит её — она больше не безымянная
