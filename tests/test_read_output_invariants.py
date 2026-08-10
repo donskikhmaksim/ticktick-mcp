@@ -150,6 +150,13 @@ CASES = {
                                 "tasks": [{"task_id": TASK_ROOT,
                                            "title": "Собрать отчёт"}]},
                                note="READONLY по аннотации: строит план, ничего не пишет"),
+    # header=None/item=None: на стенде TASKS ни одна задача не безымянна —
+    # ИНВ-1/2/4 (заголовок==телу, id годен дальше, усечение объявлено) здесь
+    # проверять нечем, тот же случай, что у get_recurring_tasks выше.
+    # П15 п.4 (1.3.5, 2026-08-09): count-разбивку и постраничность отдельно
+    # покрывает tests/test_find_untitled.py — там же обе ловушки задания.
+    "find_untitled_tasks": Case({}, None, None,
+                                note="на стенде безымянных задач нет — предмет ИНВ-5"),
 }
 
 _LIST_CASES = [n for n, c in CASES.items() if c.header]
