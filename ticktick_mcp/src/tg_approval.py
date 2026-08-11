@@ -1303,7 +1303,11 @@ _CALLBACK_DATA_RE = re.compile(r"^([ar]):(.+)$")
 # 2026-08-10) — отдельный, НЕ пересекающийся префикс: `_CALLBACK_DATA_RE`
 # матчит РОВНО один символ группы 1 (`a`/`r`), "ak" под неё не подходит, так
 # что два набора кнопок не могут случайно перепутаться в разборе.
-_AK_CALLBACK_RE = re.compile(r"^ak:(show|off|status)$")
+# window_id — `secrets.token_hex(6)` (automation_key.py) = 12 hex-символов,
+# отсюда `[0-9a-fA-F]+` у "revoke:<id>" (не жадный "любой символ" — id не
+# несёт ничего, кроме hex, лишнее в callback_data просто не смэтчится и
+# кнопка тихо не сработает, а не откроет что-то по чужому id).
+_AK_CALLBACK_RE = re.compile(r"^ak:(new|list|offall|revoke:[0-9a-fA-F]+)$")
 _AUTOMATION_KEY_COMMAND = "/automation_key"
 
 
@@ -1397,36 +1401,68 @@ def _handle_callback_query(cfg: TgApprovalConfig, cq: Dict[str, Any]) -> None:
                 {"callback_query_id": cq_id, "text": answer_text})
 
 
-# ───────────────────── /automation_key: команда + меню (2026-08-10) ─────────
-# TZ_temp_automation_key.md §3.2/3.3. Owner-only на ОБОИХ шагах (команда И
-# каждая из трёх кнопок) — та же проверка `from.id == cfg.owner_chat_id`, что
-# уже стоит на approve/reject, никакого нового пути авторизации. Сама
-# генерация/отзыв/статус — в `automation_key.py` (этот файл только вызывает
-# её пять публичных функций и знает, КАК говорить с Telegram; деталей схемы
-# БД временных окон здесь нет — см. докстринг того модуля).
+# ───────────────────── /automation_key: команда + меню (2026-08-10, ─────────
+# ───────────────────── переработано под НЕСКОЛЬКО окон 2026-08-11) ─────────
+# TZ_temp_automation_key.md §3.2/3.3 + TZ_multi_automation_windows.md
+# «Команды в Telegram». Owner-only на ОБОИХ шагах (команда И каждая кнопка) —
+# та же проверка `from.id == cfg.owner_chat_id`, что уже стоит на
+# approve/reject, никакого нового пути авторизации. Сама генерация/отзыв/
+# список — в `automation_key.py` (этот файл только вызывает её публичные
+# функции и знает, КАК говорить с Telegram; деталей схемы БД временных окон
+# здесь нет — см. докстринг того модуля).
+#
+# Раньше `/automation_key` без аргумента открывало МЕНЮ («Показать ключ» /
+# «Выключить» / «Статус») — при одном окне на сервер этого хватало. Теперь
+# окон может быть несколько одновременно, и ТЗ прямо требует: команда БЕЗ
+# аргумента (и кнопка «Новый ключ») сразу генерируют ОЧЕРЕДНОЕ окно, не
+# трогая уже существующие — «Показать» вместо «сгенерировать» больше не
+# нужно различать, различать нужно «какое из окон» (список/отзыв). Четыре
+# точки входа — `_ak_do_generate`/`_ak_do_list`/`_ak_do_revoke`/
+# `_ak_do_offall` — общие для текстовой команды И кнопок, чтобы поведение не
+# разъезжалось между двумя путями.
 _AUTOMATION_KEY_MENU_MARKUP = {"inline_keyboard": [
-    [{"text": "Показать ключ", "callback_data": "ak:show"}],
-    [{"text": "Выключить", "callback_data": "ak:off"}],
-    [{"text": "Статус", "callback_data": "ak:status"}],
+    [{"text": "Новый ключ", "callback_data": "ak:new"}],
+    [{"text": "Список", "callback_data": "ak:list"}],
+    [{"text": "Выключить всё", "callback_data": "ak:offall"}],
 ]}
 
+# Сообщение с СЫРЫМ токеном стоит открытым в чате короче, чем обычные
+# сообщения гейта (`_GATE_MESSAGE_DELETE_DELAY_S` = 60): здесь на экране
+# лежит сам секрет, не план/отчёт, поэтому TZ_multi_automation_windows.md
+# требует именно 10 секунд — передаётся В `schedule_message_delete` явным
+# `delay_s`, дефолт остальных сообщений гейта (60с) этим не меняется.
+_AK_TOKEN_MESSAGE_DELETE_DELAY_S = 10.0
 
-def _handle_automation_key_message(cfg: TgApprovalConfig, msg: Dict[str, Any]) -> None:
-    """Единственное сообщение, на которое этот вебхук реагирует: `/automation_key`
-    от владельца → меню из трёх кнопок. Всё остальное (не команда, не
-    владелец) — тихо игнорируется; это НЕ общий чат-бот, обычное текстовое
-    «да» approval-гейта по-прежнему читает МОДЕЛЬ через MCP-инструмент, а не
-    этот вебхук."""
-    from_id = str((msg.get("from") or {}).get("id") or "")
-    if not from_id or from_id != str(cfg.owner_chat_id):
-        return
-    text = (msg.get("text") or "").strip()
-    # `@bot_username` — форма команды в группах; личка её не шлёт, но
-    # own_bot's owner_chat_id теоретически может быть группой.
-    command = text.split()[0].split("@")[0] if text else ""
-    if command != _AUTOMATION_KEY_COMMAND:
-        return
-    chat_id = str((msg.get("chat") or {}).get("id") or cfg.owner_chat_id)
+
+def _format_windows_list(windows: List[Dict[str, Any]]) -> str:
+    """Текст кнопки/команды «Список» (TZ_multi_automation_windows.md, тест
+    4) — id, когда создано, сколько осталось у КАЖДОГО активного окна. Без
+    токенов и без хэшей — те не восстановимы принципиально (см. `list_
+    windows`'s докстринг)."""
+    if not windows:
+        return "🔑 Активных временных окон нет."
+    lines = [f"🔑 <b>Активные временные окна</b> ({len(windows)}):"]
+    for w in windows:
+        hours_left = w["remaining_s"] / 3600
+        label = f" — {w['label']}" if w.get("label") else ""
+        lines.append(
+            f"• <code>{w['window_id']}</code>{label}: создано "
+            f"{automation_key.format_ms(w['created_at'])}, ещё ~{hours_left:.1f} ч "
+            f"(до {automation_key.format_ms(w['expires_at'])})"
+        )
+    return "\n".join(lines)
+
+
+def _ak_list_markup(windows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Меню + ОТДЕЛЬНАЯ кнопка «Отозвать» на КАЖДОЙ строке списка (TZ:
+    «кнопка на конкретной строке списка» гасит РОВНО это окно, не все)."""
+    rows = [[{"text": f"Отозвать {w['window_id']}",
+             "callback_data": f"ak:revoke:{w['window_id']}"}] for w in windows]
+    rows += _AUTOMATION_KEY_MENU_MARKUP["inline_keyboard"]
+    return {"inline_keyboard": rows}
+
+
+def _ak_send_menu(cfg: TgApprovalConfig, chat_id: str) -> None:
     _tg_call(cfg, "sendMessage", {
         "chat_id": chat_id,
         "text": "🔑 <b>Ключ автоматики</b>\nВыбери действие:",
@@ -1435,66 +1471,138 @@ def _handle_automation_key_message(cfg: TgApprovalConfig, msg: Dict[str, Any]) -
     })
 
 
-def _format_automation_key_status(status: Optional[Dict[str, Any]]) -> str:
-    """Текст кнопки «Статус» — три исхода, дословно различимых (TZ §3.3):
-    окно никогда не выдавалось / активно сейчас / неактивно (истекло или
-    отозвано вручную — тоже различаются)."""
-    if status is None:
-        return "🔑 Статус: временное окно ещё ни разу не выдавалось."
-    if status["active"]:
-        hours_left = status["remaining_s"] / 3600
-        return (f"🔑 Статус: <b>активно</b>, ещё ~{hours_left:.1f} ч "
-               f"(истекает {automation_key.format_ms(status['expires_at'])}).")
-    if status["revoked"]:
-        return (f"🔑 Статус: выключено вручную "
-               f"({automation_key.format_ms(status['revoked_at'])}).")
-    return (f"🔑 Статус: истекло "
-           f"({automation_key.format_ms(status['expires_at'])}).")
+def _ak_do_generate(cfg: TgApprovalConfig, chat_id: str) -> str:
+    """Генерирует ОЧЕРЕДНОЕ окно (не трогая уже существующие активные —
+    `automation_key.generate_window` теперь INSERT, не UPSERT), присылает
+    сырой токен ОТДЕЛЬНЫМ сообщением БЕЗ кнопок (кнопки на сообщении,
+    которое исчезнет через 10 секунд, были бы бесполезны) и ставит его на
+    самоудаление через `_AK_TOKEN_MESSAGE_DELETE_DELAY_S`. Меню для
+    дальнейших действий (Список/Выключить всё) уходит СЛЕДОМ отдельным,
+    НЕ самоудаляемым сообщением. Возвращает текст для `answerCallbackQuery`."""
+    token = automation_key.generate_window(chat_id)
+    if not token:
+        text = ("🛑 Хранилище временных окон не поднято (проверь "
+                "TG_APPROVAL_ENABLED/CONSENT_DATABASE_URL) — ключ не выдан.")
+        _tg_call(cfg, "sendMessage", {"chat_id": chat_id, "text": text,
+                                      "parse_mode": "HTML"})
+        return "Не удалось выдать ключ"
+    hours = automation_key.AUTOMATION_WINDOW_HOURS
+    text = (f"🔑 Временный ключ (действует {hours:g} ч):\n"
+            f"<code>{md_to_telegram_html(token)}</code>\n\n"
+            "Хранится только его хэш — этот текст больше нигде не "
+            "повторится. Передай его автоматике как automation_key. Другие "
+            "уже выданные ключи (в других чатах) это НЕ трогает. Само это "
+            "сообщение исчезнет через 10 секунд.")
+    res = _tg_call(cfg, "sendMessage", {"chat_id": chat_id, "text": text,
+                                        "parse_mode": "HTML"})
+    message_id = (res.get("result") or {}).get("message_id") if res.get("ok") else None
+    schedule_message_delete(chat_id, message_id, delay_s=_AK_TOKEN_MESSAGE_DELETE_DELAY_S)
+    _ak_send_menu(cfg, chat_id)
+    return "Ключ отправлен"
+
+
+def _ak_do_list(cfg: TgApprovalConfig, chat_id: str) -> str:
+    windows = automation_key.list_windows(chat_id)
+    _tg_call(cfg, "sendMessage", {
+        "chat_id": chat_id, "text": _format_windows_list(windows),
+        "parse_mode": "HTML", "reply_markup": _ak_list_markup(windows),
+    })
+    return "Список отправлен"
+
+
+def _ak_do_revoke(cfg: TgApprovalConfig, chat_id: str, window_id: str) -> str:
+    ok = automation_key.revoke_window(window_id, chat_id)
+    text = (f"🔒 Окно <code>{window_id}</code> выключено." if ok else
+            f"Окно <code>{window_id}</code> не найдено или уже неактивно.")
+    _tg_call(cfg, "sendMessage", {"chat_id": chat_id, "text": text,
+                                  "parse_mode": "HTML",
+                                  "reply_markup": _AUTOMATION_KEY_MENU_MARKUP})
+    return "Готово"
+
+
+def _ak_do_offall(cfg: TgApprovalConfig, chat_id: str) -> str:
+    n = automation_key.revoke_all_windows(chat_id)
+    text = (f"🔒 Выключено окон: {n}." if n else "Активных окон и так не было.")
+    _tg_call(cfg, "sendMessage", {"chat_id": chat_id, "text": text,
+                                  "reply_markup": _AUTOMATION_KEY_MENU_MARKUP})
+    return "Готово"
+
+
+# `/automation_key list`, `/automation_key revoke <id>`, `/automation_key off`
+# — тот же самый разбор, что и у кнопок, только текстом. `<id>` — первое
+# слово после `revoke` (window_id не содержит пробелов, см. `secrets.
+# token_hex` в automation_key.py), лишний хвост после него игнорируется.
+_AK_TEXT_ARG_RE = re.compile(r"^(list|off|revoke)(?:\s+(\S+))?$", re.IGNORECASE)
+
+
+def _handle_automation_key_message(cfg: TgApprovalConfig, msg: Dict[str, Any]) -> None:
+    """Единственное сообщение, на которое этот вебхук реагирует:
+    `/automation_key[ list|revoke <id>|off]` от владельца. Всё остальное (не
+    команда, не владелец) — тихо игнорируется; это НЕ общий чат-бот, обычное
+    текстовое «да» approval-гейта по-прежнему читает МОДЕЛЬ через
+    MCP-инструмент, а не этот вебхук."""
+    from_id = str((msg.get("from") or {}).get("id") or "")
+    if not from_id or from_id != str(cfg.owner_chat_id):
+        return
+    text = (msg.get("text") or "").strip()
+    # `@bot_username` — форма команды в группах; личка её не шлёт, но
+    # own_bot's owner_chat_id теоретически может быть группой.
+    parts = text.split(None, 1) if text else []
+    command = parts[0].split("@")[0] if parts else ""
+    if command != _AUTOMATION_KEY_COMMAND:
+        return
+    chat_id = str((msg.get("chat") or {}).get("id") or cfg.owner_chat_id)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    if not arg:
+        _ak_do_generate(cfg, chat_id)
+        return
+    m = _AK_TEXT_ARG_RE.match(arg)
+    if not m:
+        _tg_call(cfg, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "Не понял аргумент. Варианты: /automation_key, "
+                    "/automation_key list, /automation_key revoke <id>, "
+                    "/automation_key off.",
+        })
+        return
+    sub, sub_id = m.group(1).lower(), m.group(2)
+    if sub == "list":
+        _ak_do_list(cfg, chat_id)
+    elif sub == "off":
+        _ak_do_offall(cfg, chat_id)
+    elif sub_id:  # sub == "revoke" — единственное оставшееся значение
+        _ak_do_revoke(cfg, chat_id, sub_id)
+    else:
+        _tg_call(cfg, "sendMessage", {
+            "chat_id": chat_id,
+            "text": "/automation_key revoke требует id окна — возьми его "
+                    "из /automation_key list.",
+        })
 
 
 def _handle_automation_key_callback(cfg: TgApprovalConfig, cq: Dict[str, Any],
                                     action: str) -> None:
-    """Одна из трёх кнопок меню `/automation_key` — owner-only УЖЕ проверен
+    """Одна из кнопок меню `/automation_key` — owner-only УЖЕ проверен
     вызывающим (`_handle_callback_query`), здесь этот вопрос не переспрашиваем
     второй раз (TZ: «никаких новых путей авторизации не изобретать»).
 
-      "show"   — TZ §3.2: новый `secrets.token_urlsafe(32)` → хэш в базу
-                 (`automation_key.generate_window`), СЫРОЙ токен уходит
-                 владельцу ОТДЕЛЬНЫМ сообщением — это единственный момент,
-                 когда он вообще виден в открытом тексте;
-      "off"    — TZ §3.3: гасит активное окно немедленно;
-      "status" — TZ §3.3: активно ли окно сейчас и сколько осталось.
+      "new"          — очередное окно (не трогая существующие), сырой токен
+                       уходит владельцу отдельным самоудаляющимся сообщением;
+      "list"         — все активные окна;
+      "offall"       — гасит ВСЕ активные окна разом;
+      "revoke:<id>"  — гасит ОДНО конкретное окно (кнопка со строки списка).
 
     `answerCallbackQuery` — всегда, тем же принципом, что и у approve/reject."""
     chat_id = str(((cq.get("message") or {}).get("chat") or {}).get("id")
                   or cfg.owner_chat_id)
-    if action == "show":
-        token = automation_key.generate_window(chat_id)
-        if not token:
-            text = ("🛑 Хранилище временных окон не поднято (проверь "
-                    "TG_APPROVAL_ENABLED/CONSENT_DATABASE_URL) — ключ не выдан.")
-            answer = "Не удалось выдать ключ"
-        else:
-            hours = automation_key.AUTOMATION_WINDOW_HOURS
-            text = (f"🔑 Временный ключ (действует {hours:g} ч):\n"
-                    f"<code>{md_to_telegram_html(token)}</code>\n\n"
-                    "Хранится только его хэш — этот текст больше нигде не "
-                    "повторится. Передай его автоматике как automation_key.")
-            answer = "Ключ отправлен"
-        _tg_call(cfg, "sendMessage", {"chat_id": chat_id, "text": text,
-                                      "parse_mode": "HTML"})
-    elif action == "off":
-        was_active = automation_key.revoke_window(chat_id)
-        text = ("🔒 Окно выключено." if was_active else
-                "Активного окна и так не было.")
-        _tg_call(cfg, "sendMessage", {"chat_id": chat_id, "text": text})
-        answer = "Готово"
-    else:  # "status" — единственное оставшееся значение _AK_CALLBACK_RE
-        status = automation_key.window_status(chat_id)
-        _tg_call(cfg, "sendMessage", {
-            "chat_id": chat_id, "text": _format_automation_key_status(status),
-            "parse_mode": "HTML"})
-        answer = "Статус отправлен"
+    if action == "new":
+        answer = _ak_do_generate(cfg, chat_id)
+    elif action == "list":
+        answer = _ak_do_list(cfg, chat_id)
+    elif action == "offall":
+        answer = _ak_do_offall(cfg, chat_id)
+    else:  # "revoke:<window_id>" — единственное оставшееся значение _AK_CALLBACK_RE
+        answer = _ak_do_revoke(cfg, chat_id, action.split(":", 1)[1])
     cq_id = cq.get("id")
     if cq_id:
         _tg_call(cfg, "answerCallbackQuery",
