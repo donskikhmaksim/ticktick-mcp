@@ -176,18 +176,18 @@ def store_ready() -> bool:
 
 
 def _ensure_schema() -> None:
-    """DDL из TZ_multi_automation_windows.md — `server`/`window_id` составной
-    смысл (одна таблица может завтра обслуживать несколько серверов), PRIMARY
-    KEY только `window_id`, но теперь это СЛУЧАЙНЫЙ id на каждую генерацию
-    (`secrets.token_hex(6)`, см. `generate_window`), а не фиксированный
-    `SERVER` — поэтому несколько строк ОДНОВРЕМЕННО активны для одного
-    `server`, там где раньше была ровно одна.
+    """DDL из TZ_automation_key_hub.md (2026-08-11) — таблица теперь ОБЩАЯ на
+    всю экосистему MCP-серверов, не только ticktick. Генерация переехала в
+    gmail-mcp (он один держит вебхук после консолидации ботов) — ticktick-mcp
+    только ЧИТАЕТ и проверяет, подходит ли окно для него по `scope`.
 
-    `ALTER TABLE ... ADD COLUMN IF NOT EXISTS label` — на случай, если таблица
-    уже существует в проде со старой (одно-оконной) схемой без `label`:
-    `CREATE TABLE IF NOT EXISTS` её не тронет, а старая единственная строка
-    (`window_id = 'ticktick'`) остаётся как есть и участвует в выдаче наравне
-    с новыми — не теряем то, что уже было выдано до этой миграции."""
+    `server` — старый столбец (одно-серверная схема до 2026-08-11), оставлен
+    НЕТРОНУТЫМ ради уже выданных строк на боевой базе, но новый код по нему
+    не фильтрует. `scope` — csv из канонических имён сервисов
+    (gmail/calendar/drive/sheets/docs/ticktick) ИЛИ буквально `"all"`.
+    `ADD COLUMN IF NOT EXISTS scope` + бэкафилл из `server` — идемпотентно,
+    безопасно повторять при каждом старте (тот же приём, что у `label`
+    раньше)."""
     with _conn() as cur:
         cur.execute(
             """
@@ -207,8 +207,14 @@ def _ensure_schema() -> None:
             "ALTER TABLE tg_automation_windows ADD COLUMN IF NOT EXISTS label TEXT"
         )
         cur.execute(
-            "CREATE INDEX IF NOT EXISTS tg_automation_windows_lookup_idx "
-            "ON tg_automation_windows (server, revoked_at, expires_at)"
+            "ALTER TABLE tg_automation_windows ADD COLUMN IF NOT EXISTS scope TEXT"
+        )
+        cur.execute(
+            "UPDATE tg_automation_windows SET scope = server WHERE scope IS NULL"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS tg_automation_windows_scope_idx "
+            "ON tg_automation_windows (revoked_at, expires_at)"
         )
 
 
@@ -245,7 +251,16 @@ def matches_static(provided: str) -> bool:
 
 
 def generate_window(chat_id: str, label: Optional[str] = None) -> str:
-    """Выпускает НОВЫЙ временной токен как ОТДЕЛЬНУЮ строку (INSERT, не
+    """УСТАРЕЛО для боевого пути (TZ_automation_key_hub.md, 2026-08-11):
+    генерация временных окон теперь происходит В gmail-mcp (он один держит
+    вебхук после консолидации ботов) — ticktick-mcp свою собственную команду/
+    кнопку `/automation_key` в Telegram больше НЕ показывает (см.
+    `tg_approval.py`, где обработчик выключен). Функция оставлена
+    работоспособной (пишет `scope=SERVER`, то есть окно валидно только для
+    ticktick) ради обратной совместимости с прямыми вызовами/тестами — не
+    удалена, но живого пути к ней из Telegram больше нет.
+
+    Выпускает НОВЫЙ временной токен как ОТДЕЛЬНУЮ строку (INSERT, не
     UPSERT — TZ_multi_automation_windows.md, «повторная генерация НЕ должна
     убивать более раннюю»): все ранее выданные и всё ещё активные окна
     продолжают работать как ни в чём не бывало. `window_id` — случайный
@@ -280,11 +295,11 @@ def generate_window(chat_id: str, label: Optional[str] = None) -> str:
                     """
                     INSERT INTO tg_automation_windows
                       (server, window_id, token_hash, label, created_at,
-                       expires_at, revoked_at, created_by_chat)
-                    VALUES (%s, %s, %s, %s, %s, %s, NULL, %s)
+                       expires_at, revoked_at, created_by_chat, scope)
+                    VALUES (%s, %s, %s, %s, %s, %s, NULL, %s, %s)
                     """,
                     (SERVER, window_id, _hash(token), label_val, now, expires,
-                     str(chat_id)),
+                     str(chat_id), SERVER),
                 )
             return token
         except psycopg2.IntegrityError:
@@ -298,23 +313,35 @@ def generate_window(chat_id: str, label: Optional[str] = None) -> str:
     )
 
 
-def find_window(provided: str) -> Optional[Dict[str, Any]]:
-    """Какое ИМЕННО активное окно совпало с присланным `provided` — словарь
-    (`window_id`, `label`, `created_at`, `expires_at`, `created_by_chat`) или
-    None, если ни одно активное окно не совпало (или `provided` пуст, или
-    хранилище не поднято).
+def _scope_covers_me(scope: Optional[str]) -> bool:
+    """Разбирает `scope` строки таблицы и решает, действует ли она на МЕНЯ
+    (`SERVER = "ticktick"`) — TZ_automation_key_hub.md, раздел "Проверка
+    scope". `"all"` — покрывает всех. Иначе — точное совпадение токена ПОСЛЕ
+    разбиения по запятой, НЕ подстрокой (`"ticktick2"` не обязан совпасть с
+    `"ticktick"`). Пустой/NULL `scope` (старая строка до миграции, бэкафилл
+    почему-то не сработал) — трактуется как НЕ покрывающий: fail-closed,
+    молчаливое совпадение опаснее отказа."""
+    if not scope:
+        return False
+    scope = scope.strip()
+    if scope == "all":
+        return True
+    return SERVER in {part.strip() for part in scope.split(",") if part.strip()}
 
-    Ищет СРЕДИ ВСЕХ активных окон (`revoked_at IS NULL AND expires_at >
-    now`), не одного фиксированного, как раньше (TZ_multi_automation_
-    windows.md) — при множестве одновременно открытых окон это единственный
-    способ узнать, КАКОЕ из них сейчас используется (нужно для аудита —
-    `server.py`'s `_automation_key_channel` несёт `created_at` совпавшего
-    окна в метку журнала). Каждое сравнение хэша — постоянное по времени
-    (`_digest_matches`); порядок перебора — по `created_at` (детерминирован
-    ради тестов), но сам перебор НЕ constant-time по количеству активных
-    окон — то же самое тайминг-допущение, что фиксирует ТЗ («все
-    constant-time» — про КАЖДОЕ сравнение по отдельности, не про общее число
-    окон, которое и так не секрет)."""
+
+def find_window(provided: str) -> Optional[Dict[str, Any]]:
+    """Какое ИМЕННО активное окно, ПОКРЫВАЮЩЕЕ МЕНЯ ПО SCOPE, совпало с
+    присланным `provided` — словарь (`window_id`, `label`, `created_at`,
+    `expires_at`, `created_by_chat`) или None, если ни одно такое окно не
+    совпало (или `provided` пуст, или хранилище не поднято).
+
+    Таблица ОБЩАЯ на всю экосистему (TZ_automation_key_hub.md, 2026-08-11):
+    строку могло создать любой сервис (сейчас — только gmail-mcp, он один
+    владеет генерацией), поэтому запрос больше НЕ фильтрует по `server` в
+    SQL — читает ВСЕ активные окна и в Python отбрасывает те, чей `scope` не
+    покрывает `ticktick` (`_scope_covers_me`). Каждое сравнение хэша —
+    постоянное по времени (`_digest_matches`); порядок перебора — по
+    `created_at` (детерминирован ради тестов)."""
     if not (provided and store_ready()):
         return None
     now = _now_ms()
@@ -322,13 +349,15 @@ def find_window(provided: str) -> Optional[Dict[str, Any]]:
     with _conn() as cur:
         cur.execute(
             "SELECT window_id, token_hash, label, created_at, expires_at, "
-            "created_by_chat FROM tg_automation_windows "
-            "WHERE server = %s AND revoked_at IS NULL AND expires_at > %s "
+            "created_by_chat, scope FROM tg_automation_windows "
+            "WHERE revoked_at IS NULL AND expires_at > %s "
             "ORDER BY created_at ASC",
-            (SERVER, now),
+            (now,),
         )
         rows = cur.fetchall()
-    for window_id, token_hash, label, created_at, expires_at, created_by_chat in rows:
+    for window_id, token_hash, label, created_at, expires_at, created_by_chat, scope in rows:
+        if not _scope_covers_me(scope):
+            continue
         if _digest_matches(token_hash, provided_hash):
             return {
                 "window_id": window_id, "label": label,

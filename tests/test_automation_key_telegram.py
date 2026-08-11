@@ -1,26 +1,23 @@
-"""Команда `/automation_key` и её кнопки в Telegram.
+"""Команда `/automation_key` и кнопки `ak:*` в Telegram — ПОСЛЕ переезда
+генерации в gmail-mcp (docs/TZ/TZ_automation_key_hub.md, 2026-08-11).
 
-Базовый контракт (владелец-only) — docs/TZ/TZ_temp_automation_key.md
-§3.2/§3.3, тестовый план §6, пункт 4: «генерировать/отзывать может только
-владелец». Многооконный контракт (без аргумента = сразу генерирует
-ОЧЕРЕДНОЕ окно; list/revoke <id>/off) — docs/TZ/TZ_multi_automation_windows.md
-«Команды в Telegram».
+АДАПТАЦИЯ ПОД НОВЫЙ КОНТРАКТ (не подгонка под правку — сама команда сменила
+поведение по решению владельца). До этого файла (см. git-историю) команда и
+кнопки реально генерировали/листали/отзывали временные окна прямо в
+ticktick-mcp. После консолидации ботов ticktick-mcp больше не держит
+собственный вебхук — Telegram физически не может доставить сюда апдейт, а
+владелец явно попросил единый механизм на всю экосистему MCP-серверов:
+генерация/список/отзыв переехали ЦЕЛИКОМ в gmail-mcp (общая таблица со
+`scope`, кнопки с выбором сервисов). Ticktick-mcp теперь ТОЛЬКО проверяет
+присланный ключ (`automation_key.check_window`/`find_window`, покрыто
+`tests/test_automation_key_windows.py`) — сама Telegram-точка входа здесь
+осталась исключительно ради явного редиректа («такой команды больше нет
+тут, она в gmail-mcp»), а не молчаливого игнора: владелец, наткнувшись на
+старую привычку или старую кнопку в чате, обязан получить понятный ответ,
+а не тишину.
 
-Нет реальной сети, нет реального Postgres — Telegram HTTP и automation_key's
-хранилище monkeypatch'нуты, та же дисциплина, что у
-tests/test_own_bot_webhook.py (owner-only разбор callback_query/message).
-
-АДАПТАЦИЯ ПОД НОВЫЙ КОНТРАКТ (не подгонка — сама команда сменила поведение).
-Раньше `/automation_key` без аргумента и кнопка `ak:show` ТОЛЬКО показывали
-меню трёх кнопок («Показать ключ» / «Выключить» / «Статус») — генерация была
-ОТДЕЛЬНЫМ шагом (нажатием кнопки). Аддендум прямо требует: команда без
-аргумента (и кнопка «Новый ключ», `ak:new`) сразу генерируют ОЧЕРЕДНОЕ окно
-и присылают токен — «Статус» одного окна перестал быть осмысленным понятием
-при множестве окон и заменён «Списком» (`ak:list`/`list`). Тесты, проверявшие
-старое меню-без-генерации и кнопку/команду «Статус», переписаны под новое
-поведение; тесты владелец-only дисциплины (кто может жать/писать) и
-owner-only разбора остались по смыслу теми же, только под новые имена
-действий."""
+Нет реальной сети — `_tg_call` monkeypatch'нут, та же дисциплина, что у
+tests/test_own_bot_webhook.py (owner-only разбор callback_query/message)."""
 import ticktick_mcp.src.automation_key as ak
 import ticktick_mcp.src.tg_approval as tg
 
@@ -48,10 +45,6 @@ def _ak_callback_update(data="ak:new", from_id="1", chat_id="1", cq_id="cbq1"):
 
 
 def _sent_recorder(monkeypatch):
-    """`_tg_call` заглушка, которая копит (method, body) и возвращает
-    успешный ответ sendMessage с фиктивным message_id — нужен, чтобы
-    `_ak_do_generate`'s `schedule_message_delete` не падал на отсутствующем
-    `result`."""
     sent = []
 
     def fake(cfg, method, body):
@@ -64,28 +57,52 @@ def _sent_recorder(monkeypatch):
     return sent
 
 
-# ═══════════════ /automation_key без аргумента — только владелец ═══════════
+def _no_lifecycle_calls(monkeypatch):
+    """Приколачивает generate/list/revoke/revoke_all так, чтобы любой вызов
+    провалил тест — редирект обязан отвечать текстом, НЕ трогая жизненный
+    цикл окон (та часть теперь целиком у gmail-mcp)."""
+    def boom(name):
+        def _f(*a, **k):
+            raise AssertionError(f"automation_key.{name} не должен вызываться "
+                                 f"из ticktick-mcp Telegram-редиректа")
+        return _f
+    monkeypatch.setattr(ak, "generate_window", boom("generate_window"))
+    monkeypatch.setattr(ak, "list_windows", boom("list_windows"))
+    monkeypatch.setattr(ak, "revoke_window", boom("revoke_window"))
+    monkeypatch.setattr(ak, "revoke_all_windows", boom("revoke_all_windows"))
 
-def test_command_from_owner_generates_and_sends_the_token(monkeypatch):
-    """Без аргумента команда теперь СРАЗУ генерирует — не просто открывает
-    меню (TZ_multi_automation_windows.md)."""
-    calls = []
-    monkeypatch.setattr(ak, "generate_window", lambda chat_id: calls.append(chat_id) or "raw-token-xyz")
+
+# ═══════════════ /automation_key (текст) — редирект, только владелец ═══════
+
+def test_command_from_owner_gets_redirect_to_gmail_mcp(monkeypatch):
+    _no_lifecycle_calls(monkeypatch)
     sent = _sent_recorder(monkeypatch)
 
     tg.handle_webhook(_cfg(), _command_update())
 
-    assert calls == ["1"], "generate_window не вызван (или вызван не для того чата)"
     send_calls = [b for m, b in sent if m == "sendMessage"]
-    # Токен-сообщение + меню для дальнейших действий.
-    assert len(send_calls) == 2
-    assert "raw-token-xyz" in send_calls[0]["text"]
-    buttons = [b["callback_data"] for row in send_calls[1]["reply_markup"]["inline_keyboard"]
-              for b in row]
-    assert buttons == ["ak:new", "ak:list", "ak:offall"]
+    assert len(send_calls) == 1
+    assert "gmail-mcp" in send_calls[0]["text"]
+
+
+def test_command_with_any_argument_still_only_redirects(monkeypatch):
+    """list/revoke/off/мусор — раньше это были разные под-команды, теперь
+    ЛЮБОЙ аргумент после `/automation_key` ведёт к тому же редиректу, без
+    разбора аргумента вообще (разбор аргументов переехал в gmail-mcp)."""
+    for text in ("/automation_key list", "/automation_key revoke aaa111",
+                "/automation_key off", "/automation_key blah"):
+        _no_lifecycle_calls(monkeypatch)
+        sent = _sent_recorder(monkeypatch)
+
+        tg.handle_webhook(_cfg(), _command_update(text=text))
+
+        send_calls = [b for m, b in sent if m == "sendMessage"]
+        assert len(send_calls) == 1, f"неожиданно {len(send_calls)} сообщений для {text!r}"
+        assert "gmail-mcp" in send_calls[0]["text"]
 
 
 def test_command_from_non_owner_sends_nothing(monkeypatch):
+    _no_lifecycle_calls(monkeypatch)
     sent = _sent_recorder(monkeypatch)
 
     tg.handle_webhook(_cfg(owner="999"), _command_update(from_id="1"))
@@ -94,6 +111,7 @@ def test_command_from_non_owner_sends_nothing(monkeypatch):
 
 
 def test_command_without_from_sends_nothing(monkeypatch):
+    _no_lifecycle_calls(monkeypatch)
     sent = _sent_recorder(monkeypatch)
 
     tg.handle_webhook(_cfg(), _command_update(from_id=None))
@@ -102,6 +120,7 @@ def test_command_without_from_sends_nothing(monkeypatch):
 
 
 def test_unrelated_message_text_is_ignored(monkeypatch):
+    _no_lifecycle_calls(monkeypatch)
     sent = _sent_recorder(monkeypatch)
 
     tg.handle_webhook(_cfg(), _command_update(text="привет, бот"))
@@ -110,265 +129,44 @@ def test_unrelated_message_text_is_ignored(monkeypatch):
 
 
 def test_command_with_bot_username_suffix_still_matches(monkeypatch):
-    """Группы шлют `/automation_key@bot_name` — та же команда."""
-    monkeypatch.setattr(ak, "generate_window", lambda chat_id: "")  # хранилище не поднято
+    """Группы шлют `/automation_key@bot_name` — команда распознаётся
+    (регистрация вебхука на bot_name здесь не проверяется, это забота
+    Telegram), редирект уходит как обычно."""
+    _no_lifecycle_calls(monkeypatch)
     sent = _sent_recorder(monkeypatch)
 
     tg.handle_webhook(_cfg(), _command_update(text="/automation_key@maksim_mcp_bot"))
 
-    assert len(sent) == 1  # "не поднято" — единственное сообщение, без меню
-
-
-def test_command_with_unknown_argument_reports_a_hint(monkeypatch):
-    sent = _sent_recorder(monkeypatch)
-
-    tg.handle_webhook(_cfg(), _command_update(text="/automation_key blah"))
-
     send_calls = [b for m, b in sent if m == "sendMessage"]
     assert len(send_calls) == 1
-    assert "Не понял аргумент" in send_calls[0]["text"]
+    assert "gmail-mcp" in send_calls[0]["text"]
 
 
-# ═══════════════ Кнопка/команда «Новый ключ» — только владелец ═══════════════
+# ═══════════════ Кнопки ak:* — редирект через answerCallbackQuery ═══════════
 
-def test_new_button_from_owner_generates_and_sends_the_token(monkeypatch):
-    calls = []
-    monkeypatch.setattr(ak, "generate_window", lambda chat_id: calls.append(chat_id) or "raw-token-xyz")
-    sent = _sent_recorder(monkeypatch)
+def test_any_ak_button_from_owner_answers_with_redirect_no_sendmessage(monkeypatch):
+    """Старая кнопка (`ak:new`/`ak:list`/`ak:offall`/`ak:revoke:<id>`), если
+    она осталась висеть в чате от версии до переезда — нажатие отвечает
+    ЧЕРЕЗ `answerCallbackQuery` (не через новое `sendMessage`), редирект в
+    тексте всплывающей подсказки. Никакого вызова жизненного цикла окон."""
+    for data in ("ak:new", "ak:list", "ak:offall", "ak:revoke:aaa111"):
+        _no_lifecycle_calls(monkeypatch)
+        sent = _sent_recorder(monkeypatch)
 
-    tg.handle_webhook(_cfg(), _ak_callback_update(data="ak:new"))
+        tg.handle_webhook(_cfg(), _ak_callback_update(data=data))
 
-    assert calls == ["1"], "generate_window не вызван (или вызван не для того чата)"
-    send_calls = [b for m, b in sent if m == "sendMessage"]
-    assert "raw-token-xyz" in send_calls[0]["text"]
-    answer_calls = [b for m, b in sent if m == "answerCallbackQuery"]
-    assert len(answer_calls) == 1
-
-
-def test_new_button_does_not_disturb_other_already_generated_windows(monkeypatch):
-    """`generate_window` в новом контракте — INSERT, не UPSERT: этот тест
-    проверяет только то, что обработчик передаёт chat_id и не пытается сам
-    что-то отзывать/трогать перед генерацией (сама изоляция окон друг от
-    друга — automation_key.py's ответственность, покрыта
-    tests/test_automation_key_windows.py)."""
-    calls = []
-
-    def fake_generate(chat_id):
-        calls.append(chat_id)
-        return f"token-{len(calls)}"
-
-    monkeypatch.setattr(ak, "generate_window", fake_generate)
-    revoke_calls = []
-    monkeypatch.setattr(ak, "revoke_window", lambda *a, **k: revoke_calls.append(a) or False)
-    monkeypatch.setattr(ak, "revoke_all_windows", lambda *a, **k: revoke_calls.append(a) or 0)
-    _sent_recorder(monkeypatch)
-
-    tg.handle_webhook(_cfg(), _ak_callback_update(data="ak:new"))
-    tg.handle_webhook(_cfg(), _ak_callback_update(data="ak:new"))
-
-    assert calls == ["1", "1"]
-    assert revoke_calls == [], "генерация НЕ должна вызывать revoke ни разу"
+        assert [b for m, b in sent if m == "sendMessage"] == [], f"{data!r}: лишнее sendMessage"
+        answer_calls = [b for m, b in sent if m == "answerCallbackQuery"]
+        assert len(answer_calls) == 1, f"{data!r}: ожидал ровно один answerCallbackQuery"
+        assert "gmail-mcp" in answer_calls[0]["text"]
 
 
-def test_new_button_from_non_owner_never_calls_generate_window(monkeypatch):
-    calls = []
-    monkeypatch.setattr(ak, "generate_window", lambda chat_id: calls.append(chat_id) or "leaked-token")
+def test_ak_button_from_non_owner_does_nothing(monkeypatch):
+    _no_lifecycle_calls(monkeypatch)
     sent = _sent_recorder(monkeypatch)
 
     tg.handle_webhook(_cfg(owner="999"), _ak_callback_update(data="ak:new", from_id="1"))
 
-    assert calls == [], "владелец НЕ подтверждён, но ключ всё равно сгенерирован"
-    assert sent == [], "владелец НЕ подтверждён, но что-то ушло в Telegram"
-
-
-def test_new_button_empty_token_reports_store_not_ready(monkeypatch):
-    """generate_window вернул "" (хранилище не поднято) — владелец обязан
-    получить внятное сообщение, а не пустой/сломанный текст."""
-    monkeypatch.setattr(ak, "generate_window", lambda chat_id: "")
-    sent = _sent_recorder(monkeypatch)
-
-    tg.handle_webhook(_cfg(), _ak_callback_update(data="ak:new"))
-
-    send_calls = [b for m, b in sent if m == "sendMessage"]
-    assert len(send_calls) == 1
-    assert "не поднято" in send_calls[0]["text"] or "🛑" in send_calls[0]["text"]
-
-
-def test_new_button_schedules_the_token_message_for_10s_deletion(monkeypatch):
-    """TZ_multi_automation_windows.md: сообщение со свежим токеном
-    самоудаляется через 10с, не через дефолтные 60с гейта."""
-    monkeypatch.setattr(ak, "generate_window", lambda chat_id: "raw-token-xyz")
-    scheduled = []
-    monkeypatch.setattr(tg, "schedule_message_delete",
-                        lambda chat_id, message_id, delay_s=None: scheduled.append(
-                            (chat_id, message_id, delay_s)))
-    monkeypatch.setattr(tg, "_tg_call", lambda cfg, method, body: (
-        {"ok": True, "result": {"message_id": 555}} if method == "sendMessage" else {"ok": True}))
-
-    tg.handle_webhook(_cfg(), _ak_callback_update(data="ak:new"))
-
-    assert len(scheduled) == 1
-    chat_id, message_id, delay_s = scheduled[0]
-    assert chat_id == "1"
-    assert message_id == 555
-    assert delay_s == 10.0, f"ожидал delay_s=10, получил {delay_s!r}"
-
-
-# ═══════════════ Кнопка/команда «Выключить всё» — только владелец ═══════════
-
-def test_offall_button_from_owner_revokes_everything(monkeypatch):
-    calls = []
-    monkeypatch.setattr(ak, "revoke_all_windows", lambda chat_id: calls.append(chat_id) or 2)
-    sent = _sent_recorder(monkeypatch)
-
-    tg.handle_webhook(_cfg(), _ak_callback_update(data="ak:offall"))
-
-    assert calls == ["1"]
-    send_calls = [b for m, b in sent if m == "sendMessage"]
-    assert "Выключено окон: 2" in send_calls[0]["text"]
-
-
-def test_offall_button_with_nothing_active_reports_that(monkeypatch):
-    monkeypatch.setattr(ak, "revoke_all_windows", lambda chat_id: 0)
-    sent = _sent_recorder(monkeypatch)
-
-    tg.handle_webhook(_cfg(), _ak_callback_update(data="ak:offall"))
-
-    send_calls = [b for m, b in sent if m == "sendMessage"]
-    assert "и так не было" in send_calls[0]["text"]
-
-
-def test_off_text_command_revokes_everything(monkeypatch):
-    calls = []
-    monkeypatch.setattr(ak, "revoke_all_windows", lambda chat_id: calls.append(chat_id) or 1)
-    _sent_recorder(monkeypatch)
-
-    tg.handle_webhook(_cfg(), _command_update(text="/automation_key off"))
-
-    assert calls == ["1"]
-
-
-def test_offall_button_from_non_owner_never_calls_revoke_all_windows(monkeypatch):
-    calls = []
-    monkeypatch.setattr(ak, "revoke_all_windows", lambda chat_id: calls.append(chat_id) or 1)
-    sent = _sent_recorder(monkeypatch)
-
-    tg.handle_webhook(_cfg(owner="999"), _ak_callback_update(data="ak:offall", from_id="1"))
-
-    assert calls == [], "владелец НЕ подтверждён, но окна всё равно погашены"
-    assert sent == [], "владелец НЕ подтверждён, но что-то ушло в Telegram"
-
-
-# ═══════════════ Кнопка/команда «Список» ═══════════════
-
-def test_list_button_reports_no_windows(monkeypatch):
-    monkeypatch.setattr(ak, "list_windows", lambda chat_id: [])
-    sent = _sent_recorder(monkeypatch)
-
-    tg.handle_webhook(_cfg(), _ak_callback_update(data="ak:list"))
-
-    send_calls = [b for m, b in sent if m == "sendMessage"]
-    assert len(send_calls) == 1
-    assert "нет" in send_calls[0]["text"]
-
-
-def test_list_button_reports_active_windows_with_per_row_revoke_buttons(monkeypatch):
-    monkeypatch.setattr(ak, "list_windows", lambda chat_id: [
-        {"window_id": "aaa111", "label": None, "created_at": 1000,
-         "expires_at": 2000, "created_by_chat": "1", "remaining_s": 3600},
-        {"window_id": "bbb222", "label": "чат Б", "created_at": 1500,
-         "expires_at": 2500, "created_by_chat": "1", "remaining_s": 7200},
-    ])
-    sent = _sent_recorder(monkeypatch)
-
-    tg.handle_webhook(_cfg(), _ak_callback_update(data="ak:list"))
-
-    send_calls = [b for m, b in sent if m == "sendMessage"]
-    assert "aaa111" in send_calls[0]["text"]
-    assert "bbb222" in send_calls[0]["text"] and "чат Б" in send_calls[0]["text"]
-    buttons = [b["callback_data"] for row in send_calls[0]["reply_markup"]["inline_keyboard"]
-              for b in row]
-    assert "ak:revoke:aaa111" in buttons
-    assert "ak:revoke:bbb222" in buttons
-
-
-def test_list_text_command_works(monkeypatch):
-    monkeypatch.setattr(ak, "list_windows", lambda chat_id: [])
-    sent = _sent_recorder(monkeypatch)
-
-    tg.handle_webhook(_cfg(), _command_update(text="/automation_key list"))
-
-    send_calls = [b for m, b in sent if m == "sendMessage"]
-    assert len(send_calls) == 1
-
-
-def test_list_button_from_non_owner_calls_nothing(monkeypatch):
-    calls = []
-    monkeypatch.setattr(ak, "list_windows", lambda chat_id: calls.append(chat_id) or [])
-    sent = _sent_recorder(monkeypatch)
-
-    tg.handle_webhook(_cfg(owner="999"), _ak_callback_update(data="ak:list", from_id="1"))
-
-    assert calls == []
-    assert sent == [], "владелец НЕ подтверждён, но что-то ушло в Telegram"
-
-
-# ═══════════════ Кнопка/команда «Отозвать <id>» ═══════════════
-
-def test_revoke_button_from_owner_revokes_that_specific_window(monkeypatch):
-    calls = []
-    monkeypatch.setattr(ak, "revoke_window", lambda window_id, chat_id: calls.append((window_id, chat_id)) or True)
-    sent = _sent_recorder(monkeypatch)
-
-    tg.handle_webhook(_cfg(), _ak_callback_update(data="ak:revoke:aaa111"))
-
-    assert calls == [("aaa111", "1")]
-    send_calls = [b for m, b in sent if m == "sendMessage"]
-    assert "aaa111" in send_calls[0]["text"] and "выключено" in send_calls[0]["text"]
-
-
-def test_revoke_button_reports_when_window_is_already_gone(monkeypatch):
-    monkeypatch.setattr(ak, "revoke_window", lambda window_id, chat_id: False)
-    sent = _sent_recorder(monkeypatch)
-
-    tg.handle_webhook(_cfg(), _ak_callback_update(data="ak:revoke:aaa111"))
-
-    send_calls = [b for m, b in sent if m == "sendMessage"]
-    assert "не найдено" in send_calls[0]["text"] or "неактивно" in send_calls[0]["text"]
-
-
-def test_revoke_text_command_with_id_works(monkeypatch):
-    calls = []
-    monkeypatch.setattr(ak, "revoke_window", lambda window_id, chat_id: calls.append((window_id, chat_id)) or True)
-    sent = _sent_recorder(monkeypatch)
-
-    tg.handle_webhook(_cfg(), _command_update(text="/automation_key revoke aaa111"))
-
-    assert calls == [("aaa111", "1")]
-    send_calls = [b for m, b in sent if m == "sendMessage"]
-    assert len(send_calls) == 1 and "aaa111" in send_calls[0]["text"]
-
-
-def test_revoke_text_command_without_id_asks_for_one(monkeypatch):
-    calls = []
-    monkeypatch.setattr(ak, "revoke_window", lambda *a: calls.append(a) or True)
-    sent = _sent_recorder(monkeypatch)
-
-    tg.handle_webhook(_cfg(), _command_update(text="/automation_key revoke"))
-
-    assert calls == []
-    send_calls = [b for m, b in sent if m == "sendMessage"]
-    assert "id" in send_calls[0]["text"]
-
-
-def test_revoke_button_from_non_owner_never_calls_revoke_window(monkeypatch):
-    calls = []
-    monkeypatch.setattr(ak, "revoke_window", lambda window_id, chat_id: calls.append((window_id, chat_id)) or True)
-    sent = _sent_recorder(monkeypatch)
-
-    tg.handle_webhook(_cfg(owner="999"), _ak_callback_update(data="ak:revoke:aaa111", from_id="1"))
-
-    assert calls == []
     assert sent == [], "владелец НЕ подтверждён, но что-то ушло в Telegram"
 
 
@@ -380,7 +178,7 @@ def test_ak_callback_does_not_trip_the_approval_decision_path(monkeypatch):
     несуществующий манифест с id "new"."""
     consume_calls = []
     monkeypatch.setattr(tg, "consume_tg_decision", lambda *a: consume_calls.append(a))
-    monkeypatch.setattr(ak, "generate_window", lambda chat_id: "tok")
+    _no_lifecycle_calls(monkeypatch)
     _sent_recorder(monkeypatch)
 
     tg.handle_webhook(_cfg(), _ak_callback_update(data="ak:new"))

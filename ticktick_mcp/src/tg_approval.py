@@ -1536,11 +1536,20 @@ _AK_TEXT_ARG_RE = re.compile(r"^(list|off|revoke)(?:\s+(\S+))?$", re.IGNORECASE)
 
 
 def _handle_automation_key_message(cfg: TgApprovalConfig, msg: Dict[str, Any]) -> None:
-    """Единственное сообщение, на которое этот вебхук реагирует:
-    `/automation_key[ list|revoke <id>|off]` от владельца. Всё остальное (не
-    команда, не владелец) — тихо игнорируется; это НЕ общий чат-бот, обычное
-    текстовое «да» approval-гейта по-прежнему читает МОДЕЛЬ через
-    MCP-инструмент, а не этот вебхук."""
+    """УСТАРЕЛО (TZ_automation_key_hub.md, 2026-08-11): генерация/список/
+    отзыв временных окон переехали в gmail-mcp — он один держит вебхук после
+    консолидации ботов, единый ключ действует на выбранные при генерации
+    сервисы (scope), не только на ticktick. Ветка НЕ удалена (маленькая,
+    безопасно оставить — она уже не единственная защита ни от чего), но
+    вместо реального выполнения отвечает редиректом на новую команду —
+    ИНАЧЕ, будь own_bot когда-нибудь снова включён, здесь тихо ожил бы
+    старый одно-серверный путь генерации, который больше не согласован с
+    общей scope-схемой (создал бы `scope='ticktick'`-only окно в обход
+    выбора сервисов в gmail-mcp).
+
+    Всё остальное (не команда, не владелец) — тихо игнорируется, как и
+    раньше; это НЕ общий чат-бот, обычное текстовое «да» approval-гейта
+    по-прежнему читает МОДЕЛЬ через MCP-инструмент, а не этот вебхук."""
     from_id = str((msg.get("from") or {}).get("id") or "")
     if not from_id or from_id != str(cfg.owner_chat_id):
         return
@@ -1552,61 +1561,30 @@ def _handle_automation_key_message(cfg: TgApprovalConfig, msg: Dict[str, Any]) -
     if command != _AUTOMATION_KEY_COMMAND:
         return
     chat_id = str((msg.get("chat") or {}).get("id") or cfg.owner_chat_id)
-    arg = parts[1].strip() if len(parts) > 1 else ""
-    if not arg:
-        _ak_do_generate(cfg, chat_id)
-        return
-    m = _AK_TEXT_ARG_RE.match(arg)
-    if not m:
-        _tg_call(cfg, "sendMessage", {
-            "chat_id": chat_id,
-            "text": "Не понял аргумент. Варианты: /automation_key, "
-                    "/automation_key list, /automation_key revoke <id>, "
-                    "/automation_key off.",
-        })
-        return
-    sub, sub_id = m.group(1).lower(), m.group(2)
-    if sub == "list":
-        _ak_do_list(cfg, chat_id)
-    elif sub == "off":
-        _ak_do_offall(cfg, chat_id)
-    elif sub_id:  # sub == "revoke" — единственное оставшееся значение
-        _ak_do_revoke(cfg, chat_id, sub_id)
-    else:
-        _tg_call(cfg, "sendMessage", {
-            "chat_id": chat_id,
-            "text": "/automation_key revoke требует id окна — возьми его "
-                    "из /automation_key list.",
-        })
+    _tg_call(cfg, "sendMessage", {
+        "chat_id": chat_id,
+        "text": "Генерация ключей переехала в gmail-mcp (единый бот, выбор "
+                "сервисов при генерации) — набери /automation_key там же, "
+                "в этом чате.",
+    })
 
 
 def _handle_automation_key_callback(cfg: TgApprovalConfig, cq: Dict[str, Any],
                                     action: str) -> None:
-    """Одна из кнопок меню `/automation_key` — owner-only УЖЕ проверен
-    вызывающим (`_handle_callback_query`), здесь этот вопрос не переспрашиваем
-    второй раз (TZ: «никаких новых путей авторизации не изобретать»).
-
-      "new"          — очередное окно (не трогая существующие), сырой токен
-                       уходит владельцу отдельным самоудаляющимся сообщением;
-      "list"         — все активные окна;
-      "offall"       — гасит ВСЕ активные окна разом;
-      "revoke:<id>"  — гасит ОДНО конкретное окно (кнопка со строки списка).
-
-    `answerCallbackQuery` — всегда, тем же принципом, что и у approve/reject."""
-    chat_id = str(((cq.get("message") or {}).get("chat") or {}).get("id")
-                  or cfg.owner_chat_id)
-    if action == "new":
-        answer = _ak_do_generate(cfg, chat_id)
-    elif action == "list":
-        answer = _ak_do_list(cfg, chat_id)
-    elif action == "offall":
-        answer = _ak_do_offall(cfg, chat_id)
-    else:  # "revoke:<window_id>" — единственное оставшееся значение _AK_CALLBACK_RE
-        answer = _ak_do_revoke(cfg, chat_id, action.split(":", 1)[1])
+    """УСТАРЕЛО (TZ_automation_key_hub.md, 2026-08-11) — тот же редирект, что
+    у `_handle_automation_key_message`: старые кнопки меню могли остаться на
+    экране у владельца от версии до переезда генерации в gmail-mcp; нажатие
+    отвечает, куда идти, вместо того чтобы молча создавать одно-серверное
+    (`scope='ticktick'`-only) окно в обход выбора сервисов. `_ak_do_*`
+    функции ниже оставлены нетронутыми (используются тестами/на случай
+    отката), просто эта точка входа их больше не зовёт."""
     cq_id = cq.get("id")
     if cq_id:
-        _tg_call(cfg, "answerCallbackQuery",
-                {"callback_query_id": cq_id, "text": answer})
+        _tg_call(cfg, "answerCallbackQuery", {
+            "callback_query_id": cq_id,
+            "text": "Генерация ключей переехала в gmail-mcp — набери "
+                    "/automation_key там же.",
+        })
 
 
 def register_webhook(cfg: TgApprovalConfig, public_base_url: Optional[str]) -> None:
