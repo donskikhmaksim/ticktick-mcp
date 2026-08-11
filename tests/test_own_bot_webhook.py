@@ -414,7 +414,9 @@ def test_register_webhook_calls_setwebhook_with_secret_and_allowed_updates(monke
     assert method == "setWebhook"
     assert body["url"] == "https://tt.example.com/tg/webhook"
     assert body["secret_token"] == "topsecret"
-    assert body["allowed_updates"] == ["callback_query"]
+    # 2026-08-10 (TZ_temp_automation_key.md §3.2): "message" добавлен ради
+    # команды /automation_key — вебхук раньше видел ТОЛЬКО нажатия кнопок.
+    assert body["allowed_updates"] == ["callback_query", "message"]
 
 
 def test_register_webhook_logs_error_on_telegram_failure_without_raising(monkeypatch, caplog):

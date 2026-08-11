@@ -90,11 +90,12 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import (Any, Callable, Dict, Iterable, List, NamedTuple,
-                    Optional)
+                    Optional, Tuple)
 from zoneinfo import ZoneInfo
 
 import requests
 
+from . import automation_key
 from . import log_redaction
 
 logger = logging.getLogger(__name__)
@@ -778,6 +779,88 @@ def delete_message(cfg: TgApprovalConfig, chat_id: str, message_id: int) -> bool
     return True
 
 
+# ────────────── Исчезновение сообщений гейта (2026-08-10, TZ §5) ────────────
+#
+# Владелец: сообщения гейта, которые уже «ушли в отчёт» (результат доступен
+# через operation_report/журнал), должны самоудаляться из чата примерно через
+# 1 минуту после того, как их роль исполнена — иначе чат бесконечно копит
+# историю подтверждений.
+#
+# ЧТО ИМЕННО И КОГДА (таймер стартует от МОМЕНТА, когда сообщение исполнило
+# свою роль, НЕ от момента отправки — план может провисеть в ожидании
+# нажатия сколько угодно):
+#   • план/кнопки в личке владельца — таймер стартует, когда пришёл ОТВЕТ
+#     (нажатие кнопки — `_handle_callback_query`, либо разбор текстового
+#     «да»/отказа — `_require_consent` в consent.py), не раньше;
+#   • отчёт в группе-архиве (`post_report_to_group`) — таймер стартует СРАЗУ
+#     при отправке (он и так уже финальное сообщение).
+#
+# МЕХАНИЗМ. Небольшой список в памяти процесса — TZ явно говорит, что
+# долговечность через рестарт НЕ нужна (потеря пары сообщений на «не
+# удалилось секунда в секунду» не критична, в отличие от манифестов/решений).
+# Существующий периодический поллер (`_tg_auto_execute_tick`,
+# tg_auto_execute.py) на каждом проходе дополнительно зовёт
+# `sweep_scheduled_deletes` — она сама решает, что просрочено, и убирает это
+# из списка НЕЗАВИСИМО от того, удалилось сообщение реально или нет (сбой
+# удаления — сообщение уже стёрто вручную, чат недоступен — НЕ считается
+# сбоем поллера, тихо пропускается, см. `delete_message` выше, которая и так
+# никогда не бросает).
+_GATE_MESSAGE_DELETE_DELAY_S = float(
+    os.environ.get("TG_GATE_MESSAGE_DELETE_DELAY_S", "60"))
+
+# (chat_id, message_id, delete_after_epoch_s). Список, а не множество/словарь:
+# один и тот же message_id теоретически может встретиться дважды (повторная
+# уборка не страшна — второй deleteMessage на уже стёртое сообщение просто
+# вернёт False и будет тихо пропущен).
+_SCHEDULED_DELETES: List[Tuple[str, int, float]] = []
+
+
+def schedule_message_delete(chat_id: Optional[str], message_id: Optional[int],
+                            delay_s: Optional[float] = None) -> None:
+    """Ставит сообщение в очередь на удаление примерно через `delay_s`
+    секунд (по умолчанию `_GATE_MESSAGE_DELETE_DELAY_S` = 60, настраиваемо
+    через `TG_GATE_MESSAGE_DELETE_DELAY_S`). Зовётся ИМЕННО в момент, когда
+    сообщение исполнило свою роль (см. блок-комментарий выше) — не раньше,
+    не позже. `chat_id`/`message_id` отсутствуют → тихий no-op (нечего
+    удалять/некуда — та же дисциплина, что у `delete_message`)."""
+    if not chat_id or message_id is None:
+        return
+    delay = _GATE_MESSAGE_DELETE_DELAY_S if delay_s is None else delay_s
+    _SCHEDULED_DELETES.append((str(chat_id), int(message_id), time.time() + delay))
+
+
+def sweep_scheduled_deletes(cfg: TgApprovalConfig) -> int:
+    """Зовётся КАЖДЫЙ проход поллера (`_tg_auto_execute_tick`): удаляет всё,
+    что просрочило свой таймер, снимает это из очереди НЕЗАВИСИМО от исхода
+    (удалилось / не удалилось — не наша забота, `delete_message` best-effort
+    сама по себе). Возвращает число реально удалённых сообщений (для
+    логов/тестов, не для решений).
+
+    Сбой ОДНОГО удаления (исключение из `_tg_call`, сеть, что угодно) не
+    должен прерывать уборку остальных и тем более не должен ронять
+    вызывающий поллер — отдельный `try/except` НА КАЖДОЕ сообщение, хотя
+    `delete_message` и так не бросает наружу при обычных ошибках Telegram
+    (не-2xx/`ok:false`); страховка на будущее, если это когда-нибудь
+    изменится."""
+    global _SCHEDULED_DELETES
+    if not _SCHEDULED_DELETES:
+        return 0
+    now = time.time()
+    due = [e for e in _SCHEDULED_DELETES if e[2] <= now]
+    if not due:
+        return 0
+    _SCHEDULED_DELETES = [e for e in _SCHEDULED_DELETES if e[2] > now]
+    deleted = 0
+    for chat_id, message_id, _ in due:
+        try:
+            if delete_message(cfg, chat_id, message_id):
+                deleted += 1
+        except Exception as e:  # noqa: BLE001 — уборка НИКОГДА не роняет поллер
+            logger.debug(f"TG: sweep_scheduled_deletes({chat_id}, {message_id}) "
+                         f"упало: {e}")
+    return deleted
+
+
 # ───────────────────────── Postgres (общий с 5 TS-серверами) ─────────────────
 
 _pg_pool = None
@@ -1216,41 +1299,67 @@ def consume_tg_decision(manifest_id: str, status: str) -> Optional[Dict[str, Any
 
 
 _CALLBACK_DATA_RE = re.compile(r"^([ar]):(.+)$")
+# Кнопки меню `/automation_key` (TZ_temp_automation_key.md §3.2/3.3,
+# 2026-08-10) — отдельный, НЕ пересекающийся префикс: `_CALLBACK_DATA_RE`
+# матчит РОВНО один символ группы 1 (`a`/`r`), "ak" под неё не подходит, так
+# что два набора кнопок не могут случайно перепутаться в разборе.
+_AK_CALLBACK_RE = re.compile(r"^ak:(show|off|status)$")
+_AUTOMATION_KEY_COMMAND = "/automation_key"
 
 
 def handle_webhook(cfg: TgApprovalConfig, update: Dict[str, Any]) -> None:
     """Обрабатывает ОДИН апдейт Telegram, уже прошедший проверку секрета в
     server.py's роуте (тому нужен сырой заголовок запроса, которого здесь
     нет — та же граница ответственности, что в TS-референсе между http.ts и
-    tg_approval.ts). Порт `handleWebhook`, ветка `cfg.ownBot=true`:
+    tg_approval.ts). Порт `handleWebhook`, ветка `cfg.ownBot=true`.
 
-    1. игнорирует любой апдейт без `callback_query` (не наш тип апдейта —
-       `register_webhook` подписывается только на `["callback_query"]`, но
-       чужой/будущий тип апдейта не должен ронять вебхук);
-    2. owner-only — `callback_query.from.id` обязан совпадать с
+    Диспетчер по типу апдейта (2026-08-10, TZ §3.2 расширила подписку с
+    `["callback_query"]` на `["callback_query", "message"]` — см.
+    `register_webhook`): callback_query → `_handle_callback_query` (кнопки
+    подтверждения ✅/🛑 И кнопки меню `/automation_key`, см. ниже),
+    message → `_handle_automation_key_message` (сама команда `/automation_key`
+    — единственное сообщение, на которое этот вебхук вообще реагирует).
+    Любой другой/будущий тип апдейта — тихо игнорируется, вебхук не роняем."""
+    cq = (update or {}).get("callback_query")
+    if cq:
+        _handle_callback_query(cfg, cq)
+        return
+    msg = (update or {}).get("message")
+    if msg:
+        _handle_automation_key_message(cfg, msg)
+
+
+def _handle_callback_query(cfg: TgApprovalConfig, cq: Dict[str, Any]) -> None:
+    """Тело прежней `handle_webhook` (до 2026-08-10) — БЕЗ ИЗМЕНЕНИЙ в своей
+    части ✅/🛑, плюс НОВАЯ ветка для кнопок меню `/automation_key`:
+
+    1. owner-only — `callback_query.from.id` обязан совпадать с
        `cfg.owner_chat_id`; иначе тихо игнорируется (Telegram всё равно
        получит 200 от вызывающего роута — это не тот случай, чтобы
-       предупреждать нажавшего, кем бы он ни был);
-    3. `callback_data` — это АДРЕС, не факт доверия: решение читается назад
-       из БД по `manifest_id`, сама метка кнопки не считается истиной сама по
-       себе (та же дисциплина, что и у TS-версии);
-    4. anti-replay — атомарный `consume_tg_decision` (`WHERE status =
-       'PENDING'`); повторный тап/ретрай — no-op;
-    5. кнопки снимаются с сообщения ПОСЛЕ любого зафиксированного решения —
-       best-effort, никогда не блокирует само решение;
-    6. `answerCallbackQuery` зовётся ВСЕГДА, когда есть `callback_query.id` —
-       иначе «часики» на кнопке в клиенте Telegram крутятся до таймаута.
+       предупреждать нажавшего, кем бы он ни был). ОБЩАЯ проверка для ОБОИХ
+       наборов кнопок — TZ явно требует ту же owner-only дисциплину для
+       `/automation_key`, что и для approve/reject, никаких новых путей
+       авторизации не изобретаем;
+    2. `ak:show|off|status` → `_handle_automation_key_callback` (новое);
+    3. иначе — прежний разбор `a:`/`r:`: callback_data — это АДРЕС, не факт
+       доверия (решение читается назад из БД по manifest_id), anti-replay —
+       атомарный `consume_tg_decision`, кнопки снимаются ПОСЛЕ решения
+       best-effort, `answerCallbackQuery` зовётся всегда, когда есть
+       `callback_query.id` — иначе «часики» крутятся до таймаута.
 
     НЕ исполняет мутацию сама — см. блок-комментарий в шапке файла про то,
     что исполнение остаётся за поллером и его атомарным `manifest_store.
-    claim()`; эта функция только переводит статус."""
-    cq = (update or {}).get("callback_query")
-    if not cq:
-        return
+    claim()`; approve/reject-ветка здесь только переводит статус."""
     from_id = str((cq.get("from") or {}).get("id") or "")
     if not from_id or from_id != str(cfg.owner_chat_id):
         return
     data = cq.get("data") or ""
+
+    ak_m = _AK_CALLBACK_RE.match(data)
+    if ak_m:
+        _handle_automation_key_callback(cfg, cq, ak_m.group(1))
+        return
+
     m = _CALLBACK_DATA_RE.match(data)
     if not m:
         return
@@ -1271,6 +1380,14 @@ def handle_webhook(cfg: TgApprovalConfig, update: Dict[str, Any]) -> None:
             message_id = consumed.get("message_id")
         if message_id is not None:
             clear_inline_keyboard(cfg, str(chat_id), message_id)
+        # TZ §5: ОТВЕТ (нажатие кнопки) только что пришёл — план исполнил
+        # свою роль. Таймер на удаление стартует ИМЕННО здесь, не от момента
+        # отправки плана (который мог провисеть сколько угодно). Куски
+        # длинного плана (extra_message_ids) уходят тем же таймером.
+        schedule_message_delete(chat_id, message_id)
+        approval_row = get_tg_approval(manifest_id)
+        for extra_mid in (approval_row or {}).get("extra_message_ids") or []:
+            schedule_message_delete(chat_id, extra_mid)
 
     cq_id = cq.get("id")
     if cq_id:
@@ -1278,6 +1395,110 @@ def handle_webhook(cfg: TgApprovalConfig, update: Dict[str, Any]) -> None:
             "Подтверждено" if decision == "APPROVED" else "Отклонено")
         _tg_call(cfg, "answerCallbackQuery",
                 {"callback_query_id": cq_id, "text": answer_text})
+
+
+# ───────────────────── /automation_key: команда + меню (2026-08-10) ─────────
+# TZ_temp_automation_key.md §3.2/3.3. Owner-only на ОБОИХ шагах (команда И
+# каждая из трёх кнопок) — та же проверка `from.id == cfg.owner_chat_id`, что
+# уже стоит на approve/reject, никакого нового пути авторизации. Сама
+# генерация/отзыв/статус — в `automation_key.py` (этот файл только вызывает
+# её пять публичных функций и знает, КАК говорить с Telegram; деталей схемы
+# БД временных окон здесь нет — см. докстринг того модуля).
+_AUTOMATION_KEY_MENU_MARKUP = {"inline_keyboard": [
+    [{"text": "Показать ключ", "callback_data": "ak:show"}],
+    [{"text": "Выключить", "callback_data": "ak:off"}],
+    [{"text": "Статус", "callback_data": "ak:status"}],
+]}
+
+
+def _handle_automation_key_message(cfg: TgApprovalConfig, msg: Dict[str, Any]) -> None:
+    """Единственное сообщение, на которое этот вебхук реагирует: `/automation_key`
+    от владельца → меню из трёх кнопок. Всё остальное (не команда, не
+    владелец) — тихо игнорируется; это НЕ общий чат-бот, обычное текстовое
+    «да» approval-гейта по-прежнему читает МОДЕЛЬ через MCP-инструмент, а не
+    этот вебхук."""
+    from_id = str((msg.get("from") or {}).get("id") or "")
+    if not from_id or from_id != str(cfg.owner_chat_id):
+        return
+    text = (msg.get("text") or "").strip()
+    # `@bot_username` — форма команды в группах; личка её не шлёт, но
+    # own_bot's owner_chat_id теоретически может быть группой.
+    command = text.split()[0].split("@")[0] if text else ""
+    if command != _AUTOMATION_KEY_COMMAND:
+        return
+    chat_id = str((msg.get("chat") or {}).get("id") or cfg.owner_chat_id)
+    _tg_call(cfg, "sendMessage", {
+        "chat_id": chat_id,
+        "text": "🔑 <b>Ключ автоматики</b>\nВыбери действие:",
+        "parse_mode": "HTML",
+        "reply_markup": _AUTOMATION_KEY_MENU_MARKUP,
+    })
+
+
+def _format_automation_key_status(status: Optional[Dict[str, Any]]) -> str:
+    """Текст кнопки «Статус» — три исхода, дословно различимых (TZ §3.3):
+    окно никогда не выдавалось / активно сейчас / неактивно (истекло или
+    отозвано вручную — тоже различаются)."""
+    if status is None:
+        return "🔑 Статус: временное окно ещё ни разу не выдавалось."
+    if status["active"]:
+        hours_left = status["remaining_s"] / 3600
+        return (f"🔑 Статус: <b>активно</b>, ещё ~{hours_left:.1f} ч "
+               f"(истекает {automation_key.format_ms(status['expires_at'])}).")
+    if status["revoked"]:
+        return (f"🔑 Статус: выключено вручную "
+               f"({automation_key.format_ms(status['revoked_at'])}).")
+    return (f"🔑 Статус: истекло "
+           f"({automation_key.format_ms(status['expires_at'])}).")
+
+
+def _handle_automation_key_callback(cfg: TgApprovalConfig, cq: Dict[str, Any],
+                                    action: str) -> None:
+    """Одна из трёх кнопок меню `/automation_key` — owner-only УЖЕ проверен
+    вызывающим (`_handle_callback_query`), здесь этот вопрос не переспрашиваем
+    второй раз (TZ: «никаких новых путей авторизации не изобретать»).
+
+      "show"   — TZ §3.2: новый `secrets.token_urlsafe(32)` → хэш в базу
+                 (`automation_key.generate_window`), СЫРОЙ токен уходит
+                 владельцу ОТДЕЛЬНЫМ сообщением — это единственный момент,
+                 когда он вообще виден в открытом тексте;
+      "off"    — TZ §3.3: гасит активное окно немедленно;
+      "status" — TZ §3.3: активно ли окно сейчас и сколько осталось.
+
+    `answerCallbackQuery` — всегда, тем же принципом, что и у approve/reject."""
+    chat_id = str(((cq.get("message") or {}).get("chat") or {}).get("id")
+                  or cfg.owner_chat_id)
+    if action == "show":
+        token = automation_key.generate_window(chat_id)
+        if not token:
+            text = ("🛑 Хранилище временных окон не поднято (проверь "
+                    "TG_APPROVAL_ENABLED/CONSENT_DATABASE_URL) — ключ не выдан.")
+            answer = "Не удалось выдать ключ"
+        else:
+            hours = automation_key.AUTOMATION_WINDOW_HOURS
+            text = (f"🔑 Временный ключ (действует {hours:g} ч):\n"
+                    f"<code>{md_to_telegram_html(token)}</code>\n\n"
+                    "Хранится только его хэш — этот текст больше нигде не "
+                    "повторится. Передай его автоматике как automation_key.")
+            answer = "Ключ отправлен"
+        _tg_call(cfg, "sendMessage", {"chat_id": chat_id, "text": text,
+                                      "parse_mode": "HTML"})
+    elif action == "off":
+        was_active = automation_key.revoke_window(chat_id)
+        text = ("🔒 Окно выключено." if was_active else
+                "Активного окна и так не было.")
+        _tg_call(cfg, "sendMessage", {"chat_id": chat_id, "text": text})
+        answer = "Готово"
+    else:  # "status" — единственное оставшееся значение _AK_CALLBACK_RE
+        status = automation_key.window_status(chat_id)
+        _tg_call(cfg, "sendMessage", {
+            "chat_id": chat_id, "text": _format_automation_key_status(status),
+            "parse_mode": "HTML"})
+        answer = "Статус отправлен"
+    cq_id = cq.get("id")
+    if cq_id:
+        _tg_call(cfg, "answerCallbackQuery",
+                {"callback_query_id": cq_id, "text": answer})
 
 
 def register_webhook(cfg: TgApprovalConfig, public_base_url: Optional[str]) -> None:
@@ -1311,7 +1532,16 @@ def register_webhook(cfg: TgApprovalConfig, public_base_url: Optional[str]) -> N
         res = _tg_call(cfg, "setWebhook", {
             "url": url,
             "secret_token": cfg.webhook_secret,
-            "allowed_updates": ["callback_query"],
+            # "message" добавлен 2026-08-10 (TZ_temp_automation_key.md §3.2)
+            # ради команды `/automation_key` — до этого вебхук подписывался
+            # ТОЛЬКО на нажатия кнопок (callback_query), обычные текстовые
+            # сообщения Telegram сюда не присылал вовсе. `handle_webhook`
+            # ниже по-прежнему игнорирует любое сообщение, которое не
+            # начинается с `/automation_key` и не от владельца (см. её
+            # докстринг) — расширение подписки НЕ открывает никакой новый
+            # путь исполнения гейтованных операций, только сам этот один
+            # новый набор кнопок.
+            "allowed_updates": ["callback_query", "message"],
         })
     except Exception as e:  # noqa: BLE001 — регистрация best-effort на старте
         logger.error(f"TG own_bot: setWebhook упал: {e} — url={url}")
@@ -1642,6 +1872,11 @@ def post_report_to_group(cfg: TgApprovalConfig, manifest_id: str, report_md: str
                            f"частей): {res.error}")
         if res.message_ids:
             record_report_messages(manifest_id, chat_id, res.message_ids)
+            # TZ §5: отчёт — уже финальное сообщение, таймер стартует СРАЗУ
+            # при отправке (в отличие от плана/кнопок, чей таймер ждёт
+            # ответа человека).
+            for mid in res.message_ids:
+                schedule_message_delete(chat_id, mid)
         return ReportDelivery(list(res.message_ids), res.total_chunks,
                               len(res.message_ids), bool(res.ok))
     except Exception as e:  # noqa: BLE001 — отчёт best-effort по определению

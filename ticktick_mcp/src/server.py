@@ -33,6 +33,7 @@ from .ticktick_v2_client import (ATTACHMENT_MAX_BYTES, COMPLETED_MAX_LIMIT,
                                  TRASH_MAX_LIMIT, TickTickAuthError,
                                  TickTickV2Client, id2error_failures,
                                  new_attachment_id)
+from . import automation_key
 from . import declutter_sheet
 from . import log_redaction
 from . import manifest_store
@@ -106,9 +107,11 @@ def _tool_error(context: str, exc: Any) -> str:
     return f"Error {context}: {_redact_for_user(exc)}"
 
 
-def _automation_key_matches(provided: str) -> bool:
-    """Постоянное по времени сравнение `automation_key` с MCP_SECRET, которое
-    НЕ падает на не-ASCII (2026-08-06).
+def _legacy_secret_matches(provided: str) -> bool:
+    """Постоянное по времени сравнение с `MCP_SECRET`, которое НЕ падает на
+    не-ASCII (2026-08-06) — БЫЛА единственным телом `_automation_key_matches`
+    до TZ_temp_automation_key.md (2026-08-10); имя изменилось, сравнение —
+    нет, ни на символ.
 
     Было: `hmac.compare_digest(automation_key, SECRET)` с ДВУМЯ `str`. В этой
     форме CPython требует, чтобы обе строки были ASCII-only, иначе бросает
@@ -123,13 +126,77 @@ def _automation_key_matches(provided: str) -> bool:
 
     Сравниваем sha256-дайджесты utf-8-байтов: байты `compare_digest` принимает
     любые, дайджест всегда 32 байта — значит не утекает и длина секрета
-    (у сравнения сырых байтов разной длины она видна по времени)."""
+    (у сравнения сырых байтов разной длины она видна по времени).
+
+    ЭТОТ КАНАЛ — ВРЕМЕННЫЙ (docs/TZ/TZ_temp_automation_key.md §2/§3.4,
+    2026-08-10). `MCP_SECRET` теряет роль automation_key в пользу нового
+    отдельного `AUTOMATION_KEY` и временных Telegram-окон — но продолжает
+    приниматься здесь РАДИ ОБРАТНОЙ СОВМЕСТИМОСТИ: внешние автоматизации
+    (n8n и подобные), уже настроенные на `MCP_SECRET`, не должны сломаться
+    молча в момент выкладки. Убирается ОТДЕЛЬНОЙ правкой, когда владелец
+    подтвердит, что все они переведены на `AUTOMATION_KEY` — см. TZ §7."""
     if not (SECRET and provided):
         return False
     return hmac.compare_digest(
         hashlib.sha256(provided.encode("utf-8")).digest(),
         hashlib.sha256(SECRET.encode("utf-8")).digest(),
     )
+
+
+def _automation_key_channel(provided: str) -> str:
+    """Какой из ТРЁХ независимых каналов automation_key (TZ §3.4) открыл
+    дверь для `provided` — "" если ни один. Порядок проверки не имеет
+    значения для корректности (каналы независимы и не пересекаются по
+    значениям на практике — токены/секреты разной длины и происхождения),
+    но фиксирован ради детерминированного текста в аудите:
+
+      1. "static" — новый статический `AUTOMATION_KEY` (env,
+         `automation_key.matches_static`);
+      2. "window:<created_at_ms>" — активное временное окно, выданное по
+         кнопке в Telegram (`automation_key.check_window`); метка несёт
+         время открытия окна для строки аудита («открыт <когда>», TZ §4) —
+         без лишней поездки в базу канал вычислялся бы без даты открытия,
+         а она нужна ИМЕННО в момент совпадения, не позже;
+      3. "legacy" — старый `MCP_SECRET` (см. `_legacy_secret_matches`),
+         временно, ради обратной совместимости.
+
+    Каждая из трёх проверок — сравнение за постоянное время; порядок между
+    ними НЕ constant-time (короткое замыкание на первом совпадении), но это
+    не секрет-в-секрет сравнение, а всего лишь «какой из трёх бы сработал» —
+    TZ §3.4 требует constant-time у каждого СРАВНЕНИЯ по отдельности, не у
+    очерёдности каналов."""
+    if not provided:
+        return ""
+    if automation_key.matches_static(provided):
+        return "static"
+    if automation_key.check_window(provided):
+        status = automation_key.window_status(_TG_CFG.owner_chat_id if _TG_CFG else "")
+        opened = (status or {}).get("created_at")
+        return f"window:{opened}" if opened else "window"
+    if _legacy_secret_matches(provided):
+        return "legacy"
+    return ""
+
+
+def _automation_key_matches(provided: str) -> bool:
+    """True — `provided` открывает дверь ХОТЯ БЫ ОДНИМ из трёх независимых
+    каналов automation_key (docs/TZ/TZ_temp_automation_key.md §3.4):
+
+      1. новый статический `AUTOMATION_KEY` (env, отдельный от MCP_SECRET);
+      2. временное окно, выданное по кнопке в Telegram (24ч по умолчанию,
+         `AUTOMATION_WINDOW_HOURS`);
+      3. старый `MCP_SECRET` — ВРЕМЕННО, ради обратной совместимости (см.
+         `_legacy_secret_matches`'s докстринг) — убирается отдельной правкой.
+
+    Сохраняет ТОЧНО прежнюю сигнатуру и семантику `_automation_key_matches`
+    (bool, не бросает, пустой/несовпавший ключ → False) — весь код,
+    вызывающий эту функцию, не тронут: `_automation_only`/`_require_
+    automation_key`, прямой обход в `delete_tasks`, и сама
+    `_legacy_secret_matches`, которая раньше была её единственным телом.
+
+    Который ИМЕННО канал совпал — знает `_automation_key_channel` (см. выше);
+    эта функция — только «да/нет» для мест, которым канал не нужен."""
+    return bool(_automation_key_channel(provided))
 
 
 # ───────────── ТАБЛИЦА ПОКРЫТИЯ: закрытое имя → замена в агрегаторе ─────────
@@ -5465,7 +5532,13 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
         # «человек согласен?», а не «та ли это задача»: identity guard в
         # `_execute_task_deletion_impl` отрабатывает ещё раз, снимок пишется
         # в журнал, эффект перепроверяется свежим чтением — как и по кнопке.
-        if _automation_key_matches(automation_key):
+        _ak_channel = _automation_key_channel(automation_key)
+        if _ak_channel:
+            # Метка канала для журнала/аудита (TZ §4) — тем же ContextVar,
+            # что и `_require_consent`/`_gate_batch`/`_gate_single`;
+            # `_execute_task_deletion_impl` пишет в журнал через
+            # `_journal_write`, которая съедает метку на первой же записи.
+            consent._AUTOMATION_CHANNEL.set(_ak_channel)
             done = await _execute_task_deletion_impl(mid, _MANIFESTS[mid])
             # `lines` — предупреждения про пропущенные/несовпавшие задачи.
             # В интерактивном пути они видны человеку в превью; headless-путь
@@ -5535,6 +5608,7 @@ ConsentResult, _CONSENT_MAX_TOKENS, _JOURNAL_DIR, _MANIFESTS,
     _tombstone_reason_for_verdict)
 consent.bind_server_hooks(  # noqa: E402
     tg_cfg=_TG_CFG, automation_key_matches=_automation_key_matches,
+    automation_key_channel=_automation_key_channel,
     redact_for_user=_redact_for_user, run_blocking=_run_blocking)
 @mcp.tool(annotations=READONLY)
 async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
@@ -6478,6 +6552,26 @@ class _ReportData(NamedTuple):
 _REPORT_LIST_CAP = 50
 
 
+def _automation_channel_note(raw_channel: str) -> str:
+    """Строка аудита канала automation_key (TZ_temp_automation_key.md §4) —
+    ровно три формулировки, дословно из ТЗ. `raw_channel` — то, что положил
+    `_journal_write` в запись журнала (см. `_AUTOMATION_CHANNEL` в
+    consent.py): "static" | "window" | "window:<created_at_ms>" | "legacy".
+    Пустая строка (обычный интерактивный путь план→подтверждение) → "" —
+    вызывающий не печатает строку вовсе."""
+    if not raw_channel:
+        return ""
+    if raw_channel == "static":
+        return "🤖 Исполнено автоматикой (AUTOMATION_KEY)."
+    if raw_channel.startswith("window"):
+        opened_ms = raw_channel.split(":", 1)[1] if ":" in raw_channel else ""
+        opened = automation_key.format_ms(int(opened_ms)) if opened_ms.isdigit() else "?"
+        return f"🤖 Исполнено в открытом окне (временный ключ, открыт {opened})."
+    if raw_channel == "legacy":
+        return "🤖 Исполнено автоматикой (MCP_SECRET, устаревший путь)."
+    return f"🤖 Исполнено автоматикой (канал: {raw_channel})."
+
+
 def _capped_lines(records: List[Dict], render, cap: int = _REPORT_LIST_CAP,
                   what: str = "записей") -> List[str]:
     """Строки перечня с ЧЕСТНЫМ усечением: сначала строки, затем — если что-то
@@ -6596,6 +6690,19 @@ def _build_operation_report_data(record_id: str) -> _ReportData:
             pass
         lines = [f"### 🧾 Независимый отчёт — `{record_id}`",
                  f"_{when} · журнал операции ⇄ живое состояние TickTick_", ""]
+        # Аудит канала automation_key (TZ §4) — печатается ТОЛЬКО когда
+        # операция реально прошла мимо интерактивного плана→подтверждения.
+        # Метку кладёт `_journal_write` (consent.py) на первую запись,
+        # относящуюся к этому record_id; сканируем ВСЕ записи (не только
+        # последнюю) на случай нескольких _op_journal-вызовов за одну
+        # операцию — им положена ОДНА и та же метка (весь вызов шёл под
+        # одним ключом), первая найденная и печатается.
+        _ak_note = _automation_channel_note(
+            next((r.get("automation_channel") for r in records
+                  if r.get("automation_channel")), ""))
+        if _ak_note:
+            lines.append(f"_{_ak_note}_")
+            lines.append("")
         # Единый источник истины: каждый вердикт сначала собирается сюда, в
         # виде пары (status, напечатанная_строка). И строки, печатаемые ниже,
         # и итоговый подсчёт дальше — оба выведены из ЭТОГО ЖЕ списка, а не
@@ -18052,6 +18159,14 @@ def main():
         # кнопки (см. шапку manifest_store.py). Миграция применяется здесь же,
         # кодом при старте, как и схема tg_approvals.
         manifest_store.init_store(db_url)
+        # Тот же ДСН, ТРЕТЬЯ отдельная таблица (tg_automation_windows) —
+        # временные окна automation_key (docs/TZ/TZ_temp_automation_key.md
+        # §3.1). Живёт даже без own_bot: `check_window`/`window_status`
+        # читают её независимо от того, кто владеет вебхуком, — только
+        # генерация/отзыв по кнопке требуют own_bot (см. ниже).
+        automation_key.init_store(db_url)
+        logger.info("automation_key: таблица tg_automation_windows готова "
+                    f"(AUTOMATION_KEY {'задан' if automation_key.AUTOMATION_KEY else 'НЕ задан'})")
         if _TG_CFG.own_bot:
             logger.info("TG approval: Postgres подключен, слой активен "
                         "(server=ticktick, TG_BOT_TOKEN_OVERRIDE задан — свой бот, "
