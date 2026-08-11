@@ -141,11 +141,15 @@ def _close_pools() -> None:
     `fresh_stores` до этой правки просто обнуляла ссылку — соединения жили до
     сборки мусора."""
     try:
-        from ticktick_mcp.src import manifest_store, tg_approval
+        from ticktick_mcp.src import automation_key, manifest_store, tg_approval
     except Exception:  # noqa: BLE001 — сервер мог и не импортироваться
         return
     try:
         manifest_store.close_store()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        automation_key.close_store()
     except Exception:  # noqa: BLE001
         pass
     pool = getattr(tg_approval, "_pg_pool", None)
@@ -270,3 +274,18 @@ def fresh_store(monkeypatch=None):
     with manifest_store._conn() as cur:
         cur.execute("DELETE FROM mcp_manifests")
     return manifest_store
+
+
+def fresh_automation_key_store():
+    """Чистое хранилище временных окон automation_key (docs/TZ/
+    TZ_temp_automation_key.md, 2026-08-10) — тот же приём, что `fresh_store`:
+    пул поднят на СВОЕЙ базе этого прогона, таблица `tg_automation_windows`
+    пуста, схема — та же миграция, что и в проде (`init_store` →
+    `_ensure_schema`)."""
+    from ticktick_mcp.src import automation_key
+
+    automation_key.close_store()
+    automation_key.init_store(pg_dsn())
+    with automation_key._conn() as cur:
+        cur.execute("DELETE FROM tg_automation_windows")
+    return automation_key
