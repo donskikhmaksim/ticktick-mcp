@@ -85,19 +85,45 @@ def resolve_tool_alias(tool: str) -> str:
 # `consent` пригодным к импорту в одиночку.
 _TG_CFG = None
 _automation_key_matches = None
+_automation_key_channel = None
 _redact_for_user = None
 _run_blocking = None
 
 
 def bind_server_hooks(*, tg_cfg, automation_key_matches, redact_for_user,
-                      run_blocking) -> None:
+                      run_blocking, automation_key_channel=None) -> None:
     """Подставить зависимости главного файла. Зовётся из `server.py` сразу
-    после импорта — то есть до первого плана и первого гейта."""
-    global _TG_CFG, _automation_key_matches, _redact_for_user, _run_blocking
+    после импорта — то есть до первого плана и первого гейта.
+
+    `automation_key_channel` (2026-08-10, TZ_temp_automation_key.md) — как
+    `automation_key_matches`, но вместо bool отдаёт КАКОЙ ИМЕННО из трёх
+    независимых каналов совпал ("" — ни один). Опциональна (default None) —
+    вызывающие, которые ещё не завели новые каналы, продолжают работать по
+    одному лишь `automation_key_matches` (см. использование ниже: при None
+    гейт откатывается на бинарную проверку и помечает канал как "legacy",
+    то же имя, что печаталось в `ConsentResult.reason` ДО этой правки)."""
+    global _TG_CFG, _automation_key_matches, _automation_key_channel
+    global _redact_for_user, _run_blocking
     _TG_CFG = tg_cfg
     _automation_key_matches = automation_key_matches
+    _automation_key_channel = automation_key_channel
     _redact_for_user = redact_for_user
     _run_blocking = run_blocking
+
+
+def _automation_channel_for(provided: str) -> str:
+    """Единая точка входа для гейтов ниже: канал, которым `provided` открыл
+    дверь ("" — не открыл никаким). Если `server.py` предоставил
+    `automation_key_channel` (обычный случай) — используется он; иначе (тест
+    вызвал `bind_server_hooks` по старой сигнатуре, без нового хука) —
+    откат на бинарную `automation_key_matches` с меткой "legacy", то есть
+    ПОВЕДЕНИЕ ДО ЭТОЙ ПРАВКИ, только с именем канала для журнала."""
+    if _automation_key_channel is not None:
+        return _automation_key_channel(provided)
+    if _automation_key_matches and _automation_key_matches(provided):
+        return "legacy"
+    return ""
+
 
 # --- Обратная связь с модулем кнопки ----------------------------------------
 # Гейт спрашивает у исполнения по кнопке, есть ли для команды исполнитель:
@@ -1034,6 +1060,34 @@ def _tg_button_only(manifest: Optional[Dict]) -> bool:
     return _resolve_auto_executor(_auto_execute_tool_of(manifest), manifest) is not None
 
 
+def _schedule_tg_gate_message_delete(manifest: Optional[Dict],
+                                     manifest_id: str) -> None:
+    """TZ_temp_automation_key.md §5 (2026-08-10): текстовый ОТВЕТ (да/нет)
+    только что пришёл — если план реально уходил в Telegram (`tg_notified`),
+    ставим его сообщение (и предыдущие куски, если план был длинным) в
+    очередь на удаление примерно через минуту, СЕЙЧАС, а не от момента
+    отправки. No-op, если план в Telegram не уходил (обычный чат-путь) или
+    строки подтверждения уже нет (best-effort — так же, как остальной этот
+    механизм).
+
+    Единственный путь, которым текстовый ответ вообще доезжает досюда с
+    `tg_notified=True`, — `delete_project`/слияние `rename_tag` (см.
+    `_tg_button_only` выше): у всех остальных TG-уведомлённых планов
+    текстовый путь закрыт целиком, и удаление их сообщений по кнопке уже
+    делает `tg_approval._handle_callback_query`."""
+    if not (manifest or {}).get("tg_notified"):
+        return
+    mid = manifest_id or (manifest or {}).get("_tg_manifest_id", "")
+    if not mid:
+        return
+    row = tg_approval.get_tg_approval(mid)
+    if not row:
+        return
+    tg_approval.schedule_message_delete(row.get("chat_id"), row.get("message_id"))
+    for extra in row.get("extra_message_ids") or []:
+        tg_approval.schedule_message_delete(row.get("chat_id"), extra)
+
+
 _NO_REPLY_INSTRUCTION = (
     "🛑 Нужно подтверждение пользователя, а не самого себя: этот инструмент "
     "физически необратим/массовый, поэтому вызывай его ТОЛЬКО после того, "
@@ -1062,6 +1116,14 @@ def _require_consent(
     affirmative-reply check still fully applies. Never mutates `manifest`
     except to invalidate it on an explicit "no".
 
+    `automation_key` теперь сверяется с ТРЕМЯ независимыми каналами (TZ
+    §3.4) через `_automation_channel_for` — первая совпавшая строка ниже НЕ
+    изменилась (`ConsentResult(True, "automation_key")` дословно, ради
+    обратной совместимости с существующими проверками
+    `cr.reason == "automation_key"`), но КАКОЙ именно канал открыл дверь
+    теперь помечается отдельно в `_AUTOMATION_CHANNEL` — журнал мутаций
+    подхватит метку на первой же записи (см. `_journal_write`).
+
     ОСТАЁТСЯ СИНХРОННОЙ НАМЕРЕННО (2026-08-06, #115). Внутри есть поход в
     Postgres — `tg_approval.check_approval` (один индексируемый SELECT), и
     соблазн унести его в поток тем же `_run_blocking`, каким унесена отправка
@@ -1075,7 +1137,9 @@ def _require_consent(
     CONSENT_PG_CONNECT_TIMEOUT_S / CONSENT_PG_STATEMENT_TIMEOUT_MS). Если
     когда-нибудь понадобится унести и его — сначала нужен явный захват
     манифеста ДО await (compare-and-set «в работе»), а не голый вынос."""
-    if _automation_key_matches(automation_key):
+    _ak_channel = _automation_channel_for(automation_key)
+    if _ak_channel:
+        _AUTOMATION_CHANNEL.set(_ak_channel)
         return ConsentResult(True, "automation_key")
     if tier <= 0:
         return ConsentResult(True, "tier0-no-gate")
@@ -1117,6 +1181,10 @@ def _require_consent(
         # «воскресил» бы отменённый план, и висящая в Telegram кнопка ✅
         # исполнила бы то, от чего человек уже отказался вслух.
         _mark_manifest_consumed(manifest, manifest_id)
+        # TZ §5 (2026-08-10): текстовый ОТВЕТ (отказ) только что пришёл —
+        # план, если он ушёл в Telegram, исполнил свою роль. Таймер на
+        # удаление стартует ЗДЕСЬ, не от момента отправки.
+        _schedule_tg_gate_message_delete(manifest, manifest_id)
         detail = _consent_refusal_reason(user_reply)
         # Ведущая фраза «Пользователь НЕ подтвердил» сохранена дословно: на неё
         # опираются существующие тесты и, возможно, внешние интеграции, читающие
@@ -1227,6 +1295,13 @@ def _require_consent(
                                   "дождись ЕГО отдельного сообщения, потом "
                                   "повтори execute с user_reply.")
 
+    # TZ §5 (2026-08-10): текстовое «да» только что подтвердило план — если
+    # он ушёл в Telegram (delete_project / слияние rename_tag — единственные
+    # два плана без авто-исполнителя, у которых текстовый путь после
+    # `tg_notified` вообще ещё жив, см. `_tg_button_only` выше), таймер на
+    # удаление сообщения с кнопками стартует ИМЕННО сейчас, а не от момента
+    # отправки.
+    _schedule_tg_gate_message_delete(manifest, manifest_id)
     return ConsentResult(True, "user_reply")
 
 
@@ -1249,6 +1324,33 @@ def _require_consent(
 _TG_AUTO_EXECUTE_MANIFEST: "contextvars.ContextVar[str]" = contextvars.ContextVar(
     "tg_auto_execute_manifest", default="")
 
+# Какой канал automation_key исполняет операцию ПРЯМО СЕЙЧАС (2026-08-10,
+# TZ_temp_automation_key.md §4 — аудируемость). Тот же приём, что у
+# `_TG_AUTO_EXECUTE_MANIFEST` прямо над этим комментарием: устанавливается в
+# ЕДИНСТВЕННОМ месте, где ключ реально открыл дверь без плана/кнопки
+# (`_require_consent`/`_gate_batch`/`_gate_single`, все три — ниже), и
+# читается ЗДЕСЬ же, в `_journal_write` — единственной двери в журнал
+# мутаций. Значения: "static" (новый AUTOMATION_KEY), "window" (временное
+# окно; см. `_automation_channel_for` — при активном окне сюда может
+# прилететь "window:<created_at_ms>", см. server.py), "legacy" (устаревший
+# путь через MCP_SECRET). Пусто — обычный интерактивный путь (план→кнопка/
+# чат-«да»), метка не нужна.
+#
+# ПОЧЕМУ «СЪЕДАЕТСЯ» ПРИ ЧТЕНИИ (ниже, в `_journal_write`), А НЕ ГАСИТСЯ
+# through try/finally вокруг вызова исполнителя, как у `_TG_AUTO_EXECUTE_
+# MANIFEST`. Место, где канал становится известен (гейт), и место, где
+# вызывается сам исполнитель мутации, — РАЗНЫЕ функции (гейт возвращает
+# управление вызывающему тулу, а тот уже сам зовёт `_op_journal`), поэтому
+# обернуть вызов исполнителя в try/finally прямо в гейте невозможно. Взамен
+# `_journal_write` читает значение и СРАЗУ ЖЕ его гасит (`.set("")`) — первая
+# же запись в журнал после того, как гейт пометил канал, потребляет метку и
+# не даёт ей утечь на СЛЕДУЮЩУЮ, не связанную с этим вызовом запись. Каждый
+# гейтованный тул в этом сервере пишет в журнал не больше одного раза за
+# вызов (см. `_op_journal`'s вызывающих) — этого достаточно, чтобы «съесть
+# при первом чтении» не теряло метку внутри одной операции.
+_AUTOMATION_CHANNEL: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "automation_channel", default="")
+
 
 def _journal_write(record: Dict) -> str:
     """Append a JSON record to the mutation journal (best-effort). Returns the
@@ -1259,6 +1361,12 @@ def _journal_write(record: Dict) -> str:
         # Копия, а не мутация аргумента: вызывающие собирают record инлайном,
         # но полагаться на это нельзя.
         record = {**record, "tg_manifest": mid}
+    channel = _AUTOMATION_CHANNEL.get()
+    if channel and not record.get("automation_channel"):
+        record = {**record, "automation_channel": channel}
+        # Съедено: следующая, не связанная с этим вызовом запись в журнал не
+        # унаследует чужую метку канала (см. блок-комментарий у ContextVar).
+        _AUTOMATION_CHANNEL.set("")
     try:
         os.makedirs(_JOURNAL_DIR, exist_ok=True)
         path = os.path.join(_JOURNAL_DIR, "deletion_journal.jsonl")
@@ -1594,11 +1702,14 @@ async def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
     #
     # Сверка стоит ПЕРВОЙ строкой обоих гейтов намеренно: ниже неё нет ни
     # одной ветки, которая создаёт манифест или зовёт `_maybe_tg_notify_plan`.
-    # Ослабления здесь нет: `_automation_key_matches` — то же самое сравнение
-    # с `MCP_SECRET` за постоянное время, что и в `_require_consent`; при
-    # неверном, пустом или отсутствующем ключе оно возвращает False, и
-    # управление уходит в прежний интерактивный путь целиком.
-    if _automation_key_matches(automation_key):
+    # Ослабления здесь нет: `_automation_channel_for` — те же три сравнения
+    # за постоянное время, что и в `_require_consent`; при неверном, пустом
+    # или отсутствующем ключе она возвращает "", и управление уходит в
+    # прежний интерактивный путь целиком. Помечаем КАКОЙ канал открыл дверь
+    # (TZ §4, аудируемость) — журнал подхватит метку на первой же записи.
+    _ak_channel = _automation_channel_for(automation_key)
+    if _ak_channel:
+        _AUTOMATION_CHANNEL.set(_ak_channel)
         stored = await _claim_plan_for_automation(kind, manifest_id)
         if stored is not None:
             return _GateOutcome(True, tasks=stored.get("tasks") or [],
@@ -1715,7 +1826,9 @@ async def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
     call #1; ветка call #2 синхронна от проверки согласия до `consumed`."""
     # ─── ОБХОД ПО КЛЮЧУ — ДО построения плана и ДО отправки (#118) ───
     # Тот же блок, что и в `_gate_batch`; развёрнутое обоснование — там.
-    if _automation_key_matches(automation_key):
+    _ak_channel = _automation_channel_for(automation_key)
+    if _ak_channel:
+        _AUTOMATION_CHANNEL.set(_ak_channel)
         stored = await _claim_plan_for_automation(kind, manifest_id)
         if stored is not None:
             return _GateOutcome(True, extra=stored.get("params") or {})

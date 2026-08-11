@@ -54,7 +54,7 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
         перед стартом сервера — но защита обязана быть невозможной для
         обхода, а не просто «в бою так не бывает»).
 
-        Сравнение — как `_automation_key_matches` в server.py:61 (тот же
+        Сравнение — как `_legacy_secret_matches` в server.py (тот же
         приём, тот же комментарий про причину): `hmac.compare_digest` по
         sha256-дайджестам, а не по сырым строкам через `==`, — константное
         время, не течёт даже длина значения."""
