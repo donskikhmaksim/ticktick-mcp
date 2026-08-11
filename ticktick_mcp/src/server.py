@@ -153,10 +153,14 @@ def _automation_key_channel(provided: str) -> str:
       1. "static" — новый статический `AUTOMATION_KEY` (env,
          `automation_key.matches_static`);
       2. "window:<created_at_ms>" — активное временное окно, выданное по
-         кнопке в Telegram (`automation_key.check_window`); метка несёт
-         время открытия окна для строки аудита («открыт <когда>», TZ §4) —
-         без лишней поездки в базу канал вычислялся бы без даты открытия,
-         а она нужна ИМЕННО в момент совпадения, не позже;
+         кнопке/команде в Telegram (`automation_key.find_window`); метка
+         несёт время открытия ИМЕННО ТОГО окна, что совпало (TZ_multi_
+         automation_windows.md: при множестве одновременно активных окон
+         аудит обязан различать их, не только «первое» или единственное) —
+         для строки аудита («открыт <когда>», TZ §4). `find_window` уже
+         перебирает ВСЕ активные окна и возвращает совпавшее одним запросом
+         (не два похода в базу, как было раньше с `check_window` +
+         отдельным `window_status`);
       3. "legacy" — старый `MCP_SECRET` (см. `_legacy_secret_matches`),
          временно, ради обратной совместимости.
 
@@ -169,9 +173,9 @@ def _automation_key_channel(provided: str) -> str:
         return ""
     if automation_key.matches_static(provided):
         return "static"
-    if automation_key.check_window(provided):
-        status = automation_key.window_status(_TG_CFG.owner_chat_id if _TG_CFG else "")
-        opened = (status or {}).get("created_at")
+    win = automation_key.find_window(provided)
+    if win:
+        opened = win.get("created_at")
         return f"window:{opened}" if opened else "window"
     if _legacy_secret_matches(provided):
         return "legacy"
@@ -18161,9 +18165,10 @@ def main():
         manifest_store.init_store(db_url)
         # Тот же ДСН, ТРЕТЬЯ отдельная таблица (tg_automation_windows) —
         # временные окна automation_key (docs/TZ/TZ_temp_automation_key.md
-        # §3.1). Живёт даже без own_bot: `check_window`/`window_status`
-        # читают её независимо от того, кто владеет вебхуком, — только
-        # генерация/отзыв по кнопке требуют own_bot (см. ниже).
+        # §3.1; docs/TZ/TZ_multi_automation_windows.md §"несколько окон").
+        # Живёт даже без own_bot: `check_window`/`find_window` читают её
+        # независимо от того, кто владеет вебхуком, — только генерация/
+        # отзыв по кнопке требуют own_bot (см. ниже).
         automation_key.init_store(db_url)
         logger.info("automation_key: таблица tg_automation_windows готова "
                     f"(AUTOMATION_KEY {'задан' if automation_key.AUTOMATION_KEY else 'НЕ задан'})")

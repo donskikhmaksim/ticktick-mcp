@@ -1,5 +1,7 @@
 """automation_key.py — отдельный статический AUTOMATION_KEY + временные окна
-по кнопке в Telegram (docs/TZ/TZ_temp_automation_key.md, 2026-08-10).
+по кнопке в Telegram (docs/TZ/TZ_temp_automation_key.md, 2026-08-10;
+docs/TZ/TZ_multi_automation_windows.md, 2026-08-11 — НЕСКОЛЬКО одновременно
+активных окон вместо одного, см. ниже).
 
 ЗАЧЕМ ЭТОТ МОДУЛЬ ВООБЩЕ ЕСТЬ
 ─────────────────────────────
@@ -33,14 +35,30 @@ docs-mcp, sheets-mcp), когда это понадобится — НЕ сей�
 не забытый рефакторинг.
 
 ЧТО СЕРВЕР (server.py) ДОЛЖЕН ЗНАТЬ, А ЧТО — НЕТ (TZ §3.5). `server.py`
-зовёт РОВНО пять функций отсюда: `matches_static`, `generate_window`,
-`check_window`, `revoke_window`, `window_status` — деталей схемы таблицы
-`tg_automation_windows` он не видит и видеть не должен, ровно как
-`manifest_store`/`tg_approval` инкапсулируют свою часть уже сегодня. Никакой
-Telegram-логики (отправка сообщений, кнопки, разбор апдейтов) здесь тоже
-нет — это ответственность `tg_approval.py` (он уже владеет транспортом
-Telegram); этот модуль — «минисервис» ТОЛЬКО жизненного цикла ключей,
-как и попросил владелец (TZ §1).
+зовёт функции отсюда: `matches_static`, `generate_window`, `check_window`,
+`find_window` — деталей схемы таблицы `tg_automation_windows` он не видит и
+видеть не должен, ровно как `manifest_store`/`tg_approval` инкапсулируют
+свою часть уже сегодня. Никакой Telegram-логики (отправка сообщений, кнопки,
+разбор апдейтов) здесь тоже нет — это ответственность `tg_approval.py` (он
+уже владеет транспортом Telegram, и он же зовёт `revoke_window`/
+`revoke_all_windows`/`list_windows` по командам/кнопкам владельца); этот
+модуль — «минисервис» ТОЛЬКО жизненного цикла ключей, как и попросил
+владелец (TZ §1).
+
+НЕСКОЛЬКО ОДНОВРЕМЕННЫХ ОКОН (docs/TZ/TZ_multi_automation_windows.md,
+2026-08-11). Владелец использует временные ключи в НЕСКОЛЬКИХ разных чатах
+одновременно — первая версия этого модуля хранила РОВНО ОДНО окно на сервер
+(`_WINDOW_ID = SERVER` фиксирован, повторная генерация UPSERT'ила ту же
+строку и инвалидировала предыдущий токен), что молча ломало этот сценарий:
+сгенерировал ключ для чата А → вставил → сгенерировал ключ для чата Б → ключ
+чата А перестал работать. Теперь `window_id` — случайный (`secrets.
+token_hex(6)`) на КАЖДУЮ генерацию, `generate_window` — INSERT новой строки
+(не UPSERT существующей), и произвольное число окон активно параллельно,
+каждое истекает по своему собственному `expires_at`. `window_status`
+(алиас «последнего» окна) убран — при множестве окон концепция «последнее»
+не осмысленна для вызывающего; ему на замену `find_window` (какое ИМЕННО
+окно совпало с присланным токеном — нужно для аудита) и `list_windows`
+(все активные, для команды/кнопки «Список»).
 
 ХРАНИМ ХЭШ, НЕ САМ ТОКЕН — тот же принцип, что и у `tg_approvals`/
 `mcp_manifests` не хранят пароли в открытом виде нигде, кроме DSN подключения
@@ -56,7 +74,7 @@ import secrets
 import threading
 import time
 from datetime import timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
@@ -75,14 +93,12 @@ AUTOMATION_KEY = os.environ.get("AUTOMATION_KEY", "").strip()
 # (секунды/3600), чтобы не ждать реальные сутки для проверки истечения.
 AUTOMATION_WINDOW_HOURS = float(os.environ.get("AUTOMATION_WINDOW_HOURS", "24"))
 
-# window_id стабилен (= SERVER): у одного владельца одновременно активно НЕ
-# БОЛЬШЕ ОДНОГО временного окна, и повторная генерация — это UPSERT той же
-# строки (TZ §3.6.4: «повторное нажатие ПРОДЛЕВАЕТ — перезаписывает
-# expires_at, генерирует новый токен, старый хэш инвалидируется ЗАМЕНОЙ
-# СТРОКИ»). Отдельного «пришедшего вторым» окна поэтому не бывает — ровно то
-# поведение, которое требует ТЗ, без attrition правил вида «гасить прежние
-# активные окна перед вставкой новой строки».
-_WINDOW_ID = SERVER
+# Сколько раз generate_window пробует новый случайный window_id, если он
+# внезапно совпал с уже существующим (PRIMARY KEY conflict) — 12 hex-символов
+# (secrets.token_hex(6)) значит 48 бит энтропии, реальная коллизия практически
+# невозможна, но код не должен молча упасть в том редком случае, когда она
+# всё же случится.
+_WINDOW_ID_INSERT_ATTEMPTS = 5
 
 _pg_pool = None
 _init_lock = threading.Lock()
@@ -160,10 +176,18 @@ def store_ready() -> bool:
 
 
 def _ensure_schema() -> None:
-    """DDL из TZ §3.1, дословно. `server`/`window_id` — составной смысл (одна
-    таблица может завтра обслуживать несколько серверов), но PRIMARY KEY —
-    только `window_id` (см. `_WINDOW_ID` выше: одна активная строка на
-    сервер, генерация — UPSERT)."""
+    """DDL из TZ_multi_automation_windows.md — `server`/`window_id` составной
+    смысл (одна таблица может завтра обслуживать несколько серверов), PRIMARY
+    KEY только `window_id`, но теперь это СЛУЧАЙНЫЙ id на каждую генерацию
+    (`secrets.token_hex(6)`, см. `generate_window`), а не фиксированный
+    `SERVER` — поэтому несколько строк ОДНОВРЕМЕННО активны для одного
+    `server`, там где раньше была ровно одна.
+
+    `ALTER TABLE ... ADD COLUMN IF NOT EXISTS label` — на случай, если таблица
+    уже существует в проде со старой (одно-оконной) схемой без `label`:
+    `CREATE TABLE IF NOT EXISTS` её не тронет, а старая единственная строка
+    (`window_id = 'ticktick'`) остаётся как есть и участвует в выдаче наравне
+    с новыми — не теряем то, что уже было выдано до этой миграции."""
     with _conn() as cur:
         cur.execute(
             """
@@ -171,12 +195,16 @@ def _ensure_schema() -> None:
                 server          TEXT NOT NULL,
                 window_id       TEXT PRIMARY KEY,
                 token_hash      TEXT NOT NULL,
+                label           TEXT,
                 created_at      BIGINT NOT NULL,
                 expires_at      BIGINT NOT NULL,
                 revoked_at      BIGINT,
                 created_by_chat TEXT NOT NULL
             )
             """
+        )
+        cur.execute(
+            "ALTER TABLE tg_automation_windows ADD COLUMN IF NOT EXISTS label TEXT"
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS tg_automation_windows_lookup_idx "
@@ -216,125 +244,189 @@ def matches_static(provided: str) -> bool:
     )
 
 
-def generate_window(chat_id: str) -> str:
-    """Выпускает новый временной токен, кладёт его ХЭШ в базу (UPSERT той же
-    строки — TZ §3.6.4, см. `_WINDOW_ID`), возвращает СЫРОЙ токен ровно один
-    раз — вызывающий (Telegram-обработчик кнопки в tg_approval.py) обязан
-    показать его владельцу немедленно и не сохранять нигде, кроме этого
-    возврата.
+def generate_window(chat_id: str, label: Optional[str] = None) -> str:
+    """Выпускает НОВЫЙ временной токен как ОТДЕЛЬНУЮ строку (INSERT, не
+    UPSERT — TZ_multi_automation_windows.md, «повторная генерация НЕ должна
+    убивать более раннюю»): все ранее выданные и всё ещё активные окна
+    продолжают работать как ни в чём не бывало. `window_id` — случайный
+    (`secrets.token_hex(6)`), не связан с чат-идентификатором и не
+    последовательный (owner попросил явно: «не предсказуемый»).
+
+    Возвращает СЫРОЙ токен ровно один раз — вызывающий (Telegram-обработчик
+    в tg_approval.py) обязан показать его владельцу немедленно и не сохранять
+    нигде, кроме этого возврата.
+
+    `label` — необязательная человекочитаемая метка («чат с Х»), NULL по
+    умолчанию; сегодня её некому передавать (ни команда, ни кнопки её не
+    спрашивают), но `list_windows` уже умеет её показывать, если она когда-то
+    появится.
 
     Пустая строка, если хранилище не поднято (TG_APPROVAL_ENABLED=false или
     CONSENT_DATABASE_URL не задан) — вызывающий обязан явно сказать об этом,
     а не тихо выдать токен, который негде проверить."""
     if not store_ready():
         return ""
+    import psycopg2
+
     token = secrets.token_urlsafe(32)
     now = _now_ms()
     expires = now + int(AUTOMATION_WINDOW_HOURS * 3600 * 1000)
+    label_val = (label or "").strip() or None
+    for _attempt in range(_WINDOW_ID_INSERT_ATTEMPTS):
+        window_id = secrets.token_hex(6)
+        try:
+            with _conn() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO tg_automation_windows
+                      (server, window_id, token_hash, label, created_at,
+                       expires_at, revoked_at, created_by_chat)
+                    VALUES (%s, %s, %s, %s, %s, %s, NULL, %s)
+                    """,
+                    (SERVER, window_id, _hash(token), label_val, now, expires,
+                     str(chat_id)),
+                )
+            return token
+        except psycopg2.IntegrityError:
+            # window_id уже занят — статистически почти невозможно (48 бит
+            # энтропии), но не молчим: пробуем ещё раз с новым случайным id,
+            # а не роняем выдачу ключа владельцу.
+            continue
+    raise RuntimeError(
+        f"automation_key.generate_window: не подобрал свободный window_id "
+        f"за {_WINDOW_ID_INSERT_ATTEMPTS} попыток"
+    )
+
+
+def find_window(provided: str) -> Optional[Dict[str, Any]]:
+    """Какое ИМЕННО активное окно совпало с присланным `provided` — словарь
+    (`window_id`, `label`, `created_at`, `expires_at`, `created_by_chat`) или
+    None, если ни одно активное окно не совпало (или `provided` пуст, или
+    хранилище не поднято).
+
+    Ищет СРЕДИ ВСЕХ активных окон (`revoked_at IS NULL AND expires_at >
+    now`), не одного фиксированного, как раньше (TZ_multi_automation_
+    windows.md) — при множестве одновременно открытых окон это единственный
+    способ узнать, КАКОЕ из них сейчас используется (нужно для аудита —
+    `server.py`'s `_automation_key_channel` несёт `created_at` совпавшего
+    окна в метку журнала). Каждое сравнение хэша — постоянное по времени
+    (`_digest_matches`); порядок перебора — по `created_at` (детерминирован
+    ради тестов), но сам перебор НЕ constant-time по количеству активных
+    окон — то же самое тайминг-допущение, что фиксирует ТЗ («все
+    constant-time» — про КАЖДОЕ сравнение по отдельности, не про общее число
+    окон, которое и так не секрет)."""
+    if not (provided and store_ready()):
+        return None
+    now = _now_ms()
+    provided_hash = _hash(provided)
     with _conn() as cur:
         cur.execute(
-            """
-            INSERT INTO tg_automation_windows
-              (server, window_id, token_hash, created_at, expires_at,
-               revoked_at, created_by_chat)
-            VALUES (%s, %s, %s, %s, %s, NULL, %s)
-            ON CONFLICT (window_id) DO UPDATE SET
-              token_hash      = EXCLUDED.token_hash,
-              created_at      = EXCLUDED.created_at,
-              expires_at      = EXCLUDED.expires_at,
-              revoked_at      = NULL,
-              created_by_chat = EXCLUDED.created_by_chat
-            """,
-            (SERVER, _WINDOW_ID, _hash(token), now, expires, str(chat_id)),
+            "SELECT window_id, token_hash, label, created_at, expires_at, "
+            "created_by_chat FROM tg_automation_windows "
+            "WHERE server = %s AND revoked_at IS NULL AND expires_at > %s "
+            "ORDER BY created_at ASC",
+            (SERVER, now),
         )
-    return token
+        rows = cur.fetchall()
+    for window_id, token_hash, label, created_at, expires_at, created_by_chat in rows:
+        if _digest_matches(token_hash, provided_hash):
+            return {
+                "window_id": window_id, "label": label,
+                "created_at": created_at, "expires_at": expires_at,
+                "created_by_chat": created_by_chat,
+            }
+    return None
 
 
 def check_window(provided: str) -> bool:
-    """Непросроченный, неотозванный хэш совпал с присланным значением (TZ
-    §3.4, пункт 2). Пустой `provided` или отключённое хранилище → False.
+    """Есть ли СРЕДИ ВСЕХ активных окон хоть одно, чей хэш совпал с `provided`
+    (TZ §3.4, пункт 2, расширено TZ_multi_automation_windows.md на множество
+    окон). Пустой `provided` или отключённое хранилище → False.
 
-    Один SELECT: строка либо активна (`revoked_at IS NULL AND expires_at >
-    now`), либо для этой проверки её как будто нет — истёкшая/отозванная
-    запись НЕ стирается (см. `revoke_window`/TZ §3.6/тест 7), но и не
-    участвует в сравнении."""
-    if not (provided and store_ready()):
-        return False
-    now = _now_ms()
-    with _conn() as cur:
-        cur.execute(
-            "SELECT token_hash FROM tg_automation_windows "
-            "WHERE server = %s AND window_id = %s "
-            "AND revoked_at IS NULL AND expires_at > %s",
-            (SERVER, _WINDOW_ID, now),
-        )
-        row = cur.fetchone()
-    if not row:
-        return False
-    return _digest_matches(row[0], _hash(provided))
+    Тонкая обёртка над `find_window` — тот же единственный SQL-запрос и та
+    же логика перебора, здесь просто отбрасывается КАКОЕ окно совпало (это
+    нужно только аудиту в server.py, не самой проверке допуска)."""
+    return find_window(provided) is not None
 
 
-def revoke_window(chat_id: str) -> bool:
-    """Гасит активное окно немедленно (`revoked_at = now`) — НЕ удаляет
-    строку (TZ §3.6/тест 7, та же дисциплина, что `manifest_store.
-    mark_consumed`: гасить, не стирать, история остаётся видна в базе).
+def revoke_window(window_id: str, chat_id: str = "") -> bool:
+    """Гасит ОДНО конкретное окно по его `window_id` немедленно (`revoked_at
+    = now`) — НЕ удаляет строку (TZ §3.6/тест 7, та же дисциплина, что
+    `manifest_store.mark_consumed`: гасить, не стирать, история остаётся
+    видна в базе). Остальные активные окна (если есть) не затрагивает —
+    TZ_multi_automation_windows.md, тест 2.
 
-    `chat_id` — кто нажал «Выключить» (для будущей многотенантности /
-    аудита; owner-only проверка САМА уже сделана вызывающим до этой функции,
-    здесь второй раз не переспрашивается — см. TZ «никаких новых путей
-    авторизации не изобретать»).
+    `chat_id` — кто нажал «Отозвать» (для будущей многотенантности / аудита;
+    owner-only проверка САМА уже сделана вызывающим до этой функции, здесь
+    второй раз не переспрашивается — см. TZ «никаких новых путей авторизации
+    не изобретать»).
 
-    Возвращает True, если было что гасить (строка существовала и была
-    активна); False — окна и так не было / оно уже неактивно / хранилище
-    выключено. И то, и другое НЕ ошибка."""
-    if not store_ready():
+    Возвращает True, если было что гасить (окно с таким id существовало и
+    было активно); False — такого окна нет / оно уже неактивно / хранилище
+    выключено / `window_id` пуст. Ни то, ни другое НЕ ошибка."""
+    if not (store_ready() and window_id):
         return False
     with _conn() as cur:
         cur.execute(
             "UPDATE tg_automation_windows SET revoked_at = %s "
             "WHERE server = %s AND window_id = %s AND revoked_at IS NULL "
             "AND expires_at > %s",
-            (_now_ms(), SERVER, _WINDOW_ID, _now_ms()),
+            (_now_ms(), SERVER, window_id, _now_ms()),
         )
         return cur.rowcount > 0
 
 
-def window_status(chat_id: str = "") -> Optional[Dict[str, Any]]:
-    """Текущее состояние окна — для кнопки/команды «Статус» (TZ §3.3) И для
-    аудит-пометки в отчёте (TZ §4: «открыт <когда>»).
+def revoke_all_windows(chat_id: str = "") -> int:
+    """Гасит ВСЕ активные окна разом (TZ_multi_automation_windows.md, тест 3)
+    — команда/кнопка «Выключить всё». Возвращает число реально погашенных
+    (0, если активных окон и не было, или хранилище выключено — не ошибка).
 
-    None — окно НИКОГДА не создавалось (строки в базе нет вовсе, или
-    хранилище выключено). Иначе — словарь с исходом ПОСЛЕДНЕЙ генерации,
-    даже если оно уже отозвано/истекло: `active` — единственное поле, на
-    которое стоит смотреть, чтобы решить «работает ли оно сейчас».
-
-    `chat_id` в сигнатуре — по интерфейсу TZ §3.5 (симметрично
-    `revoke_window`); сегодня НЕ используется как фильтр (одна строка на
-    сервер, см. `_WINDOW_ID`), задел на будущую многотенантность."""
+    `chat_id` — по тому же интерфейсу, что `revoke_window` (задел на
+    аудит/многотенантность, сегодня не фильтр)."""
     if not store_ready():
-        return None
+        return 0
     with _conn() as cur:
         cur.execute(
-            "SELECT created_at, expires_at, revoked_at, created_by_chat "
-            "FROM tg_automation_windows WHERE server = %s AND window_id = %s",
-            (SERVER, _WINDOW_ID),
+            "UPDATE tg_automation_windows SET revoked_at = %s "
+            "WHERE server = %s AND revoked_at IS NULL AND expires_at > %s",
+            (_now_ms(), SERVER, _now_ms()),
         )
-        row = cur.fetchone()
-    if not row:
-        return None
-    created_at, expires_at, revoked_at, created_by_chat = row
+        return cur.rowcount
+
+
+def list_windows(chat_id: str = "") -> List[Dict[str, Any]]:
+    """Все АКТИВНЫЕ окна (TZ_multi_automation_windows.md, тест 4) — для
+    команды/кнопки «Список». Каждый элемент: `window_id`, `label`,
+    `created_at`, `expires_at`, `created_by_chat`, `remaining_s` — БЕЗ
+    хэшей и без сырых токенов (те не восстановимы принципиально, см.
+    докстринг файла про «хэш, не сам токен»). Погашенные/истёкшие окна не
+    попадают в список (они всё ещё есть в базе — просто не активны, см.
+    `revoke_window`), отсортированы по `created_at` (старые сверху).
+
+    Пустой список — активных окон нет (никогда не выдавались / все
+    погашены-истекли) ИЛИ хранилище выключено; вызывающий не различает эти
+    два случая (для «Списка» разница не имеет значения — в обоих «сейчас
+    активных окон нет»)."""
+    if not store_ready():
+        return []
     now = _now_ms()
-    active = revoked_at is None and expires_at > now
-    return {
-        "active": active,
-        "revoked": revoked_at is not None,
-        "expired": revoked_at is None and expires_at <= now,
-        "created_at": created_at,
-        "expires_at": expires_at,
-        "revoked_at": revoked_at,
-        "created_by_chat": created_by_chat,
-        "remaining_s": max(0, (expires_at - now) // 1000) if active else 0,
-    }
+    with _conn() as cur:
+        cur.execute(
+            "SELECT window_id, label, created_at, expires_at, created_by_chat "
+            "FROM tg_automation_windows WHERE server = %s AND revoked_at IS NULL "
+            "AND expires_at > %s ORDER BY created_at ASC",
+            (SERVER, now),
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "window_id": window_id, "label": label,
+            "created_at": created_at, "expires_at": expires_at,
+            "created_by_chat": created_by_chat,
+            "remaining_s": max(0, (expires_at - now) // 1000),
+        }
+        for window_id, label, created_at, expires_at, created_by_chat in rows
+    ]
 
 
 # ───────────────────────── форматирование для людей ─────────────────────────
