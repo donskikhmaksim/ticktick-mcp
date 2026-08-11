@@ -1830,6 +1830,19 @@ async def _tg_auto_execute_tick() -> None:
         # список живых манифестов, теперь — явная проверка, потому что поиск
         # потерянных планов от наличия манифестов не зависит.
         return
+    # Исчезновение сообщений гейта (2026-08-10, TZ_temp_automation_key.md
+    # §5) — best-effort уборка того, что накопил `tg_approval.
+    # schedule_message_delete` с прошлого тика: план/кнопки после ответа,
+    # отчёт сразу после отправки. `_run_blocking`, тем же принципом, что и
+    # остальная синхронная сеть в этом файле (requests внутри
+    # sweep_scheduled_deletes держал бы event loop на время HTTP-вызовов).
+    # Сбой ОДНОГО удаления не прерывает ни уборку, ни остальной тик —
+    # `sweep_scheduled_deletes` сама ловит исключения на каждое сообщение.
+    try:
+        await _run_blocking(tg_approval.sweep_scheduled_deletes, _TG_CFG)
+    except Exception as e:  # noqa: BLE001 — уборка сообщений НИКОГДА не
+        # роняет остальной тик (поиск/исполнение кандидатов ниже)
+        logger.warning(f"TG: sweep_scheduled_deletes упал: {e}")
     pending = _tg_auto_execute_pending()
     # Раннего выхода «нет живых манифестов — идти в базу незачем» здесь БОЛЬШЕ
     # НЕТ, и это принципиально: пустая память — это ровно то состояние, в
