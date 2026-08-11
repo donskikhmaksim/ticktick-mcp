@@ -212,6 +212,15 @@ def _ensure_schema() -> None:
         cur.execute(
             "UPDATE tg_automation_windows SET scope = server WHERE scope IS NULL"
         )
+        # 2026-08-11 (TZ_automation_key_duration_labels.md, §1): срок жизни
+        # окна теперь настраиваемый ВПЛОТЬ ДО «бессрочно» — NULL в
+        # expires_at означает именно это, а не «забыли заполнить». Раньше
+        # столбец был NOT NULL (фиксированный AUTOMATION_WINDOW_HOURS на
+        # всё). DROP NOT NULL идемпотентен — повтор на уже nullable-столбце
+        # не падает.
+        cur.execute(
+            "ALTER TABLE tg_automation_windows ALTER COLUMN expires_at DROP NOT NULL"
+        )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS tg_automation_windows_scope_idx "
             "ON tg_automation_windows (revoked_at, expires_at)"
@@ -350,7 +359,7 @@ def find_window(provided: str) -> Optional[Dict[str, Any]]:
         cur.execute(
             "SELECT window_id, token_hash, label, created_at, expires_at, "
             "created_by_chat, scope FROM tg_automation_windows "
-            "WHERE revoked_at IS NULL AND expires_at > %s "
+            "WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > %s) "
             "ORDER BY created_at ASC",
             (now,),
         )
@@ -399,7 +408,7 @@ def revoke_window(window_id: str, chat_id: str = "") -> bool:
         cur.execute(
             "UPDATE tg_automation_windows SET revoked_at = %s "
             "WHERE server = %s AND window_id = %s AND revoked_at IS NULL "
-            "AND expires_at > %s",
+            "AND (expires_at IS NULL OR expires_at > %s)",
             (_now_ms(), SERVER, window_id, _now_ms()),
         )
         return cur.rowcount > 0
@@ -417,7 +426,8 @@ def revoke_all_windows(chat_id: str = "") -> int:
     with _conn() as cur:
         cur.execute(
             "UPDATE tg_automation_windows SET revoked_at = %s "
-            "WHERE server = %s AND revoked_at IS NULL AND expires_at > %s",
+            "WHERE server = %s AND revoked_at IS NULL "
+            "AND (expires_at IS NULL OR expires_at > %s)",
             (_now_ms(), SERVER, _now_ms()),
         )
         return cur.rowcount
@@ -443,7 +453,7 @@ def list_windows(chat_id: str = "") -> List[Dict[str, Any]]:
         cur.execute(
             "SELECT window_id, label, created_at, expires_at, created_by_chat "
             "FROM tg_automation_windows WHERE server = %s AND revoked_at IS NULL "
-            "AND expires_at > %s ORDER BY created_at ASC",
+            "AND (expires_at IS NULL OR expires_at > %s) ORDER BY created_at ASC",
             (SERVER, now),
         )
         rows = cur.fetchall()
@@ -452,7 +462,10 @@ def list_windows(chat_id: str = "") -> List[Dict[str, Any]]:
             "window_id": window_id, "label": label,
             "created_at": created_at, "expires_at": expires_at,
             "created_by_chat": created_by_chat,
-            "remaining_s": max(0, (expires_at - now) // 1000),
+            # expires_at=NULL — бессрочно (TZ_automation_key_duration_labels.md
+            # §1): "сколько осталось" не осмысленно, None — не 0 (0 читался
+            # бы как "вот-вот истечёт", то есть противоположность правде).
+            "remaining_s": None if expires_at is None else max(0, (expires_at - now) // 1000),
         }
         for window_id, label, created_at, expires_at, created_by_chat in rows
     ]

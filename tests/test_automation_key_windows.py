@@ -266,6 +266,77 @@ def test_each_window_expires_on_its_own_schedule(monkeypatch):
     assert ak.check_window(token_b) is True, "Б не должно было истечь заодно с А"
 
 
+# ═ TZ_automation_key_duration_labels.md §1 — expires_at=NULL = бессрочно ═══
+#
+# ticktick-mcp сама больше не генерирует окна с NULL-сроком (генерация вся
+# переехала в gmail-mcp) — но обязана честно ЧИТАТЬ такую строку, если её
+# создал gmail-mcp. Вставляем напрямую SQL'ем, эмулируя чужую запись, а не
+# через generate_window (у неё до сих пор нет параметра "бессрочно" — она
+# вызывается только из легаси-пути/тестов, TZ §7 явно не расширяет её).
+
+def _insert_null_expiry_window(ak, window_id, token, scope="ticktick"):
+    with ak._conn() as cur:
+        cur.execute(
+            """
+            INSERT INTO tg_automation_windows
+              (server, window_id, token_hash, label, created_at, expires_at,
+               revoked_at, created_by_chat, scope)
+            VALUES (%s, %s, %s, NULL, %s, NULL, NULL, %s, %s)
+            """,
+            (ak.SERVER, window_id, ak._hash(token), ak._now_ms(), "gmail-mcp-chat", scope),
+        )
+
+
+def test_null_expiry_window_never_expires(monkeypatch):
+    ak = fresh_automation_key_store()
+    _insert_null_expiry_window(ak, "forever1", "forever-token")
+
+    assert ak.check_window("forever-token") is True
+    win = ak.find_window("forever-token")
+    assert win is not None and win["expires_at"] is None
+
+    # "Истечение" по времени не должно наступить никогда — не просто "ещё не
+    # наступило", а структурно невозможно (нет числа, с которым сравнивать).
+    # Мысленный эксперимент: если бы код сравнивал `expires_at > now` без
+    # NULL-проверки, отсутствующее число дало бы False на любом now — тест
+    # ловит именно это.
+    assert ak.check_window("forever-token") is True
+
+
+def test_null_expiry_window_appears_in_list_with_remaining_s_none(monkeypatch):
+    ak = fresh_automation_key_store()
+    _insert_null_expiry_window(ak, "forever2", "forever-token-2")
+
+    rows = ak.list_windows()
+
+    assert len(rows) == 1
+    assert rows[0]["window_id"] == "forever2"
+    assert rows[0]["expires_at"] is None
+    assert rows[0]["remaining_s"] is None, (
+        "бессрочное окно не должно получать 0 (0 читается как 'вот-вот "
+        "истечёт' — противоположность правде)")
+
+
+def test_null_expiry_window_can_still_be_revoked(monkeypatch):
+    ak = fresh_automation_key_store()
+    _insert_null_expiry_window(ak, "forever3", "forever-token-3")
+
+    revoked = ak.revoke_window("forever3", "4242")
+
+    assert revoked is True
+    assert ak.check_window("forever-token-3") is False, "отозванное бессрочное окно всё ещё проходит"
+
+
+def test_null_expiry_window_out_of_scope_is_rejected(monkeypatch):
+    """Бессрочность не освобождает от проверки scope — окно на другой
+    сервис остаётся отклонено для ticktick, даже если оно никогда не
+    истекает по времени."""
+    ak = fresh_automation_key_store()
+    _insert_null_expiry_window(ak, "forever4", "forever-token-4", scope="gmail,calendar")
+
+    assert ak.check_window("forever-token-4") is False
+
+
 # ═══════════════════════ matches_static — без базы вовсе ═══════════════════
 
 def test_matches_static_is_constant_time_and_does_not_need_a_store(monkeypatch):
