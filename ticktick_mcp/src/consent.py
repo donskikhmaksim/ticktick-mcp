@@ -19,6 +19,7 @@
 помечен в коде как копия, живущая в шести репозиториях. После этого выноса
 он становится кандидатом на общий пакет — записано долгом, здесь не делается.
 """
+import asyncio
 import collections
 import contextvars
 import hashlib
@@ -434,6 +435,23 @@ def _manifest_ttl_phrase() -> str:
 # model that calls plan+execute back-to-back in the same turn, without ever
 # handing control back to a human. Weak but free; env-tunable per tier.
 _MIN_CONSENT_GAP = float(os.environ.get("MIN_CONSENT_GAP", "2.0"))
+
+# ---------------------------------------------------------------------------
+# Часть 1 (ТЗ_consent_web_hub.md, 2026-08-12): гибридное короткое ожидание.
+# После построения плана, ДО возврата превью модели, гейт коротко (опросом)
+# ждёт: не подтвердил/отклонил ли человек этот манифест ПРЯМО СЕЙЧАС через
+# какой-то другой канал (веб-хаб `/pending-consents/decide`, кнопка в
+# Telegram). Успел — тул возвращает готовый результат ОДНИМ вызовом, без
+# второго прохода модели. Не успел — обычное превью, как сегодня.
+#
+# CONSENT_SYNC_WAIT_MS = 0 (дефолт для форков/тестов без этой переменной был
+# бы небезопасен — поэтому дефолт НЕНУЛЕВОЙ, как в остальных 5 репо экосистемы)
+# ⇒ ветка выключена целиком: ни одного лишнего await, ни одного обращения к
+# _MANIFESTS сверх того, что уже делает вызывающий код.
+CONSENT_SYNC_WAIT_MS = int(os.environ.get("CONSENT_SYNC_WAIT_MS", "25000"))
+# Интервал опроса внутри окна ожидания, мс. Не используется при
+# CONSENT_SYNC_WAIT_MS <= 0.
+CONSENT_SYNC_POLL_MS = int(os.environ.get("CONSENT_SYNC_POLL_MS", "1000"))
 
 # ===========================================================================
 # === CONSENT-REPLY CLASSIFIER — BEGIN =====================================
@@ -1662,6 +1680,69 @@ async def _claim_plan_for_automation(kind: str, manifest_id: str) -> Optional[Di
     return m
 
 
+async def _sync_wait_for_decision(manifest_id: str) -> Optional[str]:
+    """ГИБРИДНОЕ ОЖИДАНИЕ (ТЗ_consent_web_hub.md, часть 1). Зовётся из
+    `_gate_batch`/`_gate_single` СРАЗУ после создания манифеста (и, если
+    отправка в Telegram удалась, после неё) — ДО возврата превью модели.
+    Короткий опрос ТОЛЬКО собственной памяти этого процесса (`_MANIFESTS`) —
+    ни одного нового HTTP- или БД-обращения сверх того, что уже сделал
+    вызывающий путь. `CONSENT_SYNC_WAIT_MS <= 0` ⇒ функция возвращает None
+    немедленно, без единого `await` — побайтовая совместимость.
+
+    БЕЗОПАСНОСТЬ (двойное исполнение — эталон: drive-mcp's requireConsent,
+    ветка гибридного ожидания в `consent.ts`, `src/consent.ts` в
+    /Users/maksim/Code/drive-mcp). Эта функция ТОЛЬКО ЧИТАЕТ
+    `_MANIFESTS[manifest_id]` — она НИКОГДА сама не гасит и не исполняет
+    манифест. Атомарное потребление делает РОВНО ОДИН внешний путь:
+    `POST /pending-consents/decide` (server.py, веб-канал) для confirm/reject,
+    либо фоновый `_tg_auto_execute_tick` (tg_auto_execute.py) для кнопки в
+    Telegram. Если эта функция увидела `m["consumed"] is True`, решение уже
+    принято (и для confirm — уже ИСПОЛНЕНО) где-то там. Возврат отсюда текста
+    НЕ ре-исполняет ничего: `_gate_batch`/`_gate_single` оборачивают его в
+    `_GateOutcome(False, message=...)`, и КАЖДЫЙ из ~30 вызывающих тулов уже
+    безусловно делает `if not outcome.proceed: return outcome.message` — то
+    есть просто ретранслирует текст модели, мутацию не зовёт. Это тот же
+    приём, которым TS-репозитории отдают положительный исход через форму
+    `{kind: "refused", result}` — здесь роль этой формы играет `proceed=False`.
+
+    Возвращает готовый текст для `_GateOutcome(False, message=...)`, если
+    решение принято в окне ожидания, иначе `None` (дедлайн истёк, манифест
+    всё ещё не тронут — обычный planned-путь, ТЗ исход 3, ничего не потеряно).
+    """
+    wait_ms = CONSENT_SYNC_WAIT_MS
+    if wait_ms <= 0:
+        return None
+    poll_ms = max(1, CONSENT_SYNC_POLL_MS)
+    deadline = time.monotonic() + wait_ms / 1000.0
+    while time.monotonic() < deadline:
+        await asyncio.sleep(poll_ms / 1000.0)
+        m = _MANIFESTS.get(manifest_id)
+        if m is None or not m.get("consumed"):
+            continue
+        decision = m.get("_web_decision")
+        if decision == "confirmed":
+            return m.get("_web_result") or (
+                "✅ Подтверждено и исполнено. Решение по этому плану уже "
+                "принято и исполнено через веб-подтверждение, пока шло "
+                "ожидание ответа. Повторно вызывать этот инструмент с этим "
+                "планом не нужно.")
+        if decision == "rejected":
+            comment = (m.get("_web_reject_comment") or "").strip()
+            tail = f" («{comment[:200]}»)" if comment else ""
+            return (f"🛑 Отменено пользователем{tail}. План отменён, ничего "
+                    "не сделано. Чтобы повторить — построй план заново.")
+        # Погашено каким-то ДРУГИМ путём без нашей веб-пометки (кнопка в
+        # Telegram, откат неудачной отправки в Telegram и т.п.) — решение
+        # уже принято, но каким именно оно было, отсюда не видно. Безопасный
+        # общий ответ: НЕ повторное исполнение, только честное «уже решено».
+        return (
+            "✅ Решение по этому плану уже принято через другой канал "
+            "(например, кнопку в Telegram), пока шло ожидание ответа. "
+            "Повторно вызывать этот инструмент с этим планом не нужно — "
+            "проверьте результат через operation_report.")
+    return None
+
+
 async def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
                       summary: str, manifest_id: str, user_reply: str,
                       describe_item, extra: Optional[Dict] = None,
@@ -1776,8 +1857,24 @@ async def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
     # Все три правки живут вместе: здесь остаётся один вызов.
     lines, agent_tail = _gate_batch_preview_lines(tool_name, mid, summary, tasks,
                                                   describe_item, items_arg, notes)
-    return _GateOutcome(False, message=await _maybe_tg_notify_plan(
-        tool_name, mid, "\n".join(lines), agent_tail))
+    preview_text = "\n".join(lines)
+    # ТЗ_consent_web_hub.md, часть 2: единственное добавленное поле манифеста.
+    # Превью — тот же текст, что и так уже виден человеку (в чате/Telegram) —
+    # теперь ещё и СОХРАНЯЕТСЯ в манифесте, чтобы /pending-consents могло
+    # вывести title/summary/preview без новых колонок в БД (JSONB `payload`
+    # и так хранит весь `m` целиком, см. manifest_store._durable_payload).
+    _MANIFESTS[mid]["preview"] = preview_text
+    message = await _maybe_tg_notify_plan(tool_name, mid, preview_text, agent_tail)
+    # Гибридное ожидание — ТОЛЬКО если манифест ещё жив после (опциональной)
+    # отправки в Telegram. Если она провалилась, `_maybe_tg_notify_plan` уже
+    # погасила манифест (fail-closed) — опрашивать тогда нечего, и мы вернули
+    # бы неверный "уже решено" вместо настоящей причины отказа.
+    m_after = _MANIFESTS.get(mid)
+    if m_after is not None and not m_after.get("consumed"):
+        decided = await _sync_wait_for_decision(mid)
+        if decided is not None:
+            return _GateOutcome(False, message=decided)
+    return _GateOutcome(False, message=message)
 
 
 # ---------------------------------------------------------------------------
@@ -1893,8 +1990,16 @@ async def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
         "повторить как есть, на 2-м вызове они игнорируются — "
         "используются данные из манифеста). Манифест одноразовый, "
         f"действует {_manifest_ttl_phrase()}.")
-    return _GateOutcome(False, message=await _maybe_tg_notify_plan(
-        tool_name, mid, "\n".join(lines), agent_tail))
+    preview_text = "\n".join(lines)
+    # См. тот же комментарий в _gate_batch — единственное добавленное поле.
+    _MANIFESTS[mid]["preview"] = preview_text
+    message = await _maybe_tg_notify_plan(tool_name, mid, preview_text, agent_tail)
+    m_after = _MANIFESTS.get(mid)
+    if m_after is not None and not m_after.get("consumed"):
+        decided = await _sync_wait_for_decision(mid)
+        if decided is not None:
+            return _GateOutcome(False, message=decided)
+    return _GateOutcome(False, message=message)
 
 
 # === MOVED-BLOCK END ===

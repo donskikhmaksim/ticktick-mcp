@@ -18011,6 +18011,212 @@ from .tg_auto_execute import (  # noqa: E402,F401
     _verdict_from_totals, _verified_auto_execute_report)
 
 
+# ───────────────── Consent web hub: /pending-consents (+/decide) ─────────────
+# ТЗ_consent_web_hub.md, часть 2 (2026-08-12). Тот же HTTP-контракт (JSON-
+# схемы), что уже сделан в gmail/calendar/drive/sheets/docs-mcp (TS-репо), —
+# чтобы единый веб-хаб (gmail-mcp, /consent-hub) мог агрегировать этот сервис
+# точно так же, без специального кода под ticktick. Архитектура под капотом
+# другая (FastMCP/Starlette, манифесты в RAM + Postgres, а не единый
+# ConsentStore-класс), но наружу отдаётся ровно тот же JSON.
+#
+# Авторизация — общий секрет CONSENT_HUB_SECRET (та же строка на всех 6
+# сервисах экосистемы), заголовок X-Consent-Hub-Secret, сравнение постоянным
+# по времени (hmac.compare_digest — тот же приём, что и у остальных секретов
+# этого сервера, см. `_automation_key_matches`/`tg_approval.secret_token_
+# matches`). Секрет не задан ⇒ ОБА роута отвечают 404 — fail-closed, не
+# «открытый доступ» — та же дисциплина, что у /tg/webhook выше при
+# выключенном own_bot.
+#
+# Место в файле — РОВНО здесь, после импорта tg_auto_execute: и
+# GET-листинг, и POST /decide переиспользуют тот же реестр исполнителей
+# (`_resolve_auto_executor`) и тот же атомарный захват
+# (`_consume_manifest_for_auto_execute`), что и кнопка в Telegram — этих
+# имён не было в области видимости ДО этого импорта. Telegram-путь при этом
+# не тронут ни строкой: /decide лишь ДОБАВЛЯЕТ ещё один способ дойти до тех
+# же исполнителей, ничего в tg_approval.py/tg_auto_execute.py не меняя.
+_CONSENT_HUB_SECRET = os.environ.get("CONSENT_HUB_SECRET", "").strip()
+
+
+def _consent_hub_secret_ok(request: Request) -> bool:
+    if not _CONSENT_HUB_SECRET:
+        return False
+    provided = request.headers.get("x-consent-hub-secret", "")
+    return hmac.compare_digest(provided, _CONSENT_HUB_SECRET)
+
+
+def _manifest_epoch_times(m: Dict) -> Tuple[int, int]:
+    """(createdAt, expiresAt) в epoch-миллисекундах для манифеста, чьи
+    `created`/`plan_shown_at` хранятся в `time.monotonic()` ЭТОГО процесса —
+    та же формула пересчёта, что в `manifest_store._durable_payload`
+    (consent.py), просто без похода в базу: нужна ТОЛЬКО эпоха, не полная
+    сериализация."""
+    now_ms = int(time.time() * 1000)
+    now_mono = time.monotonic()
+    created = m.get("created")
+    if created is None:
+        created_ms = now_ms
+    else:
+        created_ms = now_ms - int(max(0.0, now_mono - created) * 1000)
+    return created_ms, created_ms + int(_MANIFEST_TTL * 1000)
+
+
+def _manifest_title_summary(m: Dict) -> Tuple[str, str]:
+    """title/summary для списка `/pending-consents` — выводятся из УЖЕ
+    ИМЕЮЩЕГОСЯ превью (первая непустая строка — заголовок с "### 📋 План — ",
+    вторая — обычно первый пункт списка), РОВНО тем приёмом, который просит
+    ТЗ_consent_web_hub.md §2.1: "если в сторе нет отдельных коротких полей —
+    выведи их из уже имеющегося превью... не выдумывай новых колонок в БД
+    без нужды". Само поле `preview` — единственное добавленное консент.py
+    (см. его докстринг в `_gate_batch`/`_gate_single`), никаких новых колонок
+    в Postgres это не потребовало (JSONB `payload` и так хранит манифест
+    целиком)."""
+    preview = m.get("preview") or ""
+    lines = [l.strip() for l in preview.split("\n") if l.strip()]
+    head = lines[0].replace("### 📋 План — ", "").strip() if lines else ""
+    title = (m.get("summary") or head or m.get("tool") or m.get("kind") or "").strip()
+    summary = (m.get("summary") or (lines[1] if len(lines) > 1 else title)).strip()
+    return title[:200], summary[:300]
+
+
+@mcp.custom_route("/pending-consents", methods=["GET"])
+async def pending_consents_list(request: Request) -> Response:
+    """GET /pending-consents — список СВОИХ манифестов в статусе
+    AWAITING_CONSENT (не истёкших) этого процесса. Контракт — см.
+    ТЗ_consent_web_hub.md §2.1 / соответствующий роут в gmail-mcp
+    (src/consent_hub.ts)."""
+    if not _consent_hub_secret_ok(request):
+        return PlainTextResponse("Not Found", status_code=404)
+    _prune_manifests()
+    items = []
+    for mid, m in list(_MANIFESTS.items()):
+        if m.get("consumed"):
+            continue
+        created_ms, expires_ms = _manifest_epoch_times(m)
+        title, summary = _manifest_title_summary(m)
+        items.append({
+            "manifestId": mid,
+            "tool": consent.resolve_tool_alias(m.get("tool") or m.get("kind") or ""),
+            "title": title,
+            "summary": summary,
+            "preview": m.get("preview") or summary,
+            "createdAt": created_ms,
+            "expiresAt": expires_ms,
+            "accountLabel": "default",
+        })
+    return JSONResponse({"service": "ticktick", "items": items})
+
+
+@mcp.custom_route("/pending-consents/decide", methods=["POST"])
+async def pending_consents_decide(request: Request) -> Response:
+    """POST /pending-consents/decide — `{manifestId, decision: "confirm"|
+    "reject", comment?}`. Контракт-ответ — см. ТЗ_consent_web_hub.md §2.2:
+    `{ok, outcome}` на успехе, `{ok: false, error}` на предсказуемых отказах
+    (НИКОГДА 500 на них).
+
+    `confirm` идёт РОВНО тем же путём, что нажатие ✅ в Telegram: тот же
+    реестр исполнителей (`_resolve_auto_executor` — общий с
+    `_tg_auto_execute_tick`), тот же атомарный захват
+    (`_consume_manifest_for_auto_execute` — `UPDATE … WHERE consumed_at IS
+    NULL … RETURNING` в Postgres, гонка закрыта в БД, не в этом коде), тот
+    же binding-чек (`entry.rehash`) и та же независимая перепроверка
+    (`_verified_auto_execute_report`). Единственное отличие — КУДА уходит
+    итог: сюда, HTTP-ответом, а не в Telegram
+    (`_publish_auto_execute_outcome` здесь намеренно НЕ зовётся — этот путь
+    ничего не пишет в Telegram, тот код не тронут ни строкой).
+
+    `reject` идёт тем же путём, что явный текстовый отказ в чате
+    (`_mark_manifest_consumed` — то же гашение, что видит execute-фаза
+    `_require_consent` на ветке `_is_negative_reply`), `comment` кладётся в
+    манифест как `_web_reject_comment` (лучшее доступное здесь место для
+    "userReply с веб-канала" — у ticktick-mcp, в отличие от TS-репо, нет
+    отдельной колонки audit.user_reply для отказов; это явное упрощение,
+    описанное в отчёте по задаче, а не потерянные данные)."""
+    if not _consent_hub_secret_ok(request):
+        return PlainTextResponse("Not Found", status_code=404)
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return JSONResponse({"ok": False, "error": "bad_request"}, status_code=400)
+    manifest_id = str(body.get("manifestId") or "").strip()
+    decision = str(body.get("decision") or "").strip()
+    comment = str(body.get("comment") or "").strip()
+    if not manifest_id or decision not in ("confirm", "reject"):
+        return JSONResponse({"ok": False, "error": "bad_request"}, status_code=400)
+
+    await _rehydrate_manifest(manifest_id)
+    m = _MANIFESTS.get(manifest_id)
+    if m is None:
+        return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+    if m.get("consumed"):
+        return JSONResponse({"ok": False, "error": "already_decided"}, status_code=409)
+    _created_ms, expires_ms = _manifest_epoch_times(m)
+    if int(time.time() * 1000) > expires_ms:
+        # Погашение ЖЕ формулой, что и у обычного протухания (§ execute-фазы
+        # `_require_consent`) — не новая ветка гашения, тот же путь.
+        _mark_manifest_consumed(m, manifest_id)
+        return JSONResponse({"ok": False, "error": "expired"}, status_code=409)
+
+    if decision == "reject":
+        m["_web_decision"] = "rejected"
+        m["_web_reject_comment"] = comment
+        _mark_manifest_consumed(m, manifest_id)
+        logger.info(
+            f"consent-hub: манифест {manifest_id} отклонён через веб"
+            + (f" (комментарий: {comment[:200]})" if comment else ""))
+        return JSONResponse({"ok": True, "outcome": "refused"})
+
+    # decision == "confirm"
+    tool = consent.resolve_tool_alias(_auto_execute_tool_of(m))
+    entry = _resolve_auto_executor(tool, m)
+    if entry is None:
+        return JSONResponse({"ok": False, "error": "not_executable"}, status_code=409)
+    try:
+        current_hash = entry.rehash(m)
+    except Exception:
+        logger.exception(f"consent-hub: rehash упал для {manifest_id}/{tool}")
+        return JSONResponse({"ok": False, "error": "binding_mismatch"}, status_code=409)
+    if current_hash != m.get("object_hash"):
+        return JSONResponse({"ok": False, "error": "binding_mismatch"}, status_code=409)
+    consumed = await _run_blocking(_consume_manifest_for_auto_execute, manifest_id)
+    if consumed is None:
+        # Кто-то другой (кнопка в Telegram, параллельный /decide) забрал
+        # манифест первым — то же самое "already_decided", не 500.
+        return JSONResponse({"ok": False, "error": "already_decided"}, status_code=409)
+    consumed["_web_decision"] = "confirmed"
+    token = _TG_AUTO_EXECUTE_MANIFEST.set(manifest_id)
+    try:
+        report_text = await asyncio.wait_for(
+            entry.execute(manifest_id, consumed), _TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S)
+    except Exception as e:
+        reason_text = (
+            f"🛑 Веб-подтверждение «{tool}» не уложилось в "
+            f"{_TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S:.0f} c и было прервано. "
+            "План уже погашен — проверьте состояние в TickTick: часть "
+            "операции могла успеть примениться."
+            if isinstance(e, asyncio.TimeoutError) else
+            f"🛑 Ошибка при исполнении «{tool}»: {_redact_for_user(e)}")
+        _tombstone_manifest(manifest_id, _TOMBSTONE_FAILED, reason_text)
+        m["_web_result"] = reason_text
+        logger.exception(f"consent-hub: ошибка при веб-исполнении {tool}/{manifest_id}")
+        return JSONResponse({"ok": True, "outcome": "confirmed", "result": reason_text})
+    finally:
+        _TG_AUTO_EXECUTE_MANIFEST.reset(token)
+    full_md, verdict = await _run_blocking(
+        _verified_auto_execute_report, manifest_id, tool, report_text, consumed)
+    reason = _tombstone_reason_for_verdict(
+        verdict, _auto_execute_report_is_failure(report_text))
+    if reason == _TOMBSTONE_EXECUTED:
+        _tombstone_manifest(manifest_id, reason)
+    else:
+        _tombstone_manifest(
+            manifest_id, reason,
+            f"вердикт независимой сверки — {verdict} (веб-подтверждение)")
+    m["_web_result"] = full_md
+    return JSONResponse({"ok": True, "outcome": "confirmed", "result": full_md})
+
+
 # ───────────────────── СОКРЫТИЕ ИНСТРУМЕНТОВ ИЗ ЛИСТИНГА ─────────────────────
 # 2026-08-10 (заход 1, §1.3.4, слой 2 из двух).
 #

@@ -14,6 +14,14 @@ os.environ.setdefault("TICKTICK_ACCESS_TOKEN", "atoken")
 # tests aren't fighting a timer; a dedicated consent test overrides this back
 # to a positive value with monkeypatch to exercise the gap itself.
 os.environ.setdefault("MIN_CONSENT_GAP", "0")
+# ТЗ_consent_web_hub.md, часть 1 (2026-08-12): гибридное ожидание внутри
+# _gate_batch/_gate_single. Дефолт в проде ненулевой (25000мс) — тесты,
+# которые ХОТЯТ проверить именно эту ветку, override'ят monkeypatch'ем
+# consent.CONSENT_SYNC_WAIT_MS/CONSENT_SYNC_POLL_MS на маленькие значения.
+# Обычные тесты (которых десятки — любой тест, планирующий манифест через
+# _gate_batch/_gate_single) НЕ должны платить 25с ожидания на каждый план —
+# ноль здесь даёт побайтовую совместимость со старым поведением (ТЗ, тест 1).
+os.environ.setdefault("CONSENT_SYNC_WAIT_MS", "0")
 
 import json  # noqa: E402
 
