@@ -1116,6 +1116,25 @@ _NO_REPLY_INSTRUCTION = (
 )
 
 
+_GATE_DISABLED_ENV = "TICKTICK_MCP_GATE_DISABLED"
+
+
+def _gate_disabled() -> bool:
+    """Аварийный общий выключатель гейта подтверждения — 2026-08-12, по
+    прямой просьбе Максима после разговора о том, что 6 MCP-серверов
+    выключаются НЕ одним переключателем. Точка отката ОДНА, как у
+    `MCP_HIDDEN_TOOLS` в server.py: переменная окружения, не правка кода —
+    вернуть гейт можно, просто убрав переменную в Railway, без нового деплоя.
+
+    Дефолт — гейт ВКЛЮЧЁН (переменная не задана = поведение не меняется).
+    Когда выключен — КАЖДАЯ мутация проходит без user_reply/кнопки в
+    Telegram; это буквально то, от чего весь `_require_consent` защищает
+    (см. докстринг ниже и `_NO_REPLY_INSTRUCTION`). Максим предупреждён и
+    подтвердил явно после возражения."""
+    return os.environ.get(_GATE_DISABLED_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _require_consent(
     *, action: str, tier: int, manifest: Optional[Dict] = None,
     user_reply: Optional[str] = None, automation_key: str = "",
@@ -1155,6 +1174,12 @@ def _require_consent(
     CONSENT_PG_CONNECT_TIMEOUT_S / CONSENT_PG_STATEMENT_TIMEOUT_MS). Если
     когда-нибудь понадобится унести и его — сначала нужен явный захват
     манифеста ДО await (compare-and-set «в работе»), а не голый вынос."""
+    if _gate_disabled():
+        logger.warning(
+            f"🔓 ГЕЙТ ВЫКЛЮЧЕН переключателем {_GATE_DISABLED_ENV}: действие "
+            f"'{action}' (tool={tool or '?'}) выполнено БЕЗ подтверждения "
+            "пользователя.")
+        return ConsentResult(True, "gate_disabled_switch")
     _ak_channel = _automation_channel_for(automation_key)
     if _ak_channel:
         _AUTOMATION_CHANNEL.set(_ak_channel)
