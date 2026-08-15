@@ -18231,7 +18231,20 @@ async def pending_consents_decide(request: Request) -> Response:
     # подожди его», вместо того чтобы отдавать обобщённый текст.
     m["_web_decision"] = "confirmed"
     m["_web_in_flight"] = True
-    consumed = await _run_blocking(_consume_manifest_for_auto_execute, manifest_id)
+    try:
+        consumed = await _run_blocking(_consume_manifest_for_auto_execute, manifest_id)
+    except BaseException:
+        # Захват УПАЛ (например, база манифестов недоступна) — план остался
+        # живым и непогашенным, а пометки уже стоят. Снимаем их тем же
+        # `pop`, что и в ветке `consumed is None` ниже: иначе на ЖИВОМ плане
+        # навсегда остаётся «подтверждено через веб, отчёт вот-вот будет», и
+        # последующее подтверждение того же плана кнопкой в Telegram уводит
+        # синхронное ожидание в вечное «сервер исполняет ПРЯМО СЕЙЧАС»
+        # вместо настоящего отчёта. Само исключение пробрасываем дальше без
+        # изменений — обработку ошибки менять не входило в задачу.
+        m.pop("_web_decision", None)
+        m.pop("_web_in_flight", None)
+        raise
     if consumed is None:
         # Кто-то другой (кнопка в Telegram, параллельный /decide) забрал
         # манифест первым — то же самое "already_decided", не 500. Пометки

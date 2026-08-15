@@ -379,3 +379,86 @@ def test_losing_web_decide_leaves_no_confirmed_marker_behind(
     monkeypatch.setattr(consent, "CONSENT_SYNC_POLL_MS", 10)
     text = asyncio.run(consent._sync_wait_for_decision(mid))
     assert text is not None and "другой канал" in text
+
+
+# ===========================================================================
+# 5. Захват УПАЛ исключением: пометки не имеют права остаться на живом плане
+# ===========================================================================
+
+def _failing_consume_spy(monkeypatch, boom):
+    """Подменяет `_run_blocking` так, что падает РОВНО захват манифеста, а
+    все прочие обращения к рабочему потоку работают как обычно."""
+    real_run_blocking = s._run_blocking
+
+    async def _spy(fn, *args, **kwargs):
+        if getattr(fn, "__name__", "") == "_consume_manifest_for_auto_execute":
+            raise boom
+        return await real_run_blocking(fn, *args, **kwargs)
+
+    monkeypatch.setattr(s, "_run_blocking", _spy)
+
+
+def test_failing_claim_does_not_leave_markers_on_a_live_manifest(
+        client, hub_secret, monkeypatch):
+    """Захват (`_consume_manifest_for_auto_execute`) бросил исключение —
+    манифест остался ЖИВЫМ и непогашенным, значит пометки веб-пути
+    (`_web_decision` / `_web_in_flight`), проставленные ДО захвата, обязаны
+    быть сняты. Иначе они остаются на плане навсегда, и последующее
+    подтверждение того же плана кнопкой в Telegram уводит ожидание в вечное
+    «сервер исполняет ПРЯМО СЕЙЧАС» вместо настоящего отчёта."""
+    fake_v2 = _FakeTicktickV2()
+    monkeypatch.setattr(s, "ticktick_v2", fake_v2)
+    monkeypatch.setattr(consent, "CONSENT_SYNC_WAIT_MS", 0)
+
+    outcome = asyncio.run(consent._gate_single(
+        "create_tag", "create_tag", {"name": "упавший-захват", "color": None},
+        "", "", _describe_tag))
+    mid = _mid_of(outcome.message)
+
+    _failing_consume_spy(monkeypatch, RuntimeError("база манифестов недоступна"))
+    with pytest.raises(RuntimeError, match="база манифестов недоступна"):
+        client.post("/pending-consents/decide",
+                    headers={"x-consent-hub-secret": hub_secret},
+                    json={"manifestId": mid, "decision": "confirm"})
+
+    m = consent._MANIFESTS[mid]
+    assert m.get("consumed") is False, "упавший захват не гасит план"
+    assert "_web_decision" not in m, \
+        "пометка решения осталась на ЖИВОМ плане — веб его не исполнял"
+    assert "_web_in_flight" not in m
+    assert fake_v2.created == [], "мутации при упавшем захвате быть не могло"
+
+
+def test_after_a_failing_claim_the_wait_still_reports_a_real_outcome(
+        client, hub_secret, monkeypatch):
+    """Продолжение: после упавшего веб-захвата тот же план подтверждают
+    кнопкой в Telegram. Синхронное ожидание обязано отдать НОРМАЛЬНЫЙ исход,
+    а не залипнуть на «исполняется ПРЯМО СЕЙЧАС» из-за застрявшего
+    `_web_in_flight`."""
+    fake_v2 = _FakeTicktickV2()
+    monkeypatch.setattr(s, "ticktick_v2", fake_v2)
+    monkeypatch.setattr(consent, "CONSENT_SYNC_WAIT_MS", 0)
+
+    outcome = asyncio.run(consent._gate_single(
+        "create_tag", "create_tag", {"name": "после-падения", "color": None},
+        "", "", _describe_tag))
+    mid = _mid_of(outcome.message)
+
+    real_run_blocking = s._run_blocking
+    _failing_consume_spy(monkeypatch, RuntimeError("захват упал"))
+    with pytest.raises(RuntimeError):
+        client.post("/pending-consents/decide",
+                    headers={"x-consent-hub-secret": hub_secret},
+                    json={"manifestId": mid, "decision": "confirm"})
+
+    # Кнопка в Telegram: тот же атомарный захват, теперь успешный.
+    monkeypatch.setattr(s, "_run_blocking", real_run_blocking)
+    monkeypatch.setattr(consent, "CONSENT_SYNC_WAIT_MS", 60)
+    monkeypatch.setattr(consent, "CONSENT_SYNC_POLL_MS", 10)
+    assert _consume_manifest_for_auto_execute(mid) is not None
+
+    text = asyncio.run(consent._sync_wait_for_decision(mid))
+    assert text is not None
+    assert "ПРЯМО СЕЙЧАС" not in text, \
+        "ожидание залипло на застрявшей пометке «исполняется»"
+    assert "другой канал" in text
