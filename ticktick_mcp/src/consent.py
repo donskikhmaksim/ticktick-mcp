@@ -931,6 +931,16 @@ async def _maybe_tg_notify_plan(tool: str, manifest_id: str,
         UPDATE message_id) вынос не меняет: функция уезжает в поток целиком.
     """
     full_text = preview_text + (f"\n{agent_tail}" if agent_tail else "")
+    # АВАРИЙНЫЙ ВЫКЛЮЧАТЕЛЬ ГЕЙТА — ПЕРВОЙ СТРОКОЙ (2026-08-14). При
+    # выключенном гейте подтверждать нечего: сообщение с кнопками владельцу
+    # уходить не должно (никто его не нажмёт — операция уже исполнена или
+    # исполняется вызывающим), и уж тем более не должен срабатывать
+    # fail-closed этой функции, который на неудачной отправке ГАСИТ манифест
+    # и возвращает вместо плана текст ошибки. Возврат `full_text` — ровно то
+    # же, что функция делает при выключенном Telegram-слое, то есть ни один
+    # вызывающий не видит нового исхода.
+    if _gate_disabled():
+        return full_text
     if not (tool and tg_approval.enabled_for(_TG_CFG, tool)):
         return full_text
     # ПОМЕТКА ДО ОТПРАВКИ, А НЕ ПОСЛЕ (2026-08-06, гонка, которую создаёт
@@ -1135,6 +1145,53 @@ def _gate_disabled() -> bool:
         "1", "true", "yes", "on")
 
 
+# Метка канала для журнала мутаций (тот же ContextVar `_AUTOMATION_CHANNEL`,
+# которым помечаются обходы по `automation_key` — см. блок над ним). Обход по
+# аварийному выключателю обязан быть виден В АУДИТЕ так же, как обход по
+# ключу: иначе в журнале останется запись, неотличимая от обычной операции,
+# подтверждённой человеком.
+_GATE_DISABLED_CHANNEL = "gate_disabled"
+
+
+def _log_gate_bypass(action: str, tool: str = "") -> None:
+    """ЕДИНСТВЕННАЯ формула «гейт обойдён аварийным выключателем»: строка
+    WARNING в лог + метка канала для журнала мутаций.
+
+    Отдельной функцией — потому что мест, где выключатель обходит гейт,
+    теперь шесть (`_require_consent`, `_gate_batch`, `_gate_single` здесь и
+    `delete_tasks` / `plan_task_creation` / `plan_task_deletion` в server.py),
+    а формулировка обхода должна быть ОДНА: и в логе, и в журнале мутаций
+    (`automation_channel: "gate_disabled"`). Раньше запись жила ровно в одном
+    месте — внутри `_require_consent`, — и именно поэтому обход по остальным
+    путям было нечем отличить от обычной подтверждённой операции."""
+    logger.warning(
+        f"🔓 ГЕЙТ ВЫКЛЮЧЕН переключателем {_GATE_DISABLED_ENV}: действие "
+        f"'{action}' (tool={tool or '?'}) выполнено БЕЗ подтверждения "
+        "пользователя.")
+    _AUTOMATION_CHANNEL.set(_GATE_DISABLED_CHANNEL)
+
+
+def _gate_bypass_channel(automation_key: str, *, action: str,
+                         tool: str = "") -> str:
+    """Канал, которым ЭТОТ вызов проходит без интерактивного подтверждения
+    ("" — не проходит, работает обычный путь план→подтверждение).
+
+    Два основания, в этом порядке: (1) верный `automation_key` — легальный
+    headless-обход (`references/automation-secrets.md`), (2) аварийный
+    выключатель `TICKTICK_MCP_GATE_DISABLED`. Оба помечают канал в журнале;
+    второй ещё и кричит в лог. При ВЫКЛЮЧЕННОМ выключателе и пустом/неверном
+    ключе функция возвращает "" и не делает НИЧЕГО — то есть поведение по
+    умолчанию не меняется ни на йоту (это условие приёмки правки)."""
+    channel = _automation_channel_for(automation_key)
+    if channel:
+        _AUTOMATION_CHANNEL.set(channel)
+        return channel
+    if _gate_disabled():
+        _log_gate_bypass(action, tool)
+        return _GATE_DISABLED_CHANNEL
+    return ""
+
+
 def _require_consent(
     *, action: str, tier: int, manifest: Optional[Dict] = None,
     user_reply: Optional[str] = None, automation_key: str = "",
@@ -1175,10 +1232,7 @@ def _require_consent(
     когда-нибудь понадобится унести и его — сначала нужен явный захват
     манифеста ДО await (compare-and-set «в работе»), а не голый вынос."""
     if _gate_disabled():
-        logger.warning(
-            f"🔓 ГЕЙТ ВЫКЛЮЧЕН переключателем {_GATE_DISABLED_ENV}: действие "
-            f"'{action}' (tool={tool or '?'}) выполнено БЕЗ подтверждения "
-            "пользователя.")
+        _log_gate_bypass(action, tool)
         return ConsentResult(True, "gate_disabled_switch")
     _ak_channel = _automation_channel_for(automation_key)
     if _ak_channel:
@@ -1813,9 +1867,17 @@ async def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
     # или отсутствующем ключе она возвращает "", и управление уходит в
     # прежний интерактивный путь целиком. Помечаем КАКОЙ канал открыл дверь
     # (TZ §4, аудируемость) — журнал подхватит метку на первой же записи.
-    _ak_channel = _automation_channel_for(automation_key)
+    #
+    # ТЕМ ЖЕ БЛОКОМ (2026-08-14) проходит АВАРИЙНЫЙ ВЫКЛЮЧАТЕЛЬ ГЕЙТА
+    # (`TICKTICK_MCP_GATE_DISABLED`, см. `_gate_bypass_channel`). До этой
+    # правки он проверялся только в `_require_consent`, то есть уже ВНУТРИ
+    # ветки call #2, и при включённом выключателе инструмент всё равно
+    # возвращал превью плана и требовал второго вызова — гейт выключался
+    # ровно наполовину. Теперь основание обхода одно на оба случая: первый же
+    # вызов исполняет операцию, плана не строит, в Telegram ничего не шлёт.
+    _ak_channel = _gate_bypass_channel(automation_key, action=kind,
+                                       tool=tool_name)
     if _ak_channel:
-        _AUTOMATION_CHANNEL.set(_ak_channel)
         stored = await _claim_plan_for_automation(kind, manifest_id)
         if stored is not None:
             return _GateOutcome(True, tasks=stored.get("tasks") or [],
@@ -1946,11 +2008,12 @@ async def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
     КОРУТИНА по той же причине и с той же оговоркой, что и `_gate_batch`
     выше (#115): await ровно один — отправка плана в Telegram в конце ветки
     call #1; ветка call #2 синхронна от проверки согласия до `consumed`."""
-    # ─── ОБХОД ПО КЛЮЧУ — ДО построения плана и ДО отправки (#118) ───
+    # ─── ОБХОД ПО КЛЮЧУ И ПО ВЫКЛЮЧАТЕЛЮ — ДО построения плана и ДО
+    # отправки (#118 / 2026-08-14) ───
     # Тот же блок, что и в `_gate_batch`; развёрнутое обоснование — там.
-    _ak_channel = _automation_channel_for(automation_key)
+    _ak_channel = _gate_bypass_channel(automation_key, action=kind,
+                                       tool=tool_name)
     if _ak_channel:
-        _AUTOMATION_CHANNEL.set(_ak_channel)
         stored = await _claim_plan_for_automation(kind, manifest_id)
         if stored is not None:
             return _GateOutcome(True, extra=stored.get("params") or {})

@@ -4440,6 +4440,18 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
                  f"`execute_task_creation(manifest_id=\"{mid}\", "
                  "user_reply=\"<дословная реплика пользователя>\")` · "
                  f"действует {_manifest_ttl_phrase()}, одноразово.")
+    # ─── АВАРИЙНЫЙ ВЫКЛЮЧАТЕЛЬ ГЕЙТА (2026-08-14) ───
+    # `plan_task_creation` — САМОСТОЯТЕЛЬНЫЙ инструмент фазы плана: он не
+    # проходит через `_gate_batch`/`_gate_single` и `_require_consent` зовёт
+    # только его напарник `execute_task_creation`. Поэтому выключатель,
+    # проверявшийся ТОЛЬКО внутри `_require_consent`, на этот путь не влиял
+    # никак: при выключенном гейте инструмент всё равно возвращал превью и
+    # требовал второго вызова. Исполняем через самого напарника, а не своей
+    # копией движка: он и гасит манифест, и пишет запись в журнал мутаций
+    # (с меткой канала `gate_disabled`), и приклеивает независимый отчёт —
+    # разойтись двум путям исполнения тут негде.
+    if _gate_disabled():
+        return await execute_task_creation(manifest_id=mid, user_reply="")
     # Опциональный ТГ-фактор. При выключенном слое (дефолт) возвращает текст
     # плана БЕЗ единого изменения; при включённом — шлёт план кнопкой и
     # помечает манифест `tg_notified`, из-за чего execute-фаза начинает
@@ -5543,6 +5555,14 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
             # `_execute_task_deletion_impl` пишет в журнал через
             # `_journal_write`, которая съедает метку на первой же записи.
             consent._AUTOMATION_CHANNEL.set(_ak_channel)
+        elif _gate_disabled():
+            # Аварийный выключатель гейта (2026-08-14) — второе основание
+            # исполнить с первого вызова, ровно тем же кодом ниже. Своя
+            # запись в лог и своя метка канала (`gate_disabled`), чтобы обход
+            # по выключателю не выглядел в журнале как обход по ключу.
+            _log_gate_bypass("delete", "delete_tasks")
+            _ak_channel = consent._GATE_DISABLED_CHANNEL
+        if _ak_channel:
             done = await _execute_task_deletion_impl(mid, _MANIFESTS[mid])
             # `lines` — предупреждения про пропущенные/несовпавшие задачи.
             # В интерактивном пути они видны человеку в превью; headless-путь
@@ -5602,7 +5622,8 @@ ConsentResult, _CONSENT_MAX_TOKENS, _JOURNAL_DIR, _MANIFESTS,
     _TOMBSTONE_CLAIMED, _TOMBSTONE_EXECUTED, _TOMBSTONE_FAILED,
     _TOMBSTONE_UNCONFIRMED, _classify_consent_reply,
     _consent_refusal_reason, _durable_payload, _duration_ru, _gate_batch,
-    _gate_item_id, _gate_single, _is_affirmative_reply, _is_negative_reply,
+    _gate_disabled, _gate_item_id, _gate_single, _is_affirmative_reply,
+    _is_negative_reply, _log_gate_bypass,
     _journal_write, _manifest_from_payload, _manifest_gone_msg,
     _manifest_object_hash, _manifest_params_hash, _manifest_ttl_phrase,
     _mark_manifest_consumed, _maybe_tg_notify_plan, _op_journal,
@@ -5771,6 +5792,15 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
                  "user_reply=\"<дословная реплика пользователя>\")` — НЕ в "
                  "этом же ходе. Манифест одноразовый, "
                  f"действует {_manifest_ttl_phrase()}.")
+    # ─── АВАРИЙНЫЙ ВЫКЛЮЧАТЕЛЬ ГЕЙТА (2026-08-14) ───
+    # То же самое, что в `plan_task_creation` выше и по той же причине: этот
+    # инструмент — самостоятельная фаза плана, `_require_consent` (внутри
+    # которого выключатель проверялся раньше) зовёт только напарник
+    # `execute_task_deletion`. Исполняем через него — план гаснет, снимки
+    # задач уходят в журнал, эффект перепроверяется свежим чтением, ровно как
+    # на обычном пути.
+    if _gate_disabled():
+        return await execute_task_deletion(manifest_id=mid, user_reply="")
     # Сетевую часть отправки уводит в поток сам хук (см. delete_tasks выше и
     # докстринг `_maybe_tg_notify_plan`) — здесь просто await.
     return await _maybe_tg_notify_plan("delete_tasks", mid, "\n".join(lines),
@@ -7039,7 +7069,14 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
                           # включать его заодно значило бы менять поведение
                           # при выключенном ТГ-слое (запрещено).
                           min_gap=0)
-    if cr.ok and m is None and tg_approval.enabled_for(_TG_CFG, "delete_project"):
+    # `not _gate_disabled()` (2026-08-14): при аварийно выключенном гейте
+    # откат к фазе плана бессмыслен — подтверждать нечем и некому, кнопка в
+    # Telegram при выключенном гейте не уходит вовсе (см.
+    # `_maybe_tg_notify_plan`), и без этой оговорки инструмент завис бы на
+    # вечном превью. `_require_consent` выше уже впустил вызов и записал
+    # факт обхода в лог и в журнал.
+    if (cr.ok and m is None and not _gate_disabled()
+            and tg_approval.enabled_for(_TG_CFG, "delete_project")):
         # Дыра, которую иначе оставила бы связка «нет манифеста → manifest=
         # None → ТГ-фактор не требуется»: модель могла позвать тул СРАЗУ с
         # user_reply="да", без первой фазы, и удалить проект в обход кнопки
@@ -12157,7 +12194,8 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
                                   # таймера у этой ветки не было — не вводим
                                   # его вместе с манифестом.
                                   min_gap=0)
-            if cr.ok and m is None and tg_approval.enabled_for(_TG_CFG, "rename_tag"):
+            if (cr.ok and m is None and not _gate_disabled()
+                    and tg_approval.enabled_for(_TG_CFG, "rename_tag")):
                 # см. тот же комментарий в delete_project: без этого вызов
                 # сразу с allow_merge=true + user_reply="да" слил бы теги в
                 # обход кнопки при включённом слое. Откатываемся к фазе
