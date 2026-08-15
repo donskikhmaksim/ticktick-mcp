@@ -18217,12 +18217,37 @@ async def pending_consents_decide(request: Request) -> Response:
         return JSONResponse({"ok": False, "error": "binding_mismatch"}, status_code=409)
     if current_hash != m.get("object_hash"):
         return JSONResponse({"ok": False, "error": "binding_mismatch"}, status_code=409)
+    # ПОМЕТКИ — ДО ЗАХВАТА, А НЕ ПОСЛЕ (2026-08-14, третья гонка ожидания).
+    # `_consume_manifest_for_auto_execute` уходит в рабочий поток и ставит
+    # `consumed = True` там; управление возвращается в event loop только
+    # ПОСЛЕ этого. Пока `_web_decision` проставлялся строкой ниже, между
+    # фактом погашения и появлением метки успевал влезть тик синхронного
+    # ожидания (`_sync_wait_for_decision`) — он видел «погашено, метки нет» и
+    # отдавал модели обобщённое «решение принято через другой канал» вместо
+    # реального результата этого самого веб-подтверждения. Теперь метка
+    # видна ОДНОВРЕМЕННО с погашением: ожидание либо ещё не видит consumed,
+    # либо видит его уже с меткой. `_web_in_flight` — вторая половина той же
+    # правки: она говорит ожиданию «исход есть, но отчёт ещё пишется —
+    # подожди его», вместо того чтобы отдавать обобщённый текст.
+    m["_web_decision"] = "confirmed"
+    m["_web_in_flight"] = True
     consumed = await _run_blocking(_consume_manifest_for_auto_execute, manifest_id)
     if consumed is None:
         # Кто-то другой (кнопка в Telegram, параллельный /decide) забрал
-        # манифест первым — то же самое "already_decided", не 500.
+        # манифест первым — то же самое "already_decided", не 500. Пометки
+        # снимаем: исполняет не этот путь, и обещать по нему результат
+        # нельзя (ожидание тогда честно скажет «решено другим каналом»).
+        m.pop("_web_decision", None)
+        m.pop("_web_in_flight", None)
         return JSONResponse({"ok": False, "error": "already_decided"}, status_code=409)
-    consumed["_web_decision"] = "confirmed"
+    # Обычно `_consume_manifest_for_auto_execute` возвращает ТОТ ЖЕ объект,
+    # что лежит в `_MANIFESTS`; но если плана в памяти не оказалось, он
+    # работает по копии, поднятой из базы. Пишем в оба — читатель (ожидание)
+    # смотрит именно в `_MANIFESTS`.
+    _decided = [m] if consumed is m else [m, consumed]
+    for _t in _decided:
+        _t["_web_decision"] = "confirmed"
+        _t["_web_in_flight"] = True
     token = _TG_AUTO_EXECUTE_MANIFEST.set(manifest_id)
     try:
         report_text = await asyncio.wait_for(
@@ -18236,7 +18261,9 @@ async def pending_consents_decide(request: Request) -> Response:
             if isinstance(e, asyncio.TimeoutError) else
             f"🛑 Ошибка при исполнении «{tool}»: {_redact_for_user(e)}")
         _tombstone_manifest(manifest_id, _TOMBSTONE_FAILED, reason_text)
-        m["_web_result"] = reason_text
+        for _t in _decided:
+            _t["_web_result"] = reason_text
+            _t["_web_in_flight"] = False
         logger.exception(f"consent-hub: ошибка при веб-исполнении {tool}/{manifest_id}")
         return JSONResponse({"ok": True, "outcome": "confirmed", "result": reason_text})
     finally:
@@ -18251,7 +18278,12 @@ async def pending_consents_decide(request: Request) -> Response:
         _tombstone_manifest(
             manifest_id, reason,
             f"вердикт независимой сверки — {verdict} (веб-подтверждение)")
-    m["_web_result"] = full_md
+    # Отчёт — ПОСЛЕДНИМ шагом, и вместе с ним снимается `_web_in_flight`:
+    # именно на эту пару смотрит `_sync_wait_for_decision`, решая, отдавать
+    # модели готовый отчёт или ещё подождать (см. `_sync_wait_decision_text`).
+    for _t in _decided:
+        _t["_web_result"] = full_md
+        _t["_web_in_flight"] = False
     return JSONResponse({"ok": True, "outcome": "confirmed", "result": full_md})
 
 
