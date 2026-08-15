@@ -4241,6 +4241,15 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     `user_reply`, before the press and after it alike. Do not call it — show
     the plan and let the owner tap the button.
 
+    EMERGENCY KILL-SWITCH (off unless the owner set it): when the server runs
+    with TICKTICK_MCP_GATE_DISABLED enabled, the plan phase is SKIPPED — this
+    call CREATES the tasks straight away (it delegates to
+    execute_task_creation itself) and returns the execution report instead of
+    a manifest. The "nothing is created / read-only" contract above holds in
+    every normal configuration; this switch is a deliberate operator-set
+    emergency mode, and each bypass is logged and marked in the mutation
+    journal.
+
     Args:
         summary: one-line human sentence describing the batch
         tasks: same objects create_tasks takes
@@ -5664,6 +5673,14 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
     independent outcome check.
 
     Nothing is deleted by this tool. Manifests are one-shot and expire in 1 h.
+
+    EMERGENCY KILL-SWITCH (off unless the owner set it): when the server runs
+    with TICKTICK_MCP_GATE_DISABLED enabled, the plan phase is SKIPPED — this
+    call DELETES straight away (it delegates to execute_task_deletion itself)
+    and returns the execution report instead of a manifest. The "nothing is
+    deleted / read-only" contract above holds in every normal configuration;
+    this switch is a deliberate operator-set emergency mode, and each bypass
+    is logged and marked in the mutation journal.
 
     TELEGRAM CONFIRMATION LAYER (optional, off by default): when it is on this
     plan ALSO goes to the owner as a message with ✅/🛑 buttons, and ✅ makes
