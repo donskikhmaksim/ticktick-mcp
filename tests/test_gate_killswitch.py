@@ -317,3 +317,229 @@ def test_notify_plan_is_a_no_op_with_switch_on_even_if_sending_would_fail(
     assert consent._MANIFESTS["ks-notify"]["consumed"] is False, \
         "fail-closed не должен гасить план — отправки не было вовсе"
     assert "tg_notified" not in consent._MANIFESTS["ks-notify"]
+
+
+# ===========================================================================
+# 6. `delete_tasks` — собственный гейт (свой вид манифеста со снимками задач),
+#    поэтому общий блок из `_gate_batch`/`_gate_single` сюда не подставлен и
+#    выключатель проверяется отдельной веткой рядом с обходом по ключу.
+#
+#    Зовём `.direct` — исходную функцию БЕЗ слоя 1 (`@_automation_only`,
+#    закрытый прямой путь: без верного `automation_key` обёртка отказывает
+#    ещё до тела). Ровно так же зовут этот тул остальные тесты гейта
+#    (tests/test_consent_gate.py) — сам слой 1 проверяется отдельно, в
+#    tests/test_hidden_tools.py.
+# ===========================================================================
+
+@pytest.fixture
+def _direct_deletion_stand(monkeypatch):
+    monkeypatch.setattr(s, "_ensure_ready", lambda: None)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Проект"})
+    monkeypatch.setattr(
+        s, "_open_by_id",
+        lambda fresh=False: {"t1": {"id": "t1", "title": "Мусор",
+                                    "projectId": "p1"}})
+    calls = []
+
+    async def _fake_delete(manifest_id, m=None):
+        calls.append((manifest_id, m))
+        return "✅ Удалено 1 из 1 (двойник исполнителя)"
+
+    monkeypatch.setattr(s, "_execute_task_deletion_impl", _fake_delete)
+    return calls
+
+
+_ONE_TASK = [{"taskId": "t1", "title": "Мусор", "projectId": "p1"}]
+
+
+def test_delete_tasks_executes_on_first_call_when_switch_is_on(
+        monkeypatch, _direct_deletion_stand):
+    monkeypatch.setenv(ENV, "1")
+    tg = _TgSpy(monkeypatch)
+
+    out = asyncio.run(s.delete_tasks.direct("⚠️ Удаляю «Мусор»", list(_ONE_TASK)))
+
+    assert len(_direct_deletion_stand) == 1, \
+        "при выключенном гейте первый же вызов обязан УДАЛИТЬ"
+    assert "двойник исполнителя" in out
+    assert "Манифест `" not in out, "плана быть не должно"
+    assert tg.sent == [], "в Telegram при выключенном гейте ничего не уходит"
+
+
+def test_delete_tasks_bypass_is_marked_as_gate_disabled_not_automation_key(
+        monkeypatch, _direct_deletion_stand):
+    """У этой ветки два основания исполнить сразу — верный `automation_key` и
+    выключатель. Обход по выключателю обязан помечаться СВОИМ каналом, иначе
+    в журнале он неотличим от легального headless-обхода по ключу."""
+    monkeypatch.setenv(ENV, "1")
+    _TgSpy(monkeypatch)
+    seen = {}
+
+    async def _capture(manifest_id, m=None):
+        seen["channel"] = consent._AUTOMATION_CHANNEL.get(None)
+        return "✅ Удалено 1 из 1"
+
+    monkeypatch.setattr(s, "_execute_task_deletion_impl", _capture)
+    asyncio.run(s.delete_tasks.direct("⚠️ Удаляю «Мусор»", list(_ONE_TASK)))
+
+    assert seen["channel"] == consent._GATE_DISABLED_CHANNEL
+
+
+def test_delete_tasks_default_behaviour_is_untouched(
+        monkeypatch, _direct_deletion_stand):
+    """Контроль: переменная не задана — прежние две фазы, план уходит в
+    Telegram, удаления на первом вызове нет."""
+    tg = _TgSpy(monkeypatch)
+
+    plan = asyncio.run(s.delete_tasks.direct("⚠️ Удаляю «Мусор»", list(_ONE_TASK)))
+
+    assert _direct_deletion_stand == [], "на первом вызове ничего не удаляется"
+    assert "Манифест `" in plan
+    assert len(tg.sent) == 1 and tg.sent[0][0] == "delete_tasks"
+
+
+# ===========================================================================
+# 7. `delete_project` — каскад: TickTick сносит вместе с проектом ВСЕ его
+#    задачи. Здесь выключатель влияет на откат к фазе плана
+#    (`not _gate_disabled()` в условии), а не на сам `_require_consent`
+# ===========================================================================
+
+@pytest.fixture
+def _project_stand(monkeypatch):
+    monkeypatch.setattr(s, "_ensure_official", lambda: None)
+    monkeypatch.setattr(s, "_guard_project_or_refuse",
+                        lambda pid, name="", **kw: "")
+    monkeypatch.setattr(s, "_v2_project_names", lambda: {"p1": "Проект"})
+    monkeypatch.setattr(
+        s, "ticktick",
+        type("_FakeOfficial", (), {
+            "get_project_with_data": staticmethod(
+                lambda pid: {"tasks": [{"id": "t1", "title": "Внутри"}]}),
+        })())
+    calls = []
+
+    async def _fake_impl(project_id, project_name, tasks):
+        calls.append((project_id, project_name, list(tasks)))
+        return "🗑 Проект удалён (двойник исполнителя)"
+
+    monkeypatch.setattr(s, "_delete_project_impl", _fake_impl)
+    return calls
+
+
+def test_delete_project_executes_on_first_call_when_switch_is_on(
+        monkeypatch, _project_stand):
+    monkeypatch.setenv(ENV, "1")
+    tg = _TgSpy(monkeypatch)
+
+    out = asyncio.run(s.delete_project("Проект", "p1"))
+
+    assert len(_project_stand) == 1, \
+        "при выключенном гейте первый же вызов обязан удалить проект"
+    assert _project_stand[0][0] == "p1"
+    assert "двойник исполнителя" in out
+    assert "Манифест `" not in out
+    assert tg.sent == [], "в Telegram при выключенном гейте ничего не уходит"
+
+
+def test_delete_project_default_still_falls_back_to_the_plan_phase(
+        monkeypatch, _project_stand):
+    """Контроль — самая ценная половина: переменная не задана, ТГ-слой
+    включён, модель зовёт тул СРАЗУ с user_reply="да". Прежнее поведение —
+    откат к фазе плана (кнопка владельцу), а не удаление."""
+    tg = _TgSpy(monkeypatch)
+
+    out = asyncio.run(s.delete_project("Проект", "p1", user_reply="да, удаляй"))
+
+    assert _project_stand == [], "проект не имел права удалиться без кнопки"
+    assert "Манифест `" in out
+    assert len(tg.sent) == 1 and tg.sent[0][0] == "delete_project"
+
+
+def test_delete_project_default_first_call_deletes_nothing(
+        monkeypatch, _project_stand):
+    """Контроль-2: обычный первый вызов (без user_reply) — превью с числом
+    задач в каскаде и планом, мутации нет."""
+    tg = _TgSpy(monkeypatch)
+
+    out = asyncio.run(s.delete_project("Проект", "p1"))
+
+    assert _project_stand == []
+    assert "Манифест `" in out
+    assert "Ничего не удалено." in out
+    assert len(tg.sent) == 1
+
+
+# ===========================================================================
+# 8. `rename_tag`, merge-ветка — необратимое слияние тегов (какая задача
+#    носила какой тег, после слияния не восстановить)
+# ===========================================================================
+
+@pytest.fixture
+def _merge_stand(monkeypatch):
+    monkeypatch.setattr(s, "_ensure_ready", lambda: None)
+
+    async def _tags(force=True):
+        return ["старый", "новый"]          # оба есть → это СЛИЯНИЕ
+
+    monkeypatch.setattr(s, "_live_tag_names", _tags)
+    calls = []
+
+    async def _fake_impl(old_name, new_name, merged=False):
+        calls.append((old_name, new_name, merged))
+        return "✅ Тег слит (двойник исполнителя)"
+
+    monkeypatch.setattr(s, "_rename_tag_impl", _fake_impl)
+    return calls
+
+
+def test_rename_tag_merge_executes_on_first_call_when_switch_is_on(
+        monkeypatch, _merge_stand):
+    """`allow_merge=True` остаётся обязательным и при выключенном гейте — это
+    не подтверждение человека, а явное «я знаю, что это слияние». Снимается
+    ровно вторая половина: второй вызов с `user_reply` больше не нужен."""
+    monkeypatch.setenv(ENV, "1")
+    tg = _TgSpy(monkeypatch)
+
+    out = asyncio.run(s.rename_tag("старый", "новый", allow_merge=True))
+
+    assert _merge_stand == [("старый", "новый", True)], \
+        "при выключенном гейте слияние обязано произойти с первого вызова"
+    assert "двойник исполнителя" in out
+    assert "Манифест `" not in out
+    assert tg.sent == [], "в Telegram при выключенном гейте ничего не уходит"
+
+
+def test_rename_tag_merge_default_still_falls_back_to_the_plan_phase(
+        monkeypatch, _merge_stand):
+    """Контроль: переменная не задана, ТГ-слой включён, вызов сразу с
+    allow_merge=true и user_reply="да" — прежний откат к фазе плана."""
+    tg = _TgSpy(monkeypatch)
+
+    out = asyncio.run(s.rename_tag("старый", "новый", allow_merge=True,
+                                   user_reply="да, сливай"))
+
+    assert _merge_stand == [], "теги не имели права слиться без кнопки"
+    assert "СЛИЯНИЕ тегов" in out
+    assert "Манифест `" in out
+    assert len(tg.sent) == 1 and tg.sent[0][0] == "rename_tag"
+
+
+def test_rename_tag_plain_rename_is_untouched_by_the_switch(
+        monkeypatch, _merge_stand):
+    """Контроль-2: ветка обычного переименования (тега-цели не существует)
+    гейта не имеет вовсе — выключатель не имеет права её изменить."""
+    async def _tags(force=True):
+        return ["старый"]
+
+    monkeypatch.setattr(s, "_live_tag_names", _tags)
+    tg = _TgSpy(monkeypatch)
+
+    monkeypatch.setenv(ENV, "1")
+    asyncio.run(s.rename_tag("старый", "свежий"))
+    monkeypatch.delenv(ENV, raising=False)
+    asyncio.run(s.rename_tag("старый", "свежий"))
+
+    assert _merge_stand == [("старый", "свежий", False),
+                            ("старый", "свежий", False)], \
+        "обычное переименование одинаково при любом положении выключателя"
+    assert tg.sent == []
