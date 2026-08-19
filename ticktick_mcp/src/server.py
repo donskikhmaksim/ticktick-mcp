@@ -5675,6 +5675,14 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
             # `_journal_write`, которая съедает метку на первой же записи.
             consent._AUTOMATION_CHANNEL.set(_ak_channel)
         elif _gate_disabled():
+            # Явное «нет» человека главнее выключателя (2026-08-19, разбор
+            # QA-2, см. `_refusal_beats_kill_switch` в consent.py): вызов с
+            # отрицанием в user_reply не имеет права исполниться по обходу.
+            # Манифест гасим — он уже создан строками выше и без гашения
+            # остался бы висеть живым планом.
+            if _is_negative_reply(user_reply):
+                _mark_manifest_consumed(_MANIFESTS[mid], mid)
+                return consent._REFUSAL_BEATS_KILL_SWITCH_MSG
             # Аварийный выключатель гейта (2026-08-14) — второе основание
             # исполнить с первого вызова, ровно тем же кодом ниже. Своя
             # запись в лог и своя метка канала (`gate_disabled`), чтобы обход

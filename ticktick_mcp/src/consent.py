@@ -1192,6 +1192,35 @@ def _gate_bypass_channel(automation_key: str, *, action: str,
     return ""
 
 
+# Текст отказа для точек обхода, где явное «нет» человека перехватывается ДО
+# выключателя и плана ещё нет (call #1). Формулировка нарочно повторяет
+# ведущую фразу `_require_consent` («Пользователь НЕ подтвердил») — на неё
+# уже опираются тесты и читатели ответов гейта.
+_REFUSAL_BEATS_KILL_SWITCH_MSG = (
+    "🛑 Пользователь НЕ подтвердил — ничего не сделано. Ответ похож на "
+    "отказ/отмену; при необходимости перепланируй.")
+
+
+def _refusal_beats_kill_switch(automation_key: str,
+                               user_reply: Optional[str]) -> bool:
+    """Явное «нет» человека ГЛАВНЕЕ аварийного выключателя гейта (2026-08-19,
+    разбор QA-2). «Гейт выключен» значит «не требуем подтверждения», а НЕ
+    «исполняем вопреки отказу»: если в `user_reply` приехало прямое отрицание
+    или согласие с оговоркой, обход по `TICKTICK_MCP_GATE_DISABLED` не
+    срабатывает — управление уходит в обычный путь, который сам погасит план
+    и сформулирует отказ (`_require_consent`, ветка `_is_negative_reply`).
+
+    Верный `automation_key` поведения НЕ меняет: headless-клиент реплику
+    человека не передаёт вовсе, и существующий контракт канала по ключу этой
+    правкой не трогается. Проверка дешёвая (классификатор реплики — чистая
+    строковая функция, ни кнопки, ни базы) — ей место ПЕРЕД обходом."""
+    if not _is_negative_reply(user_reply):
+        return False
+    if _automation_channel_for(automation_key):
+        return False
+    return _gate_disabled()
+
+
 def _require_consent(
     *, action: str, tier: int, manifest: Optional[Dict] = None,
     user_reply: Optional[str] = None, automation_key: str = "",
@@ -1231,9 +1260,6 @@ def _require_consent(
     CONSENT_PG_CONNECT_TIMEOUT_S / CONSENT_PG_STATEMENT_TIMEOUT_MS). Если
     когда-нибудь понадобится унести и его — сначала нужен явный захват
     манифеста ДО await (compare-and-set «в работе»), а не голый вынос."""
-    if _gate_disabled():
-        _log_gate_bypass(action, tool)
-        return ConsentResult(True, "gate_disabled_switch")
     _ak_channel = _automation_channel_for(automation_key)
     if _ak_channel:
         _AUTOMATION_CHANNEL.set(_ak_channel)
@@ -1291,6 +1317,22 @@ def _require_consent(
                                  detail.lstrip("🛑 ") if detail else
                                  "Ответ похож на отказ/отмену; при необходимости "
                                  "перепланируй."))
+
+    # ─── АВАРИЙНЫЙ ВЫКЛЮЧАТЕЛЬ — ПОСЛЕ механики манифеста и ПОСЛЕ явного
+    # «нет» (2026-08-19, разбор QA-2). Раньше `_gate_disabled()` стоял САМОЙ
+    # ПЕРВОЙ строкой функции и потому снимал не только «спроси человека», но
+    # и всё вокруг согласия: (а) one-shot/TTL/object_hash манифеста — два
+    # параллельных execute одного плана после рестарта оба проходили и
+    # операция исполнялась ДВАЖДЫ; (б) явный отказ человека — план построен,
+    # человек ответил «нет», модель честно передала user_reply="нет", а
+    # операция всё равно ИСПОЛНЯЛАСЬ. Выключатель по смыслу снимает ровно
+    # ОДНО требование — «дождись подтверждения» (текстовое «да» / кнопка в
+    # Telegram / веб-портал), поэтому и стоит он ровно перед этими
+    # проверками: механика одноразовости к согласию отношения не имеет и
+    # работает всегда, а «нет» человека главнее любого выключателя.
+    if _gate_disabled():
+        _log_gate_bypass(action, tool)
+        return ConsentResult(True, "gate_disabled_switch")
 
     # ─────────── BUTTON-ONLY: текстовый путь исполнения ЗАКРЫТ ───────────
     # Максим, 2026-08-06: «зачем вообще ждать текстовое да? нужно убрать для
@@ -1770,6 +1812,17 @@ async def _claim_plan_for_automation(kind: str, manifest_id: str) -> Optional[Di
     m = _MANIFESTS.get(manifest_id)
     if not m or m.get("kind") != kind or m.get("consumed"):
         return None
+    # TTL — та же проверка, что в `_require_consent` (2026-08-19, разбор
+    # QA-2): эта функция зовётся ДО `_prune_manifests()` вызывающих ворот, и
+    # без неё план старше часа, доживший в памяти процесса, исполнялся бы по
+    # обходу как свежий. Протухший план гасится (доезжает до базы — иначе
+    # висящая в Telegram кнопка исполнила бы его после «истёк»), а вызывающие
+    # ворота идут обычным путём, который сам объяснит «истёк — планируй
+    # заново».
+    created = m.get("created")
+    if created is not None and time.monotonic() - created > _MANIFEST_TTL:
+        _mark_manifest_consumed(m, manifest_id)
+        return None
     _mark_manifest_consumed(m, manifest_id)
     return m
 
@@ -1971,20 +2024,31 @@ async def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
     # возвращал превью плана и требовал второго вызова — гейт выключался
     # ровно наполовину. Теперь основание обхода одно на оба случая: первый же
     # вызов исполняет операцию, плана не строит, в Telegram ничего не шлёт.
-    _ak_channel = _gate_bypass_channel(automation_key, action=kind,
-                                       tool=tool_name)
-    if _ak_channel:
-        stored = await _claim_plan_for_automation(kind, manifest_id)
-        if stored is not None:
-            return _GateOutcome(True, tasks=stored.get("tasks") or [],
-                                summary=stored.get("summary") or summary,
-                                extra=stored.get("extra") or {})
-        if not manifest_id and tasks:
-            return _GateOutcome(True, tasks=tasks, summary=summary,
-                                extra=extra or {})
-        # Ни живого плана, ни данных для работы — проваливаемся в обычный
-        # путь, чтобы отказ сформулировал он (там уже есть точные тексты про
-        # «манифест не найден/истёк» и «пустой список»), а не копия здесь.
+    # Явное «нет» человека перехватывается ДО обхода по выключателю
+    # (2026-08-19, разбор QA-2, см. `_refusal_beats_kill_switch`): с
+    # manifest_id управление уходит в обычную ветку call #2 ниже — там
+    # `_require_consent` сам погасит план и сформулирует конкретный отказ;
+    # без manifest_id (call #1 с отрицанием в реплике) исполнять нечего и
+    # строить план поверх отказа тоже нечего — честный отказ сразу.
+    if _refusal_beats_kill_switch(automation_key, user_reply):
+        if not manifest_id:
+            return _GateOutcome(False, message=_REFUSAL_BEATS_KILL_SWITCH_MSG)
+    else:
+        _ak_channel = _gate_bypass_channel(automation_key, action=kind,
+                                           tool=tool_name)
+        if _ak_channel:
+            stored = await _claim_plan_for_automation(kind, manifest_id)
+            if stored is not None:
+                return _GateOutcome(True, tasks=stored.get("tasks") or [],
+                                    summary=stored.get("summary") or summary,
+                                    extra=stored.get("extra") or {})
+            if not manifest_id and tasks:
+                return _GateOutcome(True, tasks=tasks, summary=summary,
+                                    extra=extra or {})
+            # Ни живого плана, ни данных для работы — проваливаемся в обычный
+            # путь, чтобы отказ сформулировал он (там уже есть точные тексты
+            # про «манифест не найден/истёк» и «пустой список»), а не копия
+            # здесь.
     _prune_manifests()
     if manifest_id:
     # План мог быть построен ДРУГИМ процессом (перезапуск между планом и
@@ -2107,16 +2171,23 @@ async def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
     # ─── ОБХОД ПО КЛЮЧУ И ПО ВЫКЛЮЧАТЕЛЮ — ДО построения плана и ДО
     # отправки (#118 / 2026-08-14) ───
     # Тот же блок, что и в `_gate_batch`; развёрнутое обоснование — там.
-    _ak_channel = _gate_bypass_channel(automation_key, action=kind,
-                                       tool=tool_name)
-    if _ak_channel:
-        stored = await _claim_plan_for_automation(kind, manifest_id)
-        if stored is not None:
-            return _GateOutcome(True, extra=stored.get("params") or {})
-        if not manifest_id and params:
-            return _GateOutcome(True, extra=params)
-        # Ни живого плана, ни параметров — пусть обычный путь ниже объяснит,
-        # что именно не так (истёкший манифест / пустые параметры).
+    # Явное «нет» перехватывается ДО обхода — тот же блок, что в `_gate_batch`
+    # выше, развёрнутое обоснование — там и в `_refusal_beats_kill_switch`.
+    if _refusal_beats_kill_switch(automation_key, user_reply):
+        if not manifest_id:
+            return _GateOutcome(False, message=_REFUSAL_BEATS_KILL_SWITCH_MSG)
+    else:
+        _ak_channel = _gate_bypass_channel(automation_key, action=kind,
+                                           tool=tool_name)
+        if _ak_channel:
+            stored = await _claim_plan_for_automation(kind, manifest_id)
+            if stored is not None:
+                return _GateOutcome(True, extra=stored.get("params") or {})
+            if not manifest_id and params:
+                return _GateOutcome(True, extra=params)
+            # Ни живого плана, ни параметров — пусть обычный путь ниже
+            # объяснит, что именно не так (истёкший манифест / пустые
+            # параметры).
     _prune_manifests()
     if manifest_id:
     # План мог быть построен ДРУГИМ процессом (перезапуск между планом и
