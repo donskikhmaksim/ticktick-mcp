@@ -12490,6 +12490,15 @@ async def _create_tag_impl(name: str, color: str = None) -> str:
     """Pure mutation logic for create_tag — no consent gate. Called only by
     the gated create_tag() above once the plan is approved."""
     try:
+        # No-op: тег УЖЕ существует в аккаунте (2026-08-19, QA — тот же класс,
+        # что «уже в целевом списке» у move_tasks). Раньше запрос всё равно
+        # уходил в API (200 без изменений — TickTick не ругается на дубликат),
+        # а пост-чтение видело имя в свежем списке тегов и трактовало это как
+        # «создали и проверили», хотя создания не было. Отделяем ДО отправки.
+        existing = await _live_tag_names()
+        if name.lower() in existing:
+            return (f"ℹ️ Тег «{name}» уже существует — без изменений. "
+                    "Ничего не создавал.")
         await _run_blocking(lambda: ticktick_v2.create_tag(name, color))
         # Lightweight inline check — create_tag doesn't write to the journal
         # (tag creation isn't journaled), so this is the only proof available.
@@ -13426,8 +13435,23 @@ async def _update_task_comment_impl(task_title: str, text: str, project_id: str,
         if refusal:
             return refusal
         pid = g.project_id or project_id
-        # (client-side: update_task_comment fetches the comment first and
-        # raises if comment_id is absent — a moved/stale pid errors loudly)
+        # Existence pre-check (2026-08-19, QA — same pattern as
+        # delete_task_comment above): refuse a stale/foreign comment_id
+        # instead of letting the client raise mid-call. Also doubles as the
+        # no-op read below, so it's not wasted work.
+        cms = await _run_blocking(lambda: ticktick_v2.get_task_comments(pid, task_id))
+        cm = next((c for c in cms if c.get("id") == comment_id), None)
+        if cm is None:
+            return (f"🛑 НЕ изменил — комментария {comment_id} нет на задаче "
+                    f"'{task_title}' (уже удалён или чужой id). Ничего не тронул.")
+        # No-op: новый текст ПОСИМВОЛЬНО равен текущему (2026-08-19, QA — тот
+        # же класс, что «уже в целевом списке» у move_tasks). Раньше запрос
+        # всё равно уходил в API (200 без изменений), пост-чтение видело тот
+        # же текст и трактовало это как «правку подтвердили», хотя правки не
+        # было. Отделяем ДО отправки.
+        if (cm.get("title") or "") == text:
+            return (f"ℹ️ Комментарий на «{task_title}» уже содержит этот "
+                    "текст — без изменений. Ничего не тронул.")
         await _run_blocking(lambda: ticktick_v2.update_task_comment(pid, task_id, comment_id, text))
         # Post-verify: the new text must be visible in the comment list.
         cms = await _run_blocking(lambda: ticktick_v2.get_task_comments(pid, task_id))
@@ -13671,6 +13695,29 @@ async def _update_project_impl(project_name: str, project_id: str,
                                        require_known=True)
     if refusal:
         return refusal
+    live_name = _v2_project_names().get(project_id, project_name)
+    # No-op: КАЖДОЕ переданное поле РАВНО текущему живому значению
+    # (2026-08-19, QA — тот же класс, что «уже в целевом списке» у
+    # move_tasks). Раньше запрос всё равно уходил в API (200 без изменений),
+    # пост-чтение видело те же значения и трактовало это как «обновили и
+    # подтвердили», хотя изменения не было. Отделяем ДО отправки; сбой этого
+    # чтения не блокирует — операция идёт обычным путём и сверяется
+    # post-verify как раньше.
+    try:
+        cur = await _run_blocking(ticktick.get_project, project_id)
+    except Exception:
+        cur = None
+    if isinstance(cur, dict) and not cur.get('error'):
+        same = True
+        if name is not None and cur.get('name') != name:
+            same = False
+        if color is not None and cur.get('color') != color:
+            same = False
+        if view_mode is not None and cur.get('viewMode') != view_mode:
+            same = False
+        if (name is not None or color is not None or view_mode is not None) and same:
+            return (f"ℹ️ Проект «{live_name}» уже такой — без изменений. "
+                    "Ничего не тронул.")
     try:
         proj = await _run_blocking(lambda: ticktick.update_project(
             project_id, name=name, color=color, view_mode=view_mode))
