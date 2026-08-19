@@ -8761,7 +8761,8 @@ def _ensure_ready() -> Optional[str]:
 
 @mcp.tool(annotations=READONLY)
 async def get_habits() -> str:
-    """List all habits with their goal and current streak (requires v2 API)."""
+    """List all habits with their goal and a "done" count computed from
+    actual check-in records (requires v2 API)."""
     err = _ensure_ready()
     if err:
         return err
@@ -8769,19 +8770,46 @@ async def get_habits() -> str:
         habits = await _run_blocking(lambda: ticktick_v2.get_habits())
         if not habits:
             return "No habits found."
-        # totalCheckIns считает ТОЛЬКО успешные отметки — проверено живьём:
-        # привычка с «totalCheckIns: 18» отдаёт 31 запись в get_habit_checkins
-        # (18 выполнено + 13 провалено/пропущено). Слово «total» читалось как
-        # «все отметки», то есть завышало регулярность: 18 из 18 вместо 18 из
-        # 31. Поле не пересчитываем (это счётчик TickTick), но называем честно
-        # и говорим, где смотреть полную историю.
-        out = (f"Habits ({len(habits)}):\n"
-               "(«done» = SUCCESSFUL check-ins only — failed and skipped days are "
-               "NOT in that number; get_habit_checkins lists every entry)\n\n")
+        # "done" ниже считается по ЖИВЫМ записям check-in'ов, а НЕ по полю
+        # totalCheckIns из объекта привычки — это поле оказалось не просто
+        # "успехи без провалов/пропусков" (что уже само по себе стоило бы
+        # честной пометки), а ещё и УСТАРЕВШИМ: живьём чек-ин сразу после
+        # записи не попадал в totalCheckIns при следующем же get_habits
+        # (показывало done: 0), а delete_habit печатал «успешных было 3»,
+        # хотя get_habit_checkins непосредственно перед этим показывал 4
+        # done-записи. Пересчитываем реальный счёт ОДНИМ batch-запросом на
+        # все привычки сразу (тот же эндпоинт, что и get_habit_checkins) —
+        # дороже на один HTTP-вызов, зато не врёт. Если этот запрос упал —
+        # показываем "?" вместо цифры (см. правило вывода: молчание лучше
+        # неверного числа), а не откатываемся на устаревшее поле.
+        ids = [h.get("id") for h in habits if h.get("id")]
+        done_counts: Dict[str, int] = {}
+        checkins_failed = False
+        if ids:
+            try:
+                checkins = await _run_blocking(
+                    lambda: ticktick_v2.get_habit_checkins(ids, 0))
+                for hid, entries in (checkins or {}).items():
+                    done_counts[hid] = sum(1 for e in entries if e.get("status") == 2)
+            except Exception as e:
+                checkins_failed = True
+                logger.warning("get_habits: не удалось перечитать check-ins "
+                               f"для точного счёта done ({e}) — цифра не "
+                               "показывается.")
+        header = (f"Habits ({len(habits)}):\n"
+                  "(«done» = actual SUCCESSFUL check-ins, counted from live "
+                  "check-in records — not TickTick's own lagging counter)\n\n"
+                  if not checkins_failed else
+                  f"Habits ({len(habits)}):\n"
+                  "(⚠️ «done» count unavailable right now — the check-in read "
+                  "failed; showing habits without it rather than a stale number)\n\n")
+        out = header
         for h in habits:
-            out += (f"- {h.get('name','?')}  (id: {h.get('id')})\n"
+            hid = h.get("id")
+            done_str = "?" if checkins_failed else str(done_counts.get(hid, 0))
+            out += (f"- {h.get('name','?')}  (id: {hid})\n"
                     f"    goal: {h.get('goal')} {h.get('unit','')} | type: {h.get('type')} | "
-                    f"done: {h.get('totalCheckIns', 0)}\n"
+                    f"done: {done_str}\n"
                     f"    repeat: {h.get('repeatRule','')}\n")
         return out
     except Exception as e:
@@ -9148,6 +9176,13 @@ async def delete_habit(habit_name: str, habit_id: str, manifest_id: str = "",
     mutation either way. A snapshot of the habit is written to the mutation
     journal first, since nothing else can bring it back.
 
+    The "successful check-ins" count in the result is read fresh from live
+    check-in records right before the delete, NOT from the habit's own
+    totalCheckIns field (that field lags — it can disagree with what
+    get_habit_checkins shows moments earlier). If that fresh read itself
+    fails, the count shows as "?" rather than a stale/wrong number; the
+    deletion itself still proceeds (identity is already verified by then).
+
     Args:
         habit_name: Name of the habit (shown first in the summary you show the user, see get_habits) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         habit_id: ID of the habit to delete (see get_habits)
@@ -9244,12 +9279,29 @@ async def _delete_habit_impl(habit_name: str, habit_id: str) -> str:
         # confirmed-by-the-owner delete), but the RESULT text below reports
         # what actually happened — claiming a snapshot that was never written
         # would be exactly the kind of lie the output rules forbid.
-        checkins = habit.get("totalCheckIns", 0)
+        # Реальный счёт успешных отметок — ЖИВЫМ чтением check-in'ов, а НЕ
+        # habit.get("totalCheckIns") (та же причина правки, что в get_habits:
+        # поле у TickTick подвисает и расходится с get_habit_checkins буквально
+        # в соседнем вызове — живьём delete_habit печатал «успешных было 3»,
+        # хотя get_habit_checkins прямо перед этим показывал 4 done-записи).
+        # Читаем ДО удаления (после — истории уже не будет), но неудача этого
+        # чтения НЕ блокирует подтверждённое владельцем необратимое удаление —
+        # честнее показать «?», чем застопорить удаление или соврать устаревшим
+        # числом.
+        try:
+            checkins_map = await _run_blocking(
+                lambda: ticktick_v2.get_habit_checkins([habit_id], 0))
+            checkins_str = str(sum(1 for e in checkins_map.get(habit_id, [])
+                                   if e.get("status") == 2))
+        except Exception as e:
+            checkins_str = "?"
+            logger.warning("delete_habit: не удалось перечитать check-ins для "
+                           f"точного счёта ({e}) — в отчёте будет «?».")
         journal_path = _journal_write({
             "ts": datetime.now(timezone.utc).isoformat(),
             "record": "delete_habit-" + uuid.uuid4().hex[:8],
             "op": "delete_habit",
-            "summary": f"Удаление привычки «{real_name}» ({checkins} отметок)",
+            "summary": f"Удаление привычки «{real_name}» ({checkins_str} отметок)",
             "snapshot": habit,
         })
 
@@ -9276,7 +9328,7 @@ async def _delete_habit_impl(habit_name: str, habit_id: str) -> str:
                      "по данным сервера не выйдет")
         return (f"### ✅ Привычка «{real_name}» удалена (проверено)\n\n"
                 f"- вместе с ней ушла вся история отметок (успешных было "
-                f"**{checkins}**, провалы и пропуски тоже стёрты)\n"
+                f"**{checkins_str}**, провалы и пропуски тоже стёрты)\n"
                 f"{snap_line}\n"
                 "- 🧾 подтверждено отдельным живым чтением списка привычек "
                 "(`get_habits`) сразу после удаления")

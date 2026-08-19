@@ -69,11 +69,15 @@ class FakeHabitsV2:
     ошибкой: так отделяется предварительное чтение от пост-проверки.
     """
 
-    def __init__(self, habits=None, write_effect="normal", raise_on_get=None):
+    def __init__(self, habits=None, write_effect="normal", raise_on_get=None,
+                 checkins=None, raise_on_checkins=False):
         self._habits = [dict(h) for h in (habits or [])]
         self._write_effect = write_effect
         self._raise_on_get = raise_on_get
+        self._checkins = checkins
+        self._raise_on_checkins = raise_on_checkins
         self.get_habits_calls = 0
+        self.get_habit_checkins_calls = 0
         self.create_calls = []
         self.delete_calls = []
 
@@ -83,6 +87,31 @@ class FakeHabitsV2:
         if self._raise_on_get == self.get_habits_calls:
             raise RuntimeError("network blip")
         return [dict(h) for h in self._habits]
+
+    def get_habit_checkins(self, habit_ids, after_stamp):
+        # Реальный счёт «успешных отметок», который delete_habit теперь читает
+        # ЖИВЬЁМ (QA-раунд 2, 2026-08-19) вместо устаревшего totalCheckIns.
+        # По умолчанию (без явного self._checkins) синтезируем ровно
+        # totalCheckIns записей status=2 на привычку — так существующие тесты
+        # этого файла (например «**7**» для «Медитация») продолжают работать
+        # без изменений, а тесты, которым нужно ДОКАЗАТЬ расхождение с
+        # totalCheckIns, передают checkins= явно.
+        self.get_habit_checkins_calls += 1
+        self.last_after_stamp = after_stamp
+        if self._raise_on_checkins:
+            raise RuntimeError("network blip")
+        if self._checkins is not None:
+            return {hid: [e for e in self._checkins.get(hid, [])
+                          if e.get("checkinStamp", 0) > after_stamp]
+                    for hid in habit_ids}
+        out = {}
+        for hid in habit_ids:
+            habit = next((h for h in self._habits if h.get("id") == hid), None)
+            n = int((habit or {}).get("totalCheckIns", 0))
+            out[hid] = [{"checkinStamp": 20260101 + i, "status": 2,
+                        "value": 1.0, "goal": 1.0} for i in range(n)
+                        if 20260101 + i > after_stamp]
+        return out
 
     # --- запись ---
     # Сигнатура — ДОСЛОВНАЯ копия TickTickV2Client.create_habit, а не
@@ -449,6 +478,40 @@ async def test_delete_habit_api_rejection_is_reported(monkeypatch):
 
     assert result.startswith("### ❌")
     assert "TickTick отклонил" in result
+
+
+async def test_delete_habit_reports_actual_checkins_not_stale_field(monkeypatch):
+    """QA-раунд 2 (2026-08-19): delete_habit печатал «успешных было 3», хотя
+    get_habit_checkins непосредственно перед этим показывал 4 done-записи —
+    источником было устаревшее habit["totalCheckIns"]. Здесь totalCheckIns=3
+    (как в живом баге), а живое чтение check-in'ов отдаёт 4 done-записи;
+    отчёт обязан показать 4, а не 3."""
+    habits = [dict(HABITS[0], totalCheckIns=3)]
+    fake = FakeHabitsV2(habits, checkins={
+        "h1": [{"checkinStamp": 20260101 + i, "status": 2, "value": 1.0,
+                "goal": 1.0} for i in range(4)],
+    })
+    _wire(monkeypatch, fake)
+
+    result = await _delete(habit_name="Медитация", habit_id="h1")
+
+    assert result.startswith("### ✅ Привычка «Медитация» удалена")
+    assert "**4**" in result
+    assert "**3**" not in result
+
+
+async def test_delete_habit_shows_unknown_count_when_checkins_read_fails(monkeypatch):
+    """Пересчёт стоит лишнего запроса — если он падает, отчёт обязан
+    показать «?», а НЕ откатиться на устаревшее totalCheckIns (и уж тем
+    более не заблокировать подтверждённое необратимое удаление)."""
+    fake = FakeHabitsV2(HABITS, raise_on_checkins=True)
+    _wire(monkeypatch, fake)
+
+    result = await _delete(habit_name="Медитация", habit_id="h1")
+
+    assert result.startswith("### ✅ Привычка «Медитация» удалена")
+    assert "**?**" in result
+    assert fake.delete_calls == ["h1"], "неудачный подсчёт не должен блокировать удаление"
 
 
 async def test_delete_habit_writes_presnapshot_to_journal(monkeypatch, tmp_path):
