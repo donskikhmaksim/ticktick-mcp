@@ -6499,6 +6499,20 @@ def _verify_item_core(op: str, item: Dict, live_map: Dict[str, Dict],
                             "родитель: нет")
     if op == "update":
         changes = exp.get("changes") or {}
+        if not changes:
+            # ВАКУУМНАЯ ИСТИНА (2026-08-19, ночной QA). Пустой набор ожидаемых
+            # изменений давал пустой список расхождений, а пустой список
+            # расхождений читался как «все изменения на месте» — то есть
+            # «сверять было нечего» превращалось в «сверили и совпало».
+            # Штатный путь сюда больше не ведёт (`_update_item_has_changes`
+            # отказывает такой строке до мутации), но журнал переживает
+            # рестарты и версии — запись, созданная старым кодом или чужим
+            # процессом, обязана получать честное «не доказано», а не ✅.
+            return _ItemVerdict(
+                "warn", f"- ⚠️ **«{title}»** — в журнале НЕТ ни одного "
+                "ожидаемого изменения: сверять нечего, исход не доказан",
+                "пустой набор ожидаемых изменений — сверять нечего, исход "
+                "не доказан")
         diffs = []
         for field, want in changes.items():
             got = live.get(field)
@@ -9727,7 +9741,17 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
         found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
         rows, cycle_refused, cross_refused, depth_refused = [], [], [], []
         ok_items = []
+        # No-op: задача УЖЕ вложена под ЭТОГО родителя (2026-08-19, QA —
+        # тот же класс, что «уже в целевом списке» у move_tasks). Раньше
+        # такая строка уходила в API (200 без изменений), post-verify
+        # «parentId == parent_task_id» проходил тривиально, и ответ
+        # рапортовал «🔗 Вложено» об операции, которой не было. Отделяем ДО
+        # отправки и говорим фактом (ℹ️), а не успехом.
+        already: List[Dict] = []
         for f in found:
+            if (by_id.get(f["taskId"]) or {}).get("parentId") == parent_task_id:
+                already.append(f)
+                continue
             if f["taskId"] in ancestors:
                 cycle_refused.append(f["title"])
                 continue
@@ -9779,6 +9803,10 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
                          + ", ".join(f"«{t}»" for t in nested))
         if unverified:
             lines.append(f"Отправлено {len(ok_items)}, но {_UNVERIFIED_MSG}")
+        if already:
+            lines.append(f"ℹ️ Уже вложены под «{pname}» {len(already)} — без "
+                         "изменений: "
+                         + ", ".join(f"«{f['title']}»" for f in already))
         if cycle_refused:
             lines.append(f"🛑 НЕ вложено {len(cycle_refused)} — задача не может "
                          "стать подзадачей самой себя или своего потомка "
@@ -10161,10 +10189,11 @@ class _TagsOutcome:
     __slots__ = ("state_unavailable", "found", "mismatch", "missing",
                  "changes", "tags_by_id", "display_by_key", "registered",
                  "failed_register", "skipped", "applied", "failed",
-                 "api_fail", "unverified")
+                 "api_fail", "unverified", "noop")
 
     def __init__(self):
         self.state_unavailable = False  # живое состояние не прочиталось вовсе
+        self.noop = []                  # titles: набор УЖЕ ровно такой — не слали
         self.found, self.mismatch, self.missing = [], [], []
         self.changes = []               # то, что реально ушло в /batch/task
         self.tags_by_id = {}            # taskId -> запрошенный набор тегов
@@ -10201,6 +10230,21 @@ async def _apply_tags_verified(tasks: List[Dict[str, Any]]) -> _TagsOutcome:
                 "tags": [x.lstrip("#").lower() for x in (t.get("tags") or [])]}
                for t in tasks
                if (t.get("taskId") or t.get("task_id")) in ok]
+    # No-op: запрошенный набор РАВЕН текущему живому (2026-08-19, QA — тот же
+    # класс, что «уже в целевом списке» у move_tasks). Раньше такая строка
+    # уходила в /batch/task (200 без изменений), post-verify «want == got»
+    # проходил тривиально, и ответ рапортовал «🏷 Теги обновлены (проверено)»
+    # об операции, которой не было. Отделяем ДО отправки; ответ говорит
+    # фактом (ℹ️), а не успехом.
+    kept = []
+    for c in changes:
+        live_tags = {str(x).lower()
+                     for x in ((by_id.get(c["taskId"]) or {}).get("tags") or [])}
+        if set(c["tags"]) == live_tags:
+            out.noop.append(ok[c["taskId"]]["title"])
+        else:
+            kept.append(c)
+    changes = kept
 
     # TickTick keeps tags in TWO places: the account's tag list
     # (/batch/tag — what list_tags/create_tag/delete_tag see) and a raw
@@ -10327,6 +10371,11 @@ def _tag_notes_for_create(out: _TagsOutcome) -> List[str]:
         shown = sorted({t for tags in out.tags_by_id.values() for t in tags})
         notes.append("🏷 теги проставлены (проверено): "
                      + ", ".join(f"«{t}»" for t in shown))
+    if out.noop:
+        # На пути создания практически недостижимо (свежесозданная задача не
+        # несёт запрошенных тегов заранее), но молчать про отфильтрованный
+        # no-op нельзя ни на одном пути.
+        notes.append("ℹ️ теги уже ровно такие — без изменений")
     return notes
 
 
@@ -10358,6 +10407,12 @@ async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
         if applied:
             lines.append(f"🏷 Теги обновлены у {len(applied)} (проверено): "
                          + ", ".join(f"«{t}»" for t in applied))
+        if outcome.noop:
+            # ℹ️, не ✅ — это ФАКТ о состоянии задач, а не выполненная
+            # операция (тот же канал, что «Уже в …» у move_tasks).
+            lines.append(f"ℹ️ Теги уже ровно такие у {len(outcome.noop)} — "
+                         "без изменений: "
+                         + ", ".join(f"«{t}»" for t in outcome.noop))
         if registered:
             # Печатается написание, под которым тег ЗАВЕДЁН (то же, что
             # покажет list_tags), а не внутренний ключ — иначе отчёт
@@ -11093,8 +11148,27 @@ async def _move_project_to_group_impl(project_name: str, project_id: str,
                         "Ничего не тронул.")
             dest_name = grp.get("name") or group_id
         live_pname = _v2_project_names().get(project_id, project_name)
-        await _run_blocking(lambda: ticktick_v2.move_project_to_group(project_id, group_id))
         want = None if group_id == "NONE" else group_id
+        dest = ("без папки (ungrouped)" if group_id == "NONE"
+                else f"папку «{dest_name}»")
+        # No-op: проект УЖЕ в целевой папке / уже без папки (2026-08-19, QA —
+        # тот же класс, что «уже в целевом списке» у move_tasks). Раньше
+        # мутация уходила (200 без изменений), post-verify «groupId == want»
+        # проходил тривиально, и ответ рапортовал «✅ перемещён (проверено)»
+        # об операции, которой не было. Снимок свежий: _guard_project(fresh=
+        # True) выше только что обновил его. Сбой чтения не блокирует —
+        # операция идёт обычным путём и сверяется post-verify как раньше.
+        try:
+            pre = await _run_blocking(ticktick_v2.list_projects)
+            cur = next((p for p in pre if p.get("id") == project_id), None)
+        except Exception:
+            cur = None
+        if cur is not None and (cur.get("groupId") or None) == want:
+            place = ("уже без папки (ungrouped)" if want is None
+                     else f"уже в {dest}")
+            return (f"ℹ️ Проект «{live_pname}» {place} — без изменений. "
+                    "Ничего не тронул.")
+        await _run_blocking(lambda: ticktick_v2.move_project_to_group(project_id, group_id))
         # Post-verify: the project's live groupId must equal the target.
         # Retried (see _reread_projects_until / _POSTVERIFY_RETRY_*) — same
         # race class as move_tasks, found live 2026-08-06: an immediate
@@ -11105,7 +11179,6 @@ async def _move_project_to_group_impl(project_name: str, project_id: str,
             for p in ps))
         proj = next((p for p in projs if p.get("id") == project_id), None)
         got = (proj or {}).get("groupId")
-        dest = "без папки (ungrouped)" if group_id == "NONE" else f"папку «{dest_name}»"
         if proj is None:
             return (f"Проект «{live_pname}» отправлен в {dest}, но "
                     f"{_UNVERIFIED_MSG}")
@@ -13739,6 +13812,22 @@ async def _archive_project_impl(project_name: str, project_id: str,
         return refusal
     live_name = _v2_project_names().get(project_id, project_name)
     verb = 'заархивирован' if archived else 'разархивирован'
+    # No-op: проект УЖЕ в запрошенном состоянии (2026-08-19, QA — тот же
+    # класс, что «уже в целевом списке» у move_tasks). Раньше мутация уходила
+    # (200 без изменений), post-verify «closed == archived» проходил
+    # тривиально, и ответ рапортовал «✅ … (проверено)» об операции, которой
+    # не было. Снимок свежий после _guard_project(fresh=True) выше; сбой
+    # чтения не блокирует — операция идёт обычным путём и сверяется
+    # post-verify как раньше.
+    try:
+        pre = await _run_blocking(ticktick_v2.list_projects)
+        cur = next((p for p in pre if p.get("id") == project_id), None)
+    except Exception:
+        cur = None
+    if cur is not None and bool(cur.get("closed")) == archived:
+        state = "заархивирован" if archived else "активен (не архивирован)"
+        return (f"ℹ️ Проект «{live_name}» уже {state} — без изменений. "
+                "Ничего не тронул.")
     try:
         await _run_blocking(lambda: ticktick_v2.archive_project(project_id, closed=archived))
     except RuntimeError as e:
