@@ -1032,7 +1032,19 @@ def format_task(task: Dict, trash_state: Optional[bool] = None) -> str:
     # Add priority if available
     priority = task.get('priority', 0)
     formatted += f"Priority: {PRIORITY_MAP.get(priority, str(priority))}\n"
-    
+
+    # Tags (QA 2026-08-19, bug №1): this line was missing entirely — the tag
+    # WAS set (get_tasks_by_tag found it independently) and DID come back in
+    # the API response (the field is `tags`, same key format_task_line() and
+    # get_task_info() already print), format_task() just never rendered it.
+    # get_task was the standard point-lookup tool, so any post-verify of a
+    # tag through it was blind; the only working way to check was looping
+    # get_tasks_by_tag over every candidate name. Same "#name" style as the
+    # other two renderers, empty list prints nothing (same convention as
+    # Content/Subtasks below).
+    if task.get('tags'):
+        formatted += f"Tags: {', '.join('#' + t for t in task['tags'])}\n"
+
     # Status. A trashed task keeps whatever status it had before deletion, so
     # printing that field alone ("Active") is a lie about a task in the bin —
     # the deletion has to lead, with the raw field kept for reference.
