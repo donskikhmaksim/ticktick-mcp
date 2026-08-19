@@ -11893,7 +11893,7 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
 
     Args:
         task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
-        text: Comment text
+        text: Comment text — must be non-empty; an empty/whitespace-only text is refused before anything is planned (TickTick would silently create a blank comment otherwise)
         project_id: ID of the project
         task_id: ID of the task
         manifest_id: from call #1's response — pass on call #2 to actually add
@@ -11933,6 +11933,14 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
     # гейта.
     name_warning = ""
     if not manifest_id:
+        # Пустой текст — отказ ДО гейта и ДО API (QA-2 2026-08-19, добор):
+        # TickTick молча создаёт комментарий с пустым телом, и «✅ добавлено»
+        # выглядело бы успехом операции, которой по смыслу не было. Только на
+        # call #1: на call #2 аргументы игнорируются, текст берётся из
+        # манифеста — он эту проверку уже прошёл.
+        if not (text or "").strip():
+            return ("🛑 Пустой текст комментария — добавлять нечего. Передай "
+                    "непустой text. Ничего не изменено.")
         g = _guard_task_incl_completed(task_id, task_title or "", project_id)
         refusal, warn = _guard_or_refuse(
             g, stage="план", expected=task_title, missing_says="message",
@@ -14151,7 +14159,7 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
 
     Args:
         task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
-        text: New comment text
+        text: New comment text — must be non-empty; an empty/whitespace-only text is refused before anything is planned (that would silently blank the comment — deleting is delete_task_comment's job)
         project_id: ID of the project
         task_id: ID of the task
         comment_id: ID of the comment to edit
@@ -14187,6 +14195,14 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
     # же обоснованием — см. attach_file_to_task выше (та же правка).
     name_warning = ""
     if not manifest_id:
+        # Пустой новый текст — отказ ДО гейта и ДО API (QA-2 2026-08-19,
+        # добор, зеркало add_task_comment): «правка» на пустую строку молча
+        # СТИРАЛА бы комментарий под видом редактирования. Стирание — это
+        # delete_task_comment, и путать их сервер не должен.
+        if not (text or "").strip():
+            return ("🛑 Пустой новый текст — править не на что. Если нужно "
+                    "УДАЛИТЬ комментарий — это delete_task_comment. Ничего "
+                    "не изменено.")
         g = _guard_task_incl_completed(task_id, task_title or "", project_id)
         refusal, warn = _guard_or_refuse(
             g, stage="план", expected=task_title, says="message",
