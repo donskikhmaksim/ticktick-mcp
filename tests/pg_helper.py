@@ -135,11 +135,12 @@ def _drop_orphans(conn) -> None:
 
 
 def _close_pools() -> None:
-    """Закрыть пулы обоих хранилищ перед сносом базы.
+    """Закрыть пулы всех трёх хранилищ перед сносом базы.
 
-    Нужно не только для DROP: `tg_approval.init_store` пул не закрывает, а
-    `fresh_stores` до этой правки просто обнуляла ссылку — соединения жили до
-    сборки мусора."""
+    `tg_approval.close_store()` появился 2026-08-19 (симметрично
+    `manifest_store`/`automation_key`) — до этого здесь стояло ручное
+    `pool.closeall(); tg_approval._pg_pool = None`, продублированное ещё и по
+    отдельным тестовым файлам."""
     try:
         from ticktick_mcp.src import automation_key, manifest_store, tg_approval
     except Exception:  # noqa: BLE001 — сервер мог и не импортироваться
@@ -152,13 +153,10 @@ def _close_pools() -> None:
         automation_key.close_store()
     except Exception:  # noqa: BLE001
         pass
-    pool = getattr(tg_approval, "_pg_pool", None)
-    if pool is not None:
-        try:
-            pool.closeall()
-        except Exception:  # noqa: BLE001
-            pass
-    tg_approval._pg_pool = None
+    try:
+        tg_approval.close_store()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _cleanup_run_db(dsn: str, name: str) -> None:
@@ -245,16 +243,9 @@ def fresh_stores():
     from ticktick_mcp.src import tg_approval
 
     store = fresh_store()
-    # Пул закрываем, а не просто теряем ссылку: `tg_approval.init_store`
-    # своего `close_store` не имеет, и брошенный пул держал соединения до
-    # сборки мусора — за один файл тестов их набегали десятки.
-    pool = getattr(tg_approval, "_pg_pool", None)
-    if pool is not None:
-        try:
-            pool.closeall()
-        except Exception:  # noqa: BLE001
-            pass
-    tg_approval._pg_pool = None
+    # Пул закрываем, а не просто теряем ссылку: брошенный пул держал
+    # соединения до сборки мусора — за один файл тестов их набегали десятки.
+    tg_approval.close_store()
     tg_approval.init_store(pg_dsn())
     with store._conn() as cur:
         cur.execute("DELETE FROM tg_approvals WHERE server = 'ticktick'")

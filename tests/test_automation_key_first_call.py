@@ -115,7 +115,7 @@ def wired(monkeypatch, tmp_path):
     s._MANIFESTS.clear()
     s._MANIFEST_TOMBSTONES.clear()
     manifest_store.close_store()
-    tg._pg_pool = None
+    tg.close_store()
 
 
 _MID_RE = re.compile(r"Манифест `([0-9a-f]{6,})`")

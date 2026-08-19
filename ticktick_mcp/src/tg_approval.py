@@ -905,6 +905,24 @@ def init_store(database_url: str) -> None:
     _ensure_schema()
 
 
+def close_store() -> None:
+    """Закрывает пул. Нужен тестам (каждый прогон поднимает свой) и никогда не
+    зовётся в проде — там пул живёт столько же, сколько процесс.
+
+    Симметрична `manifest_store.close_store`/`automation_key.close_store`
+    (2026-08-19, изоляция тестов): раньше её не было, и каждый тест/хелпер,
+    которому нужно было закрыть пул этого модуля, лез в `_pg_pool` напрямую
+    (`tg_approval._pg_pool = None` без `closeall()`) — соединения утекали, а
+    код дублировался в tests/pg_helper.py и по тестовым файлам."""
+    global _pg_pool
+    if _pg_pool is not None:
+        try:
+            _pg_pool.closeall()
+        except Exception as e:  # noqa: BLE001 — закрытие best-effort
+            logger.debug(f"tg_approval: closeall failed: {e}")
+        _pg_pool = None
+
+
 def store_ready() -> bool:
     return _pg_pool is not None
 
