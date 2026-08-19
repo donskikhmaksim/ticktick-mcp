@@ -751,6 +751,7 @@ if SECRET and automation_key and hmac.compare_digest(automation_key, SECRET):
 | `CONSENT_DATABASE_URL` | — | общий Postgres с таблицей `tg_approvals`; обязателен при включённом слое |
 | `TG_AUTO_EXECUTE_INTERVAL_S` | `10` | период фонового поллера (сек) |
 | `TG_AUTO_EXECUTE_CANDIDATE_TIMEOUT_S` | `120` | потолок на исполнение ОДНОГО подтверждённого плана (§7.3) |
+| `TG_AUTO_EXECUTE_MAX_PARALLEL` | `4` | сколько подтверждённых кандидатов одного тика исполняются одновременно (иначе очередь отчётов в Telegram линейно задерживала следующие кнопки) |
 | `CONSENT_PG_CONNECT_TIMEOUT_S` | `10` | таймаут установления соединения с Postgres (§7.3) |
 | `CONSENT_PG_STATEMENT_TIMEOUT_MS` | `15000` | `statement_timeout` для запросов к `tg_approvals` (§7.3) |
 
