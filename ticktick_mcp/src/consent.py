@@ -1171,8 +1171,26 @@ def _log_gate_bypass(action: str, tool: str = "") -> None:
     _AUTOMATION_CHANNEL.set(_GATE_DISABLED_CHANNEL)
 
 
+async def _automation_channel_off_loop(provided: str) -> str:
+    """Тот же `_automation_channel_for`, но ВЫЧИСЛЕННЫЙ ВНЕ event loop'а
+    (2026-08-19). Канал "window" добывается `find_window` — синхронным
+    psycopg2-запросом к Postgres (connect_timeout до 10 c, statement_timeout
+    до 15 c): вызванный прямо из корутины, при медленной/недоступной базе он
+    замораживал ВЕСЬ сервер (включая /health и соседние MCP-сессии) — ровно
+    та патология, что ночные замеры показали как 12–29 c на тривиальный
+    /health. Пустой ключ бесплатен и не стоит даже похода в поток; фолбэк на
+    прямой вызов — для consent, импортированного в одиночку, без
+    `bind_server_hooks` (тот же контракт, что у остальных хуков модуля)."""
+    if not provided:
+        return ""
+    if _run_blocking is None:
+        return _automation_channel_for(provided)
+    return await _run_blocking(_automation_channel_for, provided)
+
+
 def _gate_bypass_channel(automation_key: str, *, action: str,
-                         tool: str = "") -> str:
+                         tool: str = "",
+                         precomputed_channel: Optional[str] = None) -> str:
     """Канал, которым ЭТОТ вызов проходит без интерактивного подтверждения
     ("" — не проходит, работает обычный путь план→подтверждение).
 
@@ -1181,8 +1199,15 @@ def _gate_bypass_channel(automation_key: str, *, action: str,
     выключатель `TICKTICK_MCP_GATE_DISABLED`. Оба помечают канал в журнале;
     второй ещё и кричит в лог. При ВЫКЛЮЧЕННОМ выключателе и пустом/неверном
     ключе функция возвращает "" и не делает НИЧЕГО — то есть поведение по
-    умолчанию не меняется ни на йоту (это условие приёмки правки)."""
-    channel = _automation_channel_for(automation_key)
+    умолчанию не меняется ни на йоту (это условие приёмки правки).
+
+    `precomputed_channel` (2026-08-19) — канал, уже вычисленный вызывающей
+    корутиной через `_automation_channel_off_loop` (в потоке, не в loop'е);
+    сама функция остаётся синхронной, потому что `_AUTOMATION_CHANNEL.set`
+    обязан исполниться В КОНТЕКСТЕ вызывающего (`asyncio.to_thread` копирует
+    контекст — set() из потока вызывающему не виден)."""
+    channel = (precomputed_channel if precomputed_channel is not None
+               else _automation_channel_for(automation_key))
     if channel:
         _AUTOMATION_CHANNEL.set(channel)
         return channel
@@ -1226,6 +1251,7 @@ def _require_consent(
     user_reply: Optional[str] = None, automation_key: str = "",
     object_ids: Optional[List[str]] = None, min_gap: Optional[float] = None,
     tool: str = "", manifest_id: str = "",
+    precomputed_ak_channel: Optional[str] = None,
 ) -> ConsentResult:
     """The single gate every mutating tool in tiers 🟡(1)/🔴(2) must pass
     before touching live state or writing an "approved" decision — see
@@ -1259,8 +1285,23 @@ def _require_consent(
     отказах, а этот SELECT — миллисекунды (в патологии секунды, ограничены
     CONSENT_PG_CONNECT_TIMEOUT_S / CONSENT_PG_STATEMENT_TIMEOUT_MS). Если
     когда-нибудь понадобится унести и его — сначала нужен явный захват
-    манифеста ДО await (compare-and-set «в работе»), а не голый вынос."""
-    _ak_channel = _automation_channel_for(automation_key)
+    манифеста ДО await (compare-and-set «в работе»), а не голый вынос.
+
+    `precomputed_ak_channel` (2026-08-19) — та же логика, что у
+    `_gate_bypass_channel`: канал automation_key, уже вычисленный вызывающей
+    корутиной ВНЕ loop'а (`_automation_channel_off_loop`), потому что
+    `find_window` внутри `_automation_channel_for` — синхронный Postgres, и
+    те самые «в патологии секунды» из абзаца выше он проводил, ДЕРЖА event
+    loop. Вычисление канала стоит ДО манифестных проверок, так что вынос его
+    из этой функции наружу не добавляет await между проверкой и `consumed` —
+    инвариант атомарности не тронут.
+
+    ВНИМАНИЕ (слияние 2026-08-19): аварийный выключатель `_gate_disabled()`
+    сюда НЕ возвращать. Его место — ниже, после механики манифеста и после
+    явного «нет» человека (разбор QA-2); в ветке про блокировки loop'а он
+    оставался наверху лишь потому, что она отпочковалась раньше того фикса."""
+    _ak_channel = (precomputed_ak_channel if precomputed_ak_channel is not None
+                   else _automation_channel_for(automation_key))
     if _ak_channel:
         _AUTOMATION_CHANNEL.set(_ak_channel)
         return ConsentResult(True, "automation_key")
@@ -2030,12 +2071,20 @@ async def _gate_batch(kind: str, tool_name: str, tasks: Optional[List[Dict]],
     # `_require_consent` сам погасит план и сформулирует конкретный отказ;
     # без manifest_id (call #1 с отрицанием в реплике) исполнять нечего и
     # строить план поверх отказа тоже нечего — честный отказ сразу.
+    #
+    # Канал считается В ПОТОКЕ (2026-08-19): find_window — синхронный
+    # Postgres, прямой вызов держал event loop до 10–15 c при медленной базе.
+    # `.set()` метки при этом остаётся в _gate_bypass_channel, то есть в
+    # контексте ЭТОЙ корутины (см. её докстринг). Считаем его только в ветке
+    # без отказа: при «нет» канал не нужен, и лишнего похода в базу не будет.
     if _refusal_beats_kill_switch(automation_key, user_reply):
         if not manifest_id:
             return _GateOutcome(False, message=_REFUSAL_BEATS_KILL_SWITCH_MSG)
     else:
+        _ak_pre = await _automation_channel_off_loop(automation_key)
         _ak_channel = _gate_bypass_channel(automation_key, action=kind,
-                                           tool=tool_name)
+                                           tool=tool_name,
+                                           precomputed_channel=_ak_pre)
         if _ak_channel:
             stored = await _claim_plan_for_automation(kind, manifest_id)
             if stored is not None:
@@ -2170,15 +2219,18 @@ async def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
     call #1; ветка call #2 синхронна от проверки согласия до `consumed`."""
     # ─── ОБХОД ПО КЛЮЧУ И ПО ВЫКЛЮЧАТЕЛЮ — ДО построения плана и ДО
     # отправки (#118 / 2026-08-14) ───
-    # Тот же блок, что и в `_gate_batch`; развёрнутое обоснование — там.
+    # Тот же блок, что и в `_gate_batch`; развёрнутое обоснование — там
+    # (включая вынос похода в Postgres в поток, 2026-08-19).
     # Явное «нет» перехватывается ДО обхода — тот же блок, что в `_gate_batch`
     # выше, развёрнутое обоснование — там и в `_refusal_beats_kill_switch`.
     if _refusal_beats_kill_switch(automation_key, user_reply):
         if not manifest_id:
             return _GateOutcome(False, message=_REFUSAL_BEATS_KILL_SWITCH_MSG)
     else:
+        _ak_pre = await _automation_channel_off_loop(automation_key)
         _ak_channel = _gate_bypass_channel(automation_key, action=kind,
-                                           tool=tool_name)
+                                           tool=tool_name,
+                                           precomputed_channel=_ak_pre)
         if _ak_channel:
             stored = await _claim_plan_for_automation(kind, manifest_id)
             if stored is not None:
@@ -2205,7 +2257,10 @@ async def _gate_single(kind: str, tool_name: str, params: Optional[Dict],
         cr = _require_consent(action=kind, tier=1, manifest=m,
                               user_reply=user_reply, min_gap=0,
                               automation_key=automation_key,
-                              manifest_id=manifest_id)
+                              manifest_id=manifest_id,
+                              # канал уже посчитан выше В ПОТОКЕ — второй
+                              # поход в Postgres из loop'а не нужен
+                              precomputed_ak_channel=_ak_pre)
         if not cr.ok:
             return _GateOutcome(False, message=cr.reason)
         _mark_manifest_consumed(m, manifest_id)

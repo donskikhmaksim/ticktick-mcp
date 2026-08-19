@@ -3162,7 +3162,7 @@ async def get_projects() -> str:
     with the folder (project group) it sits in ("Folder: (none)" when it sits
     in none). The Inbox is listed first and its id works like any other
     project id here (read it with get_project_tasks, target it on create)."""
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
 
@@ -3203,7 +3203,7 @@ async def get_project(project_id: str) -> str:
     Args:
         project_id: ID of the project (the Inbox id from get_projects works too)
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
 
@@ -3255,7 +3255,7 @@ async def get_project_tasks(project_id: str, limit: int = _PROJECT_TASKS_PAGE,
             is ~0.5 KB, so a page is ~25 KB)
         offset: Skip this many tasks — use it to read the tail past `limit`
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
 
@@ -3366,7 +3366,7 @@ async def get_task(project_id: str, task_id: str) -> str:
         project_id: ID of the project
         task_id: ID of the task
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
 
@@ -3646,7 +3646,7 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]],
     выковыривать из готового текста этого ответа — разбор собственного текста
     запрещён по всему серверу (название объекта попадает в текст дословно и
     извне). Ни на поведение, ни на текст ответа не влияет."""
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
 
@@ -3717,7 +3717,7 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]],
         base_level = 0
         if ext_parent_id:
             if _depth_by_id is None:
-                _depth_by_id = _open_by_id(fresh=True)
+                _depth_by_id = (await _run_blocking(_open_by_id, fresh=True))
             if _depth_by_id is None:
                 failed.append(f"#{i+1} «{title}»: {_STATE_UNAVAILABLE_MSG}")
                 continue
@@ -4085,7 +4085,7 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]],
     # A creation that landed elsewhere is reported, not silently celebrated.
     warnings = []
     if (to_verify or sub_verify) and ticktick_v2:
-        fresh = _open_by_id(fresh=True)
+        fresh = (await _run_blocking(_open_by_id, fresh=True))
         if fresh is None:
             warnings.append(f"{_UNVERIFIED_MSG} (созданное не перепроверено)")
             fresh = {}
@@ -4328,7 +4328,7 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
         tasks: same objects create_tasks takes
         max_items: refuse to plan more than this many creations
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
     _prune_manifests()
@@ -4412,7 +4412,7 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
             continue
         exp_parent = t.get("parent_title") or t.get("parentTitle") or ""
         if not plan_state_read:
-            plan_by_id = _open_by_id(fresh=True)
+            plan_by_id = (await _run_blocking(_open_by_id, fresh=True))
             plan_state_read = True
         if plan_by_id is None:
             # Fail-OPEN здесь и только здесь: разовый сбой чтения не имеет
@@ -4445,7 +4445,7 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
 
     # Duplicate radar: same-normalised title already open in the destination.
     open_titles: Dict[str, set] = {}
-    for lt in (_open_by_id() or {}).values():
+    for lt in ((await _run_blocking(_open_by_id)) or {}).values():
         open_titles.setdefault(lt.get("projectId") or "", set()).add(
             _norm_name(lt.get("title") or ""))
 
@@ -4599,7 +4599,7 @@ async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
             (this tool IS call #2 — the reply must be a genuine affirmative
             («да»/«ok»/…), quoted verbatim, not paraphrased and not made up)
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
     _prune_manifests()
@@ -4714,7 +4714,7 @@ async def update_tasks(
 
     {{TG_APPROVAL_NOTE}}
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
     # Resolve "today"/"tomorrow"/etc. off the real clock BEFORE the manifest
@@ -5056,7 +5056,7 @@ async def _update_tasks_impl(
     the public gated update_tasks() below AND directly by
     execute_declutter/resume_declutter (an already-approved declutter
     manifest must not be asked to confirm twice)."""
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
 
@@ -5069,7 +5069,7 @@ async def _update_tasks_impl(
         # Fetched once and reused for both the identity guard and the
         # point-date sync below (see _sync_point_date) — avoids re-fetching
         # fresh v2 state per task in the loop.
-        _by_id = _open_by_id(fresh=True)
+        _by_id = (await _run_blocking(_open_by_id, fresh=True))
         for t in tasks:
             tid = t.get("taskId") or t.get("task_id")
             pid = t.get("projectId") or t.get("project_id") or ""
@@ -5205,7 +5205,7 @@ async def _update_tasks_impl(
                 # only printed when the change is VISIBLE in live data.
                 item = {"taskId": tid, "title": new_title or shown_title,
                         "expect": {"changes": changes}}
-                fresh = _open_by_id(fresh=True)
+                fresh = (await _run_blocking(_open_by_id, fresh=True))
                 if fresh is None:
                     line = f"✏️ «{shown_title}» отправлено, но {_UNVERIFIED_MSG}"
                 else:
@@ -5236,12 +5236,12 @@ async def _update_tasks_impl(
         return "\n".join(results)
 
     # Multiple tasks, no advanced fields — use v2 batch
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
         # Identity guard first: only edit ids that resolve to the RIGHT task.
-        by_id = _open_by_id(fresh=True)
+        by_id = (await _run_blocking(_open_by_id, fresh=True))
         if by_id is None:
             return _STATE_UNAVAILABLE_MSG
         found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
@@ -5332,7 +5332,7 @@ async def _update_tasks_impl(
         updated, not_applied = [], []
         unverified = False
         if changes:
-            fresh = _open_by_id(fresh=True)
+            fresh = (await _run_blocking(_open_by_id, fresh=True))
             if fresh is None:
                 unverified = True
             else:
@@ -5421,7 +5421,7 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]] = None,
 
     {{TG_APPROVAL_NOTE}}
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
     # Живые названия для строк, которым вызывающий их не дал: карточка
@@ -5451,7 +5451,7 @@ async def complete_tasks(summary: str, tasks: List[Dict[str, str]] = None,
 async def _complete_tasks_impl(summary: str, tasks: List[Dict[str, str]]) -> str:
     """Pure mutation logic for complete_tasks — no consent gate. Called
     only by the public gated complete_tasks() below."""
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
     try:
@@ -5459,7 +5459,7 @@ async def _complete_tasks_impl(summary: str, tasks: List[Dict[str, str]]) -> str
             # Verify against live state: batch_complete silently skips ids that
             # aren't open, so reporting by request count would over-claim. Ids
             # whose title/project disagree with the caller are refused (guard).
-            by_id = _open_by_id(fresh=True)
+            by_id = (await _run_blocking(_open_by_id, fresh=True))
             if by_id is None:
                 return _STATE_UNAVAILABLE_MSG
             found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
@@ -5470,7 +5470,7 @@ async def _complete_tasks_impl(summary: str, tasks: List[Dict[str, str]]) -> str
                 resp = await _run_blocking(lambda: ticktick_v2.batch_complete_tasks(
                     [f["taskId"] for f in found]))
                 api_fail = id2error_failures(resp, [f["taskId"] for f in found])
-                still_open = _open_by_id(fresh=True)  # completed ⇒ leaves the open pool
+                still_open = (await _run_blocking(_open_by_id, fresh=True))  # completed ⇒ leaves the open pool
                 if still_open is None:
                     unverified = True
                 else:
@@ -5541,7 +5541,7 @@ async def _complete_tasks_impl(summary: str, tasks: List[Dict[str, str]]) -> str
                 # Post-verify: the official API can silently no-op a complete
                 # with a mismatched projectId — «✓» only after the task is
                 # SEEN gone from the fresh open pool.
-                fresh = _open_by_id(fresh=True)
+                fresh = (await _run_blocking(_open_by_id, fresh=True))
                 where = f" в «{pname}»" if pname else ""
                 if fresh is None:
                     results.append(f"«{title}»{where} — отправлено, но "
@@ -5611,7 +5611,7 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
         manifest_id: from call #1's response — pass on call #2 to actually delete
         {{GATE_ARGS_TAIL}}
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     _prune_manifests()
@@ -5632,11 +5632,19 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
         # интерактивного круга), ключ обязан провести его до конца, а не
         # оставить висеть: `_require_consent` пропускает по ключу первой же
         # своей строкой.
+        # Канал ключа — В ПОТОКЕ (2026-08-19): find_window внутри
+        # `_automation_key_channel` — синхронный Postgres, прямой вызов из
+        # корутины держал event loop до 10–15 c при медленной базе. Стоит ДО
+        # `_require_consent`, поэтому между его проверками и `consumed`
+        # по-прежнему нет await.
+        _ak_pre = (await _run_blocking(_automation_key_channel, automation_key)
+                   ) if automation_key else ""
         cr = _require_consent(action="delete", tier=2, manifest=m,
                               user_reply=user_reply,
                               automation_key=automation_key,
                               object_ids=[it["taskId"] for it in m["items"]],
-                              tool="delete_tasks", manifest_id=manifest_id)
+                              tool="delete_tasks", manifest_id=manifest_id,
+                              precomputed_ak_channel=_ak_pre)
         if not cr.ok:
             return cr.reason
         return await _execute_task_deletion_impl(manifest_id, m)
@@ -5664,7 +5672,7 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
         # REFUSE ids whose title/project don't match the caller's (guards against
         # deleting the wrong task by a stale id), and separate ids that aren't
         # among open tasks (already gone, or completed).
-        by_id = _open_by_id(fresh=True)
+        by_id = (await _run_blocking(_open_by_id, fresh=True))
         if by_id is None:
             return _STATE_UNAVAILABLE_MSG
         found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
@@ -5711,7 +5719,13 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
         # «человек согласен?», а не «та ли это задача»: identity guard в
         # `_execute_task_deletion_impl` отрабатывает ещё раз, снимок пишется
         # в журнал, эффект перепроверяется свежим чтением — как и по кнопке.
-        _ak_channel = _automation_key_channel(automation_key)
+        #
+        # В ПОТОК (2026-08-19): find_window внутри — синхронный Postgres,
+        # прямой вызов держал event loop (см. _automation_channel_off_loop в
+        # consent.py). `.set()` метки ниже остаётся в контексте корутины.
+        _ak_channel = (await _run_blocking(_automation_key_channel,
+                                           automation_key)
+                       ) if automation_key else ""
         if _ak_channel:
             # Метка канала для журнала/аудита (TZ §4) — тем же ContextVar,
             # что и `_require_consent`/`_gate_batch`/`_gate_single`;
@@ -5858,13 +5872,13 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
         tasks: List of {"taskId","title","projectId","with_subtasks"} — title recommended
         max_items: refuse to plan more than this many deletions (blast cap)
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     _prune_manifests()
     if not tasks:
         return "Пустой список — планировать нечего."
-    by_id = _open_by_id(fresh=True)
+    by_id = (await _run_blocking(_open_by_id, fresh=True))
     if by_id is None:
         return _STATE_UNAVAILABLE_MSG
     found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
@@ -6035,7 +6049,7 @@ async def execute_task_deletion(manifest_id: str, user_reply: str = "") -> str:
         manifest_id: id returned by plan_task_deletion
         user_reply: the user's literal last message approving the plan
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     _prune_manifests()
@@ -6077,7 +6091,7 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
         return (f"🛑 Манифест удаления {manifest_id} не найден/истёк/уже "
                 "исполнен. Сначала plan_task_deletion.")
     try:
-        by_id = _open_by_id(fresh=True)
+        by_id = (await _run_blocking(_open_by_id, fresh=True))
         if by_id is None:
             # Do NOT consume the manifest: nothing was verified or deleted.
             return _STATE_UNAVAILABLE_MSG
@@ -6165,7 +6179,7 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
             resp = await _run_blocking(lambda: ticktick_v2.batch_delete_tasks(
                 [{"taskId": r["taskId"], "projectId": r["projectId"]} for r in ready]))
             api_fail = id2error_failures(resp, [r["taskId"] for r in ready])
-        still = _open_by_id(fresh=True) if ready else {}
+        still = (await _run_blocking(_open_by_id, fresh=True)) if ready else {}
         lines = []
         if still is None:
             deleted, failed = [], []
@@ -6742,7 +6756,7 @@ async def operation_report(record_id: str) -> str:
     Args:
         record_id: id returned by a mutating tool (or a deletion manifest id)
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     # `_run_blocking` — внутри отчёта сетевые чтения и `time.sleep`-ретраи
@@ -7151,7 +7165,7 @@ async def create_project(
 
     {{TG_APPROVAL_NOTE}}
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
 
@@ -7272,7 +7286,7 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
         user_reply: the user's literal reply approving the deletion — omit on
             the 1st call
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
     # Destructive: verify against FRESH names and FAIL CLOSED when the id
@@ -7871,7 +7885,7 @@ async def get_all_tasks(limit: int = _ALL_TASKS_PAGE, offset: int = 0) -> str:
         offset: Skip this many TOP-LEVEL tasks — use it to read the tail; the
             footer prints the exact offset that continues the list
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
 
@@ -8081,7 +8095,7 @@ async def get_tasks_by_priority(priority_id: int, limit: int = 200, offset: int 
         limit: Maximum tasks to show in one call (default 200)
         offset: Skip this many matches — use it to read the tail past `limit`
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
 
@@ -8103,7 +8117,7 @@ async def get_tasks_by_priority(priority_id: int, limit: int = 200, offset: int 
 @mcp.tool(annotations=READONLY)
 async def get_tasks_due_today() -> str:
     """Get all tasks from TickTick that are due today. Ignores closed projects."""
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
     
@@ -8120,7 +8134,7 @@ async def get_tasks_due_today() -> str:
 @mcp.tool(annotations=READONLY)
 async def get_overdue_tasks() -> str:
     """Get all overdue tasks from TickTick. Ignores closed projects."""
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
     
@@ -8137,7 +8151,7 @@ async def get_overdue_tasks() -> str:
 @mcp.tool(annotations=READONLY)
 async def get_tasks_due_tomorrow() -> str:
     """Get all tasks from TickTick that are due tomorrow. Ignores closed projects."""
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
 
@@ -8159,7 +8173,7 @@ async def get_tasks_due_in_days(days: int) -> str:
     Args:
         days: Number of days from today (0 = today, 1 = tomorrow, etc.)
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
     
@@ -8182,7 +8196,7 @@ async def get_tasks_due_this_week() -> str:
     """Get all tasks from TickTick due from today through 7 days from now
     (today and the following 7 calendar days, 8 days inclusive — not a strict
     "next 7 days" window). Ignores closed projects."""
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
     
@@ -8208,7 +8222,7 @@ async def search_tasks(search_term: str) -> str:
     Args:
         search_term: Text to search for (case-insensitive)
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
     
@@ -8250,7 +8264,7 @@ async def get_recurring_tasks(search_term: str = "") -> str:
                      titles (case-insensitive). Leave empty to return all
                      recurring tasks.
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
 
@@ -8292,7 +8306,7 @@ async def get_engaged_tasks() -> str:
     Get all tasks from TickTick that are 'engaged'.
     This includes tasks marked as high priority (5), due today or overdue.
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
     
@@ -8315,7 +8329,7 @@ async def get_next_tasks() -> str:
     Get all tasks from TickTick that are "Next".
     This includes tasks marked as medium priority (3) or due tomorrow.
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
     
@@ -8386,7 +8400,7 @@ async def create_subtask(
     so honestly — the call #2 check is unconditional and still guards the
     mutation either way.
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
 
@@ -8443,7 +8457,7 @@ async def _create_subtask_impl(parent_task_title: str, subtask_title: str,
     by the gated create_subtask() above once the plan is approved."""
     # Fetch live state ONCE — reused for the identity guard AND the depth
     # check below (both must see the same snapshot).
-    by_id = _open_by_id(fresh=True)
+    by_id = (await _run_blocking(_open_by_id, fresh=True))
     if by_id is None:
         return _STATE_UNAVAILABLE_MSG
     # Identity guard on the PARENT: a stale parent_task_id would attach the new
@@ -8486,7 +8500,7 @@ async def _create_subtask_impl(parent_task_title: str, subtask_title: str,
         rid = _op_journal("parent", [{"taskId": sid, "title": subtask_title,
                                       "expect": {"parentId": parent_task_id}}],
                           f"Подзадача «{subtask_title}» под «{g.title or parent_task_title}»")
-        fresh = _open_by_id(fresh=True)
+        fresh = (await _run_blocking(_open_by_id, fresh=True))
         if fresh is None:
             verdict = f"⚠️ Создание отправлено, но {_UNVERIFIED_MSG}"
         else:
@@ -8532,7 +8546,7 @@ async def get_completed_tasks(limit: int = 100) -> str:
         limit: Maximum number of completed tasks to return (default 100 —
             the API's own hard cap, so there's no reason to default lower)
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -8573,7 +8587,7 @@ async def list_tags() -> str:
     выката — правка НЕ самопровозглашает совместимость с существующим
     парсером бота.
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -8587,7 +8601,7 @@ async def list_tags() -> str:
         # число, без имён). Завершённые/корзинные задачи не охвачены — то же
         # ограничение, что у `delete_tags`, и оно должно быть названо, а не
         # умолчано (П17).
-        open_tasks = _open_by_id(fresh=True)
+        open_tasks = (await _run_blocking(_open_by_id, fresh=True))
         if open_tasks is None:
             out += ("\n\n(Число тегов-сирот не посчитано — открытые задачи "
                     "недоступны для сверки.)")
@@ -8620,7 +8634,7 @@ async def get_tasks_by_tag(tag: str) -> str:
     Args:
         tag: Tag label, with or without the leading '#'
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -8651,7 +8665,7 @@ async def get_inbox_tasks(limit: int = _TREE_PAGE, offset: int = 0) -> str:
         offset: Skip this many TOP-LEVEL tasks — use it to read the tail; the
             footer prints the exact offset that continues the list
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -8727,7 +8741,7 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]] = None,
 
     {{TG_APPROVAL_NOTE}}
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     # И задача, и СПИСОК НАЗНАЧЕНИЯ должны быть названы: «→ 6a21home»
@@ -8781,7 +8795,7 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]] = None,
                 return (f"{_PLAN_REFUSAL_PREFIX} to_project_id указывает на "
                         f"«{real}», а НЕ «{to_project_name}» (защита от «не "
                         "того проекта»). Ничего не изменено.")
-        live_open = _open_by_id(fresh=False) or {}
+        live_open = (await _run_blocking(_open_by_id, fresh=False)) or {}
         for t in tasks:
             tid = str(t.get("taskId") or t.get("task_id") or "")
             row = live_open.get(tid)
@@ -8833,7 +8847,7 @@ async def _move_tasks_impl(summary: str, tasks: List[Dict[str, str]],
                            to_project_id: str, to_project_name: str = None) -> str:
     """Pure mutation logic for move_tasks — no consent gate. Called only
     by the public gated move_tasks() below."""
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -8846,7 +8860,7 @@ async def _move_tasks_impl(summary: str, tasks: List[Dict[str, str]],
             return refusal
         # Render the destination from the LIVE map — never echo the caller.
         to_name = _v2_project_names().get(to_project_id, to_project_id)
-        by_id = _open_by_id(fresh=True)
+        by_id = (await _run_blocking(_open_by_id, fresh=True))
         if by_id is None:
             return _STATE_UNAVAILABLE_MSG
         found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
@@ -8950,7 +8964,9 @@ def _ensure_ready() -> Optional[str]:
 async def get_habits() -> str:
     """List all habits with their goal and a "done" count computed from
     actual check-in records (requires v2 API)."""
-    err = _ensure_ready()
+    # `_run_blocking`: `_ensure_ready` при неготовом клиенте делает полную
+    # инициализацию с синхронными HTTP — прямой вызов держал event loop.
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -9106,7 +9122,7 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
 
     {{TG_APPROVAL_NOTE}}
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     if status not in (0, 1, 2):
@@ -9289,7 +9305,7 @@ async def create_habit(name: str, goal: float = 1.0,
 
     {{TG_APPROVAL_NOTE}}
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     if not (name or "").strip():
@@ -9432,7 +9448,7 @@ async def delete_habit(habit_name: str, habit_id: str, manifest_id: str = "",
 
     {{TG_APPROVAL_NOTE}}
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     if not (habit_name or "").strip() or not (habit_id or "").strip():
@@ -9596,7 +9612,7 @@ async def get_habit_checkins(habit_name: str, habit_id: str, after_date: str) ->
         habit_id: ID of the habit
         after_date: Only return check-ins on/after this date, as YYYY-MM-DD
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     date_err = _validate_habit_date(after_date)
@@ -9662,7 +9678,7 @@ async def get_habit_checkins(habit_name: str, habit_id: str, after_date: str) ->
 @mcp.tool(annotations=READONLY)
 async def list_filters() -> str:
     """List saved smart-list filters with their query rules (requires v2 API)."""
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -9744,7 +9760,7 @@ async def set_task_parent(summary: str, tasks: List[Dict[str, str]] = None,
     independently, on execution (see _set_task_parent_impl /
     _split_tasks_by_state).
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     # Перенос identity-guard (parent_task_id↔parent_task_title) на построение
@@ -9837,12 +9853,12 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
     by the public gated set_task_parent() below AND directly by
     execute_declutter/resume_declutter (an already-approved declutter
     manifest must not be asked to confirm twice)."""
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
         # Guard the parent AND the children against live state.
-        by_id = _open_by_id(fresh=True)
+        by_id = (await _run_blocking(_open_by_id, fresh=True))
         if by_id is None:
             return _STATE_UNAVAILABLE_MSG
         pg = _guard_task(parent_task_id, parent_task_title or "", project_id,
@@ -10030,7 +10046,7 @@ async def unset_task_parent(task_title: str, parent_task_title: str, task_id: st
     `describe_fn` below): a card that could only carry one of them would
     silently hide the other from the owner.
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     # Перенос identity-guard (task_id↔task_title, ТОЛЬКО субтаска, который
@@ -10112,7 +10128,7 @@ async def _unset_task_parent_impl(task_title: str, parent_task_title: str,
     """Pure mutation logic for unset_task_parent — no consent gate. Called
     only by the gated unset_task_parent() above once the plan is approved."""
     try:
-        by_id = _open_by_id(fresh=True)
+        by_id = (await _run_blocking(_open_by_id, fresh=True))
         if by_id is None:
             return _STATE_UNAVAILABLE_MSG
         g = _guard_task(task_id, task_title or "", project_id, by_id=by_id)
@@ -10219,7 +10235,7 @@ async def set_task_tags(summary: str, tasks: List[Dict[str, Any]] = None,
 
     {{TG_APPROVAL_NOTE}}
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     # Preview-time only (call #1, non-empty tasks): flag tags that don't
@@ -10332,7 +10348,7 @@ async def _apply_tags_verified(tasks: List[Dict[str, Any]]) -> _TagsOutcome:
     The single implementation behind BOTH `set_task_tags` (the standalone
     gated tool) and the tagging step of task creation."""
     out = _TagsOutcome()
-    by_id = _open_by_id(fresh=True)
+    by_id = (await _run_blocking(_open_by_id, fresh=True))
     if by_id is None:
         out.state_unavailable = True
         return out
@@ -10418,7 +10434,7 @@ async def _apply_tags_verified(tasks: List[Dict[str, Any]]) -> _TagsOutcome:
     # orphan hole, not just moved it.
     out.tags_by_id = {c["taskId"]: c["tags"] for c in changes}
     if changes:
-        fresh = _open_by_id(fresh=True)
+        fresh = (await _run_blocking(_open_by_id, fresh=True))
         if fresh is None:
             out.unverified = True
         else:
@@ -10477,7 +10493,7 @@ def _tag_notes_for_create(out: _TagsOutcome) -> List[str]:
 async def _set_task_tags_impl(summary: str, tasks: List[Dict[str, Any]]) -> str:
     """Pure mutation logic for set_task_tags — no consent gate. Called
     only by the public gated set_task_tags() below."""
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -10724,7 +10740,7 @@ async def run_filter(filter: str, limit: int = _TREE_PAGE, offset: int = 0) -> s
         offset: Skip this many TOP-LEVEL matches — use it to read the tail; the
             footer prints the exact offset that continues the list
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -10800,7 +10816,7 @@ async def list_project_groups() -> str:
     Both lists come from the same cached v2 sync snapshot, so showing the
     contents costs no extra network request.
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -10895,7 +10911,7 @@ async def create_project_group(name: str, manifest_id: str = "",
 
     {{TG_APPROVAL_NOTE}}
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     # Пустое/пробельное имя раньше проходило молча и создавало безымянную
@@ -11015,7 +11031,7 @@ async def delete_project_group(group_name: str, group_id: str,
     read the same as a folder holding eight live projects. If that list
     can't be read, the card says exactly that instead of looking empty.
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     # Перенос identity-guard (group_id↔group_name) на построение плана — та
@@ -11238,7 +11254,7 @@ async def move_project_to_group(project_name: str, project_id: str, group_id: st
     and again, independently, right before the actual move (call #2,
     unchanged).
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     # Перенос identity-guard (project_id↔project_name) на построение плана —
@@ -11370,7 +11386,7 @@ async def get_task_comments(task_title: str, project_id: str, task_id: str) -> s
         project_id: ID of the project
         task_id: ID of the task
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -11439,7 +11455,7 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
     (see restore_tasks) — trash gets its own refusal, separate from an id
     that no source knows at all.
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     # Перенос identity-guard (task_id↔task_title) на построение плана — тот
@@ -11571,7 +11587,7 @@ async def get_statistics() -> str:
     server's USER_TIMEZONE — so they are not expected to match a get_changes
     feed (which slices calendar days in UTC). A mismatch between the two is not
     evidence that either is broken."""
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -11622,7 +11638,7 @@ async def get_trash(limit: int = 50) -> str:
             page ceiling). Anything not printed is announced, never dropped
             silently.
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -11700,7 +11716,7 @@ async def restore_tasks(summary: str, tasks: List[Dict[str, str]] = None,
 
     {{TG_APPROVAL_NOTE}}
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     # Живые названия — ИЗ КОРЗИНЫ: задачи этого тула по определению не
@@ -11725,7 +11741,7 @@ async def _restore_tasks_impl(summary: str, tasks: List[Dict[str, str]],
                               to_project_id: str = None) -> str:
     """Pure mutation logic for restore_tasks — no consent gate. Called
     only by the public gated restore_tasks() below."""
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -12010,7 +12026,7 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
     (see restore_tasks) — trash gets its own refusal, separate from an id
     that no source knows at all.
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     if not url and not content_base64:
@@ -12055,7 +12071,7 @@ async def _attach_file_to_task_impl(task_title: str, task_id: str, project_id: s
     """Pure mutation logic for attach_file_to_task — no consent gate. Called
     only by the gated attach_file_to_task() above once the plan is approved."""
     title = task_title or _lookup_task_title(task_id)
-    pre = _open_by_id(fresh=True)
+    pre = (await _run_blocking(_open_by_id, fresh=True))
     if pre is None:
         return _STATE_UNAVAILABLE_MSG
     g = _guard_task_incl_completed(task_id, task_title or "", project_id, by_id=pre)
@@ -12091,7 +12107,7 @@ async def _attach_file_to_task_impl(task_title: str, task_id: str, project_id: s
             ((url or "").split("?")[0].rstrip("/").split("/")[-1] or "attachment")
         size = att.get("size")
         size_str = f"{size} байт" if size is not None else "размер неизвестен"
-        post = _open_by_id(fresh=True)
+        post = (await _run_blocking(_open_by_id, fresh=True))
         if post is None:
             marker, verify = "⚠️", f" {_UNVERIFIED_MSG}"
         elif task_id in post:
@@ -12213,7 +12229,7 @@ async def list_task_attachments(task_id: str, project_id: str = None) -> str:
         task_id: ID of the task
         project_id: ID of the task's project (optional; auto-resolved)
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -12329,7 +12345,7 @@ async def download_task_attachment(task_id: str, project_id: str = None,
         filename: Exact attachment filename (optional, alternative to id)
         index: 1-based position in list_task_attachments' output (optional)
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -12399,7 +12415,7 @@ async def get_attachment_download_url(task_id: str, project_id: str = None,
         index: 1-based position in list_task_attachments' output (optional)
         ttl_minutes: How long the link stays valid, 1-120 (default 15)
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     base = _public_base_url()
@@ -12511,7 +12527,7 @@ async def create_attachment_upload_url(task_id: str, project_id: str = None,
 
     {{TG_APPROVAL_NOTE}}
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     base = _public_base_url()
@@ -12635,7 +12651,7 @@ async def create_tag(name: str, color: str = None, manifest_id: str = "",
 
     {{TG_APPROVAL_NOTE}}
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     params = {"name": name, "color": color}
@@ -12730,7 +12746,7 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
         user_reply: REQUIRED when a merge would happen — the user's literal
             message confirming it
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -12882,7 +12898,7 @@ async def delete_tag(name: str, manifest_id: str = "", user_reply: str = "",
         manifest_id: from call #1's response — pass on call #2 to actually delete
         {{GATE_ARGS_TAIL}}
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     params = {"name": name}
@@ -13004,7 +13020,7 @@ async def delete_tags(summary: str, tags: Optional[List[str]] = None,
         manifest_id: from call #1's response — pass on call #2 to actually delete
         {{GATE_ARGS_TAIL}}
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
 
@@ -13021,7 +13037,7 @@ async def delete_tags(summary: str, tags: Optional[List[str]] = None,
         live = _live_tag_records(force=True)
         if live is None:
             return _STATE_UNAVAILABLE_MSG
-        open_tasks = _open_by_id(fresh=True)
+        open_tasks = (await _run_blocking(_open_by_id, fresh=True))
         if open_tasks is None:
             return _STATE_UNAVAILABLE_MSG
 
@@ -13243,7 +13259,7 @@ async def abandon_task(summary: str, task_id: str, task_title: str = None,
     the plan outright, matching _abandon_task_impl's own severity on
     execution.
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     # Перенос identity-guard (task_id↔task_title) на построение плана — тот
@@ -13306,7 +13322,7 @@ async def _abandon_task_impl(summary: str, task_id: str,
         await _run_blocking(lambda: ticktick_v2.abandon_task(task_id))
         rid = _op_journal("abandon", [{"taskId": task_id, "title": title}], summary)
         # Post-verify: an abandoned task leaves the open pool.
-        fresh = _open_by_id(fresh=True)
+        fresh = (await _run_blocking(_open_by_id, fresh=True))
         if fresh is None:
             return (f"Отметка «не буду делать» для «{title}» отправлена, но "
                     f"{_UNVERIFIED_MSG}\n" + _report_line(rid))
@@ -13378,7 +13394,7 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
     (see restore_tasks) — trash gets its own refusal, separate from an id
     that no source knows at all.
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     # Перенос identity-guard (task_id↔task_title) на построение плана — тот
@@ -13461,7 +13477,7 @@ async def _duplicate_task_impl(summary: str, task_id: str, task_title: str = Non
              "expect": {"projectId": copy.get("projectId")}}],
             summary)
         # Post-verify: the copy must actually exist in fresh open state.
-        fresh = _open_by_id(fresh=True)
+        fresh = (await _run_blocking(_open_by_id, fresh=True))
         confirmed = fresh is not None and cid in fresh
         # Копия ЗАВЕРШЁННОЙ задачи может унаследовать её статус, и тогда её
         # нет среди открытых — искать подтверждение надо там, где такая
@@ -13547,7 +13563,7 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
     (see restore_tasks) — trash gets its own refusal, separate from an id
     that no source knows at all.
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     # Перенос identity-guard (task_id↔task_title) на построение плана — тот
@@ -13662,7 +13678,7 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str,
     (see restore_tasks) — trash gets its own refusal, separate from an id
     that no source knows at all.
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     # Перенос identity-guard (task_id↔task_title) на построение плана — тот
@@ -13782,7 +13798,7 @@ async def update_project(project_name: str, project_id: str, name: str = None,
     and again, independently, right before the actual update (call #2,
     unchanged).
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
     if not manifest_id:
@@ -13928,7 +13944,7 @@ async def archive_project(project_name: str, project_id: str, archived: bool = T
     (call #2, unchanged). Same archived=True/False branching as
     _archive_project_impl in both places (see below).
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     if not manifest_id:
@@ -14060,7 +14076,7 @@ async def search_all_tasks(
         fields: 'all' | 'title' | 'content'.
         search_comments: also search comments (slow; default False).
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -14197,7 +14213,7 @@ async def get_task_info(task_id: str) -> str:
     Args:
         task_id: ID of the task
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -14459,7 +14475,7 @@ async def get_task_activity(task_id: str, project_id: str) -> str:
         project_id: ID of the project the task belongs to (kept for backward
             compatibility; no longer needed by the underlying endpoint)
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -14561,7 +14577,7 @@ async def get_changes(since: str, until: str = None,
             get_completed_tasks / get_trash)
         offset: Skip this many events — use it to read the tail
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
 
@@ -14679,7 +14695,7 @@ async def get_project_members(project_id: str) -> str:
     Args:
         project_id: ID of the shared project
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -14733,7 +14749,7 @@ async def get_tasks_by_assignee(assignee: str, include_completed: bool = False) 
                   case-insensitive substring) OR their numeric userId.
         include_completed: also include completed tasks (default: only open).
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     try:
@@ -14789,7 +14805,7 @@ async def list_project_columns(project_id: str) -> str:
     Args:
         project_id: ID of the project
     """
-    err = _ensure_official()
+    err = (await _run_blocking(_ensure_official))
     if err:
         return err
     try:
@@ -14873,7 +14889,7 @@ async def create_project_column(project_id: str, name: str,
     a wrong pair never reaches the approval) and again, independently, right
     before the column is actually created (call #2, unchanged).
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
     # Перенос identity-guard (project_id↔project_name) на построение плана —
@@ -18289,7 +18305,7 @@ async def apply_task_changes(summary: str, operations: List[Dict[str, Any]] = No
 
     {{TG_APPROVAL_NOTE}}
     """
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         return err
 
@@ -18300,7 +18316,7 @@ async def apply_task_changes(summary: str, operations: List[Dict[str, Any]] = No
         refusal = _validate_triage_ops(list(operations or []), max_items)
         if refusal:
             return refusal
-        by_id = _open_by_id(fresh=True)
+        by_id = (await _run_blocking(_open_by_id, fresh=True))
         if by_id is None:
             return _STATE_UNAVAILABLE_MSG
         names = _v2_project_names()
@@ -18467,12 +18483,12 @@ async def _apply_task_changes_impl(summary: str, tasks: List[Dict],
     # которой она и писалась. Раньше её печатал только выход «ничего не
     # пережило сверку»; выходы «сервер не готов» и «живое состояние
     # недоступно» о ней молчали.
-    err = _ensure_ready()
+    err = (await _run_blocking(_ensure_ready))
     if err:
         _journal_not_executed([], not_planned, summary)
         return "\n".join([err] + _triage_not_planned_report_lines(not_planned))
     ops = list(tasks or [])
-    by_id = _open_by_id(fresh=True)
+    by_id = (await _run_blocking(_open_by_id, fresh=True))
     if by_id is None:
         _journal_not_executed([], not_planned, summary)
         return "\n".join([_STATE_UNAVAILABLE_MSG]
@@ -18648,7 +18664,7 @@ async def _apply_task_changes_impl(summary: str, tasks: List[Dict],
         # «отправлено» выполненным не считается (дизайн, раздел 4). Её нет
         # вовсе, когда уровень один, — то есть у сегодняшних планов не
         # появляется ни одного лишнего запроса.
-        wave_state = _open_by_id(fresh=True)
+        wave_state = (await _run_blocking(_open_by_id, fresh=True))
         if wave_state is None:
             # Читать нечем — продолжать волнами вслепую нельзя: зависимые
             # операции работают по подставленным id, а подтвердить их нечем.
@@ -18685,7 +18701,7 @@ async def _apply_task_changes_impl(summary: str, tasks: List[Dict],
     lines = ["### 🧾 Ручной разбор — итог", f"_{summary}_", ""]
     verdicts: List[str] = []
     try:
-        fresh = _open_by_id(fresh=True)
+        fresh = (await _run_blocking(_open_by_id, fresh=True))
         if fresh is None:
             lines.append(f"⚠️ Отправлено {len(ready)} операций из {len(ops)}, но "
                          f"{_UNVERIFIED_MSG} Считать выполненным НЕЛЬЗЯ — "
@@ -19247,8 +19263,47 @@ def main():
     anyio.run(_run_server_with_auto_execute_poller)
 
 
+# Детектор залипшего event loop'а (2026-08-19). Ночные замеры на проде:
+# /health отвечал 29с и 12с подряд, MCP-вызовы отваливались по таймауту —
+# процесс замирал целиком, и в логах об этом не было НИ СТРОКИ. Механика:
+# корутина спит ровно интервал и сравнивает, сколько прошло на самом деле;
+# всё, что сверх интервала, — время, которое loop был занят/заблокирован и
+# не мог обслужить даже готовый к пробуждению sleep. Порог берём крупный
+# (по умолчанию 1с): лаг такого размера — это уже синхронная сеть/сон в
+# loop'е, а не шум планировщика. Констант две и обе читаются на КАЖДОЙ
+# итерации через модульные атрибуты — тесты monkeypatch'ат их на лету.
+_LOOP_LAG_CHECK_INTERVAL_S = float(os.environ.get("LOOP_LAG_CHECK_INTERVAL_S", "1.0"))
+_LOOP_LAG_WARN_S = float(os.environ.get("LOOP_LAG_WARN_S", "1.0"))
+
+
+async def _event_loop_lag_watchdog() -> None:
+    """Heartbeat: логирует warning, когда event loop был заблокирован дольше
+    _LOOP_LAG_WARN_S (признак синхронного вызова в async-пути — ровно то,
+    что запрещает tests/test_event_loop_blocking.py). Стоит копейки: один
+    asyncio.sleep и два monotonic() на интервал, никакой сети и БД. Своё
+    исключение глотает с логом — страховка обязана не уметь ронять сервер."""
+    while True:
+        try:
+            interval = _LOOP_LAG_CHECK_INTERVAL_S
+            t0 = time.monotonic()
+            await asyncio.sleep(interval)
+            lag = time.monotonic() - t0 - interval
+            if lag >= _LOOP_LAG_WARN_S:
+                logger.warning(
+                    f"Event loop был заблокирован ~{lag:.1f} c — какой-то "
+                    "синхронный вызов исполняется вне _run_blocking "
+                    "(на это время замирают /health и все MCP-сессии)")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"loop-lag watchdog: сбой замера ({e}) — продолжаю")
+
+
 async def _run_server_with_auto_execute_poller() -> None:
     poller_task = None
+    # Watchdog — безусловно (не только при TG_APPROVAL_ENABLED): залипание
+    # loop'а бьёт по любому деплою, а стоит замер копейки.
+    watchdog_task = asyncio.create_task(_event_loop_lag_watchdog())
     if _TG_CFG.enabled:
         poller_task = asyncio.create_task(_tg_auto_execute_poller_loop())
     try:
@@ -19257,6 +19312,7 @@ async def _run_server_with_auto_execute_poller() -> None:
         else:
             await mcp.run_stdio_async()
     finally:
+        watchdog_task.cancel()
         if poller_task is not None:
             poller_task.cancel()
 
