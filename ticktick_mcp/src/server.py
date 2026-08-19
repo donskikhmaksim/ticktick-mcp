@@ -8500,8 +8500,74 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]] = None,
     dest = (_plan_project_name(to_project_id, to_project_name)
             if not manifest_id else "")
 
+    # ── Сверка НАЗНАЧЕНИЯ с живым состоянием на фазе ПЛАНА (2026-08-19, QA).
+    # Строки-задачи план сверяет с круга 8 (`_plan_live_check` ниже), а
+    # назначение — нет: мусорный/чужой to_project_id давал гладкий план, и
+    # «да» ставилось под операцией, которой исполнитель гарантированно
+    # откажет ЦЕЛИКОМ (`_guard_project_or_refuse(require_known=True)` в
+    # `_move_tasks_impl`). План на заведомо обречённую операцию — просьба
+    # нажать «да» впустую, поэтому исход тот же, что «исполнимых строк не
+    # осталось»: плана НЕТ. Сбой чтения списка проектов отказом НЕ становится
+    # (политика `_PLAN_UNVERIFIED_NOTE`): план строится, но сомнение в
+    # назначении сказано вслух — на исполнении назначение сверяется заново.
+    #
+    # Тем же прочитанным состоянием план узнаёт, ОТКУДА каждая задача уезжает
+    # (имя исходного проекта в строке — не пересказ вызывающего) и какие
+    # строки уже В ЦЕЛЕВОМ списке (no-op): клиентский слой такие строки даже
+    # не отправляет (batch_move_tasks_raw пропускает fromId == toId), и без
+    # пометки человек подтверждал бы пустую операцию, неотличимую от
+    # настоящей.
+    from_names: Dict[str, str] = {}
+    noop_ids: set = set()
+    extra_notes: List[str] = []
+    if not manifest_id and tasks:
+        # Пустая карта читается как «недоступно», не как «проектов нет» — тот
+        # же паттерн, что у plan_task_creation: с v2 в карте всегда есть
+        # Inbox, пустота приходит только от упавших чтений.
+        live_names = _v2_project_names()
+        if not live_names:
+            extra_notes.append(
+                "⚠️ ПРОВЕРИТЬ СПИСОК НАЗНАЧЕНИЯ НЕ УДАЛОСЬ (список проектов "
+                "сейчас недоступен): существует ли он, сверить нельзя. При "
+                "исполнении назначение сверяется заново — на неживом будет "
+                "отказ всей операции.")
+        else:
+            real = (live_names.get(to_project_id) or "").strip()
+            if not real:
+                return (f"{_PLAN_REFUSAL_PREFIX} список назначения по id "
+                        f"{to_project_id} не найден среди живых проектов — "
+                        "перемещать некуда, на исполнении был бы отказ всей "
+                        "операции. Проверь id (get_projects) и построй план "
+                        "заново. Ничего не изменено.")
+            if to_project_name and not _names_agree(to_project_name, real):
+                return (f"{_PLAN_REFUSAL_PREFIX} to_project_id указывает на "
+                        f"«{real}», а НЕ «{to_project_name}» (защита от «не "
+                        "того проекта»). Ничего не изменено.")
+        live_open = _open_by_id(fresh=False) or {}
+        for t in tasks:
+            tid = str(t.get("taskId") or t.get("task_id") or "")
+            row = live_open.get(tid)
+            if not row:
+                continue
+            pid = row.get("projectId") or ""
+            nm = ((live_names or {}).get(pid) or "").strip()
+            if nm:
+                from_names[tid] = nm
+            if pid and pid == to_project_id:
+                noop_ids.add(tid)
+
     def _describe(t: Dict[str, Any]) -> str:
-        return f"**{_plan_task_name(t, titles)}** → {dest}"
+        tid = str(t.get("taskId") or t.get("task_id") or "")
+        src = from_names.get(tid, "")
+        head = f"**{_plan_task_name(t, titles)}**"
+        line = (f"{head} — из «{src}» → {dest}" if src
+                else f"{head} → {dest}")
+        if tid in noop_ids:
+            # ℹ️, не ⚠️/⛔ — это ФАКТ о состоянии задачи, а не сомнение
+            # проверки и не отказ исполнителя (см. правило каналов у
+            # _COMPLETED_TASK_NOTE).
+            line += "\n   ℹ️ уже в этом списке — перемещение ничего не изменит"
+        return line
 
     # Сверка с живым состоянием на фазе ПЛАНА — см. `_plan_live_check`.
     notes = None
@@ -8509,6 +8575,8 @@ async def move_tasks(summary: str, tasks: List[Dict[str, str]] = None,
         _describe, notes, refusal = _plan_live_check(tasks, _describe)
         if refusal:
             return refusal
+        if extra_notes:
+            notes = (notes or []) + extra_notes
     outcome = await _gate_batch(
         "move", "move_tasks", tasks, summary, manifest_id, user_reply,
         _describe, notes=notes,
@@ -8544,6 +8612,14 @@ async def _move_tasks_impl(summary: str, tasks: List[Dict[str, str]],
         if by_id is None:
             return _STATE_UNAVAILABLE_MSG
         found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
+        # No-op: задача УЖЕ в целевом списке (2026-08-19, QA). Раньше такие
+        # строки шли общим потоком: клиентский слой их даже не отправлял
+        # (batch_move_tasks_raw пропускает fromId == toId), но post-verify
+        # «projectId == to_project_id» проходил тривиально, и ответ рапортовал
+        # «↪ Перемещено» об операции, которой не было. Отделяем ДО отправки и
+        # говорим фактом (ℹ️), а не успехом.
+        already = [f for f in found if f.get("projectId") == to_project_id]
+        found = [f for f in found if f.get("projectId") != to_project_id]
         moved, failed = [], []
         unverified = False
         api_fail = {}
@@ -8587,6 +8663,10 @@ async def _move_tasks_impl(summary: str, tasks: List[Dict[str, str]],
         if unverified:
             lines.append(f"Отправлено на перемещение {len(found)}, но "
                          f"{_UNVERIFIED_MSG}")
+        if already:
+            lines.append(f"ℹ️ Уже в «{to_name}» {len(already)} — без "
+                         "изменений: "
+                         + ", ".join(f"«{f['title']}»" for f in already))
         note = _unarmed_note(found)
         if note:
             lines.append(note)
