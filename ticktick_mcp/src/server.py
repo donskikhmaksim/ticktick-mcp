@@ -123,6 +123,14 @@ def _humanize_api_error(exc: Any) -> str:
     текст сохраняется в скобках для диагностики. Всё остальное проходит без
     изменений — это расшифровка, а не переписывание ошибок."""
     raw = _redact_for_user(exc)
+    # Сетевые ошибки БЕЗ HTTP-статуса (QA-2 2026-08-19, добор): DNS/connect
+    # выбрасывает «HTTPSConnectionPool(host=…) … NameResolutionError…» — сырой
+    # питоний стектрейст вместо ответа человеку. Расшифровываем так же, как
+    # HTTP-коды ниже: понятная фраза + исходный текст в скобках.
+    if ("NameResolutionError" in raw or "Failed to resolve" in raw
+            or "getaddrinfo" in raw):
+        return ("сетевая ошибка: имя хоста не разрешилось — проверь "
+                f"адрес/ссылку [{raw}]")
     m = _HTTP_STATUS_RE.search(raw)
     if not m:
         return raw
@@ -12697,6 +12705,21 @@ def _attachments_any_state(task_id: str) -> Optional[List[Dict]]:
         return None
 
 
+def _human_file_size(size) -> str:
+    """Размер файла по-человечески: байты — маленьким файлам, KB/MB — большим
+    (QA-2 2026-08-19, добор): `size // 1024` печатал «0 KB» для файла в 16
+    байт — при том что attach_file_to_task в своём отчёте называет точное
+    число байт. Округление до одного знака, хвост «.0» отбрасывается."""
+    size = int(size)
+    if size < 1024:
+        return f"{size} байт"
+    if size < 1024 * 1024:
+        shown = f"{size / 1024:.1f}".rstrip("0").rstrip(".")
+        return f"{shown} KB"
+    shown = f"{size / (1024 * 1024):.1f}".rstrip("0").rstrip(".")
+    return f"{shown} MB"
+
+
 @mcp.tool(annotations=READONLY)
 async def list_task_attachments(task_id: str, project_id: str = None) -> str:
     """
@@ -12728,7 +12751,8 @@ async def list_task_attachments(task_id: str, project_id: str = None) -> str:
             name = a.get("fileName") or a.get("name") or "(unnamed)"
             att_id = a.get("id") or "?"
             size = a.get("fileSize") or a.get("size")
-            size_str = f", {size // 1024} KB" if isinstance(size, (int, float)) else ""
+            size_str = (f", {_human_file_size(size)}"
+                        if isinstance(size, (int, float)) else "")
             out += f"  {i}. {name}  (id:{att_id}{size_str})\n"
         return out
     except Exception as e:
