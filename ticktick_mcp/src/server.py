@@ -4615,7 +4615,14 @@ async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
     # right here, so it reaches the user even if the model never asks for it.
     rid_m = re.search(r'operation_report\(record_id="([\w-]+)"\)', result)
     if rid_m:
-        result += "\n\n" + _build_operation_report(rid_m.group(1))
+        # `_run_blocking` обязателен (2026-08-19, разбор QA-2): внутри
+        # `_build_operation_report` — сетевые чтения живого состояния и цикл
+        # ретраев post-verify с `time.sleep` (до ~9 секунд суммарно); прямой
+        # вызов замораживал весь event loop — /health, фоновый поллер кнопок
+        # и все параллельные MCP-сессии. Кнопочный путь уже делает это
+        # правильно (tg_auto_execute.py) — здесь тот же приём.
+        result += "\n\n" + await _run_blocking(_build_operation_report,
+                                               rid_m.group(1))
     return result
 
 
@@ -6174,9 +6181,12 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
                          "(восстановление: restore_tasks из корзины, либо "
                          "пересоздание из снапшота).")
         # Append the server-built independent report — not optional, the model
-        # can't skip what's already in the tool result.
+        # can't skip what's already in the tool result. `_run_blocking` —
+        # внутри отчёта сетевые чтения и `time.sleep`-ретраи post-verify (до
+        # ~9 c), прямой вызов замораживал event loop (2026-08-19, QA-2).
         if deleted or failed:
-            lines.append("\n" + _build_operation_report(manifest_id))
+            lines.append("\n" + await _run_blocking(_build_operation_report,
+                                                    manifest_id))
         return "\n".join(lines) if lines else "Ничего не удалено."
     except Exception as e:
         logger.exception("Error in execute_task_deletion")
@@ -6721,7 +6731,10 @@ async def operation_report(record_id: str) -> str:
     err = _ensure_ready()
     if err:
         return err
-    return _build_operation_report(record_id)
+    # `_run_blocking` — внутри отчёта сетевые чтения и `time.sleep`-ретраи
+    # post-verify (до ~9 c); прямой вызов замораживал event loop целиком
+    # (2026-08-19, разбор QA-2).
+    return await _run_blocking(_build_operation_report, record_id)
 
 
 class _ReportData(NamedTuple):
