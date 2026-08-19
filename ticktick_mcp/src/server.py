@@ -14763,7 +14763,13 @@ def _validate_triage_ops(operations: List[Dict], max_items: int) -> Optional[str
     refusal = _triage_input_volume_refusal(len(operations))
     if refusal:
         return refusal
-    kind_of: Dict[str, str] = {}
+    # Значение — СПИСОК типов, увиденных для этого task_id (обычно длины 1).
+    # Раздел 5 дизайна, снятие ограничения (2026-08-19): РОВНО одна пара
+    # «restore + любая другая операция» над одним объектом разрешена — план
+    # «восстановить и сразу поменять срок/проект» больше не требует второго
+    # захода. Всё прочее — как раньше: та же задача не может стоять в плане
+    # второй раз.
+    kind_of: Dict[str, List[str]] = {}
     for i, op in enumerate(operations, 1):
         if not isinstance(op, dict):
             return (f"🛑 Отказ: операция #{i} — не объект. Каждая операция это "
@@ -14834,11 +14840,28 @@ def _validate_triage_ops(operations: List[Dict], max_items: int) -> Optional[str
                     "(дословно или сжато), иначе в предпросмотре не видно, "
                     "откуда взялась строка плана. Ничего не сделано.")
         if tid:
-            if tid in kind_of:
-                return (f"🛑 Отказ: task_id {tid[:8]}… встречается в плане дважды "
-                        f"({kind_of[tid]} и {kind}) — одну задачу нельзя и "
-                        "изменить, и удалить одним планом. Ничего не сделано.")
-            kind_of[tid] = kind
+            prior = kind_of.get(tid)
+            if prior:
+                # Разрешена РОВНО одна комбинация: одна из двух — restore,
+                # другая — нет, и всего их не больше двух. restore+restore,
+                # X+Y без restore или третья операция над тем же id — как и
+                # раньше, отказ целиком: план исполнился бы наполовину.
+                is_restore_pair = (len(prior) == 1 and prior[0] != kind
+                                   and ("restore" in (prior[0], kind)))
+                if not is_restore_pair:
+                    return (f"🛑 Отказ: task_id {tid[:8]}… встречается в "
+                            f"плане {'дважды' if len(prior) == 1 else 'больше двух раз'} "
+                            f"({'/'.join(prior)} и {kind}) — "
+                            + ("restore можно совместить РОВНО с одной "
+                               "другой операцией над той же задачей, "
+                               "остальные сочетания — отдельным планом. "
+                               if "restore" in (prior[0], kind)
+                               else "одну задачу нельзя и изменить, и "
+                               "удалить одним планом. ")
+                            + "Ничего не сделано.")
+                kind_of[tid] = prior + [kind]
+            else:
+                kind_of[tid] = [kind]
         # Специфика ТИПА — в его собственном валидаторе из реестра (1.3.3/
         # изм-1, 2026-08-09). Здесь остаётся только то, что одинаково у ВСЕХ
         # типов; лестница `if kind == …` на двенадцати типах — ровно тот рост
@@ -14848,8 +14871,8 @@ def _validate_triage_ops(operations: List[Dict], max_items: int) -> Optional[str
             return refusal
     # Отдельным проходом: «оставляемая» копия не должна сама исчезнуть в этом
     # же плане — иначе объединение снесёт ОБЕ копии и данные пропадут совсем.
-    doomed = {tid for tid, k in kind_of.items()
-              if k in ("delete", "merge", "complete")}
+    doomed = {tid for tid, kinds in kind_of.items()
+              if any(k in ("delete", "merge", "complete") for k in kinds)}
     for i, op in enumerate(operations, 1):
         if str(op.get("op") or "").strip().lower() != "merge":
             continue
@@ -14925,6 +14948,71 @@ def _triage_bind_live(e: Dict, live: Dict, names: Dict) -> None:
     e["_snapshot"] = _snapshot_of(live)
 
 
+def _triage_restore_injections(operations: List[Dict], by_id: Dict[str, Dict],
+                               names: Dict) -> Dict[str, Dict]:
+    """Снимает ограничение раздела 5 дизайна: «restore нельзя совместить с
+    другой операцией над той же задачей». Причина ограничения была в том, что
+    общая сверка личности (ниже) ищет ТОЛЬКО среди открытых задач, а
+    восстанавливаемая лежит в корзине — вторая операция над тем же task_id
+    честно не находила её и выбрасывалась из плана.
+
+    Для каждой операции `op="restore"` этого же плана, чья СОБСТВЕННАЯ сверка
+    (`_op_restore_plan`) проходит успешно, готовит запись «как если бы уже
+    открыта» — из корзины, с полем `projectId`, подменённым на РЕАЛЬНОЕ
+    назначение возврата (`_to_project_id`: явный `to_project_id/to_project`
+    либо исходный проект). Она подмешивается в `by_id` ДО того, как
+    `_resolve_triage_ops` построит по нему счётчик детей и пройдёт по
+    операциям, — поэтому любая другая операция над тем же task_id (по
+    `_validate_triage_ops` их разрешено ровно две: restore и одна другая)
+    находит объект по ОБЩЕЙ ветке сверки, как и по-настоящему открытую
+    задачу, и её собственная специфика (`_op_*_plan`, читающая `ctx.by_id`)
+    работает без единой доп. правки.
+
+    Пробный вызов `_op_restore_plan` идемпотентен: он только читает корзину
+    (кэш `_TRIAGE_READ_CACHE` на весь проход) и не имеет побочных эффектов —
+    повторный вызов той же операции чуть ниже, в основном цикле, не стоит ни
+    одного лишнего запроса и не может разойтись с этим результатом.
+
+    Если restore сам не пройдёт сверку (запись не в корзине, имя не
+    совпало, назначение не резолвится) — инъекции не будет, и другая
+    операция над тем же task_id провалит сверку естественно, тем же текстом,
+    что и раньше: задачи нет ни в открытых, ни в подмене.
+
+    Корзина читается ТОЛЬКО когда в плане ЕСТЬ хоть одна операция `restore` —
+    план без единого возврата обязан остаться ровно на тех же чтениях, что и
+    раньше (см. `v2.calls == []` в тестах отказа на прочих типах: лишний
+    `get_trash` там читался бы за каждый чужой план, не имеющий к корзине
+    никакого отношения)."""
+    if not any(str(op.get("op") or "").strip().lower() == "restore"
+               for op in operations):
+        return {}
+    trash = _triage_trash_by_id()
+    if not trash:
+        return {}
+    out: Dict[str, Dict] = {}
+    empty_kids: Dict[str, int] = collections.Counter()
+    for op in operations:
+        if str(op.get("op") or "").strip().lower() != "restore":
+            continue
+        tid = str(op.get("task_id") or "").strip()
+        if not tid or tid in out or tid in by_id:
+            continue
+        probe = dict(op)
+        probe["task_id"] = tid
+        why = _op_restore_plan(
+            probe, _TriagePlanCtx(by_id={}, names=names, kids=empty_kids))
+        if why:
+            continue
+        entry = trash.get(tid)
+        if not entry:
+            continue
+        injected = dict(entry)
+        injected["projectId"] = probe.get("_to_project_id") \
+            or entry.get("projectId") or ""
+        out[tid] = injected
+    return out
+
+
 def _resolve_triage_ops(operations: List[Dict], by_id: Dict[str, Dict],
                         names: Dict) -> List[Dict]:
     """Сверяет КАЖДУЮ переданную операцию с живым состоянием и обогащает её
@@ -14937,6 +15025,14 @@ def _resolve_triage_ops(operations: List[Dict], by_id: Dict[str, Dict],
     из плана ВЫБРАСЫВАЮТСЯ: в манифест попадает только прошедшее сверку.
     Здесь по-прежнему возвращается ПОЛНЫЙ список — чтобы про каждую
     непрошедшую операцию было что сказать человеку поимённо."""
+    # РАЗДЕЛ 5 ДИЗАЙНА, СНЯТИЕ ОГРАНИЧЕНИЯ (2026-08-19): задачи, которые
+    # `restore` этого же плана возвращает из корзины, подмешиваются в снимок
+    # ТАК, КАК БУДТО уже открыты, — заранее одним словарём, без узкого случая
+    # на каждый тип операции. Единственное экстра-чтение — корзина, а она уже
+    # кэширована на весь проход (`_TRIAGE_READ_CACHE`).
+    restore_injected = _triage_restore_injections(operations, by_id, names)
+    by_id = dict(by_id)
+    by_id.update(restore_injected)
     # Сколько ОТКРЫТЫХ детей у каждой задачи — считается по УЖЕ прочитанному
     # живому состоянию, без единого дополнительного запроса. Дети в план не
     # добавляются (тул не имеет права разрастаться сверх названного), но
@@ -14972,6 +15068,16 @@ def _resolve_triage_ops(operations: List[Dict], by_id: Dict[str, Dict],
             # «не найдена среди открытых» и выбросила бы законную операцию,
             # поэтому сверка личности целиком живёт в сверке плана ТИПА — и
             # она обязана быть там не мягче общей, а просто по своей ленте.
+            #
+            # `duplicate` — единственный ДРУГОЙ (не restore) тип этой ветки —
+            # тоже читает `ctx.by_id` напрямую (сверка по двум лентам): если
+            # его объект восстанавливается ЭТИМ ЖЕ планом, инъекция уже дала
+            # ему найтись, и его сверку перед исполнением так же нужно
+            # отложить до своей волны (раздел 5, снятие ограничения). Сам
+            # `restore` не помечается: его дрейф читает корзину напрямую, а
+            # не `by_id`, и уже корректен без этого флага.
+            if e["op"] != "restore" and e["task_id"] in restore_injected:
+                e["_deferred_restore"] = True
             why = reg.plan(e, ctx)
             if why:
                 e["_skip"] = why
@@ -14983,6 +15089,17 @@ def _resolve_triage_ops(operations: List[Dict], by_id: Dict[str, Dict],
                           "закрыл её вручную?)")
             resolved.append(e)
             continue
+        if e["task_id"] in restore_injected:
+            # Раздел 5 дизайна, снятие ограничения (2026-08-19): это НЕ
+            # по-настоящему открытая задача, а корзинная запись, подставленная
+            # `_triage_restore_injections`, — она станет открытой только
+            # после своей волны `restore` (та же операция этого же плана).
+            # Сверка личности ниже — законная (по данным, которые уже
+            # проверил `_op_restore_plan`), а вот повторная сверка ПЕРЕД
+            # исполнением обязана состояться ПОЗЖЕ, по-настоящему свежим
+            # состоянием СВОЕЙ волны — иначе исполнитель мутировал бы задачу,
+            # которая физически ещё в корзине.
+            e["_deferred_restore"] = True
         live_title = live.get("title") or ""
         # Маркер «названия нет» (Д1, 2026-08-09) — ОТДЕЛЬНАЯ ветка сверки, а
         # не поблажка на пустую строку: он утверждает про живую задачу ровно
@@ -15779,14 +15896,25 @@ def _triage_dependency_edges(operations: List[Dict],
          следующий — деталь терялась);
       3. у `merge` — автоматически от `update` этого же плана, чей `task_id`
          равен `keep_task_id`: правка оставляемой копии обязана пройти до
-         того, как дубль исчезнет."""
+         того, как дубль исчезнет;
+      4. у ЛЮБОЙ другой операции — автоматически от `restore` этого же
+         плана над ТЕМ ЖЕ `task_id` (раздел 5, снятие ограничения,
+         2026-08-19): объект лежит в корзине и появится среди открытых
+         только после своей волны restore. `_validate_triage_ops` уже не
+         пускает в план больше одной такой пары на task_id, так что рёбер
+         этого вида на объект не бывает больше одного."""
     edges: Dict[int, set] = {i: set() for i in range(len(operations))}
     by_task_update: Dict[str, int] = {}
+    by_task_restore: Dict[str, int] = {}
     for i, op in enumerate(operations):
-        if str(op.get("op") or "").strip().lower() == "update":
-            tid = str(op.get("task_id") or "").strip()
-            if tid:
-                by_task_update[tid] = i
+        kind = str(op.get("op") or "").strip().lower()
+        tid = str(op.get("task_id") or "").strip()
+        if not tid:
+            continue
+        if kind == "update":
+            by_task_update[tid] = i
+        elif kind == "restore":
+            by_task_restore[tid] = i
     for i, op in enumerate(operations):
         for field in ("ref", "parent_ref"):
             v = _triage_ref_of(op, field)
@@ -15796,10 +15924,15 @@ def _triage_dependency_edges(operations: List[Dict],
             key = str(a).strip()
             if key in labels:
                 edges[i].add(labels[key])
-        if str(op.get("op") or "").strip().lower() == "merge":
+        kind = str(op.get("op") or "").strip().lower()
+        if kind == "merge":
             keep = str(op.get("keep_task_id") or "").strip()
             if keep and keep in by_task_update and by_task_update[keep] != i:
                 edges[i].add(by_task_update[keep])
+        if kind != "restore":
+            tid = str(op.get("task_id") or "").strip()
+            if tid and tid in by_task_restore and by_task_restore[tid] != i:
+                edges[i].add(by_task_restore[tid])
     return edges
 
 
@@ -17788,12 +17921,17 @@ async def _apply_task_changes_impl(summary: str, tasks: List[Dict],
                 # плане» нельзя ни при каких условиях.
                 blocked.append((op, op["_skip"]))
                 continue
-            if op.get("_deferred_identity") or op.get("_deferred_parent"):
+            if op.get("_deferred_identity") or op.get("_deferred_parent") \
+                    or op.get("_deferred_restore"):
                 # Объект (или его будущий родитель) создаётся ЭТИМ ЖЕ планом
-                # (изм-10): сверять с живым состоянием сейчас не с чем — его
-                # там нет и быть не должно. Сверка не пропускается, а делается
-                # в своей волне, после подстановки настоящего id
-                # (`_triage_substitute_refs` + обычный дрейф следом).
+                # (изм-10) — либо (2026-08-19, раздел 5) сейчас лежит в
+                # корзине и появится среди открытых только после своей волны
+                # `restore`: сверять его с ЭТИМ снимком (взятым ДО любой
+                # мутации) нечего — общая ветка честно сказала бы «исчезла из
+                # открытых», хотя её там просто ЕЩЁ не было. Сверка не
+                # пропускается, а делается в СВОЕЙ волне, по свежему
+                # состоянию этой волны (`_triage_drift_reason` в цикле волн
+                # ниже).
                 ready.append(op)
                 continue
             why = _triage_drift_reason(op, by_id, names)
@@ -17909,12 +18047,16 @@ async def _apply_task_changes_impl(summary: str, tasks: List[Dict],
                 failed_idx.add(i)
                 continue
             deferred = bool(_triage_ref_of(o, "ref")
-                            or _triage_ref_of(o, "parent_ref"))
+                            or _triage_ref_of(o, "parent_ref")
+                            or o.get("_deferred_restore"))
             why = _triage_substitute_refs(o, label_ids, wave_state, names)
             if not why and deferred:
-                # Подстановка состоялась — теперь операция сверяется как любая
-                # другая, тем же дрейфом, но уже по СВЕЖЕМУ состоянию своей
-                # волны: сверка личности не пропущена, а сделана позже.
+                # Подстановка состоялась (или её не было — у `_deferred_restore`
+                # id не меняется, restore не создаёт новый id) — теперь
+                # операция сверяется как любая другая, тем же дрейфом, но уже
+                # по СВЕЖЕМУ состоянию своей волны: сверка личности не
+                # пропущена, а сделана позже, когда restore этого же плана
+                # уже отработал.
                 why = _triage_drift_reason(o, wave_state, names)
             if why:
                 blocked.append((o, why))
