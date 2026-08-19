@@ -401,15 +401,34 @@ def revoke_window(window_id: str, chat_id: str = "") -> bool:
 
     Возвращает True, если было что гасить (окно с таким id существовало и
     было активно); False — такого окна нет / оно уже неактивно / хранилище
-    выключено / `window_id` пуст. Ни то, ни другое НЕ ошибка."""
+    выключено / `window_id` пуст. Ни то, ни другое НЕ ошибка.
+
+    SCOPE, НЕ server (QA-2 2026-08-19, добор №9): фильтр `server = %s`
+    отбирал только окна, СОЗДАННЫЕ этим сервером, — а `find_window` (то, что
+    реально открывает гейт) принимает окно ЛЮБОГО создателя, чей `scope`
+    покрывает ticktick. После переезда генерации ключей в gmail-mcp боевые
+    окна создаются с server='gmail' — локальный отзыв их не видел, то есть
+    окно продолжало открывать гейт ПОСЛЕ «отзыва». Теперь отзыв/список ходят
+    той же scope-логикой, что и допуск: гасится/показывается ровно то, что
+    может открыть гейт этому серверу."""
     if not (store_ready() and window_id):
         return False
+    now = _now_ms()
     with _conn() as cur:
         cur.execute(
-            "UPDATE tg_automation_windows SET revoked_at = %s "
-            "WHERE server = %s AND window_id = %s AND revoked_at IS NULL "
+            "SELECT scope FROM tg_automation_windows "
+            "WHERE window_id = %s AND revoked_at IS NULL "
             "AND (expires_at IS NULL OR expires_at > %s)",
-            (_now_ms(), SERVER, window_id, _now_ms()),
+            (window_id, now),
+        )
+        row = cur.fetchone()
+        if row is None or not _scope_covers_me(row[0]):
+            return False
+        cur.execute(
+            "UPDATE tg_automation_windows SET revoked_at = %s "
+            "WHERE window_id = %s AND revoked_at IS NULL "
+            "AND (expires_at IS NULL OR expires_at > %s)",
+            (now, window_id, now),
         )
         return cur.rowcount > 0
 
@@ -420,15 +439,33 @@ def revoke_all_windows(chat_id: str = "") -> int:
     (0, если активных окон и не было, или хранилище выключено — не ошибка).
 
     `chat_id` — по тому же интерфейсу, что `revoke_window` (задел на
-    аудит/многотенантность, сегодня не фильтр)."""
+    аудит/многотенантность, сегодня не фильтр).
+
+    SCOPE, НЕ server (QA-2 2026-08-19, добор №9, см. `revoke_window`):
+    «Выключить всё» обязано гасить ВСЁ, что способно открыть гейт этому
+    серверу, — то есть все активные окна, чей `scope` покрывает ticktick,
+    независимо от того, какой сервис их создал. Со старым фильтром
+    `server = %s` кнопка отвечала «активных окон не было», а окно от
+    gmail-mcp продолжало действовать."""
     if not store_ready():
         return 0
+    now = _now_ms()
     with _conn() as cur:
         cur.execute(
-            "UPDATE tg_automation_windows SET revoked_at = %s "
-            "WHERE server = %s AND revoked_at IS NULL "
+            "SELECT window_id, scope FROM tg_automation_windows "
+            "WHERE revoked_at IS NULL "
             "AND (expires_at IS NULL OR expires_at > %s)",
-            (_now_ms(), SERVER, _now_ms()),
+            (now,),
+        )
+        covering = [wid for wid, scope in cur.fetchall()
+                    if _scope_covers_me(scope)]
+        if not covering:
+            return 0
+        cur.execute(
+            "UPDATE tg_automation_windows SET revoked_at = %s "
+            "WHERE window_id = ANY(%s) AND revoked_at IS NULL "
+            "AND (expires_at IS NULL OR expires_at > %s)",
+            (now, covering, now),
         )
         return cur.rowcount
 
@@ -445,18 +482,25 @@ def list_windows(chat_id: str = "") -> List[Dict[str, Any]]:
     Пустой список — активных окон нет (никогда не выдавались / все
     погашены-истекли) ИЛИ хранилище выключено; вызывающий не различает эти
     два случая (для «Списка» разница не имеет значения — в обоих «сейчас
-    активных окон нет»)."""
+    активных окон нет»).
+
+    SCOPE, НЕ server (QA-2 2026-08-19, добор №9, см. `revoke_window`): в
+    списке — все активные окна, чей `scope` покрывает ticktick (та же
+    выборка, которой `find_window` решает про допуск), а не только те, что
+    создал этот сервер, — иначе окно от gmail-mcp открывало бы гейт, будучи
+    невидимым для «Списка»."""
     if not store_ready():
         return []
     now = _now_ms()
     with _conn() as cur:
         cur.execute(
-            "SELECT window_id, label, created_at, expires_at, created_by_chat "
-            "FROM tg_automation_windows WHERE server = %s AND revoked_at IS NULL "
+            "SELECT window_id, label, created_at, expires_at, "
+            "created_by_chat, scope "
+            "FROM tg_automation_windows WHERE revoked_at IS NULL "
             "AND (expires_at IS NULL OR expires_at > %s) ORDER BY created_at ASC",
-            (SERVER, now),
+            (now,),
         )
-        rows = cur.fetchall()
+        rows = [r[:5] for r in cur.fetchall() if _scope_covers_me(r[5])]
     return [
         {
             "window_id": window_id, "label": label,
