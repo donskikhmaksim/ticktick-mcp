@@ -139,14 +139,20 @@ async def test_unknown_task_name_is_stated_out_loud_not_shown_as_an_id():
 
 
 async def test_unknown_destination_project_is_stated_out_loud(monkeypatch):
+    """С 2026-08-19 (сверка назначения на фазе плана) исход СИЛЬНЕЕ прежнего
+    «сказать вслух, что имя неизвестно»: несуществующее назначение — это
+    операция, которой исполнитель откажет целиком, поэтому плана нет вовсе.
+    Требование этого файла держится: id назван прямо, ничего не молчит."""
     text = await stand.call_direct(
         "move_tasks", summary="Переношу задачи",
         tasks=[{"taskId": stand.TASK_ROOT, "title": "Собрать отчёт"},
                {"taskId": stand.TASK_MID, "title": "Записаться к врачу"}],
         to_project_id=GHOST)
 
-    assert NO_NAME in text, text
+    assert "🛑 План НЕ построен" in text, text
+    assert "не найден" in text, text
     assert GHOST in text, text
+    assert "manifest_id" not in text, text
 
 
 # ─────────────────────────── manual_triage ───────────────────────────
