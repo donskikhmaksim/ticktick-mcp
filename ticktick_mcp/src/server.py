@@ -223,7 +223,21 @@ def _automation_key_channel(provided: str) -> str:
         return ""
     if automation_key.matches_static(provided):
         return "static"
-    win = automation_key.find_window(provided)
+    # Поход в Postgres обёрнут (2026-08-19, разбор QA-2): при лежащей базе
+    # `find_window` бросает `psycopg2.OperationalError`, и раньше он рвал
+    # ЛЮБОЙ вызов инструмента с непустым automation_key голым трейсбеком —
+    # в том числе у клиента со старым MCP_SECRET (легальный legacy-канал
+    # ниже, которому база вообще не нужна). Недоступное хранилище окон —
+    # это «оконный канал сейчас не отвечает», а не «уронить вызов»:
+    # остальные каналы проверяются дальше, несовпавший ключ уходит обычным
+    # интерактивным путём (план → подтверждение), без исключения наружу.
+    try:
+        win = automation_key.find_window(provided)
+    except Exception as e:
+        logger.warning(
+            "automation_key.find_window недоступен (хранилище окон не "
+            "отвечает) — оконный канал пропущен, проверяю остальные: %s", e)
+        win = None
     if win:
         opened = win.get("created_at")
         return f"window:{opened}" if opened else "window"
@@ -4247,7 +4261,16 @@ def _create_object_hash(raw: List[Dict[str, Any]]) -> str:
          for t in raw])
 
 
-@mcp.tool(annotations=READONLY)
+# БЕЗ readOnlyHint (2026-08-19, разбор QA-2). Аннотация врала дважды: (1) при
+# включённом аварийном выключателе (`TICKTICK_MCP_GATE_DISABLED`) этот
+# инструмент НЕМЕДЛЕННО исполняет план — создаёт задачи; (2) даже в обычном
+# режиме он отправляет владельцу сообщение в Telegram (побочный эффект во
+# внешнем мире). `readOnlyHint=True` — это то, по чему MCP-клиенты (включая
+# Claude Code) автоодобряют вызов без вопроса человеку, а список инструментов
+# кэшируется — поменять аннотацию на лету при переключении выключателя
+# нельзя. Контракт «мутирующий тул не помечен readOnlyHint» закреплён тестом
+# tests/test_readonly_hint_contract.py.
+@mcp.tool()
 async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
                              max_items: int = 50) -> str:
     """
@@ -4510,7 +4533,30 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     # (с меткой канала `gate_disabled`), и приклеивает независимый отчёт —
     # разойтись двум путям исполнения тут негде.
     if _gate_disabled():
-        return await execute_task_creation(manifest_id=mid, user_reply="")
+        done = await execute_task_creation(manifest_id=mid, user_reply="")
+        # Потерянный контекст плана (2026-08-19, разбор QA-2): раньше эта
+        # ветка возвращала ТОЛЬКО отчёт исполнителя, выбрасывая собранные
+        # выше строки «исключено» (битый project_id, id не туда, отвалившийся
+        # родитель), пометки «❓ НЕ уверен» подсказчика проектов и «родитель
+        # НЕ сверен» — задача создавалась в проекте, в котором сервер сам не
+        # уверен, и человек об этом не узнавал. Образец честного поведения —
+        # такая же ветка в `delete_tasks`: предупреждения едут прямо в ответ.
+        killswitch_notes = []
+        if refused:
+            killswitch_notes.append(
+                f"🛑 **Исключены {len(refused)}:** " + "; ".join(refused))
+        unsure = [(t, pname, sug) for (t, pname, sug, _) in good
+                  if sug and (sug.get("confidence") or "unsure") != "sure"]
+        if unsure:
+            killswitch_notes.append(
+                "❓ Проект выбирал сервер и НЕ уверен: " + "; ".join(
+                    f"«{t.get('title')}» → «{pname}» "
+                    f"({sug.get('reason') or 'уточни проект'})"
+                    for t, pname, sug in unsure))
+        if any(lbl.endswith("НЕ сверено") for _, _, _, lbl in good):
+            killswitch_notes.append(_PARENT_UNVERIFIED_NOTE)
+        return ("\n".join([done, ""] + killswitch_notes)
+                if killswitch_notes else done)
     # Опциональный ТГ-фактор. При выключенном слое (дефолт) возвращает текст
     # плана БЕЗ единого изменения; при включённом — шлёт план кнопкой и
     # помечает манифест `tg_notified`, из-за чего execute-фаза начинает
@@ -4583,7 +4629,14 @@ async def execute_task_creation(manifest_id: str, user_reply: str = "") -> str:
     # right here, so it reaches the user even if the model never asks for it.
     rid_m = re.search(r'operation_report\(record_id="([\w-]+)"\)', result)
     if rid_m:
-        result += "\n\n" + _build_operation_report(rid_m.group(1))
+        # `_run_blocking` обязателен (2026-08-19, разбор QA-2): внутри
+        # `_build_operation_report` — сетевые чтения живого состояния и цикл
+        # ретраев post-verify с `time.sleep` (до ~9 секунд суммарно); прямой
+        # вызов замораживал весь event loop — /health, фоновый поллер кнопок
+        # и все параллельные MCP-сессии. Кнопочный путь уже делает это
+        # правильно (tg_auto_execute.py) — здесь тот же приём.
+        result += "\n\n" + await _run_blocking(_build_operation_report,
+                                               rid_m.group(1))
     return result
 
 
@@ -5666,6 +5719,14 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
             # `_journal_write`, которая съедает метку на первой же записи.
             consent._AUTOMATION_CHANNEL.set(_ak_channel)
         elif _gate_disabled():
+            # Явное «нет» человека главнее выключателя (2026-08-19, разбор
+            # QA-2, см. `_refusal_beats_kill_switch` в consent.py): вызов с
+            # отрицанием в user_reply не имеет права исполниться по обходу.
+            # Манифест гасим — он уже создан строками выше и без гашения
+            # остался бы висеть живым планом.
+            if _is_negative_reply(user_reply):
+                _mark_manifest_consumed(_MANIFESTS[mid], mid)
+                return consent._REFUSAL_BEATS_KILL_SWITCH_MSG
             # Аварийный выключатель гейта (2026-08-14) — второе основание
             # исполнить с первого вызова, ровно тем же кодом ниже. Своя
             # запись в лог и своя метка канала (`gate_disabled`), чтобы обход
@@ -5745,7 +5806,10 @@ consent.bind_server_hooks(  # noqa: E402
     tg_cfg=_TG_CFG, automation_key_matches=_automation_key_matches,
     automation_key_channel=_automation_key_channel,
     redact_for_user=_redact_for_user, run_blocking=_run_blocking)
-@mcp.tool(annotations=READONLY)
+# БЕЗ readOnlyHint — та же причина, что у plan_task_creation (2026-08-19,
+# разбор QA-2): при включённом выключателе гейта этот вызов сразу УДАЛЯЕТ
+# задачи, а readOnlyHint — то, по чему клиент автоодобрил бы его как чтение.
+@mcp.tool()
 async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
                              max_items: int = 50) -> str:
     """
@@ -5918,7 +5982,22 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
     # задач уходят в журнал, эффект перепроверяется свежим чтением, ровно как
     # на обычном пути.
     if _gate_disabled():
-        return await execute_task_deletion(manifest_id=mid, user_reply="")
+        done = await execute_task_deletion(manifest_id=mid, user_reply="")
+        # Потерянный контекст плана (2026-08-19, разбор QA-2): раньше эта
+        # ветка выбрасывала строки «не совпало» (`_mismatch_report`) и
+        # «исключены — не среди открытых» — человек получал отчёт об
+        # удалении и молча не узнавал, что часть списка вообще не тронута.
+        # Образец — та же ситуация в `delete_tasks`: предупреждения
+        # приклеиваются прямо к ответу.
+        killswitch_notes = []
+        if mismatch:
+            killswitch_notes.append(_mismatch_report(mismatch, "включил в план"))
+        if missing:
+            killswitch_notes.append(
+                f"↷ Исключены (не среди открытых) {len(missing)}: "
+                + ", ".join(f"«{m['title']}»" for m in missing))
+        return ("\n".join([done, ""] + killswitch_notes)
+                if killswitch_notes else done)
     # Сетевую часть отправки уводит в поток сам хук (см. delete_tasks выше и
     # докстринг `_maybe_tg_notify_plan`) — здесь просто await.
     return await _maybe_tg_notify_plan("delete_tasks", mid, "\n".join(lines),
@@ -6116,9 +6195,12 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
                          "(восстановление: restore_tasks из корзины, либо "
                          "пересоздание из снапшота).")
         # Append the server-built independent report — not optional, the model
-        # can't skip what's already in the tool result.
+        # can't skip what's already in the tool result. `_run_blocking` —
+        # внутри отчёта сетевые чтения и `time.sleep`-ретраи post-verify (до
+        # ~9 c), прямой вызов замораживал event loop (2026-08-19, QA-2).
         if deleted or failed:
-            lines.append("\n" + _build_operation_report(manifest_id))
+            lines.append("\n" + await _run_blocking(_build_operation_report,
+                                                    manifest_id))
         return "\n".join(lines) if lines else "Ничего не удалено."
     except Exception as e:
         logger.exception("Error in execute_task_deletion")
@@ -6663,7 +6745,10 @@ async def operation_report(record_id: str) -> str:
     err = _ensure_ready()
     if err:
         return err
-    return _build_operation_report(record_id)
+    # `_run_blocking` — внутри отчёта сетевые чтения и `time.sleep`-ретраи
+    # post-verify (до ~9 c); прямой вызов замораживал event loop целиком
+    # (2026-08-19, разбор QA-2).
+    return await _run_blocking(_build_operation_report, record_id)
 
 
 class _ReportData(NamedTuple):

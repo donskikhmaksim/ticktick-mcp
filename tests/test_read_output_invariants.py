@@ -145,11 +145,15 @@ CASES = {
     "plan_task_creation": Case({"summary": "план",
                                 "tasks": [{"title": "Купить бумагу",
                                            "project_id": P_WORK}]},
-                               note="READONLY по аннотации: строит план, ничего не пишет"),
+                               note="readOnlyHint СНЯТ (QA-2, 2026-08-19): "
+                                    "kill-switch-ветка мутирует; здесь "
+                                    "проверяется обычный плановый вывод"),
     "plan_task_deletion": Case({"summary": "план",
                                 "tasks": [{"task_id": TASK_ROOT,
                                            "title": "Собрать отчёт"}]},
-                               note="READONLY по аннотации: строит план, ничего не пишет"),
+                               note="readOnlyHint СНЯТ (QA-2, 2026-08-19): "
+                                    "kill-switch-ветка мутирует; здесь "
+                                    "проверяется обычный плановый вывод"),
     # header=None/item=None: на стенде TASKS ни одна задача не безымянна —
     # ИНВ-1/2/4 (заголовок==телу, id годен дальше, усечение объявлено) здесь
     # проверять нечем, тот же случай, что у get_recurring_tasks выше.
@@ -158,6 +162,13 @@ CASES = {
     "find_untitled_tasks": Case({}, None, None,
                                 note="на стенде безымянных задач нет — предмет ИНВ-5"),
 }
+
+# Разобраны здесь ДОБРОВОЛЬНО, хотя readOnlyHint с них снят (2026-08-19,
+# разбор QA-2, tests/test_readonly_hint_contract.py): kill-switch-ветка
+# делает эти «планы» мутирующими, но их обычный (плановый) вывод по-прежнему
+# обязан держать инварианты этого файла — терять разбор вместе с аннотацией
+# было бы потерей покрытия, а не честностью.
+_VOLUNTARY_CASES = {"plan_task_creation", "plan_task_deletion"}
 
 _LIST_CASES = [n for n, c in CASES.items() if c.header]
 _PAGED_CASES = [n for n, c in CASES.items() if c.paged]
@@ -183,7 +194,7 @@ def test_every_readonly_tool_is_covered_by_this_file():
     registry = {t.name for t in tools
                 if getattr(t.annotations, "readOnlyHint", False)}
     missing = sorted(registry - set(CASES))
-    stale = sorted(set(CASES) - registry)
+    stale = sorted(set(CASES) - registry - _VOLUNTARY_CASES)
     assert not missing, (
         f"READONLY-инструменты без разбора в CASES: {missing} — добавь их сюда "
         "вместе с аргументами и формой вывода, иначе они не проверяются ничем")
