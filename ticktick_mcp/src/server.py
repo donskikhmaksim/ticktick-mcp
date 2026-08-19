@@ -4247,7 +4247,16 @@ def _create_object_hash(raw: List[Dict[str, Any]]) -> str:
          for t in raw])
 
 
-@mcp.tool(annotations=READONLY)
+# БЕЗ readOnlyHint (2026-08-19, разбор QA-2). Аннотация врала дважды: (1) при
+# включённом аварийном выключателе (`TICKTICK_MCP_GATE_DISABLED`) этот
+# инструмент НЕМЕДЛЕННО исполняет план — создаёт задачи; (2) даже в обычном
+# режиме он отправляет владельцу сообщение в Telegram (побочный эффект во
+# внешнем мире). `readOnlyHint=True` — это то, по чему MCP-клиенты (включая
+# Claude Code) автоодобряют вызов без вопроса человеку, а список инструментов
+# кэшируется — поменять аннотацию на лету при переключении выключателя
+# нельзя. Контракт «мутирующий тул не помечен readOnlyHint» закреплён тестом
+# tests/test_readonly_hint_contract.py.
+@mcp.tool()
 async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
                              max_items: int = 50) -> str:
     """
@@ -5745,7 +5754,10 @@ consent.bind_server_hooks(  # noqa: E402
     tg_cfg=_TG_CFG, automation_key_matches=_automation_key_matches,
     automation_key_channel=_automation_key_channel,
     redact_for_user=_redact_for_user, run_blocking=_run_blocking)
-@mcp.tool(annotations=READONLY)
+# БЕЗ readOnlyHint — та же причина, что у plan_task_creation (2026-08-19,
+# разбор QA-2): при включённом выключателе гейта этот вызов сразу УДАЛЯЕТ
+# задачи, а readOnlyHint — то, по чему клиент автоодобрил бы его как чтение.
+@mcp.tool()
 async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
                              max_items: int = 50) -> str:
     """
