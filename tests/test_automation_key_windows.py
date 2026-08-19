@@ -79,7 +79,7 @@ def test_generate_window_returns_empty_when_store_not_ready():
         assert ak.revoke_all_windows() == 0
         assert ak.list_windows() == []
     finally:
-        ak._pg_pool = None
+        ak.close_store()
 
 
 # ═══════════ 2. Токен НЕ работает после истечения (без отзыва) ═══════════
@@ -354,4 +354,4 @@ def test_matches_static_is_constant_time_and_does_not_need_a_store(monkeypatch):
         assert ak.matches_static("test-static-key") is False, (
             "пустой AUTOMATION_KEY не должен совпадать ни с чем")
     finally:
-        ak._pg_pool = None
+        ak.close_store()

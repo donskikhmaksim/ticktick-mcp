@@ -25,6 +25,50 @@ os.environ.setdefault("CONSENT_SYNC_WAIT_MS", "0")
 
 import json  # noqa: E402
 
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_pg_pools():
+    """Модульные синглтоны `_pg_pool` в `manifest_store`/`automation_key`/
+    `tg_approval` переживают отдельный тест — единственный способ их закрыть
+    был явный `close_store()` внутри самого теста/файла (см. хелперы
+    `fresh_store`/`fresh_stores`/`fresh_automation_key_store` в
+    tests/pg_helper.py). Часть файлов так и делает (test_manifest_restart.py,
+    test_automation_key_channel_audit.py, ...), часть — нет вообще
+    (test_alias_resolution.py — один вызов `fresh_store()`, никогда не
+    закрытый; test_manifest_store_pg.py — вызовов много, close_store() нет
+    ни одного).
+
+    Забытый `close_store()` оставляет пул живым для следующего по алфавиту
+    файла. Файл, который явно подменяет `store_ready` через monkeypatch
+    (`no_store` в test_manifest_persistence.py), от этого защищён, а файл,
+    который лишь ПРЕДПОЛАГАЕТ `store_ready() == False` по отсутствию env-
+    переменной — например докстринг test_consent_web_hub.py: «Ни сети, ни
+    реального Postgres: manifest_store.store_ready() остаётся False» — тихо
+    уезжает на путь через базу вместо RAM-пути, который он собирался
+    проверить, БЕЗ видимого падения (путь через базу просто не находит
+    строку и деградирует штатно). Это тот же класс дефекта, из-за которого
+    test_own_bot_webhook.py падал в изоляции, но проходил в общем прогоне
+    (там дефект — недостающий гард `store_ready()` — уже починен), только
+    сама утечка нигде не закрывалась.
+
+    Закрываем все три пула И ДО (гарантирует чистый старт, на который
+    полагаются докстринги нескольких файлов), И ПОСЛЕ (не оставляем живой
+    пул тому, кто пойдёт следующим) каждого теста. `close_store()` на уже
+    закрытом пуле — no-op, так что для тестов, вообще не трогающих
+    Postgres, это ничего не стоит."""
+    from ticktick_mcp.src import automation_key, manifest_store, tg_approval
+
+    def _close_all():
+        manifest_store.close_store()
+        automation_key.close_store()
+        tg_approval.close_store()
+
+    _close_all()
+    yield
+    _close_all()
+
 
 def pytest_configure(config):
     """Маркер `triage_e2e("<тип>")` — «этот тест совершает через агрегатор то

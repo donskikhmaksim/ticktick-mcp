@@ -106,7 +106,7 @@ def wired(monkeypatch, tmp_path):
     s._MANIFEST_TOMBSTONES.clear()
     from ticktick_mcp.src import manifest_store, tg_approval
     manifest_store.close_store()
-    tg_approval._pg_pool = None
+    tg_approval.close_store()
     ak.close_store()
 
 
