@@ -8804,7 +8804,8 @@ def _ensure_ready() -> Optional[str]:
 
 @mcp.tool(annotations=READONLY)
 async def get_habits() -> str:
-    """List all habits with their goal and current streak (requires v2 API)."""
+    """List all habits with their goal and a "done" count computed from
+    actual check-in records (requires v2 API)."""
     err = _ensure_ready()
     if err:
         return err
@@ -8812,19 +8813,46 @@ async def get_habits() -> str:
         habits = await _run_blocking(lambda: ticktick_v2.get_habits())
         if not habits:
             return "No habits found."
-        # totalCheckIns считает ТОЛЬКО успешные отметки — проверено живьём:
-        # привычка с «totalCheckIns: 18» отдаёт 31 запись в get_habit_checkins
-        # (18 выполнено + 13 провалено/пропущено). Слово «total» читалось как
-        # «все отметки», то есть завышало регулярность: 18 из 18 вместо 18 из
-        # 31. Поле не пересчитываем (это счётчик TickTick), но называем честно
-        # и говорим, где смотреть полную историю.
-        out = (f"Habits ({len(habits)}):\n"
-               "(«done» = SUCCESSFUL check-ins only — failed and skipped days are "
-               "NOT in that number; get_habit_checkins lists every entry)\n\n")
+        # "done" ниже считается по ЖИВЫМ записям check-in'ов, а НЕ по полю
+        # totalCheckIns из объекта привычки — это поле оказалось не просто
+        # "успехи без провалов/пропусков" (что уже само по себе стоило бы
+        # честной пометки), а ещё и УСТАРЕВШИМ: живьём чек-ин сразу после
+        # записи не попадал в totalCheckIns при следующем же get_habits
+        # (показывало done: 0), а delete_habit печатал «успешных было 3»,
+        # хотя get_habit_checkins непосредственно перед этим показывал 4
+        # done-записи. Пересчитываем реальный счёт ОДНИМ batch-запросом на
+        # все привычки сразу (тот же эндпоинт, что и get_habit_checkins) —
+        # дороже на один HTTP-вызов, зато не врёт. Если этот запрос упал —
+        # показываем "?" вместо цифры (см. правило вывода: молчание лучше
+        # неверного числа), а не откатываемся на устаревшее поле.
+        ids = [h.get("id") for h in habits if h.get("id")]
+        done_counts: Dict[str, int] = {}
+        checkins_failed = False
+        if ids:
+            try:
+                checkins = await _run_blocking(
+                    lambda: ticktick_v2.get_habit_checkins(ids, 0))
+                for hid, entries in (checkins or {}).items():
+                    done_counts[hid] = sum(1 for e in entries if e.get("status") == 2)
+            except Exception as e:
+                checkins_failed = True
+                logger.warning("get_habits: не удалось перечитать check-ins "
+                               f"для точного счёта done ({e}) — цифра не "
+                               "показывается.")
+        header = (f"Habits ({len(habits)}):\n"
+                  "(«done» = actual SUCCESSFUL check-ins, counted from live "
+                  "check-in records — not TickTick's own lagging counter)\n\n"
+                  if not checkins_failed else
+                  f"Habits ({len(habits)}):\n"
+                  "(⚠️ «done» count unavailable right now — the check-in read "
+                  "failed; showing habits without it rather than a stale number)\n\n")
+        out = header
         for h in habits:
-            out += (f"- {h.get('name','?')}  (id: {h.get('id')})\n"
+            hid = h.get("id")
+            done_str = "?" if checkins_failed else str(done_counts.get(hid, 0))
+            out += (f"- {h.get('name','?')}  (id: {hid})\n"
                     f"    goal: {h.get('goal')} {h.get('unit','')} | type: {h.get('type')} | "
-                    f"done: {h.get('totalCheckIns', 0)}\n"
+                    f"done: {done_str}\n"
                     f"    repeat: {h.get('repeatRule','')}\n")
         return out
     except Exception as e:
@@ -8857,10 +8885,45 @@ def _checkin_sort_key(stamp) -> tuple:
     return (1, 0)
 
 
+def _validate_habit_date(date_str: str) -> Optional[str]:
+    """Strict YYYY-MM-DD check shared by checkin_habit's `date` and
+    get_habit_checkins' `after_date`. Returns a human 🛑 error (no trailing
+    "Ничего не записано" — callers append their own tail) or None when valid.
+
+    strptime alone does NOT catch non-zero-padded input ('2026-7-4' parses
+    happily) — the format is round-tripped back through strftime to enforce
+    YYYY-MM-DD exactly, since downstream code turns this straight into an int
+    stamp (int(date.replace("-", ""))) where '2026-7-4' would silently become
+    202674, a different (and wrong) day."""
+    try:
+        parsed = datetime.strptime(str(date_str), "%Y-%m-%d")
+        if parsed.strftime("%Y-%m-%d") != date_str:
+            raise ValueError("not zero-padded")
+        return None
+    except (ValueError, TypeError):
+        return (f"🛑 Неверный формат даты {date_str!r} — нужно строго "
+                "YYYY-MM-DD (например 2026-07-04).")
+
+
+def _is_future_habit_date(date_str: str) -> bool:
+    """True when `date_str` (already format-validated YYYY-MM-DD) is after
+    "today" in the OWNER's configured zone (_USER_TZ) — comparing to UTC
+    would misfire near the day boundary (up to several hours off)."""
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    return d > datetime.now(_USER_TZ).date()
+
+
 def _describe_checkin_habit(p: Dict) -> str:
     label = _HABIT_STATUS_LABELS.get(p.get("status"), p.get("status"))
     when = p.get("date") or "сегодня"
-    return f'Отмечаю привычку «{p.get("habit_name")}» на {when}: {label}'
+    future_note = ""
+    if p.get("date") and _is_future_habit_date(p["date"]):
+        future_note = (" ⚠️ дата в будущем (сегодня "
+                        f"{datetime.now(_USER_TZ).strftime('%Y-%m-%d')})")
+    return f'Отмечаю привычку «{p.get("habit_name")}» на {when}: {label}{future_note}'
 
 
 @mcp.tool()
@@ -8891,9 +8954,9 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
     Args:
         habit_name: Name of the habit (shown first in the summary you show the user, see get_habits) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         habit_id: ID of the habit
-        date: Date to check in as YYYY-MM-DD (optional; defaults to today — pass a past date to backfill)
+        date: Date to check in as YYYY-MM-DD (optional; defaults to today — pass a past date to backfill). A FUTURE date is accepted (not blocked — may be intentional), but the response warns about it rather than staying silent.
         status: 2 = done (default), 1 = failed, 0 = not done
-        value: Numeric value for quantitative habits (optional; defaults to the goal when done)
+        value: Numeric value for quantitative habits (optional; defaults to the goal when done). For a BOOLEAN (yes/no) habit this is refused unless it's 0 or the habit's own goal — passing an unrelated number (e.g. a quantitative habit's value by mistake) would silently record nonsense otherwise, and the habit's type is only known from the live habit (fetched during execution), not from this call's arguments alone.
         manifest_id: from call #1's response — pass on call #2 to actually record
         {{GATE_ARGS_TAIL}}
 
@@ -8904,18 +8967,10 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
         return err
     if status not in (0, 1, 2):
         return "🛑 Неверный status. Используй 2 (done), 1 (failed) или 0 (not done). Ничего не записано."
-    # Strict date validation: '2026-7-4' would silently become stamp 202674
-    # downstream (int(date.replace("-", ""))). strptime alone does NOT catch
-    # this — it happily parses non-zero-padded '2026-7-4' — so the format is
-    # also round-tripped back through strftime to enforce YYYY-MM-DD exactly.
     if date is not None:
-        try:
-            parsed = datetime.strptime(date, "%Y-%m-%d")
-            if parsed.strftime("%Y-%m-%d") != date:
-                raise ValueError("not zero-padded")
-        except ValueError:
-            return (f"🛑 Неверный формат даты {date!r} — нужно строго "
-                    "YYYY-MM-DD (например 2026-07-04). Ничего не записано.")
+        date_err = _validate_habit_date(date)
+        if date_err:
+            return date_err + " Ничего не записано."
 
     params = {"habit_name": habit_name, "habit_id": habit_id, "date": date,
               "status": status, "value": value}
@@ -8950,8 +9005,34 @@ async def _checkin_habit_impl(habit_name: str, habit_id: str, date: str = None,
             goal = float(habit.get("goal") or 1.0)
         except (TypeError, ValueError):
             goal = 1.0
+        # value только имеет смысл для количественных привычек (Real) — для
+        # boolean (да/нет) TickTick сам считает "выполнено" = goal, "нет" = 0,
+        # а любое другое число (живой пример: value=99 на привычке с goal=1)
+        # записывалось бы как "выполнено, значение 99.0/1.0" — бессмысленно и
+        # никак не отражается в приложении как что-то осмысленное. Отказываем
+        # явно (тот же fail-closed стиль, что у status/date/habit_type/section
+        # выше) вместо того, чтобы молча подменить value на дефолт — молчаливая
+        # подмена спрятала бы то, что вызывающий явно попросил другое.
+        habit_type = str(habit.get("type") or "").lower()
+        if habit_type == "boolean" and value is not None:
+            try:
+                v_num = float(value)
+            except (TypeError, ValueError):
+                v_num = None
+            if v_num is None or v_num not in (0.0, goal):
+                return (f"🛑 НЕ отметил — «{real_name}» это да/нет-привычка "
+                        f"(boolean), value={value!r} для неё не имеет смысла "
+                        f"(допустимо не задавать value вовсе, либо {goal:g} "
+                        "для «выполнено» / 0 для остального — value для "
+                        "количественных привычек). Ничего не записано.")
         stamp = int((date or datetime.now().strftime("%Y-%m-%d")).replace("-", ""))
         when_fmt = datetime.strptime(str(stamp), "%Y%m%d").strftime("%d.%m.%Y")
+        future_note = ""
+        if date is not None and _is_future_habit_date(date):
+            future_note = ("\n- ⚠️ дата в будущем (сегодня "
+                            f"{datetime.now(_USER_TZ).strftime('%d.%m.%Y')}) — "
+                            "backfill в прошлое обычен, а вперёд — редко "
+                            "осмысленно; если это не опечатка, всё в порядке")
         # Duplicate detection: an unconditional 'add' on retry would double
         # the value for the same day.
         existing = await _run_blocking(
@@ -9001,7 +9082,8 @@ async def _checkin_habit_impl(habit_name: str, habit_id: str, date: str = None,
             return (f"### ✅ Чек-ин привычки «{real_name}»\n\n"
                     f"- дата: {when_fmt}\n"
                     f"- статус: **{w_label}**, значение {w_value}/{w_goal}\n"
-                    "- 🧾 подтверждено независимым чтением (`get_habit_checkins`) сразу после записи")
+                    "- 🧾 подтверждено независимым чтением (`get_habit_checkins`) сразу после записи"
+                    f"{future_note}")
         return (f"### ❌ Чек-ин «{real_name}» разошёлся с подтверждением\n\n"
                 f"- дата: {when_fmt}\n"
                 f"- запрошено: **{labels[status]}** ({val}/{goal})\n"
@@ -9191,6 +9273,13 @@ async def delete_habit(habit_name: str, habit_id: str, manifest_id: str = "",
     mutation either way. A snapshot of the habit is written to the mutation
     journal first, since nothing else can bring it back.
 
+    The "successful check-ins" count in the result is read fresh from live
+    check-in records right before the delete, NOT from the habit's own
+    totalCheckIns field (that field lags — it can disagree with what
+    get_habit_checkins shows moments earlier). If that fresh read itself
+    fails, the count shows as "?" rather than a stale/wrong number; the
+    deletion itself still proceeds (identity is already verified by then).
+
     Args:
         habit_name: Name of the habit (shown first in the summary you show the user, see get_habits) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         habit_id: ID of the habit to delete (see get_habits)
@@ -9287,12 +9376,29 @@ async def _delete_habit_impl(habit_name: str, habit_id: str) -> str:
         # confirmed-by-the-owner delete), but the RESULT text below reports
         # what actually happened — claiming a snapshot that was never written
         # would be exactly the kind of lie the output rules forbid.
-        checkins = habit.get("totalCheckIns", 0)
+        # Реальный счёт успешных отметок — ЖИВЫМ чтением check-in'ов, а НЕ
+        # habit.get("totalCheckIns") (та же причина правки, что в get_habits:
+        # поле у TickTick подвисает и расходится с get_habit_checkins буквально
+        # в соседнем вызове — живьём delete_habit печатал «успешных было 3»,
+        # хотя get_habit_checkins прямо перед этим показывал 4 done-записи).
+        # Читаем ДО удаления (после — истории уже не будет), но неудача этого
+        # чтения НЕ блокирует подтверждённое владельцем необратимое удаление —
+        # честнее показать «?», чем застопорить удаление или соврать устаревшим
+        # числом.
+        try:
+            checkins_map = await _run_blocking(
+                lambda: ticktick_v2.get_habit_checkins([habit_id], 0))
+            checkins_str = str(sum(1 for e in checkins_map.get(habit_id, [])
+                                   if e.get("status") == 2))
+        except Exception as e:
+            checkins_str = "?"
+            logger.warning("delete_habit: не удалось перечитать check-ins для "
+                           f"точного счёта ({e}) — в отчёте будет «?».")
         journal_path = _journal_write({
             "ts": datetime.now(timezone.utc).isoformat(),
             "record": "delete_habit-" + uuid.uuid4().hex[:8],
             "op": "delete_habit",
-            "summary": f"Удаление привычки «{real_name}» ({checkins} отметок)",
+            "summary": f"Удаление привычки «{real_name}» ({checkins_str} отметок)",
             "snapshot": habit,
         })
 
@@ -9319,7 +9425,7 @@ async def _delete_habit_impl(habit_name: str, habit_id: str) -> str:
                      "по данным сервера не выйдет")
         return (f"### ✅ Привычка «{real_name}» удалена (проверено)\n\n"
                 f"- вместе с ней ушла вся история отметок (успешных было "
-                f"**{checkins}**, провалы и пропуски тоже стёрты)\n"
+                f"**{checkins_str}**, провалы и пропуски тоже стёрты)\n"
                 f"{snap_line}\n"
                 "- 🧾 подтверждено отдельным живым чтением списка привычек "
                 "(`get_habits`) сразу после удаления")
@@ -9333,22 +9439,56 @@ async def get_habit_checkins(habit_name: str, habit_id: str, after_date: str) ->
     """
     Get a habit's check-in history (requires v2 API).
 
+    habit_id is cross-checked against habit_name using the LIVE habit list
+    before anything is returned (same _names_agree identity guard
+    checkin_habit/delete_habit already use) — a mismatched pair used to
+    silently return a DIFFERENT habit's check-ins, printed under the name you
+    asked about. This is the independent check checkin_habit's own docstring
+    promises ("сервер сам перечитывает check-ins свежим запросом") — it only
+    holds if a mismatched id can't quietly hand back someone else's history.
+
     Args:
-        habit_name: Name of the habit (shown first in the summary you show the user, see get_habits) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
+        habit_name: Name of the habit (shown first in the summary you show the user, see get_habits) — cross-checked against habit_id below; a mismatch refuses instead of returning the wrong habit's data
         habit_id: ID of the habit
         after_date: Only return check-ins on/after this date, as YYYY-MM-DD
     """
     err = _ensure_ready()
     if err:
         return err
+    date_err = _validate_habit_date(after_date)
+    if date_err:
+        return date_err
     try:
+        # Identity guard (same pattern as checkin_habit/delete_habit): a read
+        # failure here fails CLOSED, not open — unlike delete_habit's plan
+        # phase (which has a second, unconditional guard on execution to fall
+        # back on), this read-only tool has only ONE chance to catch a
+        # mismatched pair, so a network hiccup must not silently let it
+        # through unverified.
+        try:
+            habits = await _run_blocking(lambda: ticktick_v2.get_habits())
+        except Exception as e:
+            return (f"⚠️ Не удалось сверить habit_id с «{habit_name}» (чтение "
+                    f"списка привычек упало: {_redact_for_user(e)}) — "
+                    "чек-ины не показаны, чтобы не подставить чужие данные "
+                    "под этим именем. Повтори запрос.")
+        habit = next((h for h in habits if h.get("id") == habit_id), None)
+        if habit is None:
+            return (f"🛑 Привычка с id {str(habit_id)[:12]}… не найдена в "
+                    "живом списке (см. get_habits).")
+        real_name = habit.get("name") or ""
+        if not _names_agree(habit_name, real_name):
+            return (f"🛑 habit_id указывает на «{real_name}», а НЕ "
+                    f"«{habit_name}» (защита от «не той привычки») — "
+                    "чек-ины не показаны.")
+
         # afterStamp is exclusive (>) on the API side; subtract 1 so the
         # requested date itself is included (YYYYMMDD is monotonic).
         stamp = int(after_date.replace("-", "")) - 1
         result = await _run_blocking(lambda: ticktick_v2.get_habit_checkins([habit_id], stamp))
         entries = result.get(habit_id, [])
         if not entries:
-            return f"No check-ins for '{habit_name}' since {after_date}."
+            return f"No check-ins for '{real_name}' since {after_date}."
         labels = {2: "✓ done", 1: "✗ failed", 0: "○ not done"}
         # API отдаёт записи в произвольном порядке (живьём: 20260529 → 20260531
         # → 20260530 → 20260605) — серию по такому списку глазами не посчитать.
@@ -9363,7 +9503,7 @@ async def get_habit_checkins(habit_name: str, habit_id: str, after_date: str) ->
                  f"(value {e.get('value')}/{e.get('goal')})" for e in entries]
         # Одно число «(31)» прочитывалось как «31 раз сделал» — разбивка не
         # даёт спутать записи в журнале с выполнениями.
-        return (f"Check-ins for '{habit_name}' — {len(entries)} entries: "
+        return (f"Check-ins for '{real_name}' — {len(entries)} entries: "
                 f"{done} done, {failed} failed, {skipped} not done "
                 f"(oldest first):\n" + "\n".join(lines))
     except Exception as e:

@@ -16,12 +16,25 @@
   * записи шли в том порядке, в каком их отдал API, то есть вперемешку
     (20260529 → 20260531 → 20260530 → 20260605), и серию нельзя было
     посчитать глазами.
+
+QA-раунд 2 (2026-08-19) — переименования оказалось мало: поле totalCheckIns
+не просто не различает успех/провал, оно ещё и УСТАРЕВАЕТ (живьём: чек-ин
+сразу после записи не попадал в него при следующем get_habits — «done: 0»;
+delete_habit печатал «успешных было 3», хотя get_habit_checkins непосредственно
+перед этим показывал 4 done-записи). Правка ниже: get_habits больше НЕ читает
+totalCheckIns вообще — «done» теперь считается по-настоящему, ЖИВЫМ batch-
+чтением check-in'ов (тем же вызовом get_habit_checkins использует), поэтому
+FakeV2.get_habits() ниже больше не эмулирует «плохое» поле — счёт целиком
+идёт из CHECKINS.
 """
 import ticktick_mcp.src.server as s
 
 HABIT = {"id": "h1", "name": "Растяжка", "goal": 1.0, "unit": "Count",
          "type": "Boolean", "repeatRule": "RRULE:FREQ=WEEKLY;INTERVAL=1;TT_TIMES=3",
-         # Ровно то, что отдаёт живой API: 18 при 31 фактической отметке.
+         # Значение поля больше не читается get_habits вовсе (см. QA-раунд 2
+         # выше) — оставлено намеренно РАСХОДЯЩИМСЯ с CHECKINS (18 против 3
+         # реальных done), чтобы тест ниже доказывал, что именно расхождение
+         # НЕ просачивается наружу.
          "totalCheckIns": 18}
 
 # Порядок специально «как из API» — вперемешку, как в живом ответе.
@@ -48,16 +61,50 @@ class FakeV2:
 
 
 async def test_habits_do_not_call_successes_a_total(monkeypatch):
-    """«total check-ins» — неправда: провалы и пропуски туда не попадают."""
+    """«total check-ins» — неправда: провалы и пропуски туда не попадают.
+    Обновлено QA-раунд 2: теперь ещё и число берётся из ЖИВЫХ записей (3
+    done среди CHECKINS), а НЕ из устаревшего HABIT["totalCheckIns"]=18 —
+    расхождение специально заложено в фикстуру, чтобы это доказать."""
     monkeypatch.setattr(s, "ticktick_v2", FakeV2())
 
     out = await s.get_habits()
 
-    assert "18" in out, out
+    assert "done: 3" in out, out
+    assert "18" not in out, out
     assert "total check-ins" not in out.lower(), out
-    # Названо, что счётчик про УСПЕШНЫЕ отметки, и сказано, где смотреть все.
-    assert "done" in out.lower(), out
-    assert "get_habit_checkins" in out, out
+    # Названо честно: это реальный счёт, а не счётчик TickTick.
+    assert "actual" in out.lower(), out
+
+
+async def test_habits_done_count_is_recomputed_not_stale(monkeypatch):
+    """Живой QA-баг (2026-08-19): checkin_habit(status=2) сразу за которым
+    get_habits показывал done: 0 — поле TickTick подвисает. Проверяем, что
+    get_habits вообще не смотрит в totalCheckIns: FakeV2 ниже отдаёт habit с
+    totalCheckIns=0 (как сразу после чек-ина), но CHECKINS всё равно
+    показывают 3 done — именно 3 и должно попасть в вывод."""
+    habit_stale = dict(HABIT, totalCheckIns=0)
+    monkeypatch.setattr(s, "ticktick_v2", FakeV2(habits=[habit_stale]))
+
+    out = await s.get_habits()
+
+    assert "done: 3" in out, out
+    assert "done: 0" not in out, out
+
+
+async def test_habits_done_count_falls_back_to_unknown_on_read_failure(monkeypatch):
+    """Пересчёт стоит одного лишнего запроса — если он упал, честнее
+    показать «?», чем откатиться на устаревшее totalCheckIns."""
+    class RaisingV2(FakeV2):
+        def get_habit_checkins(self, habit_ids, after_stamp):
+            self.asked_after_stamp = after_stamp
+            raise RuntimeError("network blip")
+
+    monkeypatch.setattr(s, "ticktick_v2", RaisingV2())
+
+    out = await s.get_habits()
+
+    assert "done: ?" in out, out
+    assert "18" not in out, out
 
 
 async def test_checkin_dates_are_human_readable(monkeypatch):
