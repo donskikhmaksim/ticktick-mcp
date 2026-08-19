@@ -28,7 +28,7 @@ import time
 import urllib.parse
 import uuid
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -360,21 +360,40 @@ class TickTickV2Client:
 
     def get_completed_tasks(self, limit: int = 50, from_str: str = "",
                             to_str: str = None) -> List[Dict]:
-        """Recently completed tasks across all lists (v2 endpoint, max 100).
-        from_str/to_str are 'YYYY-MM-DD HH:MM:SS' bounds (empty = unbounded)."""
+        """Recently completed tasks across all lists (v2 endpoint, max 100),
+        sorted newest-completed first (by completedTime, NOT by due date).
+
+        from_str/to_str are 'YYYY-MM-DD HH:MM:SS' bounds (empty = unbounded)
+        that TickTick applies to completedTime **in UTC** — the same clock the
+        API stamps completedTime with. Callers passing their own bounds must
+        pass UTC wall-clock strings (get_changes does exactly that and says so
+        in its docstring).
+        """
         limit = max(1, min(limit, COMPLETED_MAX_LIMIT))
         if to_str is None:
-            # 2026-08-09: было datetime.now() без tz — время ПРОЦЕССА
-            # (сервер на Railway обычно в UTC), а не владельца. Весь
-            # остальной код в этом файле аккуратно ходит через _USER_TZ
-            # (см. её докстринг выше), чтобы "сейчас" для фильтра/среза
-            # совпадало с тем, что владелец считает "сейчас" у себя. Эта
-            # верхняя граница "recently completed" была единственным
-            # местом, где это правило нарушалось.
-            to_str = datetime.now(_USER_TZ).strftime("%Y-%m-%d %H:%M:%S")
+            # 2026-08-19 (QA-2, воспроизведено вживую): здесь стояло
+            # datetime.now(_USER_TZ) — «фикс» от 2026-08-09, который сам был
+            # багом. Сервер TickTick сравнивает from/to с completedTime в
+            # UTC, поэтому строка «сейчас по LA» читалась им как «UTC на 7
+            # часов НАЗАД» — и всё, что владелец завершил за последние ~7
+            # часов, вырезалось из ленты «recently completed» (при этом
+            # get_changes с to="…23:59:59" ту же задачу видел — что и выдало
+            # трактовку границы как UTC). До 2026-08-09 голый datetime.now()
+            # был случайно верен лишь потому, что Railway живёт в UTC.
+            # Правильное «сейчас» тут — UTC; +1 день запаса делает границу
+            # безвредной даже при рассинхроне часов, ничего не отрезая:
+            # завершений из будущего не бывает.
+            to_str = (datetime.now(timezone.utc)
+                      + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
         params = {"from": from_str, "to": to_str, "limit": limit}
         data = self._request("GET", "/project/all/completed", params=params)
-        return data if isinstance(data, list) else data.get("tasks", [])
+        tasks = data if isinstance(data, list) else data.get("tasks", [])
+        # Порядок ленты у API не гарантирован (наблюдался вперемешку) —
+        # «recently completed» обязан начинаться с завершённого минуту назад.
+        # completedTime — ISO-строки, лексикографическое сравнение корректно;
+        # задачи без completedTime ("" < любой даты) уходят в хвост.
+        tasks.sort(key=lambda t: t.get("completedTime") or "", reverse=True)
+        return tasks
 
     def find_task_any_state(self, task_id: str) -> Tuple[Optional[Dict], Optional[str]]:
         """Locate a task by id across ALL THREE read paths this client has, and

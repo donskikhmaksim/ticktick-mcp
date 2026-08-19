@@ -8941,7 +8941,16 @@ _V2_DISABLED_MSG = (
 @mcp.tool(annotations=READONLY)
 async def get_completed_tasks(limit: int = 100) -> str:
     """
-    Get recently completed tasks across all lists (requires v2 API).
+    Get recently completed tasks across all lists (requires v2 API), newest
+    completion FIRST: sorted by actual completion time (completedTime), not
+    by due date — a task completed a minute ago is the first line.
+
+    COVERAGE — the feed is a page, not an archive: TickTick serves at most
+    100 most-recently-completed tasks per call (same shape as get_trash's
+    500-entry page and find_untitled_tasks' scan window). Anything completed
+    long enough ago falls off this feed — absence here means "not among the
+    newest 100", never "was not completed"; check get_task / get_changes for
+    an individual task's fate.
 
     Asking for more than the feed can serve is answered honestly: the reply
     says the feed's own per-call ceiling was hit, instead of passing off
@@ -8957,7 +8966,13 @@ async def get_completed_tasks(limit: int = 100) -> str:
     try:
         tasks = await _run_blocking(lambda: ticktick_v2.get_completed_tasks(limit=limit))
         if not tasks:
-            return "No completed tasks found."
+            # Не «completed tasks не существует», а «лента недавних пуста»:
+            # этот фид отдаёт только новейшие завершения, и пустой ответ
+            # не опровергает завершений в далёком прошлом.
+            return ("No tasks in the recently-completed feed. (It serves only "
+                    "the newest completions — this is not proof that nothing "
+                    "was ever completed; check get_task / get_changes for a "
+                    "specific task.)")
         out = f"Completed tasks ({len(tasks)}):\n\n"
         # limit=len(tasks), NOT format_task_list's default 100: the client has
         # already applied the caller's limit (and the feed's ceiling) when
@@ -14798,6 +14813,10 @@ async def search_all_tasks(
     Args:
         query: Text to search for.
         include_completed: Also search recently completed tasks (default True).
+            Coverage caveat: the completed feed serves only the ~100 most
+            recently completed tasks — a task completed long ago is beyond
+            this search's reach, so a miss means "not among the newest 100
+            completed", not "never existed".
         scope: 'both' | 'open' | 'closed'.
         match: 'substring' | 'word'.
         fields: 'all' | 'title' | 'content'.
