@@ -3321,6 +3321,15 @@ async def get_project_tasks(project_id: str, limit: int = _PROJECT_TASKS_PAGE,
         tasks = project_data.get('tasks', [])
         pname = project_data.get('project', {}).get('name', project_id)
         if not tasks:
+            # «Проекта нет» и «проект пуст» — РАЗНЫЕ ответы (QA-2 2026-08-19,
+            # дефект №12): на несуществующий id API отдаёт пустое тело без
+            # ошибки, и «No tasks found in project '<id>'» читался как пустой
+            # СУЩЕСТВУЮЩИЙ проект. Признак — у настоящего проекта всегда есть
+            # имя; пустой project-блок означает, что id никуда не ведёт.
+            if not project_data.get('project', {}).get('name'):
+                return (f"🛑 Проект по id {project_id} не найден (или "
+                        "недоступен) — это НЕ пустой проект. Проверь id через "
+                        "get_projects.")
             return f"No tasks found in project '{pname}'."
 
         # def-E1: раньше печатались ВСЕ задачи проекта — на боевом проекте из
@@ -3411,10 +3420,26 @@ async def get_task(project_id: str, task_id: str) -> str:
     if err:
         return err
 
+    # Пара project_id/task_id, которая друг другу не соответствует (задача
+    # лежит в другом списке), у официального API отвечает ГОЛЫМ 500 — без
+    # единого слова о причине (QA-2 2026-08-19, дефект №10). Обе ветки ошибки
+    # ниже приклеивают эту подсказку к уже человеческому тексту
+    # `_humanize_api_error`, чтобы человек знал и что случилось, и что делать.
+    mismatch_hint = (
+        "\nЧастая причина: project_id и task_id не соответствуют друг другу "
+        "(задача лежит в другом проекте) — официальный API на это отвечает "
+        "500. Проверь пару, или вызови get_task_info(task_id) — он ищет по "
+        "всем спискам, включая завершённые и корзину.")
+
+    def _with_hint(text: str, source: Any) -> str:
+        return (text + mismatch_hint
+                if _HTTP_STATUS_RE.search(str(source)) else text)
+
     try:
         task = await _run_blocking(lambda: ticktick.get_task(project_id, task_id))
         if isinstance(task, dict) and 'error' in task:
-            return _tool_error("fetching task", task['error'])
+            return _with_hint(_tool_error("fetching task", task['error']),
+                              task['error'])
 
         # Пустой/чужой ответ — это ОТКАЗ, а не карточка «No title / Active».
         refusal = _identity_or_refusal(
@@ -3429,7 +3454,7 @@ async def get_task(project_id: str, task_id: str) -> str:
         return format_task(task, trash_state=in_trash) + note
     except Exception as e:
         logger.exception("Error in get_task")
-        return _tool_error("fetching task", e)
+        return _with_hint(_tool_error("fetching task", e), e)
 
 def _build_v2_task_obj(node: Dict, project_id: str, task_id: str,
                        parent_id: str = None) -> Dict:
@@ -4395,6 +4420,13 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
         pid = t.get("project_id") or t.get("projectId") or ""
         if not title:
             refused.append(f"#{i}: нет title")
+            continue
+        # Дата неподдерживаемого формата — отказ строки, а не задача БЕЗ
+        # даты (QA-2, дефект №8: «2026-08-19 20:00» теперь принимается выше
+        # в _resolve_relative_date, всё непринимаемое обязано быть названо).
+        date_why = _date_format_refusal(t)
+        if date_why:
+            refused.append(f"#{i} «{title}»: {date_why}")
             continue
         if not pid:
             pending.append((i, t))
@@ -6507,6 +6539,40 @@ def _verdict_display_name(item: Dict) -> str:
     return f"[task {str(tid)[:8]}…]"
 
 
+# Есть ли в строке даты явное смещение/зона — по нему решается, чью зону
+# подставлять «голому» времени при семантическом сравнении моментов.
+_TZ_SUFFIX_RE = re.compile(r"(?:Z|[+-]\d{2}:?\d{2})\s*$")
+
+
+def _verify_dates_equal(got: str, want: str) -> bool:
+    """Сравнение дат для пост-проверки — ПО МОМЕНТУ, а не по буквам строки
+    (QA-2 2026-08-19, дефект №9): TickTick хранит «2026-08-20T03:00:00.000
+    +0000», вызывающий просил «2026-08-19T20:00:00-07:00» — это ОДИН момент,
+    а сравнение срезов [:10] объявляло исправное обновление «не применилось»
+    (даты по разные стороны полуночи UTC).
+
+    Правила:
+      * хотя бы одна сторона — голая дата (all-day) → календарное сравнение
+        [:10], как раньше: у all-day зоны нет по определению (#36);
+      * обе — моменты и парсятся → сравнение aware-datetime; значение БЕЗ
+        смещения читается в зоне ВЛАДЕЛЬЦА (_USER_TZ — America/Los_Angeles у
+        Максима, не UTC) для ожидания вызывающего и в UTC для значения из
+        TickTick (его канал всегда шлёт +0000);
+      * не парсится → прежнее сравнение [:10] (мягче, чем ложная тревога)."""
+    g, w = str(got).strip(), str(want).strip()
+    if _DATE_ONLY.match(g) or _DATE_ONLY.match(w):
+        return g[:10] == w[:10]
+    gdt = _parse_ticktick_datetime(g)
+    wdt = _parse_ticktick_datetime(w)
+    if gdt is None or wdt is None:
+        return g[:10] == w[:10]
+    if not _TZ_SUFFIX_RE.search(w):
+        wdt = wdt.replace(tzinfo=_USER_TZ)
+    if not _TZ_SUFFIX_RE.search(g):
+        gdt = gdt.replace(tzinfo=timezone.utc)
+    return gdt == wdt
+
+
 def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
                  names: Dict) -> _ItemVerdict:
     """Один вердикт по одной записи из журнала, по ТЕКУЩЕМУ живому состоянию.
@@ -6844,7 +6910,7 @@ def _verify_item_core(op: str, item: Dict, live_map: Dict[str, Dict],
             got = live.get(field)
             if field in ("dueDate", "startDate") and isinstance(got, str) \
                     and isinstance(want, str):
-                if got[:10] != want[:10]:
+                if not _verify_dates_equal(got, want):
                     diffs.append(f"{field}: {got!r} ≠ {want!r}")
             elif field == "tags":
                 if set(got or []) != set(want or []):
@@ -7890,12 +7956,23 @@ _WEEKDAY_NAMES = {
 }
 
 
+# «2026-08-19 20:00» / «2026-08-19 20:00:30» — дата-время с ПРОБЕЛОМ вместо
+# «T» и без смещения. До QA-2 (2026-08-19, дефект №8) такое значение молча
+# проезжало в API как есть, TickTick его отбрасывал, и задача создавалась
+# БЕЗ даты — ни ответ, ни operation_report о потере не говорили.
+_SPACE_DATETIME_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})[ ](\d{2}:\d{2}(?::\d{2})?)$")
+
+
 def _resolve_relative_date(value):
     """'today'/'tomorrow'/'yesterday' or a bare weekday name (RU too,
     case-insensitive) -> real 'YYYY-MM-DD' from THIS server's clock.
-    Anything else (an already-literal date, a full ISO timestamp, None)
-    passes through unchanged — idempotent, safe to call on values that were
-    already resolved."""
+    'YYYY-MM-DD HH:MM[:SS]' (a space instead of the ISO 'T', no offset) is
+    ACCEPTED as the owner's local time (_USER_TZ) and normalized to a full
+    ISO instant — QA-2 (2026-08-19, дефект №8): before, it silently produced
+    a task WITHOUT a date. Anything else (an already-literal date, a full
+    ISO timestamp, None) passes through unchanged — idempotent, safe to call
+    on values that were already resolved."""
     if not isinstance(value, str):
         return value
     key = value.strip().lower()
@@ -7907,7 +7984,34 @@ def _resolve_relative_date(value):
         today = _today_local()
         delta = (weekday - today.weekday()) % 7
         return (today + timedelta(days=delta)).isoformat()
+    m = _SPACE_DATETIME_RE.match(value.strip())
+    if m:
+        try:
+            dt = datetime.fromisoformat(f"{m.group(1)}T{m.group(2)}")
+        except ValueError:
+            return value
+        return dt.replace(tzinfo=_USER_TZ).strftime("%Y-%m-%dT%H:%M:%S.000%z")
     return value
+
+
+def _date_format_refusal(t: Dict[str, Any]) -> str:
+    """Причина отказа для строки создания с НЕподдерживаемым форматом даты,
+    или "" когда даты в порядке. Молча терять данные нельзя (QA-2, дефект
+    №8): значение, которое API не примет, обязано остановить строку на
+    плане, а не превратиться в задачу без даты. Зовётся ПОСЛЕ
+    `_resolve_dates_in_task_tree` — всё принимаемое уже нормализовано."""
+    for key in ("due_date", "start_date"):
+        raw = t.get(key)
+        if not raw:
+            continue
+        v = str(raw).strip()
+        if _DATE_ONLY.match(v):
+            continue
+        if _parse_ticktick_datetime(v) is None:
+            return (f"{key}={raw!r} — неподдерживаемый формат даты. Принимаю: "
+                    "YYYY-MM-DD, «YYYY-MM-DD HH:MM» (время владельца) или "
+                    "полный ISO 8601 (YYYY-MM-DDTHH:MM:SS±HH:MM)")
+    return ""
 
 
 def _resolve_dates_in_task_tree(node: Dict[str, Any]) -> None:
@@ -11601,6 +11705,18 @@ async def get_task_comments(task_title: str, project_id: str, task_id: str) -> s
     try:
         comments = await _run_blocking(lambda: ticktick_v2.get_task_comments(project_id, task_id))
         if not comments:
+            # «Задачи нет» и «комментариев нет» — РАЗНЫЕ ответы (QA-2
+            # 2026-08-19, дефект №12): канал комментариев отвечает пустотой и
+            # на несуществующий task_id. Одно точечное чтение по всем лентам
+            # (открытые/завершённые/корзина) — только на этой, уже пустой
+            # ветке; счастливый путь не платит ничем.
+            found, _where, readable = await _run_blocking(
+                _locate_task_any_state, task_id)
+            if readable and found is None:
+                return (f"🛑 Задача по id {task_id} не найдена ни среди "
+                        "открытых, ни среди завершённых, ни в корзине — "
+                        "«нет комментариев» сказать не о чем. Проверь id "
+                        "через get_task_info(task_id).")
             return f"No comments on task '{task_title}'."
         out = f"Comments on '{task_title}' ({len(comments)}):\n\n"
         for c in comments:
@@ -11845,19 +11961,33 @@ async def get_trash(limit: int = 50) -> str:
 
     Args:
         limit: How many trashed tasks to print (default 50, max 500 — the
-            page ceiling). Anything not printed is announced, never dropped
-            silently.
+            page ceiling). Values below 1 are refused; values above 500 are
+            clamped to 500 and the answer says so. Anything not printed is
+            announced, never dropped silently.
     """
     err = (await _run_blocking(_ensure_ready))
     if err:
         return err
+    # Границы limit — ЯВНО (QA-2 2026-08-19, дефект №11): limit=0 молча
+    # печатал одну запись (max(1, …) читался как «одна и есть»), а
+    # limit=99999 печатал всю страницу и ронял ответ об лимит размера MCP.
+    # Бессмысленное значение отклоняется, превышение потолка КЛЭМПИТСЯ вслух.
+    if limit < 1:
+        return (f"🛑 limit={limit} не имеет смысла — передай от 1 до "
+                f"{TRASH_MAX_LIMIT} (потолок страницы корзины).")
+    clamp_note = ""
+    if limit > TRASH_MAX_LIMIT:
+        clamp_note = (f"ℹ️ limit={limit} больше потолка страницы — обрезан "
+                      f"до {TRASH_MAX_LIMIT}.\n")
+        limit = TRASH_MAX_LIMIT
     try:
         # Always ask for the full page, not `limit`: asking for exactly what we
         # print makes truncation INVISIBLE — a bare get_trash() used to answer
         # «Trashed tasks (50):» with nothing else while the trash really held
         # 497 (live, 2026-08-07). Fetching the ceiling costs the same single
-        # request (restore_tasks already does it) and is what lets the answer
-        # state the true total. «Showing 50» must never read as «there are 50».
+        # request (the restore path already does it) and is what lets the
+        # answer state the true total. «Showing 50» must never read as «there
+        # are 50».
         tasks = await _run_blocking(lambda: ticktick_v2.get_trash(TRASH_MAX_LIMIT))
         if not tasks:
             return "Trash is empty."
@@ -11867,9 +11997,9 @@ async def get_trash(limit: int = 50) -> str:
         at_ceiling = len(tasks) >= TRASH_MAX_LIMIT
         total = f"{TRASH_MAX_LIMIT}+" if at_ceiling else str(len(tasks))
         if show < len(tasks) or at_ceiling:
-            out = f"Trashed tasks (showing {show} of {total}):\n\n"
+            out = clamp_note + f"Trashed tasks (showing {show} of {total}):\n\n"
         else:
-            out = f"Trashed tasks ({len(tasks)}):\n\n"
+            out = clamp_note + f"Trashed tasks ({len(tasks)}):\n\n"
         # limit=show: the slice is already exact, so format_task_list must not
         # apply its own hidden 100-entry cut on top (the 2026-08-07 defect).
         out += format_task_list(tasks[:show], limit=show)
