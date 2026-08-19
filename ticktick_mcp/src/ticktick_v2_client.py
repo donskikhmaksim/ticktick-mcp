@@ -1097,8 +1097,36 @@ class TickTickV2Client:
         POST /api/v1/attachment/upload/{projectId}/{taskId}/{attachmentId},
         multipart with a single `file` field."""
         if url:
-            r = requests.get(url, timeout=60)
-            r.raise_for_status()
+            # Скачивание ЧУЖОГО url — отдельный шаг с человеческой ошибкой
+            # (QA-2 2026-08-19, добор): битый адрес раньше улетал наружу сырым
+            # стектрейсом requests («HTTPSConnectionPool… NameResolutionError»),
+            # а HTTP-ошибка файлового сервера ещё и попадала в общий
+            # расшифровщик как ошибка ТИКТИКА («сервис TickTick недоступен»)
+            # — оба текста лгут о том, что случилось. Здесь известен контекст
+            # («не скачался ФАЙЛ, не API»), поэтому и формулируем здесь.
+            try:
+                r = requests.get(url, timeout=60)
+                r.raise_for_status()
+            except requests.exceptions.HTTPError as e:
+                # Статус — из ответа `r`, не из текста исключения: сюда
+                # попадает только raise_for_status() уже полученного ответа,
+                # а голый текст HTTPError наружу не идёт (см.
+                # tests/test_no_raw_exception_leaks.py).
+                status = getattr(r, "status_code", "?")
+                raise ValueError(
+                    "не удалось скачать файл по ссылке — сервер по этому "
+                    f"адресу ответил {status}. Проверь url: {url}") from e
+            except requests.exceptions.Timeout as e:
+                raise ValueError(
+                    "не удалось скачать файл по ссылке — сервер не ответил "
+                    f"за 60 секунд. Проверь адрес или попробуй позже: {url}"
+                ) from e
+            except requests.RequestException as e:
+                # ConnectionError/NameResolutionError и прочая сеть: имя
+                # хоста не разрешилось или соединение не установилось.
+                raise ValueError(
+                    "не удалось скачать файл по ссылке — проверь адрес "
+                    f"(хост не отвечает или не существует): {url}") from e
             data = r.content
             if not filename:
                 filename = url.split("?")[0].rstrip("/").split("/")[-1] or "attachment"

@@ -123,6 +123,14 @@ def _humanize_api_error(exc: Any) -> str:
     текст сохраняется в скобках для диагностики. Всё остальное проходит без
     изменений — это расшифровка, а не переписывание ошибок."""
     raw = _redact_for_user(exc)
+    # Сетевые ошибки БЕЗ HTTP-статуса (QA-2 2026-08-19, добор): DNS/connect
+    # выбрасывает «HTTPSConnectionPool(host=…) … NameResolutionError…» — сырой
+    # питоний стектрейст вместо ответа человеку. Расшифровываем так же, как
+    # HTTP-коды ниже: понятная фраза + исходный текст в скобках.
+    if ("NameResolutionError" in raw or "Failed to resolve" in raw
+            or "getaddrinfo" in raw):
+        return ("сетевая ошибка: имя хоста не разрешилось — проверь "
+                f"адрес/ссылку [{raw}]")
     m = _HTTP_STATUS_RE.search(raw)
     if not m:
         return raw
@@ -4344,6 +4352,30 @@ def _create_object_hash(raw: List[Dict[str, Any]]) -> str:
          for t in raw])
 
 
+def _merge_param_alias(d: Dict[str, Any], canon: str, alias: str) -> str:
+    """Принять `alias` как синоним `canon` в словаре-аргументе (QA-2
+    2026-08-19, добор №6): одна и та же концепция «родитель» звалась
+    `parent_id`/`parent_title` в plan_task_creation и `to_task_id`/`to_title`
+    в apply_task_changes(op="parent") — модель, выучившая один путь, ошибалась
+    на другом (наблюдалось в QA живьём). Ломать существующие имена нельзя
+    (на них завязаны тесты и живые вызовы), поэтому оба набора принимаются в
+    ОБЕИХ точках, канонизируясь in-place в родное имя точки.
+
+    Возвращает "" при успехе (alias скопирован в canon, если canon пуст) или
+    текст причины отказа, когда заданы ОБА имени с РАЗНЫМИ значениями — это
+    два разных утверждения об одном объекте, и сервер не выбирает между ними."""
+    a = d.get(alias)
+    if a is None:
+        return ""
+    c = d.get(canon)
+    if c is None or str(c).strip() == str(a).strip():
+        d[canon] = a if c is None else c
+        return ""
+    return (f"{canon}={c!r} и его синоним {alias}={a!r} заданы одновременно "
+            "и не совпадают — это два разных утверждения, сервер не выбирает "
+            "между ними")
+
+
 # БЕЗ readOnlyHint (2026-08-19, разбор QA-2). Аннотация врала дважды: (1) при
 # включённом аварийном выключателе (`TICKTICK_MCP_GATE_DISABLED`) этот
 # инструмент НЕМЕДЛЕННО исполняет план — создаёт задачи; (2) даже в обычном
@@ -4370,7 +4402,10 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     («2 — в Fix&Roll»); re-plan with explicit project_id for corrections.
 
     Attaching under an EXISTING task: pass parent_id AND parent_title (the
-    parent's current title). The plan checks the parent against live state
+    parent's current title). The apply_task_changes(op="parent") names
+    to_task_id/to_title are accepted here as exact synonyms of
+    parent_id/parent_title (passing both names with DIFFERENT values refuses
+    that row). The plan checks the parent against live state
     BEFORE it is shown — a parent that is completed, deleted or in the trash,
     or an id whose real title is a different one, drops that row from the
     plan entirely (it is never a confirmable line), because such a "subtask"
@@ -4432,6 +4467,14 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
         pid = t.get("project_id") or t.get("projectId") or ""
         if not title:
             refused.append(f"#{i}: нет title")
+            continue
+        # Синонимы имён родителя (QA-2, добор №6): to_task_id/to_title — имена
+        # той же концепции у apply_task_changes(op="parent") — принимаются и
+        # здесь; конфликт двух имён с разными значениями — отказ строки.
+        alias_why = (_merge_param_alias(t, "parent_id", "to_task_id")
+                     or _merge_param_alias(t, "parent_title", "to_title"))
+        if alias_why:
+            refused.append(f"#{i} «{title}»: {alias_why}")
             continue
         # Дата неподдерживаемого формата — отказ строки, а не задача БЕЗ
         # даты (QA-2, дефект №8: «2026-08-19 20:00» теперь принимается выше
@@ -4604,6 +4647,14 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
                      "(«2 — в Fix&Roll»), тогда план пересоберётся с явными "
                      "адресами._")
     lines.append("")
+    # Превью — В МАНИФЕСТ (QA-2 2026-08-19, добор: «подтверждение вслепую» в
+    # веб-хабе). `GET /pending-consents` отдаёт `m["preview"]`, а заполняли его
+    # только `_gate_batch`/`_gate_single` — у планов с СОБСТВЕННОЙ сборкой
+    # текста (этот, plan_task_deletion, delete_tasks, delete_project, слияние
+    # rename_tag) карточка в вебе показывала одну строку summary, сочинённую
+    # вызывающей моделью, — и именно у самых разрушительных планов состав был
+    # невидим. Текст уже собран — кладём его же.
+    _MANIFESTS[mid]["preview"] = "\n".join(lines)
     # Инструкция для модели («вызови execute_task_creation…») — ОТДЕЛЬНО от
     # человеческой части `lines` (2026-08-06, дефект №2): `_maybe_tg_notify_plan`
     # приклеивает её только к ответу модели, в Telegram-карточку плана она не
@@ -5745,6 +5796,14 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
             return cr.reason
         return await _execute_task_deletion_impl(manifest_id, m)
 
+    if tasks is None:
+        # Тот же класс, что у delete_tags (QA-2, добор №7): параметр не
+        # передан вовсе (например, опечатка в его имени) — это НЕ «пустой
+        # список», и отвечать надо отказом с именем параметра, а не тихим
+        # «нечего удалять», по которому вызывающий решит, что всё удалено.
+        return ("🛑 Параметр `tasks` обязателен на первом вызове: передай "
+                "список задач [{\"title\", \"projectName\", \"taskId\", "
+                "\"projectId\"}]. Ничего не удалено.")
     if not tasks:
         return "Нечего удалять: список пуст."
     # SINGLE task → direct delete allowed, but only fully armed: the title is
@@ -5870,6 +5929,9 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
             preview.append(f"{i}. **«{it['title']}»** — {it['project']} (`{it['taskId']}`)")
         preview.extend(lines)
         preview.append("")
+        # Превью — в манифест, для карточки веб-хаба `/pending-consents`
+        # (см. комментарий в plan_task_creation — тот же добор QA-2).
+        _MANIFESTS[mid]["preview"] = "\n".join(preview)
         # Инструкция для модели — ОТДЕЛЬНО от `preview` (2026-08-06, дефект
         # №2): раньше уходила дословно в Telegram-карточку плана.
         agent_tail = ("Покажи это пользователю дословно и ДОЖДИСЬ его "
@@ -6152,6 +6214,9 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
             f"«{m['title']}» — {m.get('reason') or 'не среди открытых'}"
             for m in missing))
     lines.append("")
+    # Превью — в манифест, для карточки веб-хаба `/pending-consents`
+    # (см. комментарий в plan_task_creation — тот же добор QA-2).
+    _MANIFESTS[mid]["preview"] = "\n".join(lines)
     # Инструкция для модели — ОТДЕЛЬНО от `lines` (2026-08-06, дефект №2):
     # раньше уходила дословно в Telegram-карточку плана.
     agent_tail = ("Покажи этот план пользователю дословно и ДОЖДИСЬ его "
@@ -7704,6 +7769,11 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
         # угадывать свой план по разнице списка ожидающих до/после вызова —
         # что и делал агент уборки, получив 19 «планов без идентификатора».
         lines.insert(1, _plan_id_line(new_mid, "ничего ещё не удалено"))
+        # Превью — в манифест, для карточки веб-хаба `/pending-consents`
+        # (см. комментарий в plan_task_creation — тот же добор QA-2):
+        # владелец в вебе обязан видеть, СКОЛЬКО задач умрёт вместе с
+        # проектом и какие, а не одну строку summary.
+        _MANIFESTS[new_mid]["preview"] = "\n".join(lines)
         return await _maybe_tg_notify_plan("delete_project", new_mid,
                                            "\n".join(lines), agent_tail)
 
@@ -11839,7 +11909,7 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
 
     Args:
         task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
-        text: Comment text
+        text: Comment text — must be non-empty; an empty/whitespace-only text is refused before anything is planned (TickTick would silently create a blank comment otherwise)
         project_id: ID of the project
         task_id: ID of the task
         manifest_id: from call #1's response — pass on call #2 to actually add
@@ -11879,6 +11949,14 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
     # гейта.
     name_warning = ""
     if not manifest_id:
+        # Пустой текст — отказ ДО гейта и ДО API (QA-2 2026-08-19, добор):
+        # TickTick молча создаёт комментарий с пустым телом, и «✅ добавлено»
+        # выглядело бы успехом операции, которой по смыслу не было. Только на
+        # call #1: на call #2 аргументы игнорируются, текст берётся из
+        # манифеста — он эту проверку уже прошёл.
+        if not (text or "").strip():
+            return ("🛑 Пустой текст комментария — добавлять нечего. Передай "
+                    "непустой text. Ничего не изменено.")
         g = _guard_task_incl_completed(task_id, task_title or "", project_id)
         refusal, warn = _guard_or_refuse(
             g, stage="план", expected=task_title, missing_says="message",
@@ -12635,6 +12713,21 @@ def _attachments_any_state(task_id: str) -> Optional[List[Dict]]:
         return None
 
 
+def _human_file_size(size) -> str:
+    """Размер файла по-человечески: байты — маленьким файлам, KB/MB — большим
+    (QA-2 2026-08-19, добор): `size // 1024` печатал «0 KB» для файла в 16
+    байт — при том что attach_file_to_task в своём отчёте называет точное
+    число байт. Округление до одного знака, хвост «.0» отбрасывается."""
+    size = int(size)
+    if size < 1024:
+        return f"{size} байт"
+    if size < 1024 * 1024:
+        shown = f"{size / 1024:.1f}".rstrip("0").rstrip(".")
+        return f"{shown} KB"
+    shown = f"{size / (1024 * 1024):.1f}".rstrip("0").rstrip(".")
+    return f"{shown} MB"
+
+
 @mcp.tool(annotations=READONLY)
 async def list_task_attachments(task_id: str, project_id: str = None) -> str:
     """
@@ -12666,7 +12759,8 @@ async def list_task_attachments(task_id: str, project_id: str = None) -> str:
             name = a.get("fileName") or a.get("name") or "(unnamed)"
             att_id = a.get("id") or "?"
             size = a.get("fileSize") or a.get("size")
-            size_str = f", {size // 1024} KB" if isinstance(size, (int, float)) else ""
+            size_str = (f", {_human_file_size(size)}"
+                        if isinstance(size, (int, float)) else "")
             out += f"  {i}. {name}  (id:{att_id}{size_str})\n"
         return out
     except Exception as e:
@@ -13299,6 +13393,10 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
                 # только код, живущий В ЭТОМ ЖЕ процессе (он читал `_MANIFESTS`
                 # напрямую) — ни один сетевой клиент так не может.
                 human_msg += "\n" + _plan_id_line(new_mid, "ничего ещё не тронуто")
+                # Превью — в манифест, для карточки веб-хаба
+                # `/pending-consents` (см. комментарий в plan_task_creation —
+                # тот же добор QA-2): карточка обязана называть ОБА тега.
+                _MANIFESTS[new_mid]["preview"] = human_msg
                 return await _maybe_tg_notify_plan("rename_tag", new_mid,
                                                    human_msg, agent_tail)
             if m is not None:
@@ -13585,6 +13683,16 @@ async def delete_tags(summary: str, tags: Optional[List[str]] = None,
         tags, fmt_err = _coerce_str_list_arg(tags, "tags")
         if fmt_err:
             return fmt_err
+        if tags is None:
+            # Параметр НЕ ПЕРЕДАН ВОВСЕ ≠ передан пустым (QA-2 2026-08-19,
+            # добор №7): живой вызов delete_tags(names=[...]) — опечатка в
+            # имени параметра — получал «Пустой список — нечего делать» и
+            # уходил уверенным, что теги удалены. Тихий no-op на опечатку —
+            # худший из ответов; настоящий [] ниже остаётся законным «нечего
+            # делать».
+            return ("🛑 Параметр `tags` обязателен: передай список имён "
+                    "тегов, например tags=[\"дом\", \"работа\"]. Ничего не "
+                    "удалено.")
         if not tags:
             return "Пустой список — нечего делать."
         # Живое состояние ДВАЖДЫ (2026-08-09): полные записи тегов (для
@@ -14093,7 +14201,7 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
 
     Args:
         task_title: Title of the task (shown first in the summary you show the user) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
-        text: New comment text
+        text: New comment text — must be non-empty; an empty/whitespace-only text is refused before anything is planned (that would silently blank the comment — deleting is delete_task_comment's job)
         project_id: ID of the project
         task_id: ID of the task
         comment_id: ID of the comment to edit
@@ -14129,6 +14237,14 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
     # же обоснованием — см. attach_file_to_task выше (та же правка).
     name_warning = ""
     if not manifest_id:
+        # Пустой новый текст — отказ ДО гейта и ДО API (QA-2 2026-08-19,
+        # добор, зеркало add_task_comment): «правка» на пустую строку молча
+        # СТИРАЛА бы комментарий под видом редактирования. Стирание — это
+        # delete_task_comment, и путать их сервер не должен.
+        if not (text or "").strip():
+            return ("🛑 Пустой новый текст — править не на что. Если нужно "
+                    "УДАЛИТЬ комментарий — это delete_task_comment. Ничего "
+                    "не изменено.")
         g = _guard_task_incl_completed(task_id, task_title or "", project_id)
         refusal, warn = _guard_or_refuse(
             g, stage="план", expected=task_title, says="message",
@@ -17722,6 +17838,15 @@ def _op_parent_validate(i: int, op: Dict, shown: str) -> Optional[str]:
         "Правка полей задачи — это отдельная операция op=\"update\".")
     if refusal:
         return refusal
+    # Синонимы имён родителя (QA-2, добор №6): parent_id/parent_title — имена
+    # той же концепции у plan_task_creation — принимаются и здесь (реально
+    # наблюдалось в QA: первый вызов с parent_id отвергался). Конфликт двух
+    # имён с разными значениями — отказ, сервер не выбирает между ними.
+    alias_why = (_merge_param_alias(op, "to_task_id", "parent_id")
+                 or _merge_param_alias(op, "to_title", "parent_title"))
+    if alias_why:
+        return (f"🛑 Отказ: операция #{i} («{shown}») — {alias_why}. "
+                "Ничего не сделано.")
     to_id = str(op.get("to_task_id") or "").strip()
     ref = str(op.get("parent_ref") or "").strip()
     if to_id and ref:
@@ -18959,6 +19084,9 @@ async def apply_task_changes(summary: str, operations: List[Dict[str, Any]] = No
         # project (TickTick does not nest across projects — move first):
         "to_task_id": "<id of the parent task>",
         "to_title":   "<the parent's exact CURRENT title>",
+        # plan_task_creation's names "parent_id"/"parent_title" are accepted
+        # as exact synonyms of to_task_id/to_title (both names with DIFFERENT
+        # values → the whole plan is refused):
         "to_untitled": true   # INSTEAD of "to_title", same rule as "untitled"
         # op="unparent" takes NO extra fields at all: which parent to detach
         # from is read from LIVE state, not taken from the plan.

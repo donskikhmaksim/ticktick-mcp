@@ -355,3 +355,99 @@ def test_matches_static_is_constant_time_and_does_not_need_a_store(monkeypatch):
             "пустой AUTOMATION_KEY не должен совпадать ни с чем")
     finally:
         ak.close_store()
+
+
+# ═══ QA-2 2026-08-19 (добор №9): revoke/list — по SCOPE, как find_window ═══
+#
+# После переезда генерации ключей в gmail-mcp боевые окна создаются со
+# server='gmail' (и scope, покрывающим несколько сервисов). `find_window` —
+# то, что реально открывает гейт, — принимает окно ЛЮБОГО создателя, чей
+# scope покрывает ticktick; а `revoke_all_windows`/`list_windows`/
+# `revoke_window` фильтровали `WHERE server='ticktick'` и таких окон НЕ
+# ВИДЕЛИ: кнопка «Выключить всё» отвечала «активных окон не было», а окно
+# продолжало открывать гейт. Теперь отзыв/список ходят той же scope-логикой,
+# что и допуск: гасится/показывается ровно то, что может открыть гейт этому
+# серверу; чужое (scope без ticktick) — не видно и не трогается.
+
+def _insert_foreign_server_window(ak, window_id, token, scope="all",
+                                  server="gmail"):
+    """Эмуляция строки, созданной gmail-mcp: чужой `server`, свой срок."""
+    now = ak._now_ms()
+    with ak._conn() as cur:
+        cur.execute(
+            """
+            INSERT INTO tg_automation_windows
+              (server, window_id, token_hash, label, created_at, expires_at,
+               revoked_at, created_by_chat, scope)
+            VALUES (%s, %s, %s, NULL, %s, %s, NULL, %s, %s)
+            """,
+            (server, window_id, ak._hash(token), now, now + 3600_000,
+             "gmail-mcp-chat", scope),
+        )
+
+
+def test_list_windows_sees_gmail_created_window_that_opens_this_gate():
+    ak = fresh_automation_key_store()
+    _insert_foreign_server_window(ak, "gm1", "gmail-token-1", scope="all")
+    # Контроль честности стенда: это окно РЕАЛЬНО открывает гейт ticktick.
+    assert ak.check_window("gmail-token-1") is True
+
+    rows = ak.list_windows()
+
+    assert [r["window_id"] for r in rows] == ["gm1"], (
+        "окно, способное открыть гейт, невидимо для «Списка»")
+
+
+def test_list_windows_hides_foreign_scope_window():
+    ak = fresh_automation_key_store()
+    _insert_foreign_server_window(ak, "gm2", "gmail-token-2",
+                                  scope="gmail,calendar")
+    assert ak.check_window("gmail-token-2") is False  # гейт оно не открывает
+
+    assert ak.list_windows() == []
+
+
+def test_revoke_all_kills_gmail_created_window():
+    """Кнопка «Выключить всё» обязана гасить ВСЁ, что открывает гейт этому
+    серверу, — раньше она отвечала «0» и окно продолжало действовать."""
+    ak = fresh_automation_key_store()
+    _insert_foreign_server_window(ak, "gm3", "gmail-token-3", scope="all")
+    assert ak.check_window("gmail-token-3") is True
+
+    assert ak.revoke_all_windows() == 1
+    assert ak.check_window("gmail-token-3") is False, (
+        "«Выключить всё» отчиталось, а окно продолжает открывать гейт")
+
+
+def test_revoke_all_does_not_touch_foreign_scope_windows():
+    """Чужое окно (scope без ticktick) этот сервер не гасит: оно не открывает
+    ЕГО гейт, а решать за gmail-mcp судьбу его окон — не наше дело."""
+    ak = fresh_automation_key_store()
+    _insert_foreign_server_window(ak, "gm4", "gmail-token-4",
+                                  scope="gmail,calendar")
+
+    assert ak.revoke_all_windows() == 0
+    with ak._conn() as cur:
+        cur.execute("SELECT revoked_at FROM tg_automation_windows "
+                    "WHERE window_id = %s", ("gm4",))
+        assert cur.fetchone()[0] is None, "чужое окно погашено без права"
+
+
+def test_revoke_window_by_id_works_on_gmail_created_window():
+    ak = fresh_automation_key_store()
+    _insert_foreign_server_window(ak, "gm5", "gmail-token-5", scope="all")
+
+    assert ak.revoke_window("gm5", "4242") is True
+    assert ak.check_window("gmail-token-5") is False
+
+
+def test_revoke_window_by_id_refuses_foreign_scope_window():
+    ak = fresh_automation_key_store()
+    _insert_foreign_server_window(ak, "gm6", "gmail-token-6",
+                                  scope="gmail,calendar")
+
+    assert ak.revoke_window("gm6", "4242") is False
+    with ak._conn() as cur:
+        cur.execute("SELECT revoked_at FROM tg_automation_windows "
+                    "WHERE window_id = %s", ("gm6",))
+        assert cur.fetchone()[0] is None
