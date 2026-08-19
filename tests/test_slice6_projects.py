@@ -149,20 +149,30 @@ async def test_create_project_wrong_automation_key_still_refused(monkeypatch):
 # ---------------------------------------------------------------------------
 
 class FakeOfficialUpdate:
-    def __init__(self, fresh, update_resp=None, update_error=None):
+    """`fresh` is the state get_project() reports AFTER a (successful)
+    update_project() call — i.e. what post-verify sees. `before`, when given,
+    is the state get_project() reports BEFORE any update_project() call —
+    i.e. what the no-op pre-check (2026-08-19, QA) sees. Tests that don't
+    care about the pre-check (guard refusals, mismatch/fetch-failure cases)
+    can omit `before`; it then defaults to `fresh` itself, same as before
+    this parameter existed."""
+    def __init__(self, fresh, update_resp=None, update_error=None, before=None):
         self._fresh = fresh
+        self._before = before if before is not None else dict(fresh)
         self._update_resp = update_resp if update_resp is not None else dict(fresh)
         self._update_error = update_error
         self.get_calls = 0
+        self._updated = False
 
     def update_project(self, project_id, name=None, color=None, view_mode=None):
         if self._update_error:
             return {"error": self._update_error}
+        self._updated = True
         return dict(self._update_resp)
 
     def get_project(self, project_id):
         self.get_calls += 1
-        return dict(self._fresh)
+        return dict(self._fresh if self._updated else self._before)
 
 
 def _wire_update(monkeypatch, fake, names=None):
@@ -172,13 +182,22 @@ def _wire_update(monkeypatch, fake, names=None):
 
 
 async def test_update_project_success_is_post_verified(monkeypatch):
-    fake = FakeOfficialUpdate({"id": "p1", "name": "Новое имя", "color": "#111111"})
+    # before != fresh: живая запись на момент вызова ЕЩЁ старая ("Работа"/
+    # другой цвет) — иначе no-op-пречек (2026-08-19, QA, тот же тест на
+    # дыру «ложный успех», что и tests/test_noop_false_success.py) увидел
+    # бы «уже такой» и отказался бы слать мутацию вовсе, хотя тест как раз
+    # проверяет путь НАСТОЯЩЕГО обновления.
+    fake = FakeOfficialUpdate({"id": "p1", "name": "Новое имя", "color": "#111111"},
+                              before={"id": "p1", "name": "Работа", "color": "#222222"})
     _wire_update(monkeypatch, fake)
     result = await _gated_call(s.update_project, "Работа", "p1", name="Новое имя", color="#111111")
     assert result.startswith("### ✅")
     assert "Новое имя" in result
     assert "🧾" in result
-    assert fake.get_calls == 1
+    # 2 живых чтения: no-op-пречек ДО отправки + независимая пост-сверка
+    # ПОСЛЕ — оба нужны (пречек не отменяет пост-сверку, это разные факты
+    # в разное время), поэтому больше не 1.
+    assert fake.get_calls == 2
 
 
 async def test_update_project_refused_by_guard(monkeypatch):
