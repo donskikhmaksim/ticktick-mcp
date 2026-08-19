@@ -5796,6 +5796,14 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
             return cr.reason
         return await _execute_task_deletion_impl(manifest_id, m)
 
+    if tasks is None:
+        # Тот же класс, что у delete_tags (QA-2, добор №7): параметр не
+        # передан вовсе (например, опечатка в его имени) — это НЕ «пустой
+        # список», и отвечать надо отказом с именем параметра, а не тихим
+        # «нечего удалять», по которому вызывающий решит, что всё удалено.
+        return ("🛑 Параметр `tasks` обязателен на первом вызове: передай "
+                "список задач [{\"title\", \"projectName\", \"taskId\", "
+                "\"projectId\"}]. Ничего не удалено.")
     if not tasks:
         return "Нечего удалять: список пуст."
     # SINGLE task → direct delete allowed, but only fully armed: the title is
@@ -13675,6 +13683,16 @@ async def delete_tags(summary: str, tags: Optional[List[str]] = None,
         tags, fmt_err = _coerce_str_list_arg(tags, "tags")
         if fmt_err:
             return fmt_err
+        if tags is None:
+            # Параметр НЕ ПЕРЕДАН ВОВСЕ ≠ передан пустым (QA-2 2026-08-19,
+            # добор №7): живой вызов delete_tags(names=[...]) — опечатка в
+            # имени параметра — получал «Пустой список — нечего делать» и
+            # уходил уверенным, что теги удалены. Тихий no-op на опечатку —
+            # худший из ответов; настоящий [] ниже остаётся законным «нечего
+            # делать».
+            return ("🛑 Параметр `tags` обязателен: передай список имён "
+                    "тегов, например tags=[\"дом\", \"работа\"]. Ничего не "
+                    "удалено.")
         if not tags:
             return "Пустой список — нечего делать."
         # Живое состояние ДВАЖДЫ (2026-08-09): полные записи тегов (для

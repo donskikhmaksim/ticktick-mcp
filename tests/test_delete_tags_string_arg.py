@@ -142,10 +142,18 @@ async def test_delete_tags_genuinely_empty_list_is_still_the_old_message(
     assert result == "Пустой список — нечего делать."
 
 
-async def test_delete_tags_none_is_still_the_old_message(monkeypatch):
+async def test_delete_tags_none_is_a_loud_refusal_not_nothing_to_do(monkeypatch):
+    """ПЕРЕПИСАН (QA-2 2026-08-19, добор №7) — раньше закреплял старое
+    поведение «None → "Пустой список — нечего делать"». Живой случай показал,
+    что это тихий no-op на опечатку в ИМЕНИ параметра (delete_tags(names=[…])
+    → tags=None → «нечего делать» → вызывающий уверен, что теги удалены).
+    Новый контракт: параметр не передан вовсе — явный отказ с именем
+    параметра; настоящий [] остаётся «нечего делать» (тест выше). Подробности
+    — tests/test_required_list_param_missing.py."""
     fake = FakeV2(tags=[])
     _wire(monkeypatch, fake)
 
     result = await s.delete_tags("Удаляю", tags=None)
 
-    assert result == "Пустой список — нечего делать."
+    assert "🛑" in result and "`tags` обязателен" in result, result
+    assert "нечего делать" not in result.lower(), result
