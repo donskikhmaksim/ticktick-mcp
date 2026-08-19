@@ -4519,7 +4519,30 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     # (с меткой канала `gate_disabled`), и приклеивает независимый отчёт —
     # разойтись двум путям исполнения тут негде.
     if _gate_disabled():
-        return await execute_task_creation(manifest_id=mid, user_reply="")
+        done = await execute_task_creation(manifest_id=mid, user_reply="")
+        # Потерянный контекст плана (2026-08-19, разбор QA-2): раньше эта
+        # ветка возвращала ТОЛЬКО отчёт исполнителя, выбрасывая собранные
+        # выше строки «исключено» (битый project_id, id не туда, отвалившийся
+        # родитель), пометки «❓ НЕ уверен» подсказчика проектов и «родитель
+        # НЕ сверен» — задача создавалась в проекте, в котором сервер сам не
+        # уверен, и человек об этом не узнавал. Образец честного поведения —
+        # такая же ветка в `delete_tasks`: предупреждения едут прямо в ответ.
+        killswitch_notes = []
+        if refused:
+            killswitch_notes.append(
+                f"🛑 **Исключены {len(refused)}:** " + "; ".join(refused))
+        unsure = [(t, pname, sug) for (t, pname, sug, _) in good
+                  if sug and (sug.get("confidence") or "unsure") != "sure"]
+        if unsure:
+            killswitch_notes.append(
+                "❓ Проект выбирал сервер и НЕ уверен: " + "; ".join(
+                    f"«{t.get('title')}» → «{pname}» "
+                    f"({sug.get('reason') or 'уточни проект'})"
+                    for t, pname, sug in unsure))
+        if any(lbl.endswith("НЕ сверено") for _, _, _, lbl in good):
+            killswitch_notes.append(_PARENT_UNVERIFIED_NOTE)
+        return ("\n".join([done, ""] + killswitch_notes)
+                if killswitch_notes else done)
     # Опциональный ТГ-фактор. При выключенном слое (дефолт) возвращает текст
     # плана БЕЗ единого изменения; при включённом — шлёт план кнопкой и
     # помечает манифест `tg_notified`, из-за чего execute-фаза начинает
@@ -5938,7 +5961,22 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
     # задач уходят в журнал, эффект перепроверяется свежим чтением, ровно как
     # на обычном пути.
     if _gate_disabled():
-        return await execute_task_deletion(manifest_id=mid, user_reply="")
+        done = await execute_task_deletion(manifest_id=mid, user_reply="")
+        # Потерянный контекст плана (2026-08-19, разбор QA-2): раньше эта
+        # ветка выбрасывала строки «не совпало» (`_mismatch_report`) и
+        # «исключены — не среди открытых» — человек получал отчёт об
+        # удалении и молча не узнавал, что часть списка вообще не тронута.
+        # Образец — та же ситуация в `delete_tasks`: предупреждения
+        # приклеиваются прямо к ответу.
+        killswitch_notes = []
+        if mismatch:
+            killswitch_notes.append(_mismatch_report(mismatch, "включил в план"))
+        if missing:
+            killswitch_notes.append(
+                f"↷ Исключены (не среди открытых) {len(missing)}: "
+                + ", ".join(f"«{m['title']}»" for m in missing))
+        return ("\n".join([done, ""] + killswitch_notes)
+                if killswitch_notes else done)
     # Сетевую часть отправки уводит в поток сам хук (см. delete_tasks выше и
     # докстринг `_maybe_tg_notify_plan`) — здесь просто await.
     return await _maybe_tg_notify_plan("delete_tasks", mid, "\n".join(lines),
