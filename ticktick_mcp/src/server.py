@@ -4604,6 +4604,14 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
                      "(«2 — в Fix&Roll»), тогда план пересоберётся с явными "
                      "адресами._")
     lines.append("")
+    # Превью — В МАНИФЕСТ (QA-2 2026-08-19, добор: «подтверждение вслепую» в
+    # веб-хабе). `GET /pending-consents` отдаёт `m["preview"]`, а заполняли его
+    # только `_gate_batch`/`_gate_single` — у планов с СОБСТВЕННОЙ сборкой
+    # текста (этот, plan_task_deletion, delete_tasks, delete_project, слияние
+    # rename_tag) карточка в вебе показывала одну строку summary, сочинённую
+    # вызывающей моделью, — и именно у самых разрушительных планов состав был
+    # невидим. Текст уже собран — кладём его же.
+    _MANIFESTS[mid]["preview"] = "\n".join(lines)
     # Инструкция для модели («вызови execute_task_creation…») — ОТДЕЛЬНО от
     # человеческой части `lines` (2026-08-06, дефект №2): `_maybe_tg_notify_plan`
     # приклеивает её только к ответу модели, в Telegram-карточку плана она не
@@ -5870,6 +5878,9 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
             preview.append(f"{i}. **«{it['title']}»** — {it['project']} (`{it['taskId']}`)")
         preview.extend(lines)
         preview.append("")
+        # Превью — в манифест, для карточки веб-хаба `/pending-consents`
+        # (см. комментарий в plan_task_creation — тот же добор QA-2).
+        _MANIFESTS[mid]["preview"] = "\n".join(preview)
         # Инструкция для модели — ОТДЕЛЬНО от `preview` (2026-08-06, дефект
         # №2): раньше уходила дословно в Telegram-карточку плана.
         agent_tail = ("Покажи это пользователю дословно и ДОЖДИСЬ его "
@@ -6152,6 +6163,9 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
             f"«{m['title']}» — {m.get('reason') or 'не среди открытых'}"
             for m in missing))
     lines.append("")
+    # Превью — в манифест, для карточки веб-хаба `/pending-consents`
+    # (см. комментарий в plan_task_creation — тот же добор QA-2).
+    _MANIFESTS[mid]["preview"] = "\n".join(lines)
     # Инструкция для модели — ОТДЕЛЬНО от `lines` (2026-08-06, дефект №2):
     # раньше уходила дословно в Telegram-карточку плана.
     agent_tail = ("Покажи этот план пользователю дословно и ДОЖДИСЬ его "
@@ -7704,6 +7718,11 @@ async def delete_project(project_name: str, project_id: str, user_reply: str = "
         # угадывать свой план по разнице списка ожидающих до/после вызова —
         # что и делал агент уборки, получив 19 «планов без идентификатора».
         lines.insert(1, _plan_id_line(new_mid, "ничего ещё не удалено"))
+        # Превью — в манифест, для карточки веб-хаба `/pending-consents`
+        # (см. комментарий в plan_task_creation — тот же добор QA-2):
+        # владелец в вебе обязан видеть, СКОЛЬКО задач умрёт вместе с
+        # проектом и какие, а не одну строку summary.
+        _MANIFESTS[new_mid]["preview"] = "\n".join(lines)
         return await _maybe_tg_notify_plan("delete_project", new_mid,
                                            "\n".join(lines), agent_tail)
 
@@ -13299,6 +13318,10 @@ async def rename_tag(old_name: str, new_name: str, allow_merge: bool = False,
                 # только код, живущий В ЭТОМ ЖЕ процессе (он читал `_MANIFESTS`
                 # напрямую) — ни один сетевой клиент так не может.
                 human_msg += "\n" + _plan_id_line(new_mid, "ничего ещё не тронуто")
+                # Превью — в манифест, для карточки веб-хаба
+                # `/pending-consents` (см. комментарий в plan_task_creation —
+                # тот же добор QA-2): карточка обязана называть ОБА тега.
+                _MANIFESTS[new_mid]["preview"] = human_msg
                 return await _maybe_tg_notify_plan("rename_tag", new_mid,
                                                    human_msg, agent_tail)
             if m is not None:
