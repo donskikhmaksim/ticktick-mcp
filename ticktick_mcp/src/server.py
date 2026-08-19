@@ -223,7 +223,21 @@ def _automation_key_channel(provided: str) -> str:
         return ""
     if automation_key.matches_static(provided):
         return "static"
-    win = automation_key.find_window(provided)
+    # Поход в Postgres обёрнут (2026-08-19, разбор QA-2): при лежащей базе
+    # `find_window` бросает `psycopg2.OperationalError`, и раньше он рвал
+    # ЛЮБОЙ вызов инструмента с непустым automation_key голым трейсбеком —
+    # в том числе у клиента со старым MCP_SECRET (легальный legacy-канал
+    # ниже, которому база вообще не нужна). Недоступное хранилище окон —
+    # это «оконный канал сейчас не отвечает», а не «уронить вызов»:
+    # остальные каналы проверяются дальше, несовпавший ключ уходит обычным
+    # интерактивным путём (план → подтверждение), без исключения наружу.
+    try:
+        win = automation_key.find_window(provided)
+    except Exception as e:
+        logger.warning(
+            "automation_key.find_window недоступен (хранилище окон не "
+            "отвечает) — оконный канал пропущен, проверяю остальные: %s", e)
+        win = None
     if win:
         opened = win.get("created_at")
         return f"window:{opened}" if opened else "window"
