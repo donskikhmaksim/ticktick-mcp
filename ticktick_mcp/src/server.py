@@ -4344,6 +4344,30 @@ def _create_object_hash(raw: List[Dict[str, Any]]) -> str:
          for t in raw])
 
 
+def _merge_param_alias(d: Dict[str, Any], canon: str, alias: str) -> str:
+    """Принять `alias` как синоним `canon` в словаре-аргументе (QA-2
+    2026-08-19, добор №6): одна и та же концепция «родитель» звалась
+    `parent_id`/`parent_title` в plan_task_creation и `to_task_id`/`to_title`
+    в apply_task_changes(op="parent") — модель, выучившая один путь, ошибалась
+    на другом (наблюдалось в QA живьём). Ломать существующие имена нельзя
+    (на них завязаны тесты и живые вызовы), поэтому оба набора принимаются в
+    ОБЕИХ точках, канонизируясь in-place в родное имя точки.
+
+    Возвращает "" при успехе (alias скопирован в canon, если canon пуст) или
+    текст причины отказа, когда заданы ОБА имени с РАЗНЫМИ значениями — это
+    два разных утверждения об одном объекте, и сервер не выбирает между ними."""
+    a = d.get(alias)
+    if a is None:
+        return ""
+    c = d.get(canon)
+    if c is None or str(c).strip() == str(a).strip():
+        d[canon] = a if c is None else c
+        return ""
+    return (f"{canon}={c!r} и его синоним {alias}={a!r} заданы одновременно "
+            "и не совпадают — это два разных утверждения, сервер не выбирает "
+            "между ними")
+
+
 # БЕЗ readOnlyHint (2026-08-19, разбор QA-2). Аннотация врала дважды: (1) при
 # включённом аварийном выключателе (`TICKTICK_MCP_GATE_DISABLED`) этот
 # инструмент НЕМЕДЛЕННО исполняет план — создаёт задачи; (2) даже в обычном
@@ -4370,7 +4394,10 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     («2 — в Fix&Roll»); re-plan with explicit project_id for corrections.
 
     Attaching under an EXISTING task: pass parent_id AND parent_title (the
-    parent's current title). The plan checks the parent against live state
+    parent's current title). The apply_task_changes(op="parent") names
+    to_task_id/to_title are accepted here as exact synonyms of
+    parent_id/parent_title (passing both names with DIFFERENT values refuses
+    that row). The plan checks the parent against live state
     BEFORE it is shown — a parent that is completed, deleted or in the trash,
     or an id whose real title is a different one, drops that row from the
     plan entirely (it is never a confirmable line), because such a "subtask"
@@ -4432,6 +4459,14 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
         pid = t.get("project_id") or t.get("projectId") or ""
         if not title:
             refused.append(f"#{i}: нет title")
+            continue
+        # Синонимы имён родителя (QA-2, добор №6): to_task_id/to_title — имена
+        # той же концепции у apply_task_changes(op="parent") — принимаются и
+        # здесь; конфликт двух имён с разными значениями — отказ строки.
+        alias_why = (_merge_param_alias(t, "parent_id", "to_task_id")
+                     or _merge_param_alias(t, "parent_title", "to_title"))
+        if alias_why:
+            refused.append(f"#{i} «{title}»: {alias_why}")
             continue
         # Дата неподдерживаемого формата — отказ строки, а не задача БЕЗ
         # даты (QA-2, дефект №8: «2026-08-19 20:00» теперь принимается выше
@@ -17745,6 +17780,15 @@ def _op_parent_validate(i: int, op: Dict, shown: str) -> Optional[str]:
         "Правка полей задачи — это отдельная операция op=\"update\".")
     if refusal:
         return refusal
+    # Синонимы имён родителя (QA-2, добор №6): parent_id/parent_title — имена
+    # той же концепции у plan_task_creation — принимаются и здесь (реально
+    # наблюдалось в QA: первый вызов с parent_id отвергался). Конфликт двух
+    # имён с разными значениями — отказ, сервер не выбирает между ними.
+    alias_why = (_merge_param_alias(op, "to_task_id", "parent_id")
+                 or _merge_param_alias(op, "to_title", "parent_title"))
+    if alias_why:
+        return (f"🛑 Отказ: операция #{i} («{shown}») — {alias_why}. "
+                "Ничего не сделано.")
     to_id = str(op.get("to_task_id") or "").strip()
     ref = str(op.get("parent_ref") or "").strip()
     if to_id and ref:
@@ -18982,6 +19026,9 @@ async def apply_task_changes(summary: str, operations: List[Dict[str, Any]] = No
         # project (TickTick does not nest across projects — move first):
         "to_task_id": "<id of the parent task>",
         "to_title":   "<the parent's exact CURRENT title>",
+        # plan_task_creation's names "parent_id"/"parent_title" are accepted
+        # as exact synonyms of to_task_id/to_title (both names with DIFFERENT
+        # values → the whole plan is refused):
         "to_untitled": true   # INSTEAD of "to_title", same rule as "untitled"
         # op="unparent" takes NO extra fields at all: which parent to detach
         # from is read from LIVE state, not taken from the plan.
