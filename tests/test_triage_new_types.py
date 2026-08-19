@@ -806,6 +806,127 @@ async def test_restore_reads_the_trash_once_per_pass(monkeypatch, tmp_path):
     assert sum(1 for c in v2.calls if c[0] == "get_trash") == 1, v2.calls
 
 
+# ──────────── restore + другая операция над той же задачей ─────────────────
+# Раздел 5 дизайна, снятие ограничения (2026-08-19): раньше «восстановить X и
+# сразу поменять ей срок/проект» требовало ДВУХ планов — сверка личности
+# второй операции искала X среди открытых и не находила (X в корзине).
+
+async def test_restore_combined_with_update_in_one_plan(monkeypatch, tmp_path):
+    """restore + update над ОДНИМ task_id, ОДНО подтверждение: задача уходит
+    из корзины И меняется правка (приоритет) — раньше это требовало двух
+    отдельных планов."""
+    live = {}
+    trash = {"t1": {"id": "t1", "title": "Оплатить страховку",
+                    "projectId": "p_work"}}
+    v2 = _wire(monkeypatch, live, tmp_path, trash=trash)
+
+    preview, out = await _run([
+        {"op": "restore", "task_id": "t1", "title": "Оплатить страховку",
+         "said": "я её зря удалил, верни"},
+        {"op": "update", "task_id": "t1", "title": "Оплатить страховку",
+         "changes": {"priority": 5},
+         "said": "и подними приоритет, срочно"},
+    ])
+
+    assert "🛑" not in preview.splitlines()[0], preview
+    assert "t1" not in v2.trash, "запись обязана уйти из корзины"
+    assert live["t1"]["projectId"] == "p_work", "вернулась в свой список"
+    assert live["t1"]["priority"] == 5, "правка применилась тем же планом"
+    assert "✅ Выполнено 2 из 2" in out, out
+
+
+async def test_restore_combined_with_update_regardless_of_op_order(
+        monkeypatch, tmp_path):
+    """Тот же сценарий, но операции в списке идут В ОБРАТНОМ порядке (сперва
+    update, потом restore) — порядок исполнения задаёт зависимость
+    (`_triage_dependency_edges`), а не порядок строк во входном списке."""
+    live = {}
+    trash = {"t1": {"id": "t1", "title": "Оплатить страховку",
+                    "projectId": "p_work"}}
+    v2 = _wire(monkeypatch, live, tmp_path, trash=trash)
+
+    preview, out = await _run([
+        {"op": "update", "task_id": "t1", "title": "Оплатить страховку",
+         "changes": {"priority": 5}, "said": "и подними приоритет"},
+        {"op": "restore", "task_id": "t1", "title": "Оплатить страховку",
+         "said": "верни из корзины"},
+    ])
+
+    assert "🛑" not in preview.splitlines()[0], preview
+    assert "t1" not in v2.trash
+    assert live["t1"]["priority"] == 5, "правка применилась ПОСЛЕ возврата"
+    assert "✅ Выполнено 2 из 2" in out, out
+
+
+async def test_restore_twice_in_one_plan_is_still_refused(monkeypatch, tmp_path):
+    """restore + restore над ОДНИМ task_id — не та пара, которую разрешает
+    снятие ограничения (там ровно одна restore и одна ДРУГАЯ операция)."""
+    live = {}
+    trash = {"t1": {"id": "t1", "title": "Оплатить страховку",
+                    "projectId": "p_work"}}
+    v2 = _wire(monkeypatch, live, tmp_path, trash=trash)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "restore", "task_id": "t1", "title": "Оплатить страховку",
+         "said": "верни"},
+        {"op": "restore", "task_id": "t1", "title": "Оплатить страховку",
+         "said": "верни ещё раз на всякий случай"},
+    ])
+
+    assert "🛑" in out and "дважды" in out, out
+    assert v2.calls == []
+
+
+async def test_restore_plus_two_other_ops_on_same_task_is_still_refused(
+        monkeypatch, tmp_path):
+    """restore + update + move — ТРИ операции над одним task_id: снятие
+    ограничения покрывает ровно пару (restore + одна другая), не больше."""
+    live = {}
+    trash = {"t1": {"id": "t1", "title": "Оплатить страховку",
+                    "projectId": "p_work"}}
+    v2 = _wire(monkeypatch, live, tmp_path, trash=trash)
+
+    out = await s.manual_triage("Разбираю", [
+        {"op": "restore", "task_id": "t1", "title": "Оплатить страховку",
+         "said": "верни"},
+        {"op": "update", "task_id": "t1", "title": "Оплатить страховку",
+         "changes": {"priority": 5}, "said": "подними приоритет"},
+        {"op": "move", "task_id": "t1", "title": "Оплатить страховку",
+         "to_project_id": "p_in", "said": "и перенеси"},
+    ])
+
+    assert "🛑" in out
+    assert v2.calls == []
+
+
+async def test_restore_plus_update_fails_gracefully_when_restore_drifts(
+        monkeypatch, tmp_path):
+    """Между планом и «да» запись восстановили вручную (ушла из корзины) —
+    restore проваливается на исполнении, и update над тем же task_id обязан
+    остановиться следом («шаг, от которого зависела, не выполнен»), а не
+    попытаться исполниться вслепую."""
+    live = {}
+    trash = {"t1": {"id": "t1", "title": "Оплатить страховку",
+                    "projectId": "p_work"}}
+    v2 = _wire(monkeypatch, live, tmp_path, trash=trash)
+
+    preview = await s.manual_triage("Разбираю", [
+        {"op": "restore", "task_id": "t1", "title": "Оплатить страховку",
+         "said": "верни"},
+        {"op": "update", "task_id": "t1", "title": "Оплатить страховку",
+         "changes": {"priority": 5}, "said": "подними приоритет"},
+    ])
+    assert "🛑" not in preview.splitlines()[0], preview
+
+    trash.pop("t1")  # восстановили вручную между планом и подтверждением
+    out = await s.manual_triage("Разбираю", manifest_id=_mid(preview),
+                                user_reply="да")
+
+    assert not any(c[0] == "update" for c in v2.calls), \
+        "update не имеет права исполниться, если restore не состоялся"
+    assert "t1" not in live
+
+
 # ═══════════════════════════════ create ═══════════════════════════════════
 
 @pytest.mark.triage_e2e("create")
