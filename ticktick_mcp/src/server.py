@@ -13046,6 +13046,51 @@ def _tags_nonexistent_note(names: List[str]) -> str:
     return f"❔ Не существуют вовсе (ни в тегах аккаунта, ни на задачах): {body}"
 
 
+def _coerce_str_list_arg(value: Any, param_name: str) -> Tuple[Optional[List[str]], Optional[str]]:
+    """Normalize a "should be a list of strings" tool argument that may have
+    arrived as a JSON-encoded string instead (QA 2026-08-19, бага №3).
+
+    Live QA against `delete_tags(tags=...)` found that when the caller's own
+    tooling serializes the array to a string before sending it, the plain
+    top-level `if not tags:` check let a NON-empty list of real names read as
+    empty — the response claimed "Пустой список — нечего делать" even though
+    names were genuinely supplied — a SILENT no-op, worse than a loud error
+    because the caller walks away believing tags were deleted. A second,
+    uglier failure mode of the same root cause: iterating a raw Python string
+    character-by-character (`for name in "домашние"`) produces one-letter
+    garbage "tag names" instead of raising anything.
+
+    Returns (normalized_list, None) on success — normalized_list is None only
+    when `value` itself was None/omitted (caller decides what that means).
+    Returns (None, error_message) when `value` was truthy/non-empty but could
+    not be turned into an actual list — the caller must surface this as an
+    explicit refusal, never as a quiet "nothing to do".
+    """
+    if value is None:
+        return None, None
+    if isinstance(value, list):
+        return value, None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return [], None  # genuinely empty string = empty, not an error
+        try:
+            parsed = json.loads(stripped)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, list):
+            return parsed, None
+        return None, (
+            f"🛑 Параметр {param_name} пришёл строкой «{value}», а не "
+            "списком, и не распознаётся как JSON-массив строк — похоже на "
+            "ошибку клиента при сборке вызова. Ничего не сделано (список НЕ "
+            "считается пустым — не путай с «нечего делать»). Передай "
+            f"{param_name} настоящим списком имён.")
+    return None, (
+        f"🛑 Параметр {param_name} пришёл значением неожиданного типа "
+        f"({type(value).__name__}), а не списком строк. Ничего не сделано.")
+
+
 def _describe_delete_tags_item(t: Dict) -> str:
     """Строка плана на ОДИН тег — «радиус поражения» (П20, пункт 3):
     сколько открытых задач теряет метку. Ноль печатается явно («снимется с 0
@@ -13110,6 +13155,14 @@ async def delete_tags(summary: str, tags: Optional[List[str]] = None,
     notes: Optional[List[str]] = None
 
     if not manifest_id:
+        # QA 2026-08-19, бага №3: нормализуем ДО проверки на пустоту — если
+        # tags пришёл строкой (клиент сериализовал массив некорректно), она
+        # либо распознаётся как JSON-массив, либо вызов отказывает ЯВНО, а не
+        # тихо отвечает «нечего делать» на непустой ввод (см.
+        # _coerce_str_list_arg).
+        tags, fmt_err = _coerce_str_list_arg(tags, "tags")
+        if fmt_err:
+            return fmt_err
         if not tags:
             return "Пустой список — нечего делать."
         # Живое состояние ДВАЖДЫ (2026-08-09): полные записи тегов (для
