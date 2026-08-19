@@ -673,35 +673,56 @@ class TickTickV2Client:
         return self._request("POST", "/batch/projectGroup",
                              json={"add": [], "update": [], "delete": [group_id]})
 
-    def move_project_to_group(self, project_id: str, group_id: str) -> Dict:
-        """group_id='NONE' ungroups the project. Sends the FULL live project
-        object (force-fresh) with only groupId changed, so no other field is
-        reverted to a stale value as a side effect of the move.
+    def set_projects_group(self, project_ids: List[str], group_id) -> Dict:
+        """Перевести НЕСКОЛЬКО проектов в группу `group_id` (или разгруппировать
+        — 'NONE'/''/None) ОДНИМ batch-запросом. Общий низ для
+        move_project_to_group (один проект) и delete_project_group (сервер сам
+        разгруппировывает осиротевшие проекты удалённой папки).
 
-        РАЗГРУППИРОВКА (2026-08-06). До этой правки сентинел 'NONE' уходил в
-        TickTick БУКВАЛЬНОЙ строкой: `upd["groupId"] = "NONE"`. «Без папки» в
-        модели данных TickTick — это `groupId: null`, а не группа с именем
-        NONE, поэтому запрос «вынь проект из папки» не выполнялся никогда:
-        сервер получал ссылку на несуществующую группу. Контракт из этого же
-        докстринга («'NONE' ungroups») выполнял только тестовый фейк
-        (tests/test_tier0_gate_conversion.py сам переводил 'NONE' в None) — то
-        есть трансляции не было ровно в одном месте, в бою.
+        Каждый update — ПОЛНЫЙ живой объект проекта (force-fresh) с одним
+        изменённым groupId, чтобы никакое другое поле не откатилось к
+        протухшему значению как побочный эффект переноса.
 
-        Пустая строка и None трактуются так же, как 'NONE': снаружи все три
-        означают «никакой группы», и молча превратить их в id группы ""
-        (ссылка в никуда) было бы тем же самым тихим отказом."""
+        РАЗГРУППИРОВКА (история двух фиксов). 2026-08-06 (#100) сентинел
+        'NONE' стали переводить в `groupId: null` — по гипотезе, что «без
+        папки» в модели TickTick это null и буквальная строка была бы ссылкой
+        в никуда. Живой QA 2026-08-19 гипотезу ОПРОВЕРГ: запрос с
+        `groupId: null` сервер молча игнорирует (проект остался в папке —
+        «живой groupId '468110f0…', ожидался None», воспроизведено дважды).
+        При этом сам TickTick в своих же ответах помечает проекты вне папок
+        буквальной строкой "NONE" (см. list_project_groups в server.py и
+        format_project — оба давно трактуют "NONE" как «без папки», это
+        списано с живых projectProfiles). То есть канонический «без папки» у
+        TickTick — литеральная строка "NONE"; её и шлём.
+
+        Пустая строка и None снаружи трактуются так же, как 'NONE': все три
+        означают «никакой группы»."""
         self.get_state(force=True)
-        proj = next((p for p in self.list_projects() if p.get("id") == project_id), None)
-        if not proj:
-            raise ValueError(f"Project {project_id} not found.")
-        upd = dict(proj)
-        upd["groupId"] = None if group_id in ("NONE", "", None) else group_id
+        by_id = {p.get("id"): p for p in self.list_projects()}
+        updates = []
+        for pid in project_ids:
+            proj = by_id.get(pid)
+            if not proj:
+                raise ValueError(f"Project {pid} not found.")
+            upd = dict(proj)
+            upd["groupId"] = "NONE" if group_id in ("NONE", "", None) else group_id
+            updates.append(upd)
+        if not updates:
+            return {}
         resp = self._request("POST", "/batch/project",
-                             json={"add": [], "delete": [], "update": [upd]})
-        err = id2error_failures(resp, [project_id]).get(project_id)
-        if err:
-            raise RuntimeError(f"TickTick rejected the move: {err}")
+                             json={"add": [], "delete": [], "update": updates})
+        failures = id2error_failures(resp, list(project_ids))
+        if failures:
+            listed = "; ".join(f"{pid}: {err}" for pid, err in failures.items())
+            raise RuntimeError(f"TickTick rejected the move: {listed}")
         return resp
+
+    def move_project_to_group(self, project_id: str, group_id: str) -> Dict:
+        """group_id='NONE' (или ''/None) ungroups the project. Тонкая обёртка
+        над set_projects_group — вся семантика (полный живой объект,
+        трансляция сентинела разгруппировки в то, что реально понимает
+        TickTick) живёт там, в ОДНОМ месте."""
+        return self.set_projects_group([project_id], group_id)
 
     # ---- task comments ---------------------------------------------------
     def get_task_comments(self, project_id: str, task_id: str) -> List[Dict]:

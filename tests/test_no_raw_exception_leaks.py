@@ -101,7 +101,11 @@ _SCANNED_FILES = [
 
 _LOG_METHODS = frozenset({"error", "warning", "info", "debug", "exception",
                           "critical", "log"})
-_SAFE_WRAPPER_FUNCS = frozenset({"_redact_for_user", "_tool_error"})
+#: `_humanize_api_error` — расшифровка типовых HTTP-кодов в русскую фразу
+#: (QA 2026-08-19, fix/qa2-projects); первым действием прогоняет текст через
+#: `_redact_for_user`, так что это тот же санитайзер, просто с переводом.
+_SAFE_WRAPPER_FUNCS = frozenset({"_redact_for_user", "_tool_error",
+                                 "_humanize_api_error"})
 #: `log_redaction.redact(...)` — та же маскировка секретов, но по имени
 #: модуля: единственная обёртка, доступная файлам ВНЕ server.py (у них нет
 #: доступа к `_redact_for_user`/`_tool_error`, те завязаны на SECRET сервера).

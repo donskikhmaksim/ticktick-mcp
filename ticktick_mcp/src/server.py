@@ -104,7 +104,57 @@ def _tool_error(context: str, exc: Any) -> str:
         exc: the caught exception, or an already-stringified error payload
             (e.g. a dict's `['error']` value coming from the client).
     """
-    return f"Error {context}: {_redact_for_user(exc)}"
+    return f"Error {context}: {_humanize_api_error(exc)}"
+
+
+# Как выглядит текст исключения requests.raise_for_status(): «429 Client
+# Error:  for url: https://…» / «500 Server Error:  for url: https://…».
+_HTTP_STATUS_RE = re.compile(r"\b([45]\d{2})\s+(?:Client|Server)\s+Error\b")
+
+
+def _humanize_api_error(exc: Any) -> str:
+    """Редакция секретов + русская расшифровка типовых HTTP-ошибок (QA
+    2026-08-19, сквозной пункт №3).
+
+    До этой правки человеку уходил сырой текст requests как есть:
+    «TickTick отклонил: 500 Server Error:  for url: https://api.ticktick.com/
+    open/v1/project» — ни что случилось, ни что делать. Здесь типовые коды
+    переводятся в понятную русскую фразу; исходный (уже отредактированный)
+    текст сохраняется в скобках для диагностики. Всё остальное проходит без
+    изменений — это расшифровка, а не переписывание ошибок."""
+    raw = _redact_for_user(exc)
+    m = _HTTP_STATUS_RE.search(raw)
+    if not m:
+        return raw
+    code = int(m.group(1))
+    if code == 429:
+        hint = ("слишком много запросов к TickTick — подожди минуту-другую "
+                "и повтори")
+    elif code in (401, 403):
+        hint = "TickTick не принял авторизацию (токен истёк или не подходит)"
+    elif code >= 500:
+        hint = ("сервис TickTick временно недоступен или отклонил запрос "
+                "(часто это невалидное поле — например color не в hex-формате "
+                "или пустое имя) — проверь значения и повтори позже")
+    else:
+        return raw
+    return f"{hint} [{raw}]"
+
+
+# Валидация цвета проекта ДО обращения к API (QA 2026-08-19, пункт №3а):
+# TickTick на «красный»/«#ZZZZZZ» отвечает голым 500 без объяснения — дешевле
+# и понятнее отказать локально, по образцу существующей проверки view_mode.
+_HEX_COLOR_RE = re.compile(r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})")
+
+
+def _color_refusal(color: Any) -> Optional[str]:
+    """Понятный русский отказ для невалидного цвета проекта, или None когда
+    цвет валиден (hex-формат «#RRGGBB»/«#RGB»). Чисто локальная проверка
+    аргумента — никакой сети, зовётся ДО гейта и ДО API."""
+    if color is None or _HEX_COLOR_RE.fullmatch(str(color)):
+        return None
+    return (f"🛑 Невалидный color {str(color)!r} — TickTick принимает только "
+            "hex-код вида #RRGGBB (например #F18181). Ничего не изменено.")
 
 
 def _legacy_secret_matches(provided: str) -> bool:
@@ -7023,6 +7073,15 @@ async def create_project(
     # Validate view_mode up front (cheap, applies to both calls).
     if view_mode not in ["list", "kanban", "timeline"]:
         return "Invalid view_mode. Must be one of: list, kanban, timeline."
+    # Пустое имя и не-hex цвет TickTick встречает голым «500 Server Error»
+    # без объяснения (живой QA 2026-08-19) — отказываем ДО API с понятной
+    # причиной, тем же образцом, что проверка view_mode строкой выше.
+    if not (name or "").strip():
+        return ("🛑 Пустое имя проекта (name) — передай непустое название. "
+                "Ничего не создано.")
+    refusal = _color_refusal(color)
+    if refusal:
+        return refusal
 
     params = {"name": name, "color": color, "view_mode": view_mode}
     outcome = await _gate_single("create_project", "create_project",
@@ -7048,11 +7107,11 @@ async def _create_project_impl(name: str, color: str = "#F18181",
 
         if 'error' in project:
             return (f"### ❌ Проект «{name}» НЕ создан\n\nTickTick отклонил: "
-                    f"{_redact_for_user(project['error'])}")
+                    f"{_humanize_api_error(project['error'])}")
         pid = project.get('id')
     except Exception as e:
         logger.exception("Error in create_project")
-        return f"### ❌ Проект «{name}» НЕ создан\n\nОшибка: {_redact_for_user(e)}"
+        return f"### ❌ Проект «{name}» НЕ создан\n\nОшибка: {_humanize_api_error(e)}"
 
     # Post-verify: independent fresh re-read (separate GET, not the create
     # response) so a false-positive "success" from the API doesn't slip through.
@@ -10702,6 +10761,17 @@ async def list_project_groups() -> str:
         return _tool_error("fetching project groups", e)
 
 
+def _norm_group_id(gid) -> Optional[str]:
+    """Канонический groupId проекта: None и для null/отсутствующего поля, и
+    для буквальной строки "NONE" — TickTick кодирует «без папки» ОБОИМИ
+    способами (list_project_groups и format_project трактуют их одинаково с
+    самого начала; живой QA 2026-08-19 подтвердил, что при разгруппировке
+    сервер хранит именно строку "NONE"). Любая сверка «в какой папке проект»
+    обязана сравнивать нормализованные значения, иначе честная разгруппировка
+    читается как провал."""
+    return None if not gid or gid == "NONE" else gid
+
+
 async def _live_groups(fresh: bool = True) -> List[Dict]:
     """Non-deleted project groups from the (optionally force-fresh) v2 state."""
     if fresh:
@@ -10743,6 +10813,13 @@ async def create_project_group(name: str, manifest_id: str = "",
     err = _ensure_ready()
     if err:
         return err
+    # Пустое/пробельное имя раньше проходило молча и создавало безымянную
+    # группу (живой QA 2026-08-19, пункт №4) — при том, что create_project
+    # такое же имя отклоняет. Согласованное поведение: понятный отказ ДО
+    # гейта и ДО API, по образцу проверки view_mode в create_project.
+    if not (name or "").strip():
+        return ("🛑 Пустое имя группы проектов (name) — передай непустое "
+                "название. Ничего не создано.")
     params = {"name": name}
     outcome = await _gate_single("create_project_group", "create_project_group",
                                  params if not manifest_id else None,
@@ -10759,7 +10836,7 @@ async def _create_project_group_impl(name: str) -> str:
     try:
         gid = await _run_blocking(lambda: ticktick_v2.create_project_group(name))
     except RuntimeError as e:
-        return f"❌ Группа «{name}» НЕ создана — TickTick отклонил: {_redact_for_user(e)}"
+        return f"❌ Группа «{name}» НЕ создана — TickTick отклонил: {_humanize_api_error(e)}"
     except Exception as e:
         logger.exception("Error in create_project_group")
         return _tool_error("creating project group", e)
@@ -10815,7 +10892,9 @@ async def delete_project_group(group_name: str, group_id: str,
                                manifest_id: str = "", user_reply: str = "",
                                automation_key: str = "") -> str:
     """
-    Delete a project group/folder (projects inside are kept, just ungrouped)
+    Delete a project group/folder; the projects inside are kept — this server
+    then ungroups them itself (TickTick would otherwise leave them pointing
+    at the deleted folder) and verifies the actual result by re-reading them
     (requires v2 API). Gated 🟡 (docs/DESIGN_approval_gate.md): two calls,
     same tool name — nothing is changed on call #1.
 
@@ -10921,7 +11000,19 @@ async def delete_project_group(group_name: str, group_id: str,
 
 async def _delete_project_group_impl(group_name: str, group_id: str) -> str:
     """Pure mutation logic for delete_project_group — no consent gate. Called
-    only by the gated delete_project_group() above once the plan is approved."""
+    only by the gated delete_project_group() above once the plan is approved.
+
+    Живой QA 2026-08-19 (критичный пункт №1): сам TickTick при удалении
+    группы НЕ чистит groupId у входивших в неё проектов — они остаются с
+    висячей ссылкой на несуществующую папку (get_project показывал «Folder:
+    (unknown group) (id: <удалённая группа>)»), а этот тул при этом
+    рапортовал «проекты остались, просто без папки» — состояние, которого не
+    возникло. Теперь после удаления группы сервер САМ разгруппировывает
+    осиротевшие проекты (одним batch-запросом, тем же set_projects_group, на
+    котором стоит move_project_to_group(group_id="NONE")) и ПРОВЕРЯЕТ
+    фактический итог перечитыванием: «без папки» в ответе — только когда это
+    правда; не удалось — ответ называет проекты, оставшиеся с висячей
+    ссылкой, и как их переназначить."""
     try:
         # Identity guard (fresh): the id must exist AND resolve to the name.
         groups = await _live_groups()
@@ -10941,11 +11032,67 @@ async def _delete_project_group_impl(group_name: str, group_id: str) -> str:
         groups = await _live_groups()
         if any(g.get("id") == group_id for g in groups):
             return f"❌ Группа «{real}» ВСЁ ЕЩЁ в списке — удаление не сработало."
-        return (f"✅ Группа проектов «{real}» удалена (проверено; проекты "
-                "остались, просто без папки).")
+        return (f"✅ Группа проектов «{real}» удалена (проверено)."
+                + await _ungroup_orphans_note(real, group_id))
     except Exception as e:
         logger.exception("Error in delete_project_group")
         return _tool_error("deleting project group", e)
+
+
+async def _ungroup_orphans_note(real: str, group_id: str) -> str:
+    """Разгруппировать проекты, осиротевшие после удаления группы `group_id`,
+    и вернуть ЧЕСТНУЮ приписку к отчёту об удалении по ФАКТИЧЕСКОМУ итогу
+    (см. докстринг _delete_project_group_impl). Зовётся только ПОСЛЕ того,
+    как удаление группы подтверждено перечитыванием; сама группа к этому
+    моменту уже удалена, поэтому любая неудача здесь — не «❌ операция не
+    прошла», а точное описание оставшегося состояния и как его починить."""
+    how_to_fix = ("Переназначь их вручную: move_project_to_group с "
+                  "group_id=\"NONE\" (без папки) или id другой папки.")
+    try:
+        # Тот же свежий снапшот, что только что подтвердил удаление группы
+        # (_live_groups() в вызывающем коде сделал get_state(force=True)).
+        projs = await _run_blocking(ticktick_v2.list_projects)
+        orphans = [p for p in projs
+                   if not p.get("deleted")
+                   and _norm_group_id(p.get("groupId")) == group_id]
+    except Exception as e:
+        return (" ⚠️ Но состав бывшей папки прочитать НЕ удалось "
+                f"({_humanize_api_error(e)}) — если в ней были проекты, они "
+                "всё ещё ссылаются на удалённую папку. " + how_to_fix)
+    if not orphans:
+        return " Проектов в ней не было — разгруппировывать нечего."
+
+    def _listed(projects: List[Dict]) -> str:
+        return ", ".join(f"«{p.get('name') or '?'}»" for p in projects)
+
+    def _still_linked(projects: List[Dict], reason: str) -> str:
+        word = _ru_plural(len(projects), "проект", "проекта", "проектов")
+        return (f" ⚠️ Но {len(projects)} {word} внутри ({_listed(projects)}) "
+                "ОСТАЛИСЬ со ссылкой на удалённую папку — TickTick сам её не "
+                f"чистит, а снять не удалось{reason}. " + how_to_fix)
+
+    ids = {p.get("id") for p in orphans}
+    word = _ru_plural(len(orphans), "проект", "проекта", "проектов")
+    try:
+        await _run_blocking(lambda: ticktick_v2.set_projects_group(list(ids), "NONE"))
+    except Exception as e:
+        return _still_linked(orphans, f" ({_humanize_api_error(e)})")
+    # Пост-верификация разгруппировки — по фактическому состоянию проектов,
+    # с тем же ретраем на отставание чтения, что у move_project_to_group.
+    try:
+        projs = await _run_blocking(_reread_projects_until, lambda ps: all(
+            _norm_group_id(p.get("groupId")) != group_id
+            for p in ps if p.get("id") in ids))
+        stuck = [p for p in projs if p.get("id") in ids
+                 and _norm_group_id(p.get("groupId")) == group_id]
+    except Exception as e:
+        return (f" {len(orphans)} {word} внутри ({_listed(orphans)}) "
+                f"отправлены в «без папки», но {_UNVERIFIED_MSG} "
+                f"({_humanize_api_error(e)})")
+    if stuck:
+        return _still_linked(stuck, "")
+    return (f" {len(orphans)} {word} внутри — теперь без папки (проверено): "
+            f"{_listed(orphans)}.")
 
 
 def _describe_move_project_to_group(p: Dict, dest_name: Optional[str] = None,
@@ -11100,8 +11247,11 @@ async def _move_project_to_group_impl(project_name: str, project_id: str,
         # race class as move_tasks, found live 2026-08-06: an immediate
         # re-read can still show the pre-mutation groupId for a moment right
         # after the SAME v2 API just changed it.
+        # Сравнение — по НОРМАЛИЗОВАННОМУ groupId (_norm_group_id): «без
+        # папки» TickTick возвращает и как null, и как буквальную строку
+        # "NONE" — честная разгруппировка не должна читаться как провал.
         projs = await _run_blocking(_reread_projects_until, lambda ps: any(
-            p.get("id") == project_id and (p.get("groupId") or None) == want
+            p.get("id") == project_id and _norm_group_id(p.get("groupId")) == want
             for p in ps))
         proj = next((p for p in projs if p.get("id") == project_id), None)
         got = (proj or {}).get("groupId")
@@ -11109,7 +11259,7 @@ async def _move_project_to_group_impl(project_name: str, project_id: str,
         if proj is None:
             return (f"Проект «{live_pname}» отправлен в {dest}, но "
                     f"{_UNVERIFIED_MSG}")
-        if (got or None) != want:
+        if _norm_group_id(got) != want:
             return (f"❌ Проект «{live_pname}» НЕ переместился — живой groupId "
                     f"{got!r}, ожидался {want!r}.")
         return f"✅ Проект «{live_pname}» перемещён в {dest} (проверено)."
@@ -13564,6 +13714,12 @@ async def update_project(project_name: str, project_id: str, name: str = None,
                         "убери поле. Ничего не тронул.")
         if view_mode is not None and view_mode not in ("list", "kanban", "timeline"):
             return "Invalid view_mode. Must be one of: list, kanban, timeline."
+        # Не-hex цвет TickTick встречает голым «500 Server Error» без
+        # объяснения (живой QA 2026-08-19) — отказываем ДО API, тем же
+        # образцом, что проверка view_mode строкой выше.
+        refusal = _color_refusal(color)
+        if refusal:
+            return refusal
         # Перенос identity-guard (project_id↔project_name) на построение
         # плана — тот же _guard_project(..., require_known=True), что уже
         # стоит в _update_project_impl НА ИСПОЛНЕНИИ, вызванный ТЕМИ ЖЕ
@@ -13603,10 +13759,10 @@ async def _update_project_impl(project_name: str, project_id: str,
             project_id, name=name, color=color, view_mode=view_mode))
         if 'error' in proj:
             return (f"### ❌ Проект «{project_name}» НЕ обновлён\n\nTickTick отклонил: "
-                    f"{_redact_for_user(proj['error'])}")
+                    f"{_humanize_api_error(proj['error'])}")
     except Exception as e:
         logger.exception("Error in update_project")
-        return f"### ❌ Проект «{project_name}» НЕ обновлён\n\nОшибка: {_redact_for_user(e)}"
+        return f"### ❌ Проект «{project_name}» НЕ обновлён\n\nОшибка: {_humanize_api_error(e)}"
 
     # Post-verify: independent fresh re-read, compare each field that was
     # actually requested against what TickTick shows live — the write
@@ -13742,7 +13898,7 @@ async def _archive_project_impl(project_name: str, project_id: str,
     try:
         await _run_blocking(lambda: ticktick_v2.archive_project(project_id, closed=archived))
     except RuntimeError as e:
-        return f"### ❌ Проект «{live_name}» НЕ {verb}\n\nTickTick отклонил: {_redact_for_user(e)}"
+        return f"### ❌ Проект «{live_name}» НЕ {verb}\n\nTickTick отклонил: {_humanize_api_error(e)}"
     except Exception as e:
         logger.exception("Error in archive_project")
         return _tool_error("archiving project", e)
@@ -14610,7 +14766,9 @@ async def create_project_column(project_id: str, name: str,
     {{AUTOMATION_KEY_NOTE}}
 
     Sections only render in a project's kanban view; switch the project's view
-    to kanban to see them.
+    to kanban to see them. When the project's current view is NOT kanban, the
+    success reply itself carries a visible warning about this (with how to
+    switch), so the human reader learns it too — not only this docstring.
 
     Args:
         project_id: ID of the project (or the Inbox id from get_projects)
@@ -14689,7 +14847,7 @@ async def _create_project_column_impl(project_id: str, name: str,
     try:
         cid = await _run_blocking(lambda: ticktick_v2.create_column(project_id, name))
     except RuntimeError as e:
-        return f"### ❌ Раздел «{name}» НЕ создан\n\nTickTick отклонил: {_redact_for_user(e)}"
+        return f"### ❌ Раздел «{name}» НЕ создан\n\nTickTick отклонил: {_humanize_api_error(e)}"
     except Exception as e:
         logger.exception("Error in create_project_column")
         return _tool_error("creating column", e)
@@ -14704,9 +14862,26 @@ async def _create_project_column_impl(project_id: str, name: str,
             return (f"### ⚠️ Раздел «{name}» создан (id: {cid}), но НЕ подтверждён\n\n"
                     f"Его нет в свежем списке колонок проекта «{live_pname}» — "
                     f"{_UNVERIFIED_MSG}")
+        # Колонки рендерятся ТОЛЬКО в kanban-виде проекта. Это знание жило
+        # лишь в докстринге (его видит модель, не человек) — живой QA
+        # 2026-08-19 (пункт №5): человек создавал колонку в list-проекте и не
+        # понимал, почему её не видно. Вид проекта берётся из того же ответа
+        # get_project_with_data, которым пост-верификация только что
+        # подтвердила колонку, — лишнего запроса нет; неизвестный вид молчит
+        # (не пугаем предупреждением на догадке).
+        vm = ((data.get("project") or {}).get("viewMode")
+              if isinstance(data, dict) else None)
+        vm_note = ""
+        if vm and vm != "kanban":
+            vm_note = (f"\n\n⚠️ У проекта «{live_pname}» сейчас вид «{vm}» — "
+                       "колонки отображаются только в kanban-виде, поэтому в "
+                       "текущем виде созданный раздел НЕ виден. Переключить: "
+                       "update_project(view_mode=\"kanban\") или в приложении "
+                       "TickTick (вид проекта → Kanban).")
         return (f"### ✅ Раздел «{match.get('name', name)}» создан в проекте «{live_pname}» "
                 f"(проверено)\n\n"
-                f"🧾 Подтверждено отдельным живым чтением TickTick (id: {cid}).")
+                f"🧾 Подтверждено отдельным живым чтением TickTick (id: {cid})."
+                + vm_note)
     except Exception as e:
         return (f"### ⚠️ Раздел «{name}» создан (id: {cid}), но НЕ подтверждён\n\n"
                 f"⚠️ {_UNVERIFIED_MSG} ({_redact_for_user(e)})")

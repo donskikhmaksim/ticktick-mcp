@@ -304,10 +304,20 @@ async def test_model_calling_execute_after_a_failed_auto_run_is_not_told_done(
 # ═══════════════════════════════════════════════════════════════════════════
 
 class _FakeTickTickHttp:
-    """Мини-подделка v2-эндпоинта, ведущая себя как валидирующий сервер:
-    `groupId: null` = «без папки» и принимается; ссылка на НЕсуществующую
-    группу игнорируется (проект остаётся там, где был) — ровно та ситуация,
-    в которой буквальная строка "NONE" превращалась в тихий отказ."""
+    """Мини-подделка v2-эндпоинта, ведущая себя как НАСТОЯЩИЙ сервер TickTick
+    — так, как его поведение наблюдалось живьём.
+
+    Первая версия этой подделки (#100, 2026-08-06) моделировала обратное:
+    `groupId: null` принимается как «без папки». Живой QA 2026-08-19 гипотезу
+    опроверг на проде: запрос с `groupId: null` сервер молча ИГНОРИРУЕТ
+    (проект остался в папке — «живой groupId '468110f0…', ожидался None»,
+    воспроизведено дважды), а канонический «без папки» у TickTick —
+    буквальная строка "NONE" (ею же он сам помечает проекты вне папок в
+    projectProfiles; см. list_project_groups/format_project). Тесты #100 были
+    зелёными, потому что контракт соблюдал только фейк — тот же класс бага,
+    который #100 чинил в предыдущем фейке. Здесь: null → поле «не задано»,
+    папка не меняется; "NONE" → хранится как есть (без папки); ссылка на
+    несуществующую группу игнорируется."""
 
     def __init__(self):
         self.projects = [{"id": "p1", "name": "Проект", "groupId": "g1"}]
@@ -326,11 +336,12 @@ class _FakeTickTickHttp:
             if live is None:
                 continue
             gid = upd.get("groupId")
-            if gid is None:
-                live["groupId"] = None
-            elif any(g["id"] == gid for g in self.groups):
+            if gid == "NONE":
+                live["groupId"] = "NONE"  # сервер хранит сентинел буквально
+            elif gid is not None and any(g["id"] == gid for g in self.groups):
                 live["groupId"] = gid
-            # иначе: ссылка в никуда — поле игнорируется, папка не меняется
+            # иначе (null или ссылка в никуда): поле игнорируется, папка не
+            # меняется — наблюдённое поведение прода
         return {}
 
 
@@ -340,23 +351,26 @@ def _client_on(fake):
     return c
 
 
-def test_ungroup_sends_null_group_id_not_the_literal_sentinel():
+def test_ungroup_sends_the_literal_NONE_sentinel_not_null():
+    """QA 2026-08-19: null сервер игнорирует; разгруппировывает ТОЛЬКО
+    буквальная строка "NONE" (см. докстринг _FakeTickTickHttp)."""
     fake = _FakeTickTickHttp()
     c = _client_on(fake)
 
     c.move_project_to_group("p1", "NONE")
 
     assert fake.seen_updates, "запрос вообще не ушёл"
-    assert fake.seen_updates[-1]["groupId"] is None, (
-        "сентинел ушёл в TickTick как есть — разгруппировки не будет")
-    assert fake.projects[0]["groupId"] is None
+    assert fake.seen_updates[-1]["groupId"] == "NONE", (
+        "в TickTick ушло не 'NONE' — на проде такой запрос игнорируется, "
+        "разгруппировки не будет")
+    assert fake.projects[0]["groupId"] == "NONE", "проект остался в папке"
 
 
 def test_empty_group_id_also_means_ungroup():
     for empty in ("", None):
         fake = _FakeTickTickHttp()
         _client_on(fake).move_project_to_group("p1", empty)
-        assert fake.seen_updates[-1]["groupId"] is None, (
+        assert fake.seen_updates[-1]["groupId"] == "NONE", (
             f"пустое значение {empty!r} не сработало как «без папки»")
 
 
@@ -375,7 +389,9 @@ async def test_tool_level_ungroup_reports_success_only_when_it_happened(monkeypa
     """Сквозь настоящий `_move_project_to_group_impl` и настоящий клиент —
     подделан только HTTP. До фикса пост-проверка честно ловила, что проект
     остался в папке, и тул отвечал «❌ НЕ переместился»: операция была
-    невыполнима в принципе."""
+    невыполнима в принципе. Заодно закрывает нормализацию пост-проверки:
+    сервер после разгруппировки отдаёт groupId="NONE" (не null), и это
+    ОБЯЗАНО читаться как «без папки», а не как провал."""
     fake = _FakeTickTickHttp()
     monkeypatch.setattr(s, "ticktick_v2", _client_on(fake))
     monkeypatch.setattr(s, "_guard_project", lambda *a, **kw: None)
@@ -383,7 +399,7 @@ async def test_tool_level_ungroup_reports_success_only_when_it_happened(monkeypa
 
     out = await s._move_project_to_group_impl("Проект", "p1", "NONE")
 
-    assert fake.projects[0]["groupId"] is None, "проект остался в папке"
+    assert fake.projects[0]["groupId"] == "NONE", "проект остался в папке"
     assert "❌" not in out and "🛑" not in out, out
     assert "без папки" in out and "проверено" in out
 
