@@ -142,7 +142,7 @@ async def test_the_refusal_names_the_trash_and_the_way_back(tool, monkeypatch):
 
     assert "корзин" in answer.lower(), (
         f"{tool} отказывает, но не произносит слово «корзина»:\n{answer}")
-    assert "restore_tasks" in answer, (
+    assert 'apply_task_changes(op="restore")' in answer, (
         f"{tool} не подсказывает, как вернуть задачу:\n{answer}")
 
 
@@ -213,7 +213,7 @@ async def test_upload_link_is_refused_for_a_trashed_task(monkeypatch):
 
     assert "🛑" in answer and "/ul/" not in answer, (
         f"выдана ссылка-полномочие на запись в УДАЛЁННУЮ задачу:\n{answer}")
-    assert "корзин" in answer.lower() and "restore_tasks" in answer, answer
+    assert "корзин" in answer.lower() and 'apply_task_changes(op="restore")' in answer, answer
 
 
 async def test_upload_link_executor_refuses_too(monkeypatch):

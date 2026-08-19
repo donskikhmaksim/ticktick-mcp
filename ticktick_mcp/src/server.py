@@ -1568,6 +1568,45 @@ def _closed_task_snapshot(task_id: str, project_id: str = "") -> Optional[Dict]:
     return None
 
 
+def _closed_status_label(task: Dict) -> str:
+    """«завершена („Completed“)» / «отменена („Won't do“)» — как назвать
+    человеку состояние ЗАКРЫТОЙ задачи. QA-2 (2026-08-19, дефект №1): обе
+    формулировки обязаны различаться — «Completed» и «Won't do» это два
+    разных решения человека, и текст отказа/плана не имеет права их
+    смешивать в одно «не найдена»."""
+    return ("отменена («Won't do»)" if task.get("status") == -1
+            else "завершена («Completed»)")
+
+
+def _find_task_beyond_open(task_id: str, project_id: str = ""
+                           ) -> Tuple[Optional[Dict], str]:
+    """Живой объект для id, которого НЕТ в снимке открытых задач →
+    (задача, где): where ∈ "completed" | "trash" | "open" | "" (не найдена).
+
+    QA-2 (2026-08-19, дефект №1): завершённую («Completed») и отменённую
+    («Won't do») задачу нельзя было удалить НИКАКИМ путём — все резолверы
+    смотрели только в снимок открытых и объявляли живую задачу «не найденной
+    (кто-то удалил?)». Этот помощник спрашивает у источников, которые
+    закрытые задачи ЗНАЮТ, в порядке цены:
+      1. v2-ленты (`_locate_task_any_state`): открытые → завершённые (кэш,
+         ≤2 запросов) → корзина; только они отличают корзину от закрытия;
+      2. официальный Open API (точечное чтение при известном project_id,
+         иначе скан) — для закрытых задач старше лент v2 (у него нет флага
+         удаления, поэтому он идёт ПОСЛЕ корзинной ленты, а не вместо).
+    "open" означает «задача открыта, но в v2-снимок не попала» (тот же
+    25-минутный лаг, что чинит `_official_task_snapshot`). Никогда не
+    бросает исключений; ("" — не найдена нигде) честно означает «ни один
+    доступный источник не знает», а не «доказанно не существует»."""
+    found, where, _readable = _locate_task_any_state(task_id)
+    if found:
+        return found, (where or "")
+    t = (_official_task_read(project_id, task_id) if project_id
+         else _official_task_scan(task_id, open_only=False))
+    if not t:
+        return None, ""
+    return t, ("open" if t.get("status", 0) == 0 else "completed")
+
+
 def _live_task_title(task_id: str, project_id: str = "") -> Optional[str]:
     """Живое НАЗВАНИЕ задачи по её id — для КАРТОЧКИ подтверждения, чтобы
     человек читал «в задачу «Купить молоко»», а не 24 hex-символа, которые
@@ -2149,8 +2188,9 @@ def _guard_task(
             return _Guard("missing", live.get("projectId") or project_id,
                           live.get("title") or "",
                           f"задача «{live.get('title') or task_id}» лежит В "
-                          "КОРЗИНЕ (удалена) — верните её через restore_tasks, "
-                          "прежде чем работать с ней")
+                          "КОРЗИНЕ (удалена) — верните её через "
+                          "apply_task_changes(op=\"restore\"), прежде "
+                          "чем работать с ней")
     if not live:
         return _Guard("missing", project_id, expected_title,
                       f"id {str(task_id)[:8]}… не среди открытых задач "
@@ -2207,7 +2247,8 @@ _COMPLETED_TASK_NOTE = ("задача ЗАВЕРШЕНА (не среди отк
 # читается как сбой сервера, а не как состояние объекта).
 _TRASHED_TASK_NOTE = ("задача «{title}» лежит В КОРЗИНЕ (удалена): операция "
                       "над удалённым объектом не выполняется — верните её "
-                      "через restore_tasks, и тогда повторите.")
+                      "через apply_task_changes(op=\"restore\"), и тогда "
+                      "повторите.")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -3292,6 +3333,15 @@ async def get_project_tasks(project_id: str, limit: int = _PROJECT_TASKS_PAGE,
         tasks = project_data.get('tasks', [])
         pname = project_data.get('project', {}).get('name', project_id)
         if not tasks:
+            # «Проекта нет» и «проект пуст» — РАЗНЫЕ ответы (QA-2 2026-08-19,
+            # дефект №12): на несуществующий id API отдаёт пустое тело без
+            # ошибки, и «No tasks found in project '<id>'» читался как пустой
+            # СУЩЕСТВУЮЩИЙ проект. Признак — у настоящего проекта всегда есть
+            # имя; пустой project-блок означает, что id никуда не ведёт.
+            if not project_data.get('project', {}).get('name'):
+                return (f"🛑 Проект по id {project_id} не найден (или "
+                        "недоступен) — это НЕ пустой проект. Проверь id через "
+                        "get_projects.")
             return f"No tasks found in project '{pname}'."
 
         # def-E1: раньше печатались ВСЕ задачи проекта — на боевом проекте из
@@ -3382,10 +3432,26 @@ async def get_task(project_id: str, task_id: str) -> str:
     if err:
         return err
 
+    # Пара project_id/task_id, которая друг другу не соответствует (задача
+    # лежит в другом списке), у официального API отвечает ГОЛЫМ 500 — без
+    # единого слова о причине (QA-2 2026-08-19, дефект №10). Обе ветки ошибки
+    # ниже приклеивают эту подсказку к уже человеческому тексту
+    # `_humanize_api_error`, чтобы человек знал и что случилось, и что делать.
+    mismatch_hint = (
+        "\nЧастая причина: project_id и task_id не соответствуют друг другу "
+        "(задача лежит в другом проекте) — официальный API на это отвечает "
+        "500. Проверь пару, или вызови get_task_info(task_id) — он ищет по "
+        "всем спискам, включая завершённые и корзину.")
+
+    def _with_hint(text: str, source: Any) -> str:
+        return (text + mismatch_hint
+                if _HTTP_STATUS_RE.search(str(source)) else text)
+
     try:
         task = await _run_blocking(lambda: ticktick.get_task(project_id, task_id))
         if isinstance(task, dict) and 'error' in task:
-            return _tool_error("fetching task", task['error'])
+            return _with_hint(_tool_error("fetching task", task['error']),
+                              task['error'])
 
         # Пустой/чужой ответ — это ОТКАЗ, а не карточка «No title / Active».
         refusal = _identity_or_refusal(
@@ -3400,7 +3466,7 @@ async def get_task(project_id: str, task_id: str) -> str:
         return format_task(task, trash_state=in_trash) + note
     except Exception as e:
         logger.exception("Error in get_task")
-        return _tool_error("fetching task", e)
+        return _with_hint(_tool_error("fetching task", e), e)
 
 def _build_v2_task_obj(node: Dict, project_id: str, task_id: str,
                        parent_id: str = None) -> Dict:
@@ -4150,7 +4216,12 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]],
 
     parts = []
     if created:
-        parts.append(f"Создано {len(created)}:\n" + "\n".join(created))
+        # Знаменатель — сколько строк ПРОСИЛИ у движка (QA-2, дефект №2):
+        # голое «Создано 2» при 3 переданных строках читалось как полный
+        # успех, а упавшая строка терялась на фоне.
+        head = (f"Создано {len(created)}" if len(created) == len(tasks)
+                else f"Создано {len(created)} из {len(tasks)} строк запроса")
+        parts.append(head + ":\n" + "\n".join(created))
     if warnings:
         parts.append("Проверка назначения:\n" + "\n".join(warnings))
     if failed:
@@ -4289,7 +4360,7 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     Phase 1 of confirmed creation — THE way to create tasks in an interactive
     chat: build a creation MANIFEST without creating anything. Read-only.
 
-    Accepts the same task objects as create_tasks (title, project_id, content,
+    Accepts plain task objects (title, project_id, content,
     due_date, priority, tags, column_id, subtasks, …). project_id is OPTIONAL:
     when the user didn't name a project, OMIT it — the server itself looks at
     the owner's project list and proposes a destination PER TASK (sure /
@@ -4337,7 +4408,7 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
 
     Args:
         summary: one-line human sentence describing the batch
-        tasks: same objects create_tasks takes
+        tasks: task objects (title, project_id, content, due_date, priority, tags, column_id, subtasks, …)
         max_items: refuse to plan more than this many creations
     """
     err = (await _run_blocking(_ensure_official))
@@ -4361,6 +4432,13 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
         pid = t.get("project_id") or t.get("projectId") or ""
         if not title:
             refused.append(f"#{i}: нет title")
+            continue
+        # Дата неподдерживаемого формата — отказ строки, а не задача БЕЗ
+        # даты (QA-2, дефект №8: «2026-08-19 20:00» теперь принимается выше
+        # в _resolve_relative_date, всё непринимаемое обязано быть названо).
+        date_why = _date_format_refusal(t)
+        if date_why:
+            refused.append(f"#{i} «{title}»: {date_why}")
             continue
         if not pid:
             pending.append((i, t))
@@ -4555,6 +4633,12 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
         # такая же ветка в `delete_tasks`: предупреждения едут прямо в ответ.
         killswitch_notes = []
         if refused:
+            # Счёт по ЗАПРОШЕННОМУ (QA-2, дефект №2): смешанный батч печатал
+            # «Создано 2 …» и часть причин терялась — теперь шапка сводит
+            # арифметику всего запроса, а строки «Исключены» называют каждую.
+            killswitch_notes.append(
+                f"📊 Запрошено строк: {len(tasks)}, в исполнение пошло "
+                f"{len(good)}, исключено на сверке плана: {len(refused)}.")
             killswitch_notes.append(
                 f"🛑 **Исключены {len(refused)}:** " + "; ".join(refused))
         unsure = [(t, pname, sug) for (t, pname, sug, _) in good
@@ -5781,7 +5865,7 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
         preview = [f"### 📋 {summary} — {len(items)}",
                   _plan_id_line(mid, "ничего ещё не удалено"),
                   "- задачи уходят в корзину TickTick — можно вернуть через "
-                  "restore_tasks", ""]
+                  "apply_task_changes(op=\"restore\")", ""]
         for i, it in enumerate(items, 1):
             preview.append(f"{i}. **«{it['title']}»** — {it['project']} (`{it['taskId']}`)")
         preview.extend(lines)
@@ -5841,10 +5925,9 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
     """
     Phase 1 of SAFE deletion — the two-phase (plan → user says yes →
     execute) path, REQUIRED for bulk deletes and for parent+subtree deletes.
-    (A single task MAY still be removed directly via delete_tasks when its
-    title is supplied, up to DIRECT_DELETE_CAP=1 — that path is ALSO gated,
-    not disabled; anything larger than the cap is refused there and routed
-    here.) Builds a deletion MANIFEST without deleting anything. Read-only —
+    (A single task can also be deleted via apply_task_changes with
+    op="delete" — that path is ALSO gated, not disabled.) Builds a deletion
+    MANIFEST without deleting anything. Read-only —
     safe to call without confirmation.
 
     Each requested {taskId, title?, projectId?, with_subtasks?} is resolved
@@ -5895,6 +5978,41 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
         return _STATE_UNAVAILABLE_MSG
     found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
     names = _v2_project_names()
+    # ЗАКРЫТЫЕ задачи — ЗАКОННЫЙ объект удаления (QA-2 2026-08-19, дефект №1:
+    # завершённую/отменённую задачу нельзя было удалить НИКАКИМ путём — все
+    # каналы смотрели только в снимок открытых). Каждую «не найденную среди
+    # открытых» строку ищем по закрытым лентам: найдена закрытой и название
+    # сошлось → она попадает в план (с пометкой), корзина/подлог/неизвестный
+    # id → остаётся исключённой, но теперь С ПРИЧИНОЙ.
+    still_missing, closed_rows = [], []
+    for mrec in missing:
+        if "КОРЗИНЕ" in (mrec.get("reason") or ""):
+            still_missing.append(mrec)
+            continue
+        fb, fb_where = await _run_blocking(
+            _find_task_beyond_open, mrec["taskId"],
+            (mrec.get("projectId") or "").strip())
+        if fb is None or fb_where == "open":
+            # "open" = есть в официальном канале, но не в снимке v2 — guard
+            # уже отработал этот случай своим фолбэком; не дублируем.
+            still_missing.append(mrec)
+            continue
+        if fb_where == "trash":
+            mrec = dict(mrec)
+            mrec["reason"] = ("уже в КОРЗИНЕ (удалена) — восстановить: "
+                              "apply_task_changes(op=\"restore\")")
+            still_missing.append(mrec)
+            continue
+        raw_title = next(
+            (t.get("title") or "" for t in tasks
+             if (t.get("taskId") or t.get("task_id")) == mrec["taskId"]), "")
+        if raw_title and not _names_agree(raw_title, fb.get("title") or ""):
+            mismatch.append({"taskId": mrec["taskId"], "expected": raw_title,
+                             "actual": fb.get("title") or "(без названия)",
+                             "project": names.get(fb.get("projectId") or "", "")})
+            continue
+        closed_rows.append((mrec["taskId"], fb))
+    missing = still_missing
     mid = uuid.uuid4().hex[:12]
 
     def _mk_item(tid, pid, live):
@@ -5922,6 +6040,27 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
         if p:
             kids.setdefault(p, []).append(sub)
     items, seen = [], set()
+
+    def _expand_open_subtree(parent_id: str, default_pid: str) -> None:
+        # Server-side expansion: the ENTIRE open subtree of this parent
+        # (BFS over parentId, any depth) joins the manifest with its live
+        # title — nothing hand-typed by the caller, no orphans left.
+        queue = list(kids.get(parent_id, []))
+        depth_of = {parent_id: 0}
+        while queue:
+            sub = queue.pop(0)
+            sid = sub.get("id")
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            d = depth_of.get(sub.get("parentId"), 0) + 1
+            depth_of[sid] = d
+            si = _mk_item(sid, sub.get("projectId") or default_pid, sub)
+            si["title"] = si["title"] or f"[task {str(sid)[:8]}…]"
+            si["depth"] = d  # render-only; title stays clean for re-verify
+            items.append(si)
+            queue.extend(kids.get(sid, []))
+
     for f in found:
         if f["taskId"] in seen:
             continue
@@ -5931,33 +6070,50 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
         it["title"] = it["title"] or f["title"]
         items.append(it)
         if f["taskId"] in want_subs:
-            # Server-side expansion: the ENTIRE open subtree of this parent
-            # (BFS over parentId, any depth) joins the manifest with its live
-            # title — nothing hand-typed by the caller, no orphans left.
-            queue = list(kids.get(f["taskId"], []))
-            depth_of = {f["taskId"]: 0}
-            while queue:
-                sub = queue.pop(0)
-                sid = sub.get("id")
-                if not sid or sid in seen:
-                    continue
-                seen.add(sid)
-                d = depth_of.get(sub.get("parentId"), 0) + 1
-                depth_of[sid] = d
-                si = _mk_item(sid, sub.get("projectId") or f["projectId"], sub)
-                si["title"] = si["title"] or f"[task {str(sid)[:8]}…]"
-                si["depth"] = d  # render-only; title stays clean for re-verify
-                items.append(si)
-                queue.extend(kids.get(sid, []))
+            _expand_open_subtree(f["taskId"], f["projectId"])
+    for tid, fb in closed_rows:
+        # Закрытая задача в плане удаления (QA-2, дефект №1): пометка `closed`
+        # ведёт исполнителя в закрытые ленты (и на сверке, и на перепроверке),
+        # `closed_label` — то, что читает человек в превью.
+        if tid in seen:
+            continue
+        seen.add(tid)
+        it = _mk_item(tid, fb.get("projectId") or "", fb)
+        it["closed"] = True
+        it["closed_label"] = _closed_status_label(fb)
+        items.append(it)
+        if tid in want_subs:
+            # Открытые дети ЗАКРЫТОГО родителя существуют (complete не
+            # каскадится) — with_subtasks обязан подобрать и их.
+            _expand_open_subtree(tid, fb.get("projectId") or "")
     if len(items) > max_items:
         return (f"🛑 Отказ: после разворачивания подзадач в плане {len(items)} "
                 f"удалений — больше капа {max_items}. Разбей на части или "
                 "подними max_items осознанно.")
+    if not items:
+        # Полностью невалидный батч (QA-2, дефект №4): раньше пустой план
+        # доходил до исполнения и человек получал голое «Ничего не удалено.»
+        # без единой причины. Причины собраны выше — печатаем их здесь и не
+        # строим манифест вовсе (кнопка/подтверждение к пустому плану — обман).
+        zero = ["### 📋 План удаления — 0",
+                "🛑 Плана нет — ни одна строка не прошла сверку: манифест НЕ "
+                "создан, ничего не удалено."]
+        if mismatch:
+            zero.append(_mismatch_report(mismatch, "включил в план"))
+        if missing:
+            zero.append(f"↷ Исключены {len(missing)}: " + "; ".join(
+                f"«{mr['title']}» — {mr.get('reason') or 'не среди открытых'}"
+                for mr in missing))
+        return "\n".join(zero)
     now = time.monotonic()
     obj_hash = _manifest_object_hash("delete", [it["taskId"] for it in items])
     _MANIFESTS[mid] = {"kind": "delete", "items": items,
                        "created": now, "plan_shown_at": now,
                        "object_hash": obj_hash,
+                       # Сколько строк реально ЗАПРОСИЛ вызывающий — отчёт
+                       # исполнения печатает знаменатель по этому числу
+                       # (QA-2, дефект №2: «Удалено 9/9» при 11 запрошенных).
+                       "requested_total": len(tasks),
                        "summary": summary, "consumed": False}
     lines = [f"### 📋 План удаления — {len(items)}",
              _plan_id_line(mid, "ничего ещё не удалено"), ""]
@@ -5983,13 +6139,18 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
         n_orphans = len([k for k in kids.get(it["taskId"], [])
                          if k.get("id") not in planned])
         orphan_tail = f" ({_triage_orphan_note(n_orphans)})" if n_orphans else ""
+        closed_tail = (f" — задача {it['closed_label']}, удаляем закрытую"
+                       if it.get("closed") else "")
         lines.append(f"{i}. {mark}{shown} — {it['project']} "
-                     f"(`{it['taskId']}`){orphan_tail}")
+                     f"(`{it['taskId']}`){closed_tail}{orphan_tail}")
     if mismatch:
         lines.append(_mismatch_report(mismatch, "включил в план"))
     if missing:
-        lines.append(f"↷ Исключены (не среди открытых) {len(missing)}: "
-                     + ", ".join(f"«{m['title']}»" for m in missing))
+        # Причина у КАЖДОЙ строки (QA-2, дефект №4): голый список названий не
+        # говорил человеку, ЧТО с задачей — опечатка в id, корзина, старость.
+        lines.append(f"↷ Исключены {len(missing)}: " + "; ".join(
+            f"«{m['title']}» — {m.get('reason') or 'не среди открытых'}"
+            for m in missing))
     lines.append("")
     # Инструкция для модели — ОТДЕЛЬНО от `lines` (2026-08-06, дефект №2):
     # раньше уходила дословно в Telegram-карточку плана.
@@ -6020,8 +6181,9 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
             killswitch_notes.append(_mismatch_report(mismatch, "включил в план"))
         if missing:
             killswitch_notes.append(
-                f"↷ Исключены (не среди открытых) {len(missing)}: "
-                + ", ".join(f"«{m['title']}»" for m in missing))
+                f"↷ Исключены {len(missing)}: " + "; ".join(
+                    f"«{m['title']}» — {m.get('reason') or 'не среди открытых'}"
+                    for m in missing))
         return ("\n".join([done, ""] + killswitch_notes)
                 if killswitch_notes else done)
     # Сетевую часть отправки уводит в поток сам хук (см. delete_tasks выше и
@@ -6122,6 +6284,28 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
             # ones the human saw in the approved plan. Anything unverifiable
             # (task gone, no title stored to check against) is fail-closed —
             # skipped and reported, never "deleted just in case".
+            if not live and it.get("closed"):
+                # Строка плана — ЗАКРЫТАЯ задача (Completed/Won't do, QA-2
+                # дефект №1): среди открытых её нет по определению, сверка
+                # идёт по закрытым лентам — теми же правилами (id + название,
+                # корзина = отказ), просто по своему источнику.
+                fb, fb_where = await _run_blocking(
+                    _find_task_beyond_open, it["taskId"],
+                    (it.get("projectId") or "").strip())
+                if fb is None:
+                    drifted.append((it.get("title")
+                                    or f"[task {str(it['taskId'])[:8]}…]",
+                                    "закрытая задача не нашлась ни в одной "
+                                    "ленте (уже удалена вручную?)"))
+                    continue
+                if fb_where == "trash":
+                    drifted.append((fb.get("title") or it.get("title") or "",
+                                    "уже в корзине (удалена ранее)"))
+                    continue
+                live = fb
+                live_title = live.get("title") or ""
+                live_pid = (live.get("projectId")
+                            or it.get("projectId") or "")
             if not live:
                 drifted.append((it.get("title") or f"[task {str(it['taskId'])[:8]}…]",
                                 "нет среди открытых задач"))
@@ -6180,6 +6364,8 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
                           "title": (planned_title
                                     if not _looks_untitled(planned_title)
                                     else _untitled_label(live)),
+                          "closed": bool(it.get("closed")),
+                          "orphans": int(it.get("orphans") or 0),
                           "snapshot": it["snapshot"]})
         journal = _journal_write({
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -6192,21 +6378,51 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
                 [{"taskId": r["taskId"], "projectId": r["projectId"]} for r in ready]))
             api_fail = id2error_failures(resp, [r["taskId"] for r in ready])
         still = (await _run_blocking(_open_by_id, fresh=True)) if ready else {}
+        # ЗАКРЫТЫЕ строки (QA-2, дефект №1) в снимке открытых не были и ДО
+        # удаления — «нет среди открытых» для них ничего не доказывает.
+        # Перепроверка идёт по закрытым лентам: удалена = исчезла из них или
+        # переехала в корзину. Кэш v2 сбрасывается, иначе лента завершённых
+        # ответила бы снимком, снятым ДО удаления.
+        closed_ok, closed_bad = set(), set()
+        closed_ids = [r["taskId"] for r in ready if r.get("closed")]
+        if closed_ids and still is not None:
+            if ticktick_v2:
+                try:
+                    await _run_blocking(ticktick_v2.invalidate_cache)
+                except Exception:
+                    pass
+            for cid in closed_ids:
+                if cid in api_fail:
+                    continue
+                fb, fb_where = await _run_blocking(_find_task_beyond_open, cid)
+                if fb is None or fb_where == "trash":
+                    closed_ok.add(cid)
+                else:
+                    closed_bad.add(cid)
         lines = []
         if still is None:
             deleted, failed = [], []
             lines.append(f"Отправлено на удаление {len(ready)}, но "
                          f"{_UNVERIFIED_MSG}")
         else:
-            deleted = [r["title"] for r in ready
-                       if r["taskId"] not in still and r["taskId"] not in api_fail]
-            failed = [r["title"] for r in ready
-                      if r["taskId"] in still or r["taskId"] in api_fail]
+            def _gone(r) -> bool:
+                if r["taskId"] in api_fail:
+                    return False
+                if r.get("closed"):
+                    return r["taskId"] in closed_ok
+                return r["taskId"] not in still
+            deleted = [r["title"] for r in ready if _gone(r)]
+            failed = [r["title"] for r in ready if not _gone(r)]
         if api_fail:
             lines.append("❌ TickTick отклонил " + str(len(api_fail)) + ": "
                          + "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items()))
+        # ЗНАМЕНАТЕЛЬ — ЗАПРОШЕННОЕ, а не исполненное (QA-2, дефект №2):
+        # «Удалено 9/9» при 11 запрошенных строках читалось как 100% успех.
+        # `requested_total` кладёт plan_task_deletion (сколько строк реально
+        # попросил вызывающий); у манифестов без него — прежний счёт по items.
+        total_asked = int(m.get("requested_total") or len(m["items"]))
         if deleted:
-            lines.append(f"🗑 Удалено {len(deleted)}/{len(m['items'])}: "
+            lines.append(f"🗑 Удалено {len(deleted)}/{total_asked}: "
                          + ", ".join(f"«{t}»" for t in deleted))
         if drifted:
             lines.append(
@@ -6216,10 +6432,20 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
         if failed:
             lines.append(f"❌ НЕ удалено {len(failed)} (всё ещё в TickTick): "
                          + ", ".join(f"«{t}»" for t in failed))
+        # Осиротевшие подзадачи (QA-2, дефект №7): превью плана это уже
+        # говорило, но при выключенном гейте человек видит ТОЛЬКО этот отчёт.
+        orphan_notes = [f"«{r['title']}» — {_triage_orphan_note(r['orphans'])}"
+                        for r in ready
+                        if r.get("orphans") and r["title"] in deleted]
+        if orphan_notes:
+            lines.append("⚠️ Подзадачи удалённых остаются БЕЗ родителя: "
+                         + "; ".join(orphan_notes)
+                         + ". Если их тоже надо удалить — перепланируй с "
+                         "with_subtasks=true.")
         if journal:
             lines.append(f"🧾 Снапшоты удалённого — в журнале: {journal} "
-                         "(восстановление: restore_tasks из корзины, либо "
-                         "пересоздание из снапшота).")
+                         "(восстановление: apply_task_changes(op=\"restore\") "
+                         "из корзины, либо пересоздание из снапшота).")
         # Append the server-built independent report — not optional, the model
         # can't skip what's already in the tool result. `_run_blocking` —
         # внутри отчёта сетевые чтения и `time.sleep`-ретраи post-verify (до
@@ -6323,6 +6549,40 @@ def _verdict_display_name(item: Dict) -> str:
     if snap:
         return _untitled_label(snap)
     return f"[task {str(tid)[:8]}…]"
+
+
+# Есть ли в строке даты явное смещение/зона — по нему решается, чью зону
+# подставлять «голому» времени при семантическом сравнении моментов.
+_TZ_SUFFIX_RE = re.compile(r"(?:Z|[+-]\d{2}:?\d{2})\s*$")
+
+
+def _verify_dates_equal(got: str, want: str) -> bool:
+    """Сравнение дат для пост-проверки — ПО МОМЕНТУ, а не по буквам строки
+    (QA-2 2026-08-19, дефект №9): TickTick хранит «2026-08-20T03:00:00.000
+    +0000», вызывающий просил «2026-08-19T20:00:00-07:00» — это ОДИН момент,
+    а сравнение срезов [:10] объявляло исправное обновление «не применилось»
+    (даты по разные стороны полуночи UTC).
+
+    Правила:
+      * хотя бы одна сторона — голая дата (all-day) → календарное сравнение
+        [:10], как раньше: у all-day зоны нет по определению (#36);
+      * обе — моменты и парсятся → сравнение aware-datetime; значение БЕЗ
+        смещения читается в зоне ВЛАДЕЛЬЦА (_USER_TZ — America/Los_Angeles у
+        Максима, не UTC) для ожидания вызывающего и в UTC для значения из
+        TickTick (его канал всегда шлёт +0000);
+      * не парсится → прежнее сравнение [:10] (мягче, чем ложная тревога)."""
+    g, w = str(got).strip(), str(want).strip()
+    if _DATE_ONLY.match(g) or _DATE_ONLY.match(w):
+        return g[:10] == w[:10]
+    gdt = _parse_ticktick_datetime(g)
+    wdt = _parse_ticktick_datetime(w)
+    if gdt is None or wdt is None:
+        return g[:10] == w[:10]
+    if not _TZ_SUFFIX_RE.search(w):
+        wdt = wdt.replace(tzinfo=_USER_TZ)
+    if not _TZ_SUFFIX_RE.search(g):
+        gdt = gdt.replace(tzinfo=timezone.utc)
+    return gdt == wdt
 
 
 def _verify_item(op: str, item: Dict, live_map: Dict[str, Dict],
@@ -6676,7 +6936,7 @@ def _verify_item_core(op: str, item: Dict, live_map: Dict[str, Dict],
             got = live.get(field)
             if field in ("dueDate", "startDate") and isinstance(got, str) \
                     and isinstance(want, str):
-                if got[:10] != want[:10]:
+                if not _verify_dates_equal(got, want):
                     diffs.append(f"{field}: {got!r} ≠ {want!r}")
             elif field == "tags":
                 if set(got or []) != set(want or []):
@@ -7095,8 +7355,19 @@ def _build_operation_report_data(record_id: str) -> _ReportData:
         elif warn:
             overall, tail = "⚠️", "есть непроверенные пункты — это НЕ полный успех."
         elif ok and drift:
+            # «См. разделы ниже» имеет право звучать ТОЛЬКО когда разделы
+            # действительно будут напечатаны (QA-2 2026-08-19, дефект №3:
+            # drift бывает и от пометки в строке вердикта — тогда «разделов
+            # ниже» нет, и обещание вело в пустоту). Называем, ГДЕ именно
+            # искать расхождение.
+            if skipped or not_planned:
+                where_drift = ("см. разделы «Пропущено»/«Не вошло в план» "
+                               "ниже")
+            else:
+                where_drift = ("деталь — в строках проверки выше, у пунктов "
+                               "с оговоркой")
             overall, tail = "⚠️", ("подтверждённое подтвердилось, но план и "
-                                   "факт разошлись — см. разделы ниже; это НЕ "
+                                   f"факт разошлись — {where_drift}; это НЕ "
                                    "полный успех.")
         elif ok:
             overall, tail = "✅", "всё подтверждено."
@@ -7711,12 +7982,23 @@ _WEEKDAY_NAMES = {
 }
 
 
+# «2026-08-19 20:00» / «2026-08-19 20:00:30» — дата-время с ПРОБЕЛОМ вместо
+# «T» и без смещения. До QA-2 (2026-08-19, дефект №8) такое значение молча
+# проезжало в API как есть, TickTick его отбрасывал, и задача создавалась
+# БЕЗ даты — ни ответ, ни operation_report о потере не говорили.
+_SPACE_DATETIME_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})[ ](\d{2}:\d{2}(?::\d{2})?)$")
+
+
 def _resolve_relative_date(value):
     """'today'/'tomorrow'/'yesterday' or a bare weekday name (RU too,
     case-insensitive) -> real 'YYYY-MM-DD' from THIS server's clock.
-    Anything else (an already-literal date, a full ISO timestamp, None)
-    passes through unchanged — idempotent, safe to call on values that were
-    already resolved."""
+    'YYYY-MM-DD HH:MM[:SS]' (a space instead of the ISO 'T', no offset) is
+    ACCEPTED as the owner's local time (_USER_TZ) and normalized to a full
+    ISO instant — QA-2 (2026-08-19, дефект №8): before, it silently produced
+    a task WITHOUT a date. Anything else (an already-literal date, a full
+    ISO timestamp, None) passes through unchanged — idempotent, safe to call
+    on values that were already resolved."""
     if not isinstance(value, str):
         return value
     key = value.strip().lower()
@@ -7728,7 +8010,34 @@ def _resolve_relative_date(value):
         today = _today_local()
         delta = (weekday - today.weekday()) % 7
         return (today + timedelta(days=delta)).isoformat()
+    m = _SPACE_DATETIME_RE.match(value.strip())
+    if m:
+        try:
+            dt = datetime.fromisoformat(f"{m.group(1)}T{m.group(2)}")
+        except ValueError:
+            return value
+        return dt.replace(tzinfo=_USER_TZ).strftime("%Y-%m-%dT%H:%M:%S.000%z")
     return value
+
+
+def _date_format_refusal(t: Dict[str, Any]) -> str:
+    """Причина отказа для строки создания с НЕподдерживаемым форматом даты,
+    или "" когда даты в порядке. Молча терять данные нельзя (QA-2, дефект
+    №8): значение, которое API не примет, обязано остановить строку на
+    плане, а не превратиться в задачу без даты. Зовётся ПОСЛЕ
+    `_resolve_dates_in_task_tree` — всё принимаемое уже нормализовано."""
+    for key in ("due_date", "start_date"):
+        raw = t.get(key)
+        if not raw:
+            continue
+        v = str(raw).strip()
+        if _DATE_ONLY.match(v):
+            continue
+        if _parse_ticktick_datetime(v) is None:
+            return (f"{key}={raw!r} — неподдерживаемый формат даты. Принимаю: "
+                    "YYYY-MM-DD, «YYYY-MM-DD HH:MM» (время владельца) или "
+                    "полный ISO 8601 (YYYY-MM-DDTHH:MM:SS±HH:MM)")
+    return ""
 
 
 def _resolve_dates_in_task_tree(node: Dict[str, Any]) -> None:
@@ -9986,7 +10295,7 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
         if cross_refused:
             lines.append(f"🛑 НЕ вложено {len(cross_refused)} — задачи в ДРУГОМ "
                          f"проекте, а родитель в «{_v2_project_names().get(parent_pid, parent_pid)}». "
-                         "Сначала перенеси move_tasks: " + ", ".join(cross_refused))
+                         "Сначала перенеси в тот же проект (apply_task_changes, op=\"move\"): " + ", ".join(cross_refused))
         if depth_refused:
             lines.append(f"🛑 НЕ вложено {len(depth_refused)} — TickTick не "
                          f"поддерживает вложенность глубже {MAX_TASK_NEST_LEVELS} "
@@ -10650,7 +10959,9 @@ async def build_recurrence_rule(frequency: str, interval: int = 1,
                                 by_month: List[int] = None,
                                 by_set_pos: List[int] = None) -> str:
     """
-    Build an RRULE recurrence string to pass as repeat_flag in create_tasks/update_tasks.
+    Build an RRULE recurrence string to pass as repeat_flag when creating a task
+    (plan_task_creation → execute_task_creation) or updating one
+    (apply_task_changes, op="update").
 
     The FIRST line of the output is the rule itself — that is what goes into
     repeat_flag. Anything after it is a warning about a rule that is valid but
@@ -10759,7 +11070,9 @@ async def build_recurrence_rule(frequency: str, interval: int = 1,
 @mcp.tool(annotations=READONLY)
 async def build_reminder(minutes_before: int = 0) -> str:
     """
-    Build a reminder TRIGGER string to pass in the reminders list of create_tasks/update_tasks.
+    Build a reminder TRIGGER string to pass in the reminders list when creating
+    a task (plan_task_creation → execute_task_creation) or updating one
+    (apply_task_changes, op="update").
 
     Args:
         minutes_before: Minutes before the due time to remind. 0 = at the time
@@ -11477,6 +11790,18 @@ async def get_task_comments(task_title: str, project_id: str, task_id: str) -> s
     try:
         comments = await _run_blocking(lambda: ticktick_v2.get_task_comments(project_id, task_id))
         if not comments:
+            # «Задачи нет» и «комментариев нет» — РАЗНЫЕ ответы (QA-2
+            # 2026-08-19, дефект №12): канал комментариев отвечает пустотой и
+            # на несуществующий task_id. Одно точечное чтение по всем лентам
+            # (открытые/завершённые/корзина) — только на этой, уже пустой
+            # ветке; счастливый путь не платит ничем.
+            found, _where, readable = await _run_blocking(
+                _locate_task_any_state, task_id)
+            if readable and found is None:
+                return (f"🛑 Задача по id {task_id} не найдена ни среди "
+                        "открытых, ни среди завершённых, ни в корзине — "
+                        "«нет комментариев» сказать не о чем. Проверь id "
+                        "через get_task_info(task_id).")
             return f"No comments on task '{task_title}'."
         out = f"Comments on '{task_title}' ({len(comments)}):\n\n"
         for c in comments:
@@ -11537,7 +11862,7 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
     check then runs against the source that still knows the task, so the
     title IS verified, and the plan/result say the task is completed. A task
     that a source DOES know but that sits in the TRASH is refused instead
-    (see restore_tasks) — trash gets its own refusal, separate from an id
+    (see apply_task_changes(op="restore")) — trash gets its own refusal, separate from an id
     that no source knows at all.
     """
     err = (await _run_blocking(_ensure_ready))
@@ -11708,10 +12033,11 @@ async def get_statistics() -> str:
 async def get_trash(limit: int = 50) -> str:
     """
     List recently deleted (trashed) tasks (requires v2 API). Each line carries
-    the task's id and original project — restore_tasks needs both: the id/title
-    pair to identify the task (title is checked against the live trash entry
-    before restoring), and to_project_id only if you want to override the
-    original list it restored to.
+    the task's id and original project — apply_task_changes(op="restore")
+    needs both: the id/title pair to identify the task (title is checked
+    against the live trash entry before restoring), and
+    to_project_id/to_project only to override the original list it restores
+    to.
 
     A truncated answer ALWAYS says so and names the real total: the trash page
     is fetched up to its 500-entry ceiling regardless of `limit`, so "showing
@@ -11720,19 +12046,33 @@ async def get_trash(limit: int = 50) -> str:
 
     Args:
         limit: How many trashed tasks to print (default 50, max 500 — the
-            page ceiling). Anything not printed is announced, never dropped
-            silently.
+            page ceiling). Values below 1 are refused; values above 500 are
+            clamped to 500 and the answer says so. Anything not printed is
+            announced, never dropped silently.
     """
     err = (await _run_blocking(_ensure_ready))
     if err:
         return err
+    # Границы limit — ЯВНО (QA-2 2026-08-19, дефект №11): limit=0 молча
+    # печатал одну запись (max(1, …) читался как «одна и есть»), а
+    # limit=99999 печатал всю страницу и ронял ответ об лимит размера MCP.
+    # Бессмысленное значение отклоняется, превышение потолка КЛЭМПИТСЯ вслух.
+    if limit < 1:
+        return (f"🛑 limit={limit} не имеет смысла — передай от 1 до "
+                f"{TRASH_MAX_LIMIT} (потолок страницы корзины).")
+    clamp_note = ""
+    if limit > TRASH_MAX_LIMIT:
+        clamp_note = (f"ℹ️ limit={limit} больше потолка страницы — обрезан "
+                      f"до {TRASH_MAX_LIMIT}.\n")
+        limit = TRASH_MAX_LIMIT
     try:
         # Always ask for the full page, not `limit`: asking for exactly what we
         # print makes truncation INVISIBLE — a bare get_trash() used to answer
         # «Trashed tasks (50):» with nothing else while the trash really held
         # 497 (live, 2026-08-07). Fetching the ceiling costs the same single
-        # request (restore_tasks already does it) and is what lets the answer
-        # state the true total. «Showing 50» must never read as «there are 50».
+        # request (the restore path already does it) and is what lets the
+        # answer state the true total. «Showing 50» must never read as «there
+        # are 50».
         tasks = await _run_blocking(lambda: ticktick_v2.get_trash(TRASH_MAX_LIMIT))
         if not tasks:
             return "Trash is empty."
@@ -11742,9 +12082,9 @@ async def get_trash(limit: int = 50) -> str:
         at_ceiling = len(tasks) >= TRASH_MAX_LIMIT
         total = f"{TRASH_MAX_LIMIT}+" if at_ceiling else str(len(tasks))
         if show < len(tasks) or at_ceiling:
-            out = f"Trashed tasks (showing {show} of {total}):\n\n"
+            out = clamp_note + f"Trashed tasks (showing {show} of {total}):\n\n"
         else:
-            out = f"Trashed tasks ({len(tasks)}):\n\n"
+            out = clamp_note + f"Trashed tasks ({len(tasks)}):\n\n"
         # limit=show: the slice is already exact, so format_task_list must not
         # apply its own hidden 100-entry cut on top (the 2026-08-07 defect).
         out += format_task_list(tasks[:show], limit=show)
@@ -12108,7 +12448,7 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
     check then runs against the source that still knows the task, so the
     title IS verified, and the plan/result say the task is completed. A task
     that a source DOES know but that sits in the TRASH is refused instead
-    (see restore_tasks) — trash gets its own refusal, separate from an id
+    (see apply_task_changes(op="restore")) — trash gets its own refusal, separate from an id
     that no source knows at all.
     """
     err = (await _run_blocking(_ensure_ready))
@@ -13608,7 +13948,7 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
     check then runs against the source that still knows the task, so the
     title IS verified, and the plan/result say the task is completed. A task
     that a source DOES know but that sits in the TRASH is refused instead
-    (see restore_tasks) — trash gets its own refusal, separate from an id
+    (see apply_task_changes(op="restore")) — trash gets its own refusal, separate from an id
     that no source knows at all.
     """
     err = (await _run_blocking(_ensure_ready))
@@ -13777,7 +14117,7 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
     check then runs against the source that still knows the task, so the
     title IS verified, and the plan/result say the task is completed. A task
     that a source DOES know but that sits in the TRASH is refused instead
-    (see restore_tasks) — trash gets its own refusal, separate from an id
+    (see apply_task_changes(op="restore")) — trash gets its own refusal, separate from an id
     that no source knows at all.
     """
     err = (await _run_blocking(_ensure_ready))
@@ -13907,7 +14247,7 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str,
     check then runs against the source that still knows the task, so the
     title IS verified, and the plan/result say the task is completed. A task
     that a source DOES know but that sits in the TRASH is refused instead
-    (see restore_tasks) — trash gets its own refusal, separate from an id
+    (see apply_task_changes(op="restore")) — trash gets its own refusal, separate from an id
     that no source knows at all.
     """
     err = (await _run_blocking(_ensure_ready))
@@ -14502,7 +14842,7 @@ async def get_task_info(task_id: str) -> str:
             in_trash, _ = await _trash_state(task_id)
             if in_trash:
                 return (f"Task {task_id} is IN THE TRASH (deleted). "
-                        "restore_tasks can bring it back.")
+                        "apply_task_changes(op=\"restore\") can bring it back.")
             if in_trash is False:
                 return (f"Task {task_id} not found among open tasks and it is NOT in "
                         "the trash — it is either completed, or in an archived/closed "
@@ -14961,7 +15301,8 @@ async def get_project_members(project_id: str) -> str:
     """
     List the members of a shared project — owner and collaborators — with
     their user IDs (requires v2 API). Use a member's userId as the assignee
-    field in create_tasks/update_tasks to assign a task to them.
+    field of a task row (plan_task_creation, or apply_task_changes with
+    op="update") to assign a task to them.
 
     Args:
         project_id: ID of the shared project
@@ -15071,7 +15412,8 @@ async def get_tasks_by_assignee(assignee: str, include_completed: bool = False) 
 async def list_project_columns(project_id: str) -> str:
     """
     List the kanban columns/sections of a project, with their IDs (uses the
-    official API). Use a column id as column_id in create_tasks/update_tasks.
+    official API). Use a column id as column_id when creating a task
+    (plan_task_creation) or updating one (apply_task_changes, op="update").
 
     Args:
         project_id: ID of the project
@@ -15124,7 +15466,8 @@ async def create_project_column(project_id: str, name: str,
     """
     Create a kanban column/section inside a project (including the Inbox) and
     return its id (requires v2 API). Use the returned id as column_id in
-    create_tasks/update_tasks to route tasks into this section. Gated 🟡
+    task rows (plan_task_creation, or apply_task_changes with op="update")
+    to route tasks into this section. Gated 🟡
     (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
     created on call #1.
 
@@ -15371,6 +15714,28 @@ def _triage_orphan_note(n: int) -> str:
     return f"у неё {n} открытых подзадач — они останутся без родителя"
 
 
+def _open_children_note(n: int) -> str:
+    """«…у неё N открытых подзадач — они останутся ОТКРЫТЫМИ под закрытым
+    родителем». Для complete/abandon: TickTick НЕ каскадит закрытие на
+    подзадачи, и сервер сознательно тоже (план не разрастается сверх
+    названного человеком — то же правило, что у `_triage_orphan_note`), но
+    молчать об этом нельзя (QA-2 2026-08-19, дефект №6: child/grandchild
+    висели Active под закрытым родителем, и ответ не говорил ни слова).
+    Отдельная формулировка, а не переиспользование `_triage_orphan_note`:
+    «останутся без родителя» — про УДАЛЕНИЕ, у закрытия родитель никуда не
+    девается, дети именно остаются открытыми."""
+    if not n:
+        return ""
+    if n % 10 == 1 and n % 100 != 11:
+        return ("у неё 1 открытая подзадача — она останется ОТКРЫТОЙ под "
+                "закрытым родителем")
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return (f"у неё {n} открытые подзадачи — они останутся ОТКРЫТЫМИ под "
+                "закрытым родителем")
+    return (f"у неё {n} открытых подзадач — они останутся ОТКРЫТЫМИ под "
+            "закрытым родителем")
+
+
 def _describe_triage_op(op: Dict) -> str:
     """Одна человекочитаемая строка про одну операцию — то, что человек
     реально увидит перед тем, как сказать «да». Никаких голых id: настоящие
@@ -15390,7 +15755,11 @@ def _describe_triage_op(op: Dict) -> str:
             {**op, "_live_title": op.get("title") or op.get("_live_title")})
         return f"⚠️ ПРОПУЩЕНО — {shown}: {op['_skip']}"
     title = _triage_task_label(op)
-    orphan = _triage_orphan_note(op.get("_open_children") or 0)
+    # У закрытия (complete/abandon) — своя формулировка про детей: родитель
+    # не исчезает, дети остаются ОТКРЫТЫМИ (QA-2, дефект №6).
+    orphan = (_open_children_note(op.get("_open_children") or 0)
+              if kind in ("complete", "abandon")
+              else _triage_orphan_note(op.get("_open_children") or 0))
     if kind in ("delete", "complete", "abandon"):
         bits = ([f"проект «{proj}»"] if proj else []) + ([orphan] if orphan else [])
         note = f" ({'; '.join(bits)})" if bits else ""
@@ -15945,11 +16314,49 @@ def _resolve_triage_ops(operations: List[Dict], by_id: Dict[str, Dict],
             resolved.append(e)
             continue
         live = by_id.get(e["task_id"])
+        closed_fallback = False
         if not live:
-            e["_skip"] = ("не найдена среди открытых задач (кто-то удалил или "
-                          "закрыл её вручную?)")
-            resolved.append(e)
-            continue
+            # QA-2 (2026-08-19, дефект №1): раньше здесь стоял безусловный
+            # «не найдена среди открытых задач (кто-то удалил или закрыл её
+            # вручную?)» — про живую завершённую задачу это ложь, и удалить
+            # её через MCP было невозможно ВООБЩЕ. Смотрим в ленты, которые
+            # закрытые задачи знают, и отвечаем по СОСТОЯНИЮ объекта:
+            # удаление закрытой — законная операция (идёт дальше по общей
+            # сверке), остальное — честный отказ с названной причиной.
+            fb, fb_where = _find_task_beyond_open(e["task_id"])
+            if fb is None:
+                e["_skip"] = ("не найдена ни среди открытых задач, ни в "
+                              "лентах завершённых/корзины (неверный id, или "
+                              "задача закрыта/удалена слишком давно для этих "
+                              "лент)")
+                resolved.append(e)
+                continue
+            if fb_where == "trash":
+                e["_skip"] = ("лежит в КОРЗИНЕ (удалена) — верните её "
+                              "операцией op=\"restore\" этого же инструмента "
+                              "и повторите")
+                resolved.append(e)
+                continue
+            if fb_where == "open":
+                # Открыта, но в v2-снимок не попала (рассинхрон source'ов).
+                # Мутировать по объекту, которого исполнители в снимке не
+                # увидят, нельзя — но и врать «кто-то удалил» тоже.
+                e["_skip"] = ("задача существует и открыта, но в снимок "
+                              "открытых задач ещё не попала (рассинхрон) — "
+                              "повтори через минуту")
+                resolved.append(e)
+                continue
+            # fb_where == "completed": закрытая (Completed или Won't do).
+            if e["op"] != "delete":
+                e["_live_title"] = fb.get("title") or ""
+                e["_skip"] = (f"задача {_closed_status_label(fb)} — не среди "
+                              "открытых; менять/закрывать/переносить её "
+                              "нельзя, а удалить можно: op=\"delete\" в этом "
+                              "же инструменте")
+                resolved.append(e)
+                continue
+            live = fb
+            closed_fallback = True
         if e["task_id"] in restore_injected:
             # Раздел 5 дизайна, снятие ограничения (2026-08-19): это НЕ
             # по-настоящему открытая задача, а корзинная запись, подставленная
@@ -15994,6 +16401,11 @@ def _resolve_triage_ops(operations: List[Dict], by_id: Dict[str, Dict],
             resolved.append(e)
             continue
         _triage_bind_live(e, live, names)
+        if closed_fallback:
+            # Пометка для дрейф-сверки и исполнителя удаления: этого объекта
+            # НЕТ в снимке открытых, и искать его там на исполнении нельзя —
+            # сверка пойдёт по тем же закрытым лентам (QA-2, дефект №1).
+            e["_closed"] = True
         # Специфика ТИПА — в его сверке плана из реестра (1.3.3/изм-1). Она же
         # обогащает операцию тем, что нужно её собственному исполнителю
         # (проект назначения у move, живое имя оставляемой копии у merge).
@@ -16243,6 +16655,21 @@ def _triage_drift_reason(op: Dict, by_id: Dict[str, Dict],
         # исполнения типа, к своей ленте.
         return reg.drift(op, by_id, names)
     live = by_id.get(op.get("task_id"))
+    if not live and op.get("_closed"):
+        # Объект плана — ЗАКРЫТАЯ задача (delete по завершённой/отменённой,
+        # QA-2 дефект №1): в снимке открытых её нет по определению, сверка
+        # идёт по тем же закрытым лентам, которыми её нашёл план.
+        fb, fb_where = _find_task_beyond_open(
+            op.get("task_id"), op.get("_project_id") or "")
+        if fb is None:
+            return ("закрытая задача исчезла из всех лент между планом и "
+                    "исполнением (уже удалена вручную?)")
+        if fb_where == "trash":
+            return "уже в корзине (удалена между планом и исполнением)"
+        if not _names_agree(op.get("title") or "", fb.get("title") or ""):
+            return (f"название изменилось после плана "
+                    f"(сейчас «{fb.get('title')}»)")
+        return _TRIAGE_BY_OP[op["op"]].drift(op, by_id, names)
     if not live:
         return "исчезла из открытых задач между планом и исполнением"
     # Маркер «названия нет» обязан пере-проверяться ЗДЕСЬ отдельной веткой
@@ -17810,7 +18237,18 @@ async def _op_complete_execute(summary: str, ops: List[Dict],
                                ctx: _TriageExecCtx) -> List[Tuple[str, str]]:
     items = [{"taskId": o["task_id"], "title": o.get("title") or "",
               "projectId": o.get("_project_id", "")} for o in ops]
-    return [("✅ Закрытие", await _complete_tasks_impl(summary, items))]
+    text = await _complete_tasks_impl(summary, items)
+    # Дети закрытого родителя ОСТАЮТСЯ открытыми (QA-2, дефект №6) — превью
+    # это говорило, но при выключенном гейте человек видит ТОЛЬКО этот отчёт.
+    kid_notes = [f"«{o.get('_live_title') or o.get('title') or ''}» — "
+                 f"{_open_children_note(o['_open_children'])}"
+                 for o in ops if o.get("_open_children")]
+    if kid_notes:
+        text += ("\n⚠️ " + "; ".join(kid_notes)
+                 + ". Закрывать их сервер сам не стал (план не разрастается "
+                 "сверх названного) — если нужно, назови их отдельными "
+                 "операциями op=\"complete\".")
+    return [("✅ Закрытие", text)]
 
 
 # ─────────────────────────────── restore ───────────────────────────────────
@@ -18143,6 +18581,10 @@ async def _op_abandon_execute(summary: str, ops: List[Dict],
     for o in ops:
         text = await _abandon_task_impl(
             summary, o["task_id"], o.get("_live_title") or o.get("title") or "")
+        if o.get("_open_children"):
+            # Та же честность, что у complete (QA-2, дефект №6): дети
+            # остаются открытыми, отчёт исполнения обязан это сказать.
+            text += f"\n⚠️ {_open_children_note(o['_open_children'])}."
         out.append((f"🚫 Не буду делать: «{_triage_task_label(o)}»", text))
     return out
 
@@ -18258,10 +18700,21 @@ async def _op_delete_execute(summary: str, ops: List[Dict],
     for o in ops:
         live = ctx.by_id.get(o["task_id"]) or {}
         pid = live.get("projectId") or o.get("_project_id", "")
-        items.append({"taskId": o["task_id"], "projectId": pid,
-                      "title": live.get("title") or o.get("title") or "",
-                      "project": ctx.names.get(pid, ""),
-                      "snapshot": o.get("_snapshot") or _snapshot_of(live)})
+        item = {"taskId": o["task_id"], "projectId": pid,
+                "title": (live.get("title") or o.get("_live_title")
+                          or o.get("title") or ""),
+                "project": ctx.names.get(pid, ""),
+                "snapshot": o.get("_snapshot") or _snapshot_of(live)}
+        if o.get("_closed"):
+            # Закрытая задача (QA-2, дефект №1): исполнителю удаления нельзя
+            # искать её среди открытых — пометка ведёт его в закрытые ленты.
+            item["closed"] = True
+        if o.get("_open_children"):
+            # Сколько ОТКРЫТЫХ детей осиротеет (QA-2, дефект №7): превью
+            # плана это уже говорило, но при выключенном гейте человек видит
+            # только отчёт исполнения — число обязано доехать и туда.
+            item["orphans"] = int(o["_open_children"])
+        items.append(item)
     now = time.monotonic()
     synthetic = {
         "kind": "delete", "items": items, "created": now,
@@ -18485,7 +18938,7 @@ async def apply_task_changes(summary: str, operations: List[Dict[str, Any]] = No
         "untitled": true,   # INSTEAD of "title", ONLY for a task that really
                             # has NO title — see below
         "said":    "<what the HUMAN said about THIS task>",  # required
-        # op="update" only — same field names update_tasks itself takes:
+        # op="update" only — field names listed below:
         "changes": {"new_title": "...", "due_date": "YYYY-MM-DD",
                     "start_date": "...", "priority": 0|1|3|5,
                     "content": "...", "tags": ["..."]},
@@ -18559,7 +19012,7 @@ async def apply_task_changes(summary: str, operations: List[Dict[str, Any]] = No
     `untitled: true` does NOT block renaming: an `update` whose `changes`
     carry `new_title` still goes through for a task that really has no name —
     the marker is what keeps that legitimate case open now that renaming with
-    no name to verify is refused everywhere (see update_tasks).
+    no name to verify is refused everywhere.
 
     `changes` accepts ONLY these keys: new_title, content, due_date,
     start_date, priority (0|1|3|5), tags (list of strings), reminders,

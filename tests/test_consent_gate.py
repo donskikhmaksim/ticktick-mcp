@@ -445,7 +445,7 @@ async def test_delete_tasks_plan_mentions_trash_reversibility(monkeypatch, tmp_p
         [{"taskId": "t1", "title": "Купить молоко", "projectId": "p1"}])
 
     assert fake.deleted_ids == []
-    assert "restore_tasks" in preview
+    assert 'apply_task_changes(op="restore")' in preview
     assert "корзин" in preview  # «корзину»/«корзины» — падеж не важен для теста
 
 

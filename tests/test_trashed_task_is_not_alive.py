@@ -147,7 +147,7 @@ async def test_plan_on_a_trashed_task_is_refused(tool, monkeypatch):
     assert "корзин" in answer.lower(), (
         f"{tool} отказывает, но не произносит слово «корзина» — человек не "
         f"поймёт, что произошло с задачей:\n{answer}")
-    assert "restore_tasks" in answer, (
+    assert 'apply_task_changes(op="restore")' in answer, (
         f"{tool} не подсказывает, как вернуть задачу:\n{answer}")
 
 
