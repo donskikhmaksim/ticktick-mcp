@@ -23,6 +23,7 @@ import base64
 import logging
 import mimetypes
 import re
+import threading
 import time
 import urllib.parse
 import uuid
@@ -40,6 +41,27 @@ ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024  # 20 MB (premium cap)
 
 # Never let an unofficial-API call hang the MCP request forever.
 REQUEST_TIMEOUT = 20
+
+# Потолок ожидания по Retry-After (2026-08-19). Сон живёт в рабочем потоке
+# (_run_blocking), event loop он не держит, но поток из общего пула
+# asyncio.to_thread — держит: без потолка один щедрый Retry-After занимал бы
+# воркер минутами, и пул кончился бы на всех остальных.
+RETRY_AFTER_CAP_S = 30.0
+
+
+def _retry_delay_s(resp, attempt: int) -> float:
+    """Пауза перед повтором: Retry-After сервера (секундная форма), если он
+    есть и разумен, иначе прежняя экспонента 2**attempt (1с, 2с). HTTP-датой
+    Retry-After здесь не бывает (TickTick шлёт секунды) — нечисловое значение
+    просто игнорируем в пользу экспоненты. getattr — чтобы ответ-заглушка без
+    .headers (тесты, обёртки) вёл себя как ответ без заголовка, а не падал."""
+    ra = (getattr(resp, "headers", None) or {}).get("Retry-After")
+    if ra:
+        try:
+            return max(0.0, min(float(ra), RETRY_AFTER_CAP_S))
+        except (TypeError, ValueError):
+            pass
+    return float(2 ** attempt)
 
 # Completed-task endpoint hard-caps the page size.
 COMPLETED_MAX_LIMIT = 100
@@ -129,6 +151,14 @@ class TickTickV2Client:
         self._state_cache: Optional[Dict] = None
         self._state_ts: float = 0.0
         self._state_ttl: float = 20.0
+        # Single-flight для /batch/check/0 (2026-08-19): прод-логи показали
+        # 63×429 за два часа — десятки корутин, разъехавшихся по потокам
+        # _run_blocking, НЕЗАВИСИМО дёргали полный снимок с force=True и сами
+        # поддерживали rate-limit. Теперь одновременные вызовы get_state
+        # складываются в ОДИН запрос: пока чей-то fetch в полёте, остальные
+        # ждут его результат на Condition, а не шлют свой (см. get_state).
+        self._state_cond = threading.Condition()
+        self._state_inflight = False
         # find_task_any_state()'s fallback result (completed feed / trash),
         # keyed by task id. Only populated when the open-task snapshot MISSED,
         # so it never shadows the live open state; same TTL as the sync cache.
@@ -207,11 +237,16 @@ class TickTickV2Client:
         # rate-limits bursts; a short wait usually clears it. 502/504 are
         # transient proxy errors (Cloudflare) — retry those too, so a
         # post-mutation verify read doesn't fail on a blip.
+        # На 429 сервер может прислать Retry-After — уважаем его вместо
+        # слепой экспоненты (2026-08-19: слепые сны 1с/2с при уже активном
+        # rate-limit только продлевали 429-полосу), но не дольше
+        # _RETRY_AFTER_CAP_S: спать минуты в рабочем потоке — значит занять
+        # его так, что пул asyncio.to_thread кончится на всех.
         resp = self.session.request(method, url, **kwargs)
         for attempt in range(2):
             if resp.status_code not in (429, 500, 502, 503, 504):
                 break
-            time.sleep(2 ** attempt)
+            time.sleep(_retry_delay_s(resp, attempt))
             resp = self.session.request(method, url, **kwargs)
         if resp.status_code in (401, 403):
             raise TickTickAuthError(
@@ -250,16 +285,56 @@ class TickTickV2Client:
 
     def get_state(self, force: bool = False) -> Dict:
         """Full sync snapshot: projects, tags, open tasks, inboxId.
-        Cached for a few seconds so back-to-back tool calls reuse one fetch."""
-        if (not force and self._state_cache is not None
-                and (time.monotonic() - self._state_ts) < self._state_ttl):
-            return self._state_cache
-        state = self._request("GET", "/batch/check/0")
-        if isinstance(state, dict):
-            self._state_cache = state
-            self._state_ts = time.monotonic()
-            if state.get("inboxId"):
-                self.inbox_id = state["inboxId"]
+        Cached for a few seconds so back-to-back tool calls reuse one fetch.
+
+        SINGLE-FLIGHT (2026-08-19). /batch/check/0 — самый тяжёлый и самый
+        частый запрос сервера (его дёргает почти каждый инструмент, обычно с
+        force=True), и прод-логи показали, что параллельные вызовы сами
+        загоняли аккаунт в 429: у каждого потока был СВОЙ fetch. Теперь:
+
+          * пока чей-то fetch в полёте, остальные вызовы ЖДУТ его результат
+            (Condition), а не шлют свой запрос;
+          * `_state_ts` — момент СТАРТА запроса (консервативнее, чем момент
+            ответа): снимок честно «не моложе» этой отметки;
+          * force=True удовлетворён любым снимком, чей запрос стартовал НЕ
+            РАНЬШЕ вызова get_state: перечитывать ещё раз бессмысленно —
+            свежее уже не будет. Снимок, стартовавший ДО вызова (то есть
+            способный не увидеть только что сделанную запись), force
+            по-прежнему НЕ принимает — дожидается конца чужого полёта и
+            летит сам (по-прежнему по одному за раз);
+          * сбой полёта будит всех ждущих, и следующий пробует сам — ошибка
+            одного вызова не подвешивает остальных."""
+        called_at = time.monotonic()
+        with self._state_cond:
+            while True:
+                if self._state_cache is not None:
+                    fresh_enough = (
+                        (time.monotonic() - self._state_ts) < self._state_ttl
+                        if not force else self._state_ts >= called_at)
+                    if fresh_enough:
+                        return self._state_cache
+                if not self._state_inflight:
+                    self._state_inflight = True
+                    break
+                # Потолок ожидания — полный ретрай-цикл _request с запасом;
+                # спурьёзные пробуждения безвредны, цикл перепроверяет всё.
+                self._state_cond.wait(timeout=REQUEST_TIMEOUT * 3 + 10)
+        started = time.monotonic()
+        try:
+            state = self._request("GET", "/batch/check/0")
+        except BaseException:
+            with self._state_cond:
+                self._state_inflight = False
+                self._state_cond.notify_all()
+            raise
+        with self._state_cond:
+            if isinstance(state, dict):
+                self._state_cache = state
+                self._state_ts = started
+                if state.get("inboxId"):
+                    self.inbox_id = state["inboxId"]
+            self._state_inflight = False
+            self._state_cond.notify_all()
         return state
 
     # ---- features the Open API lacks -------------------------------------

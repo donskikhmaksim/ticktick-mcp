@@ -17,6 +17,25 @@ logger = logging.getLogger(__name__)
 # the whole MCP request indefinitely.
 REQUEST_TIMEOUT = 20
 
+# Потолок ожидания по Retry-After (2026-08-19) — тот же смысл, что и в
+# ticktick_v2_client.py: сон живёт в рабочем потоке пула asyncio.to_thread,
+# и без потолка один щедрый Retry-After занимал бы воркер минутами.
+RETRY_AFTER_CAP_S = 30.0
+
+
+def _retry_delay_s(resp, attempt: int) -> float:
+    """Пауза перед повтором: Retry-After сервера (секундная форма), если он
+    есть и разумен, иначе прежняя экспонента 2**attempt (1с, 2с). getattr —
+    чтобы ответ-заглушка без .headers (тесты, обёртки) вёл себя как ответ
+    без заголовка, а не падал."""
+    ra = (getattr(resp, "headers", None) or {}).get("Retry-After")
+    if ra:
+        try:
+            return max(0.0, min(float(ra), RETRY_AFTER_CAP_S))
+        except (TypeError, ValueError):
+            pass
+    return float(2 ** attempt)
+
 # Durable token store on a Railway Volume (survives restarts/redeploys without
 # needing a Railway API token or manual paste into Variables). Defaults to a
 # file under /data; set TICKTICK_TOKEN_STORE to override or "" to disable.
@@ -409,7 +428,10 @@ class TickTickClient:
                     break
                 if method != "GET" and not idempotent:
                     break
-                time.sleep(2 ** _attempt)
+                # Retry-After сервера важнее слепой экспоненты (2026-08-19,
+                # см. _retry_delay_s): при активном rate-limit сон в 1-2с
+                # только продлевает 429-полосу.
+                time.sleep(_retry_delay_s(response, _attempt))
                 response = _issue()
 
             # Check if the request was unauthorized (401)
