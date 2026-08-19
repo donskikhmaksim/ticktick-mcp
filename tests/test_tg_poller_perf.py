@@ -446,3 +446,159 @@ async def test_slow_reaper_does_not_block_the_event_loop(monkeypatch):
     assert during_first_reap >= 5, (
         f"event loop стоял во время уборки просроченных планов "
         f"(посторонняя корутина провернулась {during_first_reap} раз)")
+
+
+# ═══════════ 7. Кандидаты одного тика не стоят в очереди друг за другом ═══════
+#
+# Ночь на 2026-08-19, живой QA пятью параллельными сессиями: между нажатием
+# «✅ Подтвердить» и исполнением — до ~14 минут при тике в 10 секунд, и это УЖЕ
+# ПОСЛЕ того, как секции 1–2 закрыли N+1 в Postgres и заморозку event loop.
+# Оставшаяся линейность была в самой структуре тика:
+#   * кандидаты исполнялись строго ПО ОДНОМУ, и на каждого приходилась не
+#     только мутация, но и независимая перепроверка + публикация отчёта в
+#     Telegram (а под активным QA Telegram отвечает 429 и заставляет отсиживать
+#     retry_after — до _MAX_SEND_WAIT_S на кусок): нажатая кнопка ждала, пока
+#     ОТЧИТАЮТСЯ все предыдущие;
+#   * sweep_scheduled_deletes стоял ПЕРВЫМ в тике — отдельный HTTP
+#     `deleteMessage` на каждое накопившееся сообщение, ДО захвата кандидатов.
+# Тесты ниже краснеют при возврате любого из двух порядков.
+
+import ticktick_mcp.src.tg_auto_execute as tae  # noqa: E402
+
+
+def _concurrency_meter(monkeypatch, sleep_s: float = 0.05) -> dict:
+    """Исполнитель, который меряет, сколько кандидатов работают ОДНОВРЕМЕННО."""
+    state = {"cur": 0, "max": 0, "runs": 0}
+
+    async def _exec(manifest_id, m):
+        state["cur"] += 1
+        state["runs"] += 1
+        state["max"] = max(state["max"], state["cur"])
+        await asyncio.sleep(sleep_s)
+        state["cur"] -= 1
+        return "### ✅ Готово"
+
+    monkeypatch.setattr(s._AUTO_EXECUTORS["delete_tasks"], "execute", _exec)
+    return state
+
+
+async def test_candidates_run_in_parallel_not_one_after_another(monkeypatch):
+    """ГЛАВНЫЙ тест секции: четыре подтверждённых кандидата исполняются
+    одновременно, а не в очереди друг за другом. Вернуть последовательный
+    обход — и максимум одновременности упадёт до 1."""
+    _enable_tg(monkeypatch)
+    monkeypatch.setattr(tg, "get_tg_approvals",
+                        lambda mids, lost_scan_since_ms=None: {
+                            mid: _row() for mid in mids})
+    _silent_report(monkeypatch)
+    state = _concurrency_meter(monkeypatch)
+    _plant(4, "par")
+
+    await s._tg_auto_execute_tick()
+
+    assert state["runs"] == 4, "не все кандидаты исполнились"
+    assert state["max"] >= 3, (
+        f"кандидаты снова исполняются по одному (одновременно работало "
+        f"максимум {state['max']}) — задержка «кнопка → исполнение» опять "
+        f"растёт линейно с числом подтверждённых планов")
+
+
+async def test_slow_reports_do_not_scale_the_tick_linearly(monkeypatch):
+    """Та же линейность, но с изнанки, которая и дала «14 минут»: медленная
+    ПУБЛИКАЦИЯ отчёта (синхронный сон, как настоящий 429 retry_after) не
+    должна умножаться на число кандидатов. 4 кандидата × 0.2 c публикации:
+    последовательный обход — ≥ 0.8 c, параллельный — около одной публикации."""
+    _enable_tg(monkeypatch)
+    monkeypatch.setattr(tg, "get_tg_approvals",
+                        lambda mids, lost_scan_since_ms=None: {
+                            mid: _row() for mid in mids})
+    _noop_executor(monkeypatch)
+    _silent_report(monkeypatch, sleep_s=0.2)
+    _plant(4, "rep")
+
+    t0 = time.monotonic()
+    await s._tg_auto_execute_tick()
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 0.6, (
+        f"тик с 4 кандидатами занял {elapsed:.2f} c — публикации отчётов "
+        f"снова выстроились в очередь (последовательное исполнение)")
+
+
+async def test_parallelism_is_capped_by_the_semaphore(monkeypatch):
+    """Потолок одновременности управляем (TG_AUTO_EXECUTE_MAX_PARALLEL) и
+    реально соблюдается: 6 кандидатов при потолке 2 работают не более чем по
+    двое — иначе шквал кандидатов съел бы пул потоков _run_blocking у обычных
+    MCP-запросов."""
+    _enable_tg(monkeypatch)
+    monkeypatch.setattr(tae, "_TG_AUTO_EXECUTE_MAX_PARALLEL", 2)
+    monkeypatch.setattr(tg, "get_tg_approvals",
+                        lambda mids, lost_scan_since_ms=None: {
+                            mid: _row() for mid in mids})
+    _silent_report(monkeypatch)
+    state = _concurrency_meter(monkeypatch, sleep_s=0.03)
+    _plant(6, "cap")
+
+    await s._tg_auto_execute_tick()
+
+    assert state["runs"] == 6
+    assert state["max"] == 2, (f"потолок параллельности не соблюдается: "
+                               f"одновременно работало {state['max']}")
+
+
+async def test_sweep_runs_after_candidates_not_before(monkeypatch):
+    """Уборка отложенных сообщений (sweep_scheduled_deletes — HTTP-вызов на
+    КАЖДОЕ накопившееся сообщение) не имеет права стоять между нажатой кнопкой
+    и исполнением: активная сессия плодит десятки сообщений на тик, и уборка
+    первой строкой линейно оттягивала захват кандидатов."""
+    _enable_tg(monkeypatch)
+    events = []
+    monkeypatch.setattr(tg, "get_tg_approvals",
+                        lambda mids, lost_scan_since_ms=None: {
+                            mid: _row() for mid in mids})
+    _silent_report(monkeypatch)
+
+    def _sweep(cfg):
+        events.append("sweep")
+        return 0
+
+    monkeypatch.setattr(tg, "sweep_scheduled_deletes", _sweep)
+
+    async def _exec(manifest_id, m):
+        events.append("exec")
+        return "### ✅ Готово"
+
+    monkeypatch.setattr(s._AUTO_EXECUTORS["delete_tasks"], "execute", _exec)
+    _plant(1, "order")
+
+    await s._tg_auto_execute_tick()
+
+    assert "exec" in events and "sweep" in events
+    assert events.index("exec") < events.index("sweep"), (
+        "уборка сообщений снова идёт ДО исполнения нажатой кнопки")
+
+
+async def test_wait_from_button_press_is_visible_in_logs(monkeypatch, caplog):
+    """Наблюдаемость (вторая половина ночного инцидента): 14-минутная очередь
+    в логах выглядела как молчание, и рабочий механизм дважды сочли сломанным.
+    Теперь при старте исполнения пишется, сколько нажатие прождало, а тик с
+    кандидатами оставляет одну сводную строку."""
+    import logging
+
+    _enable_tg(monkeypatch)
+    pressed_ms = tg._now_ms() - 5_000  # кнопку нажали 5 секунд назад
+    monkeypatch.setattr(tg, "get_tg_approvals",
+                        lambda mids, lost_scan_since_ms=None: {
+                            mid: dict(_row(), decided_at=pressed_ms)
+                            for mid in mids})
+    _noop_executor(monkeypatch)
+    _silent_report(monkeypatch)
+    _plant(1, "log")
+
+    with caplog.at_level(logging.INFO):
+        await s._tg_auto_execute_tick()
+
+    assert any("после нажатия кнопки" in r.message for r in caplog.records), (
+        "время от нажатия до исполнения больше не логируется")
+    assert any("тик исполнил" in r.message for r in caplog.records), (
+        "сводная строка тика (кандидаты/длительность) пропала")
