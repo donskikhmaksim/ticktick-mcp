@@ -12676,10 +12676,42 @@ async def create_tag(name: str, color: str = None, manifest_id: str = "",
     return await _create_tag_impl(**outcome.extra)
 
 
+# TickTick's real cap on tag name length isn't documented anywhere we can
+# cite; QA 2026-08-19 (бага №5) confirmed live that a 280-char name is
+# rejected, so this stays comfortably under whatever the true limit is —
+# the goal is catching an obviously-oversized name before wasting an API
+# round trip, never mistakenly refusing a normal, legitimately long tag.
+_TAG_NAME_MAX_LEN = 100
+
+
 async def _create_tag_impl(name: str, color: str = None) -> str:
     """Pure mutation logic for create_tag — no consent gate. Called only by
-    the gated create_tag() above once the plan is approved."""
+    the gated create_tag() above once the plan is approved (or directly, on
+    the automation_key fast path — same function either way).
+
+    QA 2026-08-19, баги №4/№5: раньше здесь СЛЕПО звался API, и по одному
+    признаку (тег виден в свежем списке ПОСЛЕ вызова) печаталось «создан» —
+    это было правдой и когда тег УЖЕ существовал (API просто не менял ничего,
+    а тег и так был в списке — create_tag(name="X") дважды рапортовал
+    «создан» оба раза), и ложью в обратную сторону для пустого/сверхдлинного
+    имени (TickTick тихо отказывает, а старое сообщение говорило «не виден —
+    проверь вручную», хотя ответ уже был известен точно: не создан, а не
+    «может быть»). Обе проверки теперь ДО обращения к API — дешевле и честнее
+    неопределённости постфактум."""
+    stripped = (name or "").strip()
+    if not stripped:
+        return "🛑 Имя тега пустое — TickTick такое не создаёт. Ничего не отправлено."
+    if len(stripped) > _TAG_NAME_MAX_LEN:
+        return (f"🛑 Имя тега слишком длинное ({len(stripped)} симв., "
+                f"разумный предел ~{_TAG_NAME_MAX_LEN}) — TickTick такое "
+                "отклонит. Ничего не отправлено.")
     try:
+        # Свежее состояние (force=True), а не кэш: тег, заведённый секунду
+        # назад другим путём, иначе читался бы как «не существует» — тот же
+        # приём, что уже применяется в delete_tags/rename_tag.
+        existing = await _live_tag_names(force=True)
+        if stripped.lower() in existing:
+            return f"Тег «{name}» уже существует — ничего не создавал."
         await _run_blocking(lambda: ticktick_v2.create_tag(name, color))
         # Lightweight inline check — create_tag doesn't write to the journal
         # (tag creation isn't journaled), so this is the only proof available.
