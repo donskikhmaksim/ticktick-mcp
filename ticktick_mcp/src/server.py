@@ -1032,7 +1032,19 @@ def format_task(task: Dict, trash_state: Optional[bool] = None) -> str:
     # Add priority if available
     priority = task.get('priority', 0)
     formatted += f"Priority: {PRIORITY_MAP.get(priority, str(priority))}\n"
-    
+
+    # Tags (QA 2026-08-19, bug №1): this line was missing entirely — the tag
+    # WAS set (get_tasks_by_tag found it independently) and DID come back in
+    # the API response (the field is `tags`, same key format_task_line() and
+    # get_task_info() already print), format_task() just never rendered it.
+    # get_task was the standard point-lookup tool, so any post-verify of a
+    # tag through it was blind; the only working way to check was looping
+    # get_tasks_by_tag over every candidate name. Same "#name" style as the
+    # other two renderers, empty list prints nothing (same convention as
+    # Content/Subtasks below).
+    if task.get('tags'):
+        formatted += f"Tags: {', '.join('#' + t for t in task['tags'])}\n"
+
     # Status. A trashed task keeps whatever status it had before deletion, so
     # printing that field alone ("Active") is a lie about a task in the bin —
     # the deletion has to lead, with the raw field kept for reference.
@@ -12737,17 +12749,49 @@ async def create_tag(name: str, color: str = None, manifest_id: str = "",
     return await _create_tag_impl(**outcome.extra)
 
 
+# TickTick's real cap on tag name length isn't documented anywhere we can
+# cite; QA 2026-08-19 (бага №5) confirmed live that a 280-char name is
+# rejected, so this stays comfortably under whatever the true limit is —
+# the goal is catching an obviously-oversized name before wasting an API
+# round trip, never mistakenly refusing a normal, legitimately long tag.
+_TAG_NAME_MAX_LEN = 100
+
+
 async def _create_tag_impl(name: str, color: str = None) -> str:
     """Pure mutation logic for create_tag — no consent gate. Called only by
-    the gated create_tag() above once the plan is approved."""
+    the gated create_tag() above once the plan is approved (or directly, on
+    the automation_key fast path — same function either way).
+
+    QA 2026-08-19, баги №4/№5: раньше здесь СЛЕПО звался API, и по одному
+    признаку (тег виден в свежем списке ПОСЛЕ вызова) печаталось «создан» —
+    это было правдой и когда тег УЖЕ существовал (API просто не менял ничего,
+    а тег и так был в списке — create_tag(name="X") дважды рапортовал
+    «создан» оба раза), и ложью в обратную сторону для пустого/сверхдлинного
+    имени (TickTick тихо отказывает, а старое сообщение говорило «не виден —
+    проверь вручную», хотя ответ уже был известен точно: не создан, а не
+    «может быть»). Обе проверки теперь ДО обращения к API — дешевле и честнее
+    неопределённости постфактум."""
+    stripped = (name or "").strip()
+    if not stripped:
+        return "🛑 Имя тега пустое — TickTick такое не создаёт. Ничего не отправлено."
+    if len(stripped) > _TAG_NAME_MAX_LEN:
+        return (f"🛑 Имя тега слишком длинное ({len(stripped)} симв., "
+                f"разумный предел ~{_TAG_NAME_MAX_LEN}) — TickTick такое "
+                "отклонит. Ничего не отправлено.")
     try:
         # No-op: тег УЖЕ существует в аккаунте (2026-08-19, QA — тот же класс,
         # что «уже в целевом списке» у move_tasks). Раньше запрос всё равно
         # уходил в API (200 без изменений — TickTick не ругается на дубликат),
         # а пост-чтение видело имя в свежем списке тегов и трактовало это как
         # «создали и проверили», хотя создания не было. Отделяем ДО отправки.
-        existing = await _live_tag_names()
-        if name.lower() in existing:
+        #
+        # Свежее состояние (force=True), а не кэш: тег, заведённый секунду
+        # назад другим путём, иначе читался бы как «не существует» — тот же
+        # приём, что уже применяется в delete_tags/rename_tag. Сверяем по
+        # `stripped`, а не по сырому `name`: « X » и «X» для TickTick один и
+        # тот же тег, и по сырому имени дубликат не распознался бы.
+        existing = await _live_tag_names(force=True)
+        if stripped.lower() in existing:
             return (f"ℹ️ Тег «{name}» уже существует — без изменений. "
                     "Ничего не создавал.")
         await _run_blocking(lambda: ticktick_v2.create_tag(name, color))
@@ -12934,8 +12978,46 @@ async def _rename_tag_impl(old_name: str, new_name: str,
     кнопке через `_auto_execute_rename_tag`).
 
     Вынесена 2026-08-06 по той же причине, что и `_delete_project_impl`: без
-    неё нажатие кнопки на плане СЛИЯНИЯ тегов не приводило ни к чему."""
-    await _run_blocking(lambda: ticktick_v2.rename_tag(old_name, new_name))
+    неё нажатие кнопки на плане СЛИЯНИЯ тегов не приводило ни к чему.
+
+    QA 2026-08-19, бага №2: живой прогон показал, что слияние (merged=True)
+    надёжно валит `/tag/rename` голой 500-й — судя по всему, этот эндпоинт
+    вообще не умеет сливать в СУЩЕСТВУЮЩИЙ тег, а просто переименование
+    поверх занятого имени TickTick отклоняет. Без живого теста против прода
+    (запрещено правилами этой задачи) нельзя ни подобрать другой payload, ни
+    надёжно реализовать слияние в обход (перевесить каждую задачу со старого
+    тега на новый через set_task_tags, потом удалить старый) — у такого пути
+    есть слепая зона: get_tasks_by_tag/get_open_tasks видят только ОТКРЫТЫЕ
+    задачи, а завершённые никакой API по тегу не ищет, так что автоматический
+    перенос тихо потерял бы тег на части задач и заявил бы об этом успехом.
+    Честный отказ БЕЗ подмены API-вызова — единственный безопасный вариант:
+    ничего не тронуто, ошибка объясняет, что произошло и что сделать вручную,
+    вместо сырого текста requests наружу (`_humanize_api_error` было бы
+    недостаточно само по себе — фраза для >=500 «часто это невалидное поле»
+    вводит в заблуждение: тут не невалидное поле, а неподдержанная операция)."""
+    try:
+        await _run_blocking(lambda: ticktick_v2.rename_tag(old_name, new_name))
+    except Exception as e:
+        if merged:
+            return (
+                f"🛑 Слияние тегов «{old_name}» → «{new_name}» НЕ выполнено: "
+                f"{_humanize_api_error(e)}\n"
+                "Похоже, TickTick вообще не поддерживает слияние через этот "
+                "метод API (переименование поверх занятого имени он "
+                "отклоняет) — а надёжно повторить слияние в обход нельзя: "
+                "завершённые задачи не видны ни через get_tasks_by_tag, ни "
+                "через get_open_tasks, поэтому автоматический перенос тегов "
+                "рисковал бы тихо потерять тег на части задач.\n"
+                f"Ничего не тронуто — тег «{old_name}» на месте, "
+                f"«{new_name}» тоже не изменился.\n"
+                "Сделать вручную: 1) get_tasks_by_tag(\"" + old_name + "\") "
+                "— список ОТКРЫТЫХ задач с этим тегом; 2) на каждой — "
+                "set_task_tags, добавив «" + new_name + "» и убрав «"
+                + old_name + "»; 3) отдельно проверить завершённые задачи "
+                "через приложение TickTick (этот сервер их по тегу не "
+                "ищет); 4) когда «" + old_name + "» больше никто не носит — "
+                "delete_tag(\"" + old_name + "\").")
+        return _tool_error("renaming tag", e)
     # Post-verify against a fresh tag list.
     after = await _live_tag_names()
     if old_name.lower() in after:
@@ -13046,6 +13128,51 @@ def _tags_nonexistent_note(names: List[str]) -> str:
     return f"❔ Не существуют вовсе (ни в тегах аккаунта, ни на задачах): {body}"
 
 
+def _coerce_str_list_arg(value: Any, param_name: str) -> Tuple[Optional[List[str]], Optional[str]]:
+    """Normalize a "should be a list of strings" tool argument that may have
+    arrived as a JSON-encoded string instead (QA 2026-08-19, бага №3).
+
+    Live QA against `delete_tags(tags=...)` found that when the caller's own
+    tooling serializes the array to a string before sending it, the plain
+    top-level `if not tags:` check let a NON-empty list of real names read as
+    empty — the response claimed "Пустой список — нечего делать" even though
+    names were genuinely supplied — a SILENT no-op, worse than a loud error
+    because the caller walks away believing tags were deleted. A second,
+    uglier failure mode of the same root cause: iterating a raw Python string
+    character-by-character (`for name in "домашние"`) produces one-letter
+    garbage "tag names" instead of raising anything.
+
+    Returns (normalized_list, None) on success — normalized_list is None only
+    when `value` itself was None/omitted (caller decides what that means).
+    Returns (None, error_message) when `value` was truthy/non-empty but could
+    not be turned into an actual list — the caller must surface this as an
+    explicit refusal, never as a quiet "nothing to do".
+    """
+    if value is None:
+        return None, None
+    if isinstance(value, list):
+        return value, None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return [], None  # genuinely empty string = empty, not an error
+        try:
+            parsed = json.loads(stripped)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, list):
+            return parsed, None
+        return None, (
+            f"🛑 Параметр {param_name} пришёл строкой «{value}», а не "
+            "списком, и не распознаётся как JSON-массив строк — похоже на "
+            "ошибку клиента при сборке вызова. Ничего не сделано (список НЕ "
+            "считается пустым — не путай с «нечего делать»). Передай "
+            f"{param_name} настоящим списком имён.")
+    return None, (
+        f"🛑 Параметр {param_name} пришёл значением неожиданного типа "
+        f"({type(value).__name__}), а не списком строк. Ничего не сделано.")
+
+
 def _describe_delete_tags_item(t: Dict) -> str:
     """Строка плана на ОДИН тег — «радиус поражения» (П20, пункт 3):
     сколько открытых задач теряет метку. Ноль печатается явно («снимется с 0
@@ -13110,6 +13237,14 @@ async def delete_tags(summary: str, tags: Optional[List[str]] = None,
     notes: Optional[List[str]] = None
 
     if not manifest_id:
+        # QA 2026-08-19, бага №3: нормализуем ДО проверки на пустоту — если
+        # tags пришёл строкой (клиент сериализовал массив некорректно), она
+        # либо распознаётся как JSON-массив, либо вызов отказывает ЯВНО, а не
+        # тихо отвечает «нечего делать» на непустой ввод (см.
+        # _coerce_str_list_arg).
+        tags, fmt_err = _coerce_str_list_arg(tags, "tags")
+        if fmt_err:
+            return fmt_err
         if not tags:
             return "Пустой список — нечего делать."
         # Живое состояние ДВАЖДЫ (2026-08-09): полные записи тегов (для
