@@ -8862,10 +8862,25 @@ def _validate_habit_date(date_str: str) -> Optional[str]:
                 "YYYY-MM-DD (например 2026-07-04).")
 
 
+def _is_future_habit_date(date_str: str) -> bool:
+    """True when `date_str` (already format-validated YYYY-MM-DD) is after
+    "today" in the OWNER's configured zone (_USER_TZ) — comparing to UTC
+    would misfire near the day boundary (up to several hours off)."""
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    return d > datetime.now(_USER_TZ).date()
+
+
 def _describe_checkin_habit(p: Dict) -> str:
     label = _HABIT_STATUS_LABELS.get(p.get("status"), p.get("status"))
     when = p.get("date") or "сегодня"
-    return f'Отмечаю привычку «{p.get("habit_name")}» на {when}: {label}'
+    future_note = ""
+    if p.get("date") and _is_future_habit_date(p["date"]):
+        future_note = (" ⚠️ дата в будущем (сегодня "
+                        f"{datetime.now(_USER_TZ).strftime('%Y-%m-%d')})")
+    return f'Отмечаю привычку «{p.get("habit_name")}» на {when}: {label}{future_note}'
 
 
 @mcp.tool()
@@ -8896,9 +8911,9 @@ async def checkin_habit(habit_name: str, habit_id: str, date: str = None,
     Args:
         habit_name: Name of the habit (shown first in the summary you show the user, see get_habits) (there is no server-side confirmation dialog — printing this and getting the user's genuine "yes" is YOUR job, not the server's)
         habit_id: ID of the habit
-        date: Date to check in as YYYY-MM-DD (optional; defaults to today — pass a past date to backfill)
+        date: Date to check in as YYYY-MM-DD (optional; defaults to today — pass a past date to backfill). A FUTURE date is accepted (not blocked — may be intentional), but the response warns about it rather than staying silent.
         status: 2 = done (default), 1 = failed, 0 = not done
-        value: Numeric value for quantitative habits (optional; defaults to the goal when done)
+        value: Numeric value for quantitative habits (optional; defaults to the goal when done). For a BOOLEAN (yes/no) habit this is refused unless it's 0 or the habit's own goal — passing an unrelated number (e.g. a quantitative habit's value by mistake) would silently record nonsense otherwise, and the habit's type is only known from the live habit (fetched during execution), not from this call's arguments alone.
         manifest_id: from call #1's response — pass on call #2 to actually record
         {{GATE_ARGS_TAIL}}
 
@@ -8947,8 +8962,34 @@ async def _checkin_habit_impl(habit_name: str, habit_id: str, date: str = None,
             goal = float(habit.get("goal") or 1.0)
         except (TypeError, ValueError):
             goal = 1.0
+        # value только имеет смысл для количественных привычек (Real) — для
+        # boolean (да/нет) TickTick сам считает "выполнено" = goal, "нет" = 0,
+        # а любое другое число (живой пример: value=99 на привычке с goal=1)
+        # записывалось бы как "выполнено, значение 99.0/1.0" — бессмысленно и
+        # никак не отражается в приложении как что-то осмысленное. Отказываем
+        # явно (тот же fail-closed стиль, что у status/date/habit_type/section
+        # выше) вместо того, чтобы молча подменить value на дефолт — молчаливая
+        # подмена спрятала бы то, что вызывающий явно попросил другое.
+        habit_type = str(habit.get("type") or "").lower()
+        if habit_type == "boolean" and value is not None:
+            try:
+                v_num = float(value)
+            except (TypeError, ValueError):
+                v_num = None
+            if v_num is None or v_num not in (0.0, goal):
+                return (f"🛑 НЕ отметил — «{real_name}» это да/нет-привычка "
+                        f"(boolean), value={value!r} для неё не имеет смысла "
+                        f"(допустимо не задавать value вовсе, либо {goal:g} "
+                        "для «выполнено» / 0 для остального — value для "
+                        "количественных привычек). Ничего не записано.")
         stamp = int((date or datetime.now().strftime("%Y-%m-%d")).replace("-", ""))
         when_fmt = datetime.strptime(str(stamp), "%Y%m%d").strftime("%d.%m.%Y")
+        future_note = ""
+        if date is not None and _is_future_habit_date(date):
+            future_note = ("\n- ⚠️ дата в будущем (сегодня "
+                            f"{datetime.now(_USER_TZ).strftime('%d.%m.%Y')}) — "
+                            "backfill в прошлое обычен, а вперёд — редко "
+                            "осмысленно; если это не опечатка, всё в порядке")
         # Duplicate detection: an unconditional 'add' on retry would double
         # the value for the same day.
         existing = await _run_blocking(
@@ -8998,7 +9039,8 @@ async def _checkin_habit_impl(habit_name: str, habit_id: str, date: str = None,
             return (f"### ✅ Чек-ин привычки «{real_name}»\n\n"
                     f"- дата: {when_fmt}\n"
                     f"- статус: **{w_label}**, значение {w_value}/{w_goal}\n"
-                    "- 🧾 подтверждено независимым чтением (`get_habit_checkins`) сразу после записи")
+                    "- 🧾 подтверждено независимым чтением (`get_habit_checkins`) сразу после записи"
+                    f"{future_note}")
         return (f"### ❌ Чек-ин «{real_name}» разошёлся с подтверждением\n\n"
                 f"- дата: {when_fmt}\n"
                 f"- запрошено: **{labels[status]}** ({val}/{goal})\n"
