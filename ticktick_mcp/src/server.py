@@ -4648,11 +4648,14 @@ async def update_tasks(
     return await _update_tasks_impl(outcome.summary, outcome.tasks)
 
 
-def _update_change_bits(t: Dict[str, Any], sep: str = "; ") -> str:
-    """Человеческий перечень изменений ОДНОЙ задачи («название → «X»; срок →
-    2026-08-10»), без обёртки с названием. Вынесено из _describe_update_item,
-    чтобы manual_triage печатал те же формулировки тем же кодом, а не своей
-    копией, которая со временем разойдётся."""
+def _update_change_bit_list(t: Dict[str, Any]) -> List[str]:
+    """Список человекочитаемых пунктов изменений ОДНОЙ задачи («название →
+    «X»», «срок → 2026-08-10», …) — ОДИН источник и для текста превью
+    (`_update_change_bits`), и для решения «есть ли вообще что применять»
+    (`_update_item_has_changes`). Пустой список = ни одно распознанное поле
+    изменения не задано — исполнитель обязан отказать этой строке, а не
+    молча отправить no-op в TickTick и подтвердить его как успех (см.
+    `_update_item_has_changes`)."""
     bits = []
     if t.get("new_title"):
         bits.append(f"название → «{t['new_title']}»")
@@ -4679,7 +4682,30 @@ def _update_change_bits(t: Dict[str, Any], sep: str = "; ") -> str:
         bits.append("повтор меняется")
     if t.get("reminders") is not None:
         bits.append("напоминания меняются")
-    return sep.join(bits) or "(поля изменений не распознаны)"
+    return bits
+
+
+def _update_change_bits(t: Dict[str, Any], sep: str = "; ") -> str:
+    """Человеческий перечень изменений ОДНОЙ задачи («название → «X»; срок →
+    2026-08-10»), без обёртки с названием. Вынесено из _describe_update_item,
+    чтобы manual_triage печатал те же формулировки тем же кодом, а не своей
+    копией, которая со временем разойдётся."""
+    return sep.join(_update_change_bit_list(t)) or "(поля изменений не распознаны)"
+
+
+def _update_item_has_changes(t: Dict[str, Any]) -> bool:
+    """False, если ни одно поле изменения не распознано — тот же самый набор
+    полей, что и в превью плана (`_update_change_bits`), одной функцией.
+
+    Зачем (живой QA, 2026-08-19). До этой правки план (call #1) честно писал
+    «(поля изменений не распознаны)», но исполнение (call #2) всё равно
+    слало в TickTick no-op вызов `update_task(...)` со всеми полями None,
+    получало 200 без изменений, и пост-верификация (`_verify_item`, ветка
+    `op == "update"`) сравнивала живое состояние с ПУСТЫМ `expect.changes` —
+    пустой diff читался как «все изменения на месте», и ответ пользователю
+    гласил «обновлено (проверено)», хотя `get_task` до/после был идентичен.
+    Пустой набор полей — это НЕ вакуумная истина, это нечего проверять."""
+    return bool(_update_change_bit_list(t))
 
 
 def _describe_update_item(t: Dict[str, Any],
@@ -4947,6 +4973,20 @@ async def _update_tasks_impl(
             shown_title = t.get("title") or _lookup_task_title(tid)
             new_title = t.get("new_title")
             priority = t.get("priority")
+            # Пустое обновление (живой QA, 2026-08-19): элемент без единого
+            # распознанного поля изменения отказывается ЗДЕСЬ, до identity
+            # guard'а и до обращения к TickTick. Иначе `update_task(...)` со
+            # всеми полями None уходит как no-op 200, пост-верификация ниже
+            # сравнивает живое состояние с ПУСТЫМ `expect.changes` (пустой
+            # diff = «всё совпало» по построению `_verify_item`), и ответ
+            # лжёт «обновлено (проверено)» — план (call #1) при этом ЧЕСТНО
+            # писал «(поля изменений не распознаны)» той же самой функцией
+            # (_update_change_bits). Один источник правды для обеих фаз.
+            if not _update_item_has_changes(t):
+                results.append(f"🛑 «{shown_title}»: нечего менять — поля "
+                               "изменений не распознаны. Эта строка НЕ "
+                               "применена.")
+                continue
             if priority is not None and priority not in [0, 1, 3, 5]:
                 results.append(f"✗ «{shown_title}»: неверный приоритет (допустимо 0/1/3/5)")
                 continue
@@ -5134,6 +5174,17 @@ async def _update_tasks_impl(
                                             label_of[tid])
             if refusal:
                 refused.append((f, refusal))
+                continue
+            # Пустое обновление (живой QA, 2026-08-19) — тот же отказ, что и
+            # в одиночном пути чуть выше в этом файле: элемент без единого
+            # распознанного поля не идёт в `changes` вообще, иначе
+            # `batch_update_tasks` шлёт no-op {"taskId": tid} и пост-
+            # верификация ниже вакуумно подтверждает пустой `expect.changes`
+            # как «все изменения на месте» (см. `_update_item_has_changes`).
+            if not _update_item_has_changes(t):
+                refused.append((f, f"🛑 «{label_of[tid]}»: нечего менять — "
+                               "поля изменений не распознаны. Эта строка НЕ "
+                               "применена."))
                 continue
             kept.append(f)
             ch = {"taskId": tid}
