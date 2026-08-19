@@ -556,11 +556,22 @@ def _plan_ctx(by_id, names=None):
     return s._TriagePlanCtx(by_id=by_id, names=names or {}, kids={})
 
 
-def test_triage_move_plan_rejects_noop_already_in_destination():
+def test_triage_move_plan_rejects_noop_already_in_destination(monkeypatch):
     by_id = {"t1": {"id": "t1", "title": "Задача", "projectId": "p_new"}}
     e = {"op": "move", "task_id": "t1", "title": "Задача",
          "to_project_id": "p_new", "said": "перенеси"}
-    ctx = _plan_ctx(by_id, {"p_new": "Новый"})
+    names = {"p_new": "Новый"}
+    ctx = _plan_ctx(by_id, names)
+    # _op_move_plan сверяет ЛИЧНОСТЬ проекта назначения через
+    # _resolve_triage_destination -> _guard_project_or_refuse, а та (по
+    # дизайну, require_known=True, fail-closed) читает ЖИВЫЕ имена через
+    # глобальный _v2_project_names(), а не через ctx.names — двух РАЗНЫХ
+    # источников для одного и того же имени в проде не бывает (ctx.names
+    # сам построен из свежего _v2_project_names() перед стартом плана), но
+    # в юнит-тесте это нужно свести вручную, иначе guard всегда фейлится
+    # «проект не найден» ещё ДО того, как код доходит до no-op-сверки,
+    # которую тест на самом деле проверяет.
+    monkeypatch.setattr(s, "_v2_project_names", lambda: names)
 
     why = s._op_move_plan(e, ctx)
 
@@ -568,11 +579,13 @@ def test_triage_move_plan_rejects_noop_already_in_destination():
     assert "уже" in why.lower(), why
 
 
-def test_triage_move_plan_keeps_real_move():
+def test_triage_move_plan_keeps_real_move(monkeypatch):
     by_id = {"t1": {"id": "t1", "title": "Задача", "projectId": "p_old"}}
     e = {"op": "move", "task_id": "t1", "title": "Задача",
          "to_project_id": "p_new", "said": "перенеси"}
-    ctx = _plan_ctx(by_id, {"p_new": "Новый", "p_old": "Старый"})
+    names = {"p_new": "Новый", "p_old": "Старый"}
+    ctx = _plan_ctx(by_id, names)
+    monkeypatch.setattr(s, "_v2_project_names", lambda: names)  # см. коммент выше
 
     assert s._op_move_plan(e, ctx) == ""
 

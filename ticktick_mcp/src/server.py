@@ -16952,6 +16952,15 @@ def _op_parent_plan(e: Dict, ctx: _TriagePlanCtx) -> str:
     elif not _names_agree(e.get("to_title") or "", parent_title):
         return (f"название родителя не совпало — по to_task_id сейчас "
                 f"«{parent_title}», а в плане «{e.get('to_title')}»")
+    # No-op: задача УЖЕ вложена под ЭТОГО родителя (2026-08-19, QA — зеркало
+    # «и так не подзадача — отцеплять нечего» у unparent выше). Раньше такая
+    # строка спокойно входила в план и исполнялась как настоящее вложение —
+    # `_set_task_parent_impl` шлёт no-op в API, post-verify «parentId == …»
+    # проходит тривиально, и общий заголовок печатает «Выполнено N из N» об
+    # операции, которой не было. Отсекаем ДО плана — подтверждать нечего.
+    live_task = ctx.by_id.get(e["task_id"]) or {}
+    if (live_task.get("parentId") or "") == parent_id:
+        return f"задача уже вложена под «{parent_title}» — вкладывать нечего"
     # Цикл: подниматься по цепочке предков РОДИТЕЛЯ и встретить саму задачу —
     # значит вложить её под собственного потомка и порвать дерево.
     ancestors = set()
@@ -16998,6 +17007,13 @@ def _op_parent_drift(op: Dict, by_id: Dict[str, Dict], names: Dict) -> str:
     elif not _names_agree(op.get("to_title") or "", parent_title):
         return (f"родителя переименовали после плана (сейчас «{parent_title}») "
                 "— НЕ вкладываю")
+    # No-op: задача УЖЕ вложена под ЭТОГО родителя (2026-08-19, QA — тот же
+    # class, что у move/unparent drift рядом): между планом и «да» её могли
+    # вложить сюда же (вручную или другим планом). Блокируем, а не
+    # исполняем как настоящее вложение.
+    if (by_id.get(op.get("task_id")) or {}).get("parentId") == parent_id:
+        return (f"задача уже вложена под «{parent_title}» — между планом и "
+                "подтверждением её туда уже вложили")
     return ""
 
 
@@ -17149,6 +17165,15 @@ def _op_tags_plan(e: Dict, ctx: _TriagePlanCtx) -> str:
     e["_tags_shown"] = [t for t in want if t]
     e["_tags_now"] = sorted(set((ctx.by_id.get(e["task_id"]) or {}).get("tags")
                                 or []))
+    # No-op: запрошенный набор РАВЕН текущему живому (2026-08-19, QA — тот же
+    # класс, что у `set_task_tags` само по себе, теперь и на пути manual_triage).
+    # Раньше такая строка спокойно входила в план и исполнялась как настоящая
+    # правка тегов — `_set_task_tags_impl` дальше уже фильтрует её сама
+    # (`outcome.noop`), но заголовок манифеста и итоговый отчёт «Выполнено N
+    # из N» об этой строке узнавали ДО того, как исполнитель успевал сказать
+    # своё честное «без изменений». Отсекаем ДО плана — сверять нечего.
+    if set(e["_tags"]) == set(e["_tags_now"]):
+        return "теги уже ровно такие — менять нечего"
     try:
         known = {(t.get("name") or "").lower()
                  for t in (ticktick_v2.get_tags() if ticktick_v2 else [])}
@@ -17296,6 +17321,15 @@ def _op_move_plan(e: Dict, ctx: _TriagePlanCtx) -> str:
     to_id, to_name, why = _resolve_triage_destination(e, ctx.names)
     if why:
         return why
+    # No-op: задача УЖЕ в проекте назначения (2026-08-19, QA — тот же класс,
+    # что «уже в целевом списке» у move_tasks; здесь — его сестра на пути
+    # manual_triage). Раньше такая строка входила в план и исполнялась как
+    # настоящий перенос, `move_tasks` внутри слал no-op в API, post-verify
+    # «projectId == to_id» проходил тривиально, и общий заголовок печатал
+    # «Выполнено N из N» об операции, которой не было.
+    live = ctx.by_id.get(e["task_id"]) or {}
+    if (live.get("projectId") or "") == to_id:
+        return f"задача уже в «{to_name}» — переносить некуда"
     e["_to_project_id"] = to_id
     e["_to_project_name"] = to_name
     return ""
@@ -17305,6 +17339,15 @@ def _op_move_drift(op: Dict, by_id: Dict[str, Dict], names: Dict) -> str:
     to_id = op.get("_to_project_id") or ""
     if not to_id or to_id not in names:
         return "проект назначения больше не существует"
+    # No-op: задача оказалась в проекте назначения МЕЖДУ планом и «да»
+    # (2026-08-19, QA — зеркало проверки в _op_move_plan выше, а также
+    # unparent/parent drift рядом). Блокируем вместо повторного «переноса»,
+    # которого уже не нужно делать.
+    live = by_id.get(op.get("task_id")) or {}
+    if (live.get("projectId") or "") == to_id:
+        to_name = names.get(to_id, to_id)
+        return (f"задача уже в «{to_name}» — между планом и подтверждением "
+                "её туда уже перенесли")
     return ""
 
 
