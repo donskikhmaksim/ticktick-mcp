@@ -614,7 +614,7 @@ async def test_operation_on_a_vanished_task_is_dropped_from_the_plan(
 
     assert "ПРОПУЩЕНО" not in preview, "строки-пометки в плане больше нет"
     assert "❌ Не вошло: 1" in preview
-    assert "не найдена среди открытых" in preview
+    assert "не найдена ни среди открытых" in preview
     assert "id ghost" in preview, "справка обязана называть идентификатор"
     assert "не вошло в план 1" in preview
     m = s._MANIFESTS[_mid(preview)]
@@ -1907,7 +1907,7 @@ async def test_the_only_dead_task_creates_no_manifest_and_no_telegram_message(
     assert seen == [], f"в Telegram что-то ушло: {seen}"
     assert s._MANIFESTS == before, "манифест создан на пустом плане"
     assert "🛑" in out and "план НЕ построен" in out
-    assert "id ghost" in out and "не найдена среди открытых" in out
+    assert "id ghost" in out and "не найдена ни среди открытых" in out
 
 
 async def test_a_plan_where_everything_matches_shows_no_reference_block(
@@ -2374,7 +2374,7 @@ async def test_the_cap_refusal_still_names_what_did_not_pass_the_check(
     assert "❌ Не вошло: 1" in out, f"отказ по капу молчит о непрошедшей:\n{out}"
     assert "id ghost" in out
     assert "«Уже удалена»" in out
-    assert "не найдена среди открытых задач" in out, "причина не названа"
+    assert "не найдена ни среди открытых задач" in out, "причина не названа"
 
 
 async def test_a_clean_overflow_refusal_has_no_empty_reference_block(

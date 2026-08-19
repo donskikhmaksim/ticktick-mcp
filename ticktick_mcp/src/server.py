@@ -1556,6 +1556,45 @@ def _closed_task_snapshot(task_id: str, project_id: str = "") -> Optional[Dict]:
     return None
 
 
+def _closed_status_label(task: Dict) -> str:
+    """«завершена („Completed“)» / «отменена („Won't do“)» — как назвать
+    человеку состояние ЗАКРЫТОЙ задачи. QA-2 (2026-08-19, дефект №1): обе
+    формулировки обязаны различаться — «Completed» и «Won't do» это два
+    разных решения человека, и текст отказа/плана не имеет права их
+    смешивать в одно «не найдена»."""
+    return ("отменена («Won't do»)" if task.get("status") == -1
+            else "завершена («Completed»)")
+
+
+def _find_task_beyond_open(task_id: str, project_id: str = ""
+                           ) -> Tuple[Optional[Dict], str]:
+    """Живой объект для id, которого НЕТ в снимке открытых задач →
+    (задача, где): where ∈ "completed" | "trash" | "open" | "" (не найдена).
+
+    QA-2 (2026-08-19, дефект №1): завершённую («Completed») и отменённую
+    («Won't do») задачу нельзя было удалить НИКАКИМ путём — все резолверы
+    смотрели только в снимок открытых и объявляли живую задачу «не найденной
+    (кто-то удалил?)». Этот помощник спрашивает у источников, которые
+    закрытые задачи ЗНАЮТ, в порядке цены:
+      1. v2-ленты (`_locate_task_any_state`): открытые → завершённые (кэш,
+         ≤2 запросов) → корзина; только они отличают корзину от закрытия;
+      2. официальный Open API (точечное чтение при известном project_id,
+         иначе скан) — для закрытых задач старше лент v2 (у него нет флага
+         удаления, поэтому он идёт ПОСЛЕ корзинной ленты, а не вместо).
+    "open" означает «задача открыта, но в v2-снимок не попала» (тот же
+    25-минутный лаг, что чинит `_official_task_snapshot`). Никогда не
+    бросает исключений; ("" — не найдена нигде) честно означает «ни один
+    доступный источник не знает», а не «доказанно не существует»."""
+    found, where, _readable = _locate_task_any_state(task_id)
+    if found:
+        return found, (where or "")
+    t = (_official_task_read(project_id, task_id) if project_id
+         else _official_task_scan(task_id, open_only=False))
+    if not t:
+        return None, ""
+    return t, ("open" if t.get("status", 0) == 0 else "completed")
+
+
 def _live_task_title(task_id: str, project_id: str = "") -> Optional[str]:
     """Живое НАЗВАНИЕ задачи по её id — для КАРТОЧКИ подтверждения, чтобы
     человек читал «в задачу «Купить молоко»», а не 24 hex-символа, которые
@@ -4138,7 +4177,12 @@ async def _create_tasks_impl(summary: str, tasks: List[Dict[str, Any]],
 
     parts = []
     if created:
-        parts.append(f"Создано {len(created)}:\n" + "\n".join(created))
+        # Знаменатель — сколько строк ПРОСИЛИ у движка (QA-2, дефект №2):
+        # голое «Создано 2» при 3 переданных строках читалось как полный
+        # успех, а упавшая строка терялась на фоне.
+        head = (f"Создано {len(created)}" if len(created) == len(tasks)
+                else f"Создано {len(created)} из {len(tasks)} строк запроса")
+        parts.append(head + ":\n" + "\n".join(created))
     if warnings:
         parts.append("Проверка назначения:\n" + "\n".join(warnings))
     if failed:
@@ -4543,6 +4587,12 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
         # такая же ветка в `delete_tasks`: предупреждения едут прямо в ответ.
         killswitch_notes = []
         if refused:
+            # Счёт по ЗАПРОШЕННОМУ (QA-2, дефект №2): смешанный батч печатал
+            # «Создано 2 …» и часть причин терялась — теперь шапка сводит
+            # арифметику всего запроса, а строки «Исключены» называют каждую.
+            killswitch_notes.append(
+                f"📊 Запрошено строк: {len(tasks)}, в исполнение пошло "
+                f"{len(good)}, исключено на сверке плана: {len(refused)}.")
             killswitch_notes.append(
                 f"🛑 **Исключены {len(refused)}:** " + "; ".join(refused))
         unsure = [(t, pname, sug) for (t, pname, sug, _) in good
@@ -5883,6 +5933,41 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
         return _STATE_UNAVAILABLE_MSG
     found, mismatch, missing = _split_tasks_by_state(tasks, by_id=by_id)
     names = _v2_project_names()
+    # ЗАКРЫТЫЕ задачи — ЗАКОННЫЙ объект удаления (QA-2 2026-08-19, дефект №1:
+    # завершённую/отменённую задачу нельзя было удалить НИКАКИМ путём — все
+    # каналы смотрели только в снимок открытых). Каждую «не найденную среди
+    # открытых» строку ищем по закрытым лентам: найдена закрытой и название
+    # сошлось → она попадает в план (с пометкой), корзина/подлог/неизвестный
+    # id → остаётся исключённой, но теперь С ПРИЧИНОЙ.
+    still_missing, closed_rows = [], []
+    for mrec in missing:
+        if "КОРЗИНЕ" in (mrec.get("reason") or ""):
+            still_missing.append(mrec)
+            continue
+        fb, fb_where = await _run_blocking(
+            _find_task_beyond_open, mrec["taskId"],
+            (mrec.get("projectId") or "").strip())
+        if fb is None or fb_where == "open":
+            # "open" = есть в официальном канале, но не в снимке v2 — guard
+            # уже отработал этот случай своим фолбэком; не дублируем.
+            still_missing.append(mrec)
+            continue
+        if fb_where == "trash":
+            mrec = dict(mrec)
+            mrec["reason"] = ("уже в КОРЗИНЕ (удалена) — восстановить: "
+                              "apply_task_changes(op=\"restore\")")
+            still_missing.append(mrec)
+            continue
+        raw_title = next(
+            (t.get("title") or "" for t in tasks
+             if (t.get("taskId") or t.get("task_id")) == mrec["taskId"]), "")
+        if raw_title and not _names_agree(raw_title, fb.get("title") or ""):
+            mismatch.append({"taskId": mrec["taskId"], "expected": raw_title,
+                             "actual": fb.get("title") or "(без названия)",
+                             "project": names.get(fb.get("projectId") or "", "")})
+            continue
+        closed_rows.append((mrec["taskId"], fb))
+    missing = still_missing
     mid = uuid.uuid4().hex[:12]
 
     def _mk_item(tid, pid, live):
@@ -5910,6 +5995,27 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
         if p:
             kids.setdefault(p, []).append(sub)
     items, seen = [], set()
+
+    def _expand_open_subtree(parent_id: str, default_pid: str) -> None:
+        # Server-side expansion: the ENTIRE open subtree of this parent
+        # (BFS over parentId, any depth) joins the manifest with its live
+        # title — nothing hand-typed by the caller, no orphans left.
+        queue = list(kids.get(parent_id, []))
+        depth_of = {parent_id: 0}
+        while queue:
+            sub = queue.pop(0)
+            sid = sub.get("id")
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            d = depth_of.get(sub.get("parentId"), 0) + 1
+            depth_of[sid] = d
+            si = _mk_item(sid, sub.get("projectId") or default_pid, sub)
+            si["title"] = si["title"] or f"[task {str(sid)[:8]}…]"
+            si["depth"] = d  # render-only; title stays clean for re-verify
+            items.append(si)
+            queue.extend(kids.get(sid, []))
+
     for f in found:
         if f["taskId"] in seen:
             continue
@@ -5919,33 +6025,50 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
         it["title"] = it["title"] or f["title"]
         items.append(it)
         if f["taskId"] in want_subs:
-            # Server-side expansion: the ENTIRE open subtree of this parent
-            # (BFS over parentId, any depth) joins the manifest with its live
-            # title — nothing hand-typed by the caller, no orphans left.
-            queue = list(kids.get(f["taskId"], []))
-            depth_of = {f["taskId"]: 0}
-            while queue:
-                sub = queue.pop(0)
-                sid = sub.get("id")
-                if not sid or sid in seen:
-                    continue
-                seen.add(sid)
-                d = depth_of.get(sub.get("parentId"), 0) + 1
-                depth_of[sid] = d
-                si = _mk_item(sid, sub.get("projectId") or f["projectId"], sub)
-                si["title"] = si["title"] or f"[task {str(sid)[:8]}…]"
-                si["depth"] = d  # render-only; title stays clean for re-verify
-                items.append(si)
-                queue.extend(kids.get(sid, []))
+            _expand_open_subtree(f["taskId"], f["projectId"])
+    for tid, fb in closed_rows:
+        # Закрытая задача в плане удаления (QA-2, дефект №1): пометка `closed`
+        # ведёт исполнителя в закрытые ленты (и на сверке, и на перепроверке),
+        # `closed_label` — то, что читает человек в превью.
+        if tid in seen:
+            continue
+        seen.add(tid)
+        it = _mk_item(tid, fb.get("projectId") or "", fb)
+        it["closed"] = True
+        it["closed_label"] = _closed_status_label(fb)
+        items.append(it)
+        if tid in want_subs:
+            # Открытые дети ЗАКРЫТОГО родителя существуют (complete не
+            # каскадится) — with_subtasks обязан подобрать и их.
+            _expand_open_subtree(tid, fb.get("projectId") or "")
     if len(items) > max_items:
         return (f"🛑 Отказ: после разворачивания подзадач в плане {len(items)} "
                 f"удалений — больше капа {max_items}. Разбей на части или "
                 "подними max_items осознанно.")
+    if not items:
+        # Полностью невалидный батч (QA-2, дефект №4): раньше пустой план
+        # доходил до исполнения и человек получал голое «Ничего не удалено.»
+        # без единой причины. Причины собраны выше — печатаем их здесь и не
+        # строим манифест вовсе (кнопка/подтверждение к пустому плану — обман).
+        zero = ["### 📋 План удаления — 0",
+                "🛑 Плана нет — ни одна строка не прошла сверку: манифест НЕ "
+                "создан, ничего не удалено."]
+        if mismatch:
+            zero.append(_mismatch_report(mismatch, "включил в план"))
+        if missing:
+            zero.append(f"↷ Исключены {len(missing)}: " + "; ".join(
+                f"«{mr['title']}» — {mr.get('reason') or 'не среди открытых'}"
+                for mr in missing))
+        return "\n".join(zero)
     now = time.monotonic()
     obj_hash = _manifest_object_hash("delete", [it["taskId"] for it in items])
     _MANIFESTS[mid] = {"kind": "delete", "items": items,
                        "created": now, "plan_shown_at": now,
                        "object_hash": obj_hash,
+                       # Сколько строк реально ЗАПРОСИЛ вызывающий — отчёт
+                       # исполнения печатает знаменатель по этому числу
+                       # (QA-2, дефект №2: «Удалено 9/9» при 11 запрошенных).
+                       "requested_total": len(tasks),
                        "summary": summary, "consumed": False}
     lines = [f"### 📋 План удаления — {len(items)}",
              _plan_id_line(mid, "ничего ещё не удалено"), ""]
@@ -5971,13 +6094,18 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
         n_orphans = len([k for k in kids.get(it["taskId"], [])
                          if k.get("id") not in planned])
         orphan_tail = f" ({_triage_orphan_note(n_orphans)})" if n_orphans else ""
+        closed_tail = (f" — задача {it['closed_label']}, удаляем закрытую"
+                       if it.get("closed") else "")
         lines.append(f"{i}. {mark}{shown} — {it['project']} "
-                     f"(`{it['taskId']}`){orphan_tail}")
+                     f"(`{it['taskId']}`){closed_tail}{orphan_tail}")
     if mismatch:
         lines.append(_mismatch_report(mismatch, "включил в план"))
     if missing:
-        lines.append(f"↷ Исключены (не среди открытых) {len(missing)}: "
-                     + ", ".join(f"«{m['title']}»" for m in missing))
+        # Причина у КАЖДОЙ строки (QA-2, дефект №4): голый список названий не
+        # говорил человеку, ЧТО с задачей — опечатка в id, корзина, старость.
+        lines.append(f"↷ Исключены {len(missing)}: " + "; ".join(
+            f"«{m['title']}» — {m.get('reason') or 'не среди открытых'}"
+            for m in missing))
     lines.append("")
     # Инструкция для модели — ОТДЕЛЬНО от `lines` (2026-08-06, дефект №2):
     # раньше уходила дословно в Telegram-карточку плана.
@@ -6008,8 +6136,9 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
             killswitch_notes.append(_mismatch_report(mismatch, "включил в план"))
         if missing:
             killswitch_notes.append(
-                f"↷ Исключены (не среди открытых) {len(missing)}: "
-                + ", ".join(f"«{m['title']}»" for m in missing))
+                f"↷ Исключены {len(missing)}: " + "; ".join(
+                    f"«{m['title']}» — {m.get('reason') or 'не среди открытых'}"
+                    for m in missing))
         return ("\n".join([done, ""] + killswitch_notes)
                 if killswitch_notes else done)
     # Сетевую часть отправки уводит в поток сам хук (см. delete_tasks выше и
@@ -6110,6 +6239,28 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
             # ones the human saw in the approved plan. Anything unverifiable
             # (task gone, no title stored to check against) is fail-closed —
             # skipped and reported, never "deleted just in case".
+            if not live and it.get("closed"):
+                # Строка плана — ЗАКРЫТАЯ задача (Completed/Won't do, QA-2
+                # дефект №1): среди открытых её нет по определению, сверка
+                # идёт по закрытым лентам — теми же правилами (id + название,
+                # корзина = отказ), просто по своему источнику.
+                fb, fb_where = await _run_blocking(
+                    _find_task_beyond_open, it["taskId"],
+                    (it.get("projectId") or "").strip())
+                if fb is None:
+                    drifted.append((it.get("title")
+                                    or f"[task {str(it['taskId'])[:8]}…]",
+                                    "закрытая задача не нашлась ни в одной "
+                                    "ленте (уже удалена вручную?)"))
+                    continue
+                if fb_where == "trash":
+                    drifted.append((fb.get("title") or it.get("title") or "",
+                                    "уже в корзине (удалена ранее)"))
+                    continue
+                live = fb
+                live_title = live.get("title") or ""
+                live_pid = (live.get("projectId")
+                            or it.get("projectId") or "")
             if not live:
                 drifted.append((it.get("title") or f"[task {str(it['taskId'])[:8]}…]",
                                 "нет среди открытых задач"))
@@ -6168,6 +6319,8 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
                           "title": (planned_title
                                     if not _looks_untitled(planned_title)
                                     else _untitled_label(live)),
+                          "closed": bool(it.get("closed")),
+                          "orphans": int(it.get("orphans") or 0),
                           "snapshot": it["snapshot"]})
         journal = _journal_write({
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -6180,21 +6333,51 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
                 [{"taskId": r["taskId"], "projectId": r["projectId"]} for r in ready]))
             api_fail = id2error_failures(resp, [r["taskId"] for r in ready])
         still = (await _run_blocking(_open_by_id, fresh=True)) if ready else {}
+        # ЗАКРЫТЫЕ строки (QA-2, дефект №1) в снимке открытых не были и ДО
+        # удаления — «нет среди открытых» для них ничего не доказывает.
+        # Перепроверка идёт по закрытым лентам: удалена = исчезла из них или
+        # переехала в корзину. Кэш v2 сбрасывается, иначе лента завершённых
+        # ответила бы снимком, снятым ДО удаления.
+        closed_ok, closed_bad = set(), set()
+        closed_ids = [r["taskId"] for r in ready if r.get("closed")]
+        if closed_ids and still is not None:
+            if ticktick_v2:
+                try:
+                    await _run_blocking(ticktick_v2.invalidate_cache)
+                except Exception:
+                    pass
+            for cid in closed_ids:
+                if cid in api_fail:
+                    continue
+                fb, fb_where = await _run_blocking(_find_task_beyond_open, cid)
+                if fb is None or fb_where == "trash":
+                    closed_ok.add(cid)
+                else:
+                    closed_bad.add(cid)
         lines = []
         if still is None:
             deleted, failed = [], []
             lines.append(f"Отправлено на удаление {len(ready)}, но "
                          f"{_UNVERIFIED_MSG}")
         else:
-            deleted = [r["title"] for r in ready
-                       if r["taskId"] not in still and r["taskId"] not in api_fail]
-            failed = [r["title"] for r in ready
-                      if r["taskId"] in still or r["taskId"] in api_fail]
+            def _gone(r) -> bool:
+                if r["taskId"] in api_fail:
+                    return False
+                if r.get("closed"):
+                    return r["taskId"] in closed_ok
+                return r["taskId"] not in still
+            deleted = [r["title"] for r in ready if _gone(r)]
+            failed = [r["title"] for r in ready if not _gone(r)]
         if api_fail:
             lines.append("❌ TickTick отклонил " + str(len(api_fail)) + ": "
                          + "; ".join(f"{k[:8]}…: {v}" for k, v in api_fail.items()))
+        # ЗНАМЕНАТЕЛЬ — ЗАПРОШЕННОЕ, а не исполненное (QA-2, дефект №2):
+        # «Удалено 9/9» при 11 запрошенных строках читалось как 100% успех.
+        # `requested_total` кладёт plan_task_deletion (сколько строк реально
+        # попросил вызывающий); у манифестов без него — прежний счёт по items.
+        total_asked = int(m.get("requested_total") or len(m["items"]))
         if deleted:
-            lines.append(f"🗑 Удалено {len(deleted)}/{len(m['items'])}: "
+            lines.append(f"🗑 Удалено {len(deleted)}/{total_asked}: "
                          + ", ".join(f"«{t}»" for t in deleted))
         if drifted:
             lines.append(
@@ -6204,10 +6387,20 @@ async def _execute_task_deletion_impl(manifest_id: str, m: Optional[Dict] = None
         if failed:
             lines.append(f"❌ НЕ удалено {len(failed)} (всё ещё в TickTick): "
                          + ", ".join(f"«{t}»" for t in failed))
+        # Осиротевшие подзадачи (QA-2, дефект №7): превью плана это уже
+        # говорило, но при выключенном гейте человек видит ТОЛЬКО этот отчёт.
+        orphan_notes = [f"«{r['title']}» — {_triage_orphan_note(r['orphans'])}"
+                        for r in ready
+                        if r.get("orphans") and r["title"] in deleted]
+        if orphan_notes:
+            lines.append("⚠️ Подзадачи удалённых остаются БЕЗ родителя: "
+                         + "; ".join(orphan_notes)
+                         + ". Если их тоже надо удалить — перепланируй с "
+                         "with_subtasks=true.")
         if journal:
             lines.append(f"🧾 Снапшоты удалённого — в журнале: {journal} "
-                         "(восстановление: restore_tasks из корзины, либо "
-                         "пересоздание из снапшота).")
+                         "(восстановление: apply_task_changes(op=\"restore\") "
+                         "из корзины, либо пересоздание из снапшота).")
         # Append the server-built independent report — not optional, the model
         # can't skip what's already in the tool result. `_run_blocking` —
         # внутри отчёта сетевые чтения и `time.sleep`-ретраи post-verify (до
@@ -15674,11 +15867,49 @@ def _resolve_triage_ops(operations: List[Dict], by_id: Dict[str, Dict],
             resolved.append(e)
             continue
         live = by_id.get(e["task_id"])
+        closed_fallback = False
         if not live:
-            e["_skip"] = ("не найдена среди открытых задач (кто-то удалил или "
-                          "закрыл её вручную?)")
-            resolved.append(e)
-            continue
+            # QA-2 (2026-08-19, дефект №1): раньше здесь стоял безусловный
+            # «не найдена среди открытых задач (кто-то удалил или закрыл её
+            # вручную?)» — про живую завершённую задачу это ложь, и удалить
+            # её через MCP было невозможно ВООБЩЕ. Смотрим в ленты, которые
+            # закрытые задачи знают, и отвечаем по СОСТОЯНИЮ объекта:
+            # удаление закрытой — законная операция (идёт дальше по общей
+            # сверке), остальное — честный отказ с названной причиной.
+            fb, fb_where = _find_task_beyond_open(e["task_id"])
+            if fb is None:
+                e["_skip"] = ("не найдена ни среди открытых задач, ни в "
+                              "лентах завершённых/корзины (неверный id, или "
+                              "задача закрыта/удалена слишком давно для этих "
+                              "лент)")
+                resolved.append(e)
+                continue
+            if fb_where == "trash":
+                e["_skip"] = ("лежит в КОРЗИНЕ (удалена) — верните её "
+                              "операцией op=\"restore\" этого же инструмента "
+                              "и повторите")
+                resolved.append(e)
+                continue
+            if fb_where == "open":
+                # Открыта, но в v2-снимок не попала (рассинхрон source'ов).
+                # Мутировать по объекту, которого исполнители в снимке не
+                # увидят, нельзя — но и врать «кто-то удалил» тоже.
+                e["_skip"] = ("задача существует и открыта, но в снимок "
+                              "открытых задач ещё не попала (рассинхрон) — "
+                              "повтори через минуту")
+                resolved.append(e)
+                continue
+            # fb_where == "completed": закрытая (Completed или Won't do).
+            if e["op"] != "delete":
+                e["_live_title"] = fb.get("title") or ""
+                e["_skip"] = (f"задача {_closed_status_label(fb)} — не среди "
+                              "открытых; менять/закрывать/переносить её "
+                              "нельзя, а удалить можно: op=\"delete\" в этом "
+                              "же инструменте")
+                resolved.append(e)
+                continue
+            live = fb
+            closed_fallback = True
         if e["task_id"] in restore_injected:
             # Раздел 5 дизайна, снятие ограничения (2026-08-19): это НЕ
             # по-настоящему открытая задача, а корзинная запись, подставленная
@@ -15723,6 +15954,11 @@ def _resolve_triage_ops(operations: List[Dict], by_id: Dict[str, Dict],
             resolved.append(e)
             continue
         _triage_bind_live(e, live, names)
+        if closed_fallback:
+            # Пометка для дрейф-сверки и исполнителя удаления: этого объекта
+            # НЕТ в снимке открытых, и искать его там на исполнении нельзя —
+            # сверка пойдёт по тем же закрытым лентам (QA-2, дефект №1).
+            e["_closed"] = True
         # Специфика ТИПА — в его сверке плана из реестра (1.3.3/изм-1). Она же
         # обогащает операцию тем, что нужно её собственному исполнителю
         # (проект назначения у move, живое имя оставляемой копии у merge).
@@ -15972,6 +16208,21 @@ def _triage_drift_reason(op: Dict, by_id: Dict[str, Dict],
         # исполнения типа, к своей ленте.
         return reg.drift(op, by_id, names)
     live = by_id.get(op.get("task_id"))
+    if not live and op.get("_closed"):
+        # Объект плана — ЗАКРЫТАЯ задача (delete по завершённой/отменённой,
+        # QA-2 дефект №1): в снимке открытых её нет по определению, сверка
+        # идёт по тем же закрытым лентам, которыми её нашёл план.
+        fb, fb_where = _find_task_beyond_open(
+            op.get("task_id"), op.get("_project_id") or "")
+        if fb is None:
+            return ("закрытая задача исчезла из всех лент между планом и "
+                    "исполнением (уже удалена вручную?)")
+        if fb_where == "trash":
+            return "уже в корзине (удалена между планом и исполнением)"
+        if not _names_agree(op.get("title") or "", fb.get("title") or ""):
+            return (f"название изменилось после плана "
+                    f"(сейчас «{fb.get('title')}»)")
+        return _TRIAGE_BY_OP[op["op"]].drift(op, by_id, names)
     if not live:
         return "исчезла из открытых задач между планом и исполнением"
     # Маркер «названия нет» обязан пере-проверяться ЗДЕСЬ отдельной веткой
@@ -17944,10 +18195,21 @@ async def _op_delete_execute(summary: str, ops: List[Dict],
     for o in ops:
         live = ctx.by_id.get(o["task_id"]) or {}
         pid = live.get("projectId") or o.get("_project_id", "")
-        items.append({"taskId": o["task_id"], "projectId": pid,
-                      "title": live.get("title") or o.get("title") or "",
-                      "project": ctx.names.get(pid, ""),
-                      "snapshot": o.get("_snapshot") or _snapshot_of(live)})
+        item = {"taskId": o["task_id"], "projectId": pid,
+                "title": (live.get("title") or o.get("_live_title")
+                          or o.get("title") or ""),
+                "project": ctx.names.get(pid, ""),
+                "snapshot": o.get("_snapshot") or _snapshot_of(live)}
+        if o.get("_closed"):
+            # Закрытая задача (QA-2, дефект №1): исполнителю удаления нельзя
+            # искать её среди открытых — пометка ведёт его в закрытые ленты.
+            item["closed"] = True
+        if o.get("_open_children"):
+            # Сколько ОТКРЫТЫХ детей осиротеет (QA-2, дефект №7): превью
+            # плана это уже говорило, но при выключенном гейте человек видит
+            # только отчёт исполнения — число обязано доехать и туда.
+            item["orphans"] = int(o["_open_children"])
+        items.append(item)
     now = time.monotonic()
     synthetic = {
         "kind": "delete", "items": items, "created": now,
