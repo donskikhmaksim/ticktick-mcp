@@ -2176,8 +2176,9 @@ def _guard_task(
             return _Guard("missing", live.get("projectId") or project_id,
                           live.get("title") or "",
                           f"задача «{live.get('title') or task_id}» лежит В "
-                          "КОРЗИНЕ (удалена) — верните её через restore_tasks, "
-                          "прежде чем работать с ней")
+                          "КОРЗИНЕ (удалена) — верните её через "
+                          "apply_task_changes(op=\"restore\"), прежде "
+                          "чем работать с ней")
     if not live:
         return _Guard("missing", project_id, expected_title,
                       f"id {str(task_id)[:8]}… не среди открытых задач "
@@ -2234,7 +2235,8 @@ _COMPLETED_TASK_NOTE = ("задача ЗАВЕРШЕНА (не среди отк
 # читается как сбой сервера, а не как состояние объекта).
 _TRASHED_TASK_NOTE = ("задача «{title}» лежит В КОРЗИНЕ (удалена): операция "
                       "над удалённым объектом не выполняется — верните её "
-                      "через restore_tasks, и тогда повторите.")
+                      "через apply_task_changes(op=\"restore\"), и тогда "
+                      "повторите.")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -4321,7 +4323,7 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
     Phase 1 of confirmed creation — THE way to create tasks in an interactive
     chat: build a creation MANIFEST without creating anything. Read-only.
 
-    Accepts the same task objects as create_tasks (title, project_id, content,
+    Accepts plain task objects (title, project_id, content,
     due_date, priority, tags, column_id, subtasks, …). project_id is OPTIONAL:
     when the user didn't name a project, OMIT it — the server itself looks at
     the owner's project list and proposes a destination PER TASK (sure /
@@ -4369,7 +4371,7 @@ async def plan_task_creation(summary: str, tasks: List[Dict[str, Any]],
 
     Args:
         summary: one-line human sentence describing the batch
-        tasks: same objects create_tasks takes
+        tasks: task objects (title, project_id, content, due_date, priority, tags, column_id, subtasks, …)
         max_items: refuse to plan more than this many creations
     """
     err = (await _run_blocking(_ensure_official))
@@ -5819,7 +5821,7 @@ async def delete_tasks(summary: str, tasks: Optional[List[Dict[str, str]]] = Non
         preview = [f"### 📋 {summary} — {len(items)}",
                   _plan_id_line(mid, "ничего ещё не удалено"),
                   "- задачи уходят в корзину TickTick — можно вернуть через "
-                  "restore_tasks", ""]
+                  "apply_task_changes(op=\"restore\")", ""]
         for i, it in enumerate(items, 1):
             preview.append(f"{i}. **«{it['title']}»** — {it['project']} (`{it['taskId']}`)")
         preview.extend(lines)
@@ -5879,10 +5881,9 @@ async def plan_task_deletion(summary: str, tasks: List[Dict[str, str]],
     """
     Phase 1 of SAFE deletion — the two-phase (plan → user says yes →
     execute) path, REQUIRED for bulk deletes and for parent+subtree deletes.
-    (A single task MAY still be removed directly via delete_tasks when its
-    title is supplied, up to DIRECT_DELETE_CAP=1 — that path is ALSO gated,
-    not disabled; anything larger than the cap is refused there and routed
-    here.) Builds a deletion MANIFEST without deleting anything. Read-only —
+    (A single task can also be deleted via apply_task_changes with
+    op="delete" — that path is ALSO gated, not disabled.) Builds a deletion
+    MANIFEST without deleting anything. Read-only —
     safe to call without confirmation.
 
     Each requested {taskId, title?, projectId?, with_subtasks?} is resolved
@@ -7262,8 +7263,19 @@ def _build_operation_report_data(record_id: str) -> _ReportData:
         elif warn:
             overall, tail = "⚠️", "есть непроверенные пункты — это НЕ полный успех."
         elif ok and drift:
+            # «См. разделы ниже» имеет право звучать ТОЛЬКО когда разделы
+            # действительно будут напечатаны (QA-2 2026-08-19, дефект №3:
+            # drift бывает и от пометки в строке вердикта — тогда «разделов
+            # ниже» нет, и обещание вело в пустоту). Называем, ГДЕ именно
+            # искать расхождение.
+            if skipped or not_planned:
+                where_drift = ("см. разделы «Пропущено»/«Не вошло в план» "
+                               "ниже")
+            else:
+                where_drift = ("деталь — в строках проверки выше, у пунктов "
+                               "с оговоркой")
             overall, tail = "⚠️", ("подтверждённое подтвердилось, но план и "
-                                   "факт разошлись — см. разделы ниже; это НЕ "
+                                   f"факт разошлись — {where_drift}; это НЕ "
                                    "полный успех.")
         elif ok:
             overall, tail = "✅", "всё подтверждено."
@@ -10139,7 +10151,7 @@ async def _set_task_parent_impl(summary: str, tasks: List[Dict[str, str]],
         if cross_refused:
             lines.append(f"🛑 НЕ вложено {len(cross_refused)} — задачи в ДРУГОМ "
                          f"проекте, а родитель в «{_v2_project_names().get(parent_pid, parent_pid)}». "
-                         "Сначала перенеси move_tasks: " + ", ".join(cross_refused))
+                         "Сначала перенеси в тот же проект (apply_task_changes, op=\"move\"): " + ", ".join(cross_refused))
         if depth_refused:
             lines.append(f"🛑 НЕ вложено {len(depth_refused)} — TickTick не "
                          f"поддерживает вложенность глубже {MAX_TASK_NEST_LEVELS} "
@@ -10776,7 +10788,9 @@ async def build_recurrence_rule(frequency: str, interval: int = 1,
                                 by_month: List[int] = None,
                                 by_set_pos: List[int] = None) -> str:
     """
-    Build an RRULE recurrence string to pass as repeat_flag in create_tasks/update_tasks.
+    Build an RRULE recurrence string to pass as repeat_flag when creating a task
+    (plan_task_creation → execute_task_creation) or updating one
+    (apply_task_changes, op="update").
 
     The FIRST line of the output is the rule itself — that is what goes into
     repeat_flag. Anything after it is a warning about a rule that is valid but
@@ -10885,7 +10899,9 @@ async def build_recurrence_rule(frequency: str, interval: int = 1,
 @mcp.tool(annotations=READONLY)
 async def build_reminder(minutes_before: int = 0) -> str:
     """
-    Build a reminder TRIGGER string to pass in the reminders list of create_tasks/update_tasks.
+    Build a reminder TRIGGER string to pass in the reminders list when creating
+    a task (plan_task_creation → execute_task_creation) or updating one
+    (apply_task_changes, op="update").
 
     Args:
         minutes_before: Minutes before the due time to remind. 0 = at the time
@@ -11645,7 +11661,7 @@ async def add_task_comment(task_title: str, text: str, project_id: str, task_id:
     check then runs against the source that still knows the task, so the
     title IS verified, and the plan/result say the task is completed. A task
     that a source DOES know but that sits in the TRASH is refused instead
-    (see restore_tasks) — trash gets its own refusal, separate from an id
+    (see apply_task_changes(op="restore")) — trash gets its own refusal, separate from an id
     that no source knows at all.
     """
     err = (await _run_blocking(_ensure_ready))
@@ -11816,10 +11832,11 @@ async def get_statistics() -> str:
 async def get_trash(limit: int = 50) -> str:
     """
     List recently deleted (trashed) tasks (requires v2 API). Each line carries
-    the task's id and original project — restore_tasks needs both: the id/title
-    pair to identify the task (title is checked against the live trash entry
-    before restoring), and to_project_id only if you want to override the
-    original list it restored to.
+    the task's id and original project — apply_task_changes(op="restore")
+    needs both: the id/title pair to identify the task (title is checked
+    against the live trash entry before restoring), and
+    to_project_id/to_project only to override the original list it restores
+    to.
 
     A truncated answer ALWAYS says so and names the real total: the trash page
     is fetched up to its 500-entry ceiling regardless of `limit`, so "showing
@@ -12216,7 +12233,7 @@ async def attach_file_to_task(task_title: str, task_id: str, project_id: str,
     check then runs against the source that still knows the task, so the
     title IS verified, and the plan/result say the task is completed. A task
     that a source DOES know but that sits in the TRASH is refused instead
-    (see restore_tasks) — trash gets its own refusal, separate from an id
+    (see apply_task_changes(op="restore")) — trash gets its own refusal, separate from an id
     that no source knows at all.
     """
     err = (await _run_blocking(_ensure_ready))
@@ -13584,7 +13601,7 @@ async def duplicate_task(summary: str, task_id: str, task_title: str = None,
     check then runs against the source that still knows the task, so the
     title IS verified, and the plan/result say the task is completed. A task
     that a source DOES know but that sits in the TRASH is refused instead
-    (see restore_tasks) — trash gets its own refusal, separate from an id
+    (see apply_task_changes(op="restore")) — trash gets its own refusal, separate from an id
     that no source knows at all.
     """
     err = (await _run_blocking(_ensure_ready))
@@ -13753,7 +13770,7 @@ async def update_task_comment(task_title: str, text: str, project_id: str,
     check then runs against the source that still knows the task, so the
     title IS verified, and the plan/result say the task is completed. A task
     that a source DOES know but that sits in the TRASH is refused instead
-    (see restore_tasks) — trash gets its own refusal, separate from an id
+    (see apply_task_changes(op="restore")) — trash gets its own refusal, separate from an id
     that no source knows at all.
     """
     err = (await _run_blocking(_ensure_ready))
@@ -13868,7 +13885,7 @@ async def delete_task_comment(task_title: str, project_id: str, task_id: str,
     check then runs against the source that still knows the task, so the
     title IS verified, and the plan/result say the task is completed. A task
     that a source DOES know but that sits in the TRASH is refused instead
-    (see restore_tasks) — trash gets its own refusal, separate from an id
+    (see apply_task_changes(op="restore")) — trash gets its own refusal, separate from an id
     that no source knows at all.
     """
     err = (await _run_blocking(_ensure_ready))
@@ -14424,7 +14441,7 @@ async def get_task_info(task_id: str) -> str:
             in_trash, _ = await _trash_state(task_id)
             if in_trash:
                 return (f"Task {task_id} is IN THE TRASH (deleted). "
-                        "restore_tasks can bring it back.")
+                        "apply_task_changes(op=\"restore\") can bring it back.")
             if in_trash is False:
                 return (f"Task {task_id} not found among open tasks and it is NOT in "
                         "the trash — it is either completed, or in an archived/closed "
@@ -14883,7 +14900,8 @@ async def get_project_members(project_id: str) -> str:
     """
     List the members of a shared project — owner and collaborators — with
     their user IDs (requires v2 API). Use a member's userId as the assignee
-    field in create_tasks/update_tasks to assign a task to them.
+    field of a task row (plan_task_creation, or apply_task_changes with
+    op="update") to assign a task to them.
 
     Args:
         project_id: ID of the shared project
@@ -14993,7 +15011,8 @@ async def get_tasks_by_assignee(assignee: str, include_completed: bool = False) 
 async def list_project_columns(project_id: str) -> str:
     """
     List the kanban columns/sections of a project, with their IDs (uses the
-    official API). Use a column id as column_id in create_tasks/update_tasks.
+    official API). Use a column id as column_id when creating a task
+    (plan_task_creation) or updating one (apply_task_changes, op="update").
 
     Args:
         project_id: ID of the project
@@ -15046,7 +15065,8 @@ async def create_project_column(project_id: str, name: str,
     """
     Create a kanban column/section inside a project (including the Inbox) and
     return its id (requires v2 API). Use the returned id as column_id in
-    create_tasks/update_tasks to route tasks into this section. Gated 🟡
+    task rows (plan_task_creation, or apply_task_changes with op="update")
+    to route tasks into this section. Gated 🟡
     (docs/DESIGN_approval_gate.md): two calls, same tool name — nothing is
     created on call #1.
 
@@ -15293,6 +15313,28 @@ def _triage_orphan_note(n: int) -> str:
     return f"у неё {n} открытых подзадач — они останутся без родителя"
 
 
+def _open_children_note(n: int) -> str:
+    """«…у неё N открытых подзадач — они останутся ОТКРЫТЫМИ под закрытым
+    родителем». Для complete/abandon: TickTick НЕ каскадит закрытие на
+    подзадачи, и сервер сознательно тоже (план не разрастается сверх
+    названного человеком — то же правило, что у `_triage_orphan_note`), но
+    молчать об этом нельзя (QA-2 2026-08-19, дефект №6: child/grandchild
+    висели Active под закрытым родителем, и ответ не говорил ни слова).
+    Отдельная формулировка, а не переиспользование `_triage_orphan_note`:
+    «останутся без родителя» — про УДАЛЕНИЕ, у закрытия родитель никуда не
+    девается, дети именно остаются открытыми."""
+    if not n:
+        return ""
+    if n % 10 == 1 and n % 100 != 11:
+        return ("у неё 1 открытая подзадача — она останется ОТКРЫТОЙ под "
+                "закрытым родителем")
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return (f"у неё {n} открытые подзадачи — они останутся ОТКРЫТЫМИ под "
+                "закрытым родителем")
+    return (f"у неё {n} открытых подзадач — они останутся ОТКРЫТЫМИ под "
+            "закрытым родителем")
+
+
 def _describe_triage_op(op: Dict) -> str:
     """Одна человекочитаемая строка про одну операцию — то, что человек
     реально увидит перед тем, как сказать «да». Никаких голых id: настоящие
@@ -15312,7 +15354,11 @@ def _describe_triage_op(op: Dict) -> str:
             {**op, "_live_title": op.get("title") or op.get("_live_title")})
         return f"⚠️ ПРОПУЩЕНО — {shown}: {op['_skip']}"
     title = _triage_task_label(op)
-    orphan = _triage_orphan_note(op.get("_open_children") or 0)
+    # У закрытия (complete/abandon) — своя формулировка про детей: родитель
+    # не исчезает, дети остаются ОТКРЫТЫМИ (QA-2, дефект №6).
+    orphan = (_open_children_note(op.get("_open_children") or 0)
+              if kind in ("complete", "abandon")
+              else _triage_orphan_note(op.get("_open_children") or 0))
     if kind in ("delete", "complete", "abandon"):
         bits = ([f"проект «{proj}»"] if proj else []) + ([orphan] if orphan else [])
         note = f" ({'; '.join(bits)})" if bits else ""
@@ -17747,7 +17793,18 @@ async def _op_complete_execute(summary: str, ops: List[Dict],
                                ctx: _TriageExecCtx) -> List[Tuple[str, str]]:
     items = [{"taskId": o["task_id"], "title": o.get("title") or "",
               "projectId": o.get("_project_id", "")} for o in ops]
-    return [("✅ Закрытие", await _complete_tasks_impl(summary, items))]
+    text = await _complete_tasks_impl(summary, items)
+    # Дети закрытого родителя ОСТАЮТСЯ открытыми (QA-2, дефект №6) — превью
+    # это говорило, но при выключенном гейте человек видит ТОЛЬКО этот отчёт.
+    kid_notes = [f"«{o.get('_live_title') or o.get('title') or ''}» — "
+                 f"{_open_children_note(o['_open_children'])}"
+                 for o in ops if o.get("_open_children")]
+    if kid_notes:
+        text += ("\n⚠️ " + "; ".join(kid_notes)
+                 + ". Закрывать их сервер сам не стал (план не разрастается "
+                 "сверх названного) — если нужно, назови их отдельными "
+                 "операциями op=\"complete\".")
+    return [("✅ Закрытие", text)]
 
 
 # ─────────────────────────────── restore ───────────────────────────────────
@@ -18080,6 +18137,10 @@ async def _op_abandon_execute(summary: str, ops: List[Dict],
     for o in ops:
         text = await _abandon_task_impl(
             summary, o["task_id"], o.get("_live_title") or o.get("title") or "")
+        if o.get("_open_children"):
+            # Та же честность, что у complete (QA-2, дефект №6): дети
+            # остаются открытыми, отчёт исполнения обязан это сказать.
+            text += f"\n⚠️ {_open_children_note(o['_open_children'])}."
         out.append((f"🚫 Не буду делать: «{_triage_task_label(o)}»", text))
     return out
 
@@ -18433,7 +18494,7 @@ async def apply_task_changes(summary: str, operations: List[Dict[str, Any]] = No
         "untitled": true,   # INSTEAD of "title", ONLY for a task that really
                             # has NO title — see below
         "said":    "<what the HUMAN said about THIS task>",  # required
-        # op="update" only — same field names update_tasks itself takes:
+        # op="update" only — field names listed below:
         "changes": {"new_title": "...", "due_date": "YYYY-MM-DD",
                     "start_date": "...", "priority": 0|1|3|5,
                     "content": "...", "tags": ["..."]},
@@ -18507,7 +18568,7 @@ async def apply_task_changes(summary: str, operations: List[Dict[str, Any]] = No
     `untitled: true` does NOT block renaming: an `update` whose `changes`
     carry `new_title` still goes through for a task that really has no name —
     the marker is what keeps that legitimate case open now that renaming with
-    no name to verify is refused everywhere (see update_tasks).
+    no name to verify is refused everywhere.
 
     `changes` accepts ONLY these keys: new_title, content, due_date,
     start_date, priority (0|1|3|5), tags (list of strings), reminders,

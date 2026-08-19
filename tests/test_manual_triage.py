@@ -1648,7 +1648,10 @@ async def test_completing_a_parent_warns_about_one_subtask(monkeypatch, tmp_path
         {"op": "complete", "task_id": "P2", "title": "Отпуск",
          "said": "съездил уже"}])
 
-    assert "у неё 1 открытая подзадача — она останется без родителя" in preview
+    # QA-2 (2026-08-19, дефект №6): у ЗАКРЫТИЯ — своя формулировка: родитель
+    # не исчезает, ребёнок остаётся ОТКРЫТЫМ (не «без родителя», как у delete).
+    assert ("у неё 1 открытая подзадача — она останется ОТКРЫТОЙ под "
+            "закрытым родителем") in preview
 
 
 async def test_a_childless_task_gets_no_subtask_note(monkeypatch, tmp_path):

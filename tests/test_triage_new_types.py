@@ -605,7 +605,7 @@ async def test_abandon_warns_about_orphaned_children(monkeypatch, tmp_path):
         {"op": "abandon", "task_id": "a1", "title": "Учить испанский",
          "said": "не буду"}])
 
-    assert "останется без родителя" in preview
+    assert "останется ОТКРЫТОЙ под закрытым родителем" in preview
 
 
 # ═════════════════════════════ duplicate ══════════════════════════════════
