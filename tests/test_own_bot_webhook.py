@@ -307,16 +307,22 @@ def test_handle_webhook_approve_consumes_clears_buttons_and_answers(monkeypatch)
 
 
 def test_handle_webhook_reject_maps_r_prefix_to_rejected(monkeypatch):
-    consume_calls, answer_calls = [], []
+    """С 2026-08-19 reject не просто снимает кнопки: в сообщение плана
+    вписывается терминальный след «Отклонено — ничего не сделано»
+    (см. tests/test_reject_terminal_trace.py), поэтому тост ищем среди ВСЕХ
+    вызовов _tg_call, а не как единственный."""
+    consume_calls, tg_calls = [], []
     monkeypatch.setattr(tg, "consume_tg_decision",
                         lambda mid, status: consume_calls.append((mid, status))
                         or {"chat_id": "1", "message_id": 42})
     monkeypatch.setattr(tg, "clear_inline_keyboard", lambda *a: None)
     monkeypatch.setattr(tg, "_tg_call",
-                        lambda cfg, method, body: answer_calls.append(body) or {"ok": True})
+                        lambda cfg, method, body: tg_calls.append((method, body))
+                        or {"ok": True})
     tg.handle_webhook(_cfg(), _cq_update(data="r:m2"))
     assert consume_calls == [("m2", "REJECTED")]
-    assert answer_calls[0]["text"] == "Отклонено"
+    answers = [b for m, b in tg_calls if m == "answerCallbackQuery"]
+    assert answers and answers[-1]["text"] == "Отклонено"
 
 
 def test_handle_webhook_replay_does_not_clear_buttons_again(monkeypatch):

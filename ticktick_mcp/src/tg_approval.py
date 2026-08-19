@@ -1086,7 +1086,17 @@ def get_tg_approval(manifest_id: str) -> Optional[dict]:
     extra_message_ids (добавлен 2026-08-06) — предыдущие куски длинного плана:
     после исполнения их надо УДАЛИТЬ из лички, иначе они остаются там навсегда
     (наш reaper строки APPROVED не трогает — это архив решения, а уборщик
-    gmail-mcp знает только про message_id)."""
+    gmail-mcp знает только про message_id).
+
+    Гард `store_ready()` (2026-08-19): с 6d36dbe эта функция зовётся прямо из
+    вебхука кнопки (`_handle_callback_query` — таймеры удаления кусков
+    длинного плана), то есть выполняется и в конфигурации, где Postgres не
+    инициализирован. Без гарда это AttributeError на `_pg_pool.getconn()` —
+    нажатие кнопки роняло весь `handle_webhook` (owner не получал даже
+    `answerCallbackQuery`, «часики» крутились до таймаута). Нет store — нет
+    строки: честный None, как у `consume_tg_decision`."""
+    if not store_ready():
+        return None
     conn = _pg_pool.getconn()
     try:
         with conn, conn.cursor() as cur:
@@ -1383,7 +1393,23 @@ def _handle_callback_query(cfg: TgApprovalConfig, cq: Dict[str, Any]) -> None:
         if message_id is None:
             message_id = consumed.get("message_id")
         if message_id is not None:
-            clear_inline_keyboard(cfg, str(chat_id), message_id)
+            if decision == "REJECTED":
+                # 2026-08-19: после «🔴 Отклонить» в чате обязан остаться
+                # честный терминальный след, а не только эфемерный тост
+                # answerCallbackQuery (исчезает через секунды) и снятые
+                # кнопки на неизменённом тексте плана — иначе человек,
+                # закрывший Telegram, не отличит «отклонил» от «подтвердил и
+                # закрыл». Правка текста тем же транспортом, что у
+                # approve-итога (`summarize_in_owner_chat`): один
+                # editMessageText меняет текст И снимает кнопки. Правка не
+                # удалась (сообщение старше 48ч/стёрто руками) — резервно
+                # хотя бы снимаем кнопки, как раньше.
+                plan_text = (cq.get("message") or {}).get("text") or ""
+                if not mark_rejected_in_owner_chat(cfg, str(chat_id),
+                                                   message_id, plan_text):
+                    clear_inline_keyboard(cfg, str(chat_id), message_id)
+            else:
+                clear_inline_keyboard(cfg, str(chat_id), message_id)
         # TZ §5: ОТВЕТ (нажатие кнопки) только что пришёл — план исполнил
         # свою роль. Таймер на удаление стартует ИМЕННО здесь, не от момента
         # отправки плана (который мог провисеть сколько угодно). Куски
@@ -2030,7 +2056,16 @@ def clear_inline_keyboard(cfg: TgApprovalConfig, chat_id: str,
     исполнять было нечего, план — единственное, что у владельца осталось от
     его же просьбы: затерев текст, мы отняли бы у него возможность понять, что
     именно повторять. Поэтому текст остаётся, а вводящие в заблуждение кнопки
-    убираются, и объяснение приходит отдельным сообщением.
+    убираются. Кто объясняет ситуацию словами — зависит от вызывающего
+    (2026-08-19, раньше здесь стояло огульное «объяснение приходит отдельным
+    сообщением», что было правдой только для одного пути из трёх):
+      • lost-plan (`_publish_lost_manifest_outcome`) — да, шлёт отдельное
+        сообщение с объяснением;
+      • approve-путь вебхука — объяснит поллер: итог исполнения впишется в
+        это же сообщение (`summarize_in_owner_chat`);
+      • reject-путь вебхука — зовёт эту функцию только РЕЗЕРВНО, когда
+        `mark_rejected_in_owner_chat` не смогла вписать в текст терминальное
+        «🛑 Отклонено — ничего не сделано».
 
     Best-effort: сообщение стёрли руками / Telegram не в духе → False и лог."""
     if message_id is None:
@@ -2045,6 +2080,52 @@ def clear_inline_keyboard(cfg: TgApprovalConfig, chat_id: str,
                        f"чате {chat_id}: {res.get('description')}")
         return False
     return True
+
+
+# Терминальный след отказа (2026-08-19). Формулировка сознательно НЕ похожа
+# на успех: без ✅, без «подтверждено», без счётчиков «затронуто N объектов»
+# — по замороженной эмодзи-легенде (output-format.md §7.2) 🛑 означает
+# «ничего не изменено», и это ровно то, что случилось.
+_REJECTED_MARK_MD = (
+    "🛑 **Отклонено — ничего не сделано.**\n\n"
+    "Изменений в TickTick нет: план закрыт, исполнить его больше нельзя. "
+    "Если операция всё-таки нужна — попросите её заново, придёт новый план "
+    "с кнопками.")
+
+# Сколько символов отклонённого плана сохранять под терминальной строкой.
+# Правка обязана влезть в ОДИН editMessageText (4096): длиннее — Telegram
+# ответит 400 и следа не останется вовсе. 3000 + терминальная строка + запас
+# на HTML-экранирование в `md_to_telegram_html` укладываются с запасом.
+_REJECTED_PLAN_TAIL_CAP = 3000
+
+
+def mark_rejected_in_owner_chat(cfg: TgApprovalConfig, chat_id: str,
+                                message_id: Optional[int],
+                                plan_text: str = "") -> bool:
+    """Вписывает в сообщение плана терминальный след отказа: «🛑 Отклонено —
+    ничего не сделано» ПЕРВОЙ строкой (заголовок первым — output-format.md
+    §7.1), ниже — сам отклонённый план для справки (владелец, передумавший
+    через полминуты, должен видеть, ЧТО он отклонил; текст берётся из
+    `callback_query.message.text` — Telegram присылает его вместе с нажатием,
+    отдельного чтения не нужно).
+
+    Транспорт — `summarize_in_owner_chat`: тот же единственный путь
+    `editMessageText`, которым approve-итог вписывается в это же сообщение
+    (текст меняется И кнопки снимаются одним вызовом), а не параллельная
+    копия. Отдельное сообщение здесь было бы хуже: план и так стоит в очереди
+    самоудаления (TZ §5, таймер стартовал в `_handle_callback_query`), а
+    новое сообщение пришлось бы ставить в очередь отдельно и оно звякнуло бы
+    лишним уведомлением.
+
+    Best-effort: False — вписать не удалось (нет message_id, сообщение старше
+    48ч, стёрто руками), вызывающий тогда хотя бы снимает кнопки."""
+    text = _REJECTED_MARK_MD
+    plan = (plan_text or "").strip()
+    if plan:
+        if len(plan) > _REJECTED_PLAN_TAIL_CAP:
+            plan = plan[:_REJECTED_PLAN_TAIL_CAP] + "…"
+        text += "\n\nОтклонённый план (для справки):\n" + plan
+    return summarize_in_owner_chat(cfg, chat_id, message_id, text)
 
 
 def report_auto_execution_result(cfg: TgApprovalConfig, chat_id: str,
